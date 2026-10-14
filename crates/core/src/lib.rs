@@ -7,6 +7,7 @@
 //! periodically using the same monotonic clock as crossings and heartbeats.
 
 pub mod control;
+pub mod platform;
 pub mod topology;
 pub use control::{Action, ControlError, Controller};
 pub use seamless_input_protocol::{InputEvent, Modifier, NodeId};

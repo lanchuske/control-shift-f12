@@ -1,5 +1,5 @@
 [workspace]
-members = ["apps/seamless-input", "crates/protocol", "crates/core", "crates/discovery", "crates/transport"]
+members = ["apps/seamless-input", "crates/protocol", "crates/core", "crates/discovery", "crates/transport", "crates/platform-macos"]
 resolver = "2"
 
 [workspace.package]
