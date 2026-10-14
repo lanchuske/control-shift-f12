@@ -1,15 +1,31 @@
-use std::process::Command;
+use std::{
+    process::{Command, Stdio},
+    thread,
+    time::Duration,
+};
 
 fn run(args: &[&str]) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_seamless-input"))
         .args(args)
+        .env("SEAMLESS_INPUT_HOME", test_home())
         .output()
         .expect("CLI process should start")
+}
+
+fn test_home() -> std::path::PathBuf {
+    let path = std::env::temp_dir().join(format!(
+        "seamless-input-cli-{}-{}",
+        std::process::id(),
+        std::thread::current().name().unwrap_or("test")
+    ));
+    let _ = std::fs::remove_dir_all(&path);
+    path
 }
 
 fn run_with_sensitive_environment(args: &[&str]) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_seamless-input"))
         .args(args)
+        .env("SEAMLESS_INPUT_HOME", test_home())
         .env("USER", "sensitive-user")
         .env("USERNAME", "sensitive-user")
         .env("COMPUTERNAME", "sensitive-machine")
@@ -19,56 +35,88 @@ fn run_with_sensitive_environment(args: &[&str]) -> std::process::Output {
         .expect("CLI process should start")
 }
 
-fn assert_not_implemented(output: &std::process::Output, command: &str) {
-    assert_eq!(output.status.code(), Some(1));
-    assert_eq!(output.stdout, b"");
-    assert_eq!(
-        String::from_utf8_lossy(&output.stderr),
-        format!("error: {command} is not implemented yet\n")
+#[test]
+fn pair_new_creates_a_real_redacted_pairing_offer() {
+    let output = run(&["pair", "new"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
     );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("Pairing code:"));
+    assert_eq!(stdout.split_whitespace().skip(2).take(6).count(), 6);
+    assert!(!stdout.contains("not implemented"));
 }
 
 #[test]
-fn start_routes_to_a_not_implemented_operational_error() {
-    assert_not_implemented(&run(&["start"]), "start");
+fn start_bootstraps_the_real_supervisor_and_stays_running() {
+    let home = test_home();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_seamless-input"))
+        .arg("start")
+        .env("SEAMLESS_INPUT_HOME", &home)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    thread::sleep(Duration::from_millis(700));
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "start exited before supervision began"
+    );
+    child.kill().unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(home.join("config.toml").is_file());
+    assert!(home.join("identity").join("identity.json").is_file());
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("not implemented"));
 }
 
 #[test]
-fn pair_new_routes_to_a_not_implemented_operational_error() {
-    assert_not_implemented(&run(&["pair", "new"]), "pair");
-}
-
-#[test]
-fn pair_code_is_never_echoed_when_pairing_is_not_implemented() {
-    let code = "amber-cedar-dawn-field-grove-harbor";
+fn pair_code_is_validated_without_echoing_the_secret() {
+    let code = "abandon abandon abandon abandon abandon abandon";
     let output = run(&["pair", code]);
-    assert_not_implemented(&output, "pair");
-    assert!(!String::from_utf8(output.stdout).unwrap().contains(code));
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!combined.contains(code));
+    assert!(!combined.contains("not implemented"));
 }
 
 #[test]
-fn peers_routes_to_a_not_implemented_operational_error() {
-    assert_not_implemented(&run(&["peers"]), "peers");
+fn peers_reads_the_real_pairing_store() {
+    let output = run(&["peers"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("Paired peers: 0"));
+    assert!(!stdout.contains("not implemented"));
 }
 
 #[test]
-fn unpair_routes_to_a_not_implemented_operational_error() {
-    assert_not_implemented(&run(&["unpair", "office-mac"]), "unpair");
+fn unpair_queries_the_real_pairing_store() {
+    let output = run(&["unpair", "office-mac"]);
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("paired peer was not found"));
+    assert!(!stderr.contains("not implemented"));
 }
 
 #[test]
-fn tui_routes_to_a_not_implemented_operational_error() {
-    assert_not_implemented(&run(&["tui"]), "tui");
-}
-
-#[test]
-fn doctor_routes_to_a_not_implemented_operational_error() {
+fn doctor_measures_real_local_capabilities() {
     let output = run(&["doctor"]);
     assert!(output.status.success());
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(stdout.contains("SeamlessInput doctor"));
     assert!(stdout.contains("administrator elevation: not required"));
-    assert!(stdout.contains("NOT MEASURED"));
+    assert!(stdout.contains("input access:"));
+    assert!(stdout.contains("displays:"));
+    assert!(stdout.contains("discovery:"));
+    assert!(!stdout.contains("runtime readiness: NOT MEASURED"));
 }
 
 #[test]
@@ -98,13 +146,27 @@ fn doctor_report_is_opt_in_redacted_and_stable_identifier_free() {
 }
 
 #[test]
-fn config_show_routes_to_a_not_implemented_operational_error() {
-    assert_not_implemented(&run(&["config", "show"]), "config show");
+fn config_show_loads_the_real_default_configuration() {
+    let output = run(&["config", "show"]);
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("version = 1"));
+    assert!(!stdout.contains("not implemented"));
 }
 
 #[test]
-fn config_path_routes_to_a_not_implemented_operational_error() {
-    assert_not_implemented(&run(&["config", "path"]), "config path");
+fn config_path_prints_the_selected_user_path() {
+    let home = test_home();
+    let output = Command::new(env!("CARGO_BIN_EXE_seamless-input"))
+        .args(["config", "path"])
+        .env("SEAMLESS_INPUT_HOME", &home)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap().trim(),
+        home.join("config.toml").display().to_string()
+    );
 }
 
 #[test]

@@ -1,4 +1,5 @@
-use seamless_input::tui::{DisplayTile, PeerState, TuiModel, render_to_string};
+use seamless_input::config::{ConfigStore, ConfigV1, PeerConfig};
+use seamless_input::tui::{DisplayTile, PeerState, TuiModel, render_to_string, run_scripted};
 
 fn tile(peer: &str, display: u32, x: i32, y: i32, state: PeerState) -> DisplayTile {
     DisplayTile {
@@ -119,4 +120,36 @@ fn diagonal_only_placement_is_rejected_by_the_core_topology_rules() {
     assert_eq!(model.handle(EditorKey::Enter), EditorAction::Rejected);
     assert_eq!(model.tiles.len(), 1);
     assert!(model.error.as_deref().unwrap().contains("cardinal"));
+}
+
+#[test]
+fn scripted_editor_saves_topology_through_the_real_config_store() {
+    use seamless_input::tui::EditorKey;
+
+    let temp = tempfile::tempdir().unwrap();
+    let store = ConfigStore::new(temp.path().join("config.toml")).unwrap();
+    store
+        .save(&ConfigV1 {
+            peers: vec![PeerConfig {
+                node_id: "00112233445566778899aabbccddeeff".into(),
+                name: "office-windows".into(),
+                displays: vec!["0".into()],
+            }],
+            ..ConfigV1::default()
+        })
+        .unwrap();
+
+    run_scripted(
+        &store,
+        [EditorKey::Right, EditorKey::Enter, EditorKey::Save],
+    )
+    .unwrap();
+
+    let saved = store.load().unwrap();
+    assert_eq!(saved.placements.len(), 1);
+    assert_eq!(
+        saved.placements[0].display,
+        "00112233445566778899aabbccddeeff:0"
+    );
+    assert_eq!((saved.placements[0].x, saved.placements[0].y), (1, 0));
 }
