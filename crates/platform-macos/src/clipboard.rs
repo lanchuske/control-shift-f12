@@ -1,3 +1,4 @@
+use seamless_input_core::clipboard::{ClipboardError as CoreClipboardError, validate_png};
 use seamless_input_core::platform::{
     AccessState, ClipboardContent, ClipboardOutcome, PlatformClipboard,
 };
@@ -54,6 +55,12 @@ impl MacClipboard {
             ClipboardContent::Png(bytes) if bytes.len() > MAX_PNG_BYTES => {
                 Err(ClipboardError::TooLarge)
             }
+            ClipboardContent::Png(bytes) => validate_png(bytes).map_err(|error| match error {
+                CoreClipboardError::TooLarge => ClipboardError::TooLarge,
+                CoreClipboardError::MalformedPng | CoreClipboardError::HashMismatch => {
+                    ClipboardError::Conversion
+                }
+            }),
             _ => Ok(()),
         }
     }
@@ -222,6 +229,7 @@ mod native {
             self.snapshot()
         }
         fn write(&mut self, content: &ClipboardContent) -> Result<(), ClipboardError> {
+            MacClipboard::validate(content)?;
             let mut guard = self.clipboard.lock().map_err(|_| ClipboardError::Backend)?;
             let clipboard = guard.as_mut().ok_or(ClipboardError::AccessUnavailable)?;
             match content {

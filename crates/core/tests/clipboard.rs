@@ -10,6 +10,16 @@ fn png() -> Vec<u8> {
     ]
 }
 
+fn png_with_dimensions(width: u32, height: u32) -> Vec<u8> {
+    let mut bytes = png();
+    bytes[16..20].copy_from_slice(&width.to_be_bytes());
+    bytes[20..24].copy_from_slice(&height.to_be_bytes());
+    let mut crc = crc32fast::Hasher::new();
+    crc.update(&bytes[12..29]);
+    bytes[29..33].copy_from_slice(&crc.finalize().to_be_bytes());
+    bytes
+}
+
 #[test]
 fn accepts_bounded_text_and_png() {
     let mut d = ClipboardDeduper::new(8);
@@ -89,4 +99,15 @@ fn rejects_png_with_corrupt_crc() {
         ClipboardDeduper::new(8).accept_local(ClipboardPayload::png(bytes)),
         Err(ClipboardError::MalformedPng)
     );
+}
+
+#[test]
+fn rejects_png_decode_bombs_before_native_decoding() {
+    let mut deduper = ClipboardDeduper::new(8);
+    for (width, height) in [(16_385, 1), (1, 16_385), (8_192, 8_192)] {
+        assert_eq!(
+            deduper.accept_local(ClipboardPayload::png(png_with_dimensions(width, height))),
+            Err(ClipboardError::TooLarge)
+        );
+    }
 }

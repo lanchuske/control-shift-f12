@@ -1762,6 +1762,7 @@ dependencies = [
  "arboard",
  "core-foundation",
  "core-graphics",
+ "crc32fast",
  "image",
  "seamless-input-core",
  "seamless-input-protocol",
@@ -1774,6 +1775,7 @@ name = "seamless-input-platform-windows"
 version = "0.1.0"
 dependencies = [
  "arboard",
+ "crc32fast",
  "image",
  "seamless-input-core",
  "seamless-input-protocol",

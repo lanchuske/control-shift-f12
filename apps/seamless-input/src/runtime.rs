@@ -20,12 +20,14 @@ pub enum RuntimeReceive {
     None,
     Input(InputEvent),
     Clipboard(ClipboardPayload),
+    ReleaseInput,
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RuntimeError {
     SessionNotTrusted,
     Lease(crate::peer::LeaseError),
     Clipboard(ClipboardError),
+    Control(ControlError),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,6 +43,7 @@ pub fn apply_receive<I: PlatformInput, C: PlatformClipboard>(
 ) -> Result<(), ApplyError<I::Error, C::Error>> {
     match received {
         RuntimeReceive::None => Ok(()),
+        RuntimeReceive::ReleaseInput => input.release_all().map_err(ApplyError::Input),
         RuntimeReceive::Input(event) => input.inject(&event).map_err(ApplyError::Input),
         RuntimeReceive::Clipboard(ClipboardPayload::Text(text)) => clipboard
             .write_remote(&ClipboardContent::Text(text))
@@ -58,6 +61,11 @@ impl From<crate::peer::LeaseError> for RuntimeError {
 impl From<ClipboardError> for RuntimeError {
     fn from(v: ClipboardError) -> Self {
         Self::Clipboard(v)
+    }
+}
+impl From<ControlError> for RuntimeError {
+    fn from(v: ControlError) -> Self {
+        Self::Control(v)
     }
 }
 
@@ -129,6 +137,7 @@ impl Runtime {
         &mut self,
         peer: NodeId,
         message: PeerMessage,
+        now_ms: u64,
     ) -> Result<RuntimeReceive, RuntimeError> {
         self.peers.receive(peer, message.clone())?;
         match message {
@@ -138,8 +147,20 @@ impl Runtime {
                 .accept_remote(transfer)?
                 .map(RuntimeReceive::Clipboard)
                 .unwrap_or(RuntimeReceive::None)),
+            PeerMessage::Heartbeat { .. } => {
+                self.controller.heartbeat(peer, now_ms)?;
+                Ok(RuntimeReceive::None)
+            }
+            PeerMessage::ReleaseLease { .. } => Ok(RuntimeReceive::ReleaseInput),
             _ => Ok(RuntimeReceive::None),
         }
+    }
+    /// Recover local control without waiting for the remote peer. The returned
+    /// effects deliberately put remote release first, followed by unconditional
+    /// local cleanup and cursor recovery.
+    pub fn emergency_return(&mut self) -> Vec<RuntimeEffect> {
+        let actions = self.controller.emergency_return();
+        self.effects(actions)
     }
     pub fn offer_clipboard(
         &mut self,

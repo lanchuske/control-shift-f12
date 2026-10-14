@@ -95,6 +95,11 @@ impl MacInput {
             .all(|modifier| self.held.contains(modifier));
         if emergency {
             let _ = self.release_all();
+            return CaptureOutcome {
+                disposition: EventDisposition::PassThrough,
+                event: None,
+                emergency: true,
+            };
         }
         CaptureOutcome {
             disposition: if mode == CaptureMode::Remote {
@@ -287,7 +292,7 @@ mod native {
     impl MacEventTap {
         pub fn install(
             mode: CaptureMode,
-            callback: impl Fn(InputEvent) + Send + Sync + 'static,
+            callback: impl Fn(CaptureOutcome) + Send + Sync + 'static,
         ) -> Result<Self, InputError> {
             let mode_value = Arc::new(AtomicU8::new(mode as u8));
             let callback = Arc::new(callback);
@@ -319,21 +324,17 @@ mod native {
                     {
                         return CallbackResult::Keep;
                     }
-                    if let Some(input) = normalize_event(event_type, event) {
-                        callback(input);
-                    }
+                    let input = normalize_event(event_type, event);
                     if let Ok(mut held) = held.lock() {
-                        if let Some(InputEvent::Modifier { modifier, pressed }) =
-                            normalize_event(event_type, event)
-                        {
-                            if pressed {
-                                held.insert(modifier);
+                        if let Some(InputEvent::Modifier { modifier, pressed }) = input.as_ref() {
+                            if *pressed {
+                                held.insert(*modifier);
                             } else {
-                                held.remove(&modifier);
+                                held.remove(modifier);
                             }
                         }
                         if matches!(
-                            normalize_event(event_type, event),
+                            input.as_ref(),
                             Some(InputEvent::Key {
                                 code: EMERGENCY_HID_USAGE,
                                 pressed: true
@@ -344,10 +345,27 @@ mod native {
                         {
                             held.clear();
                             emergency_mode.store(CaptureMode::Local as u8, Ordering::Relaxed);
+                            callback(CaptureOutcome {
+                                disposition: EventDisposition::PassThrough,
+                                event: None,
+                                emergency: true,
+                            });
                             return CallbackResult::Keep;
                         }
                     }
-                    if callback_mode.load(Ordering::Relaxed) == CaptureMode::Remote as u8 {
+                    let remote = callback_mode.load(Ordering::Relaxed) == CaptureMode::Remote as u8;
+                    if let Some(input) = input {
+                        callback(CaptureOutcome {
+                            disposition: if remote {
+                                EventDisposition::Suppress
+                            } else {
+                                EventDisposition::PassThrough
+                            },
+                            event: Some(input),
+                            emergency: false,
+                        });
+                    }
+                    if remote {
                         CallbackResult::Drop
                     } else {
                         CallbackResult::Keep
