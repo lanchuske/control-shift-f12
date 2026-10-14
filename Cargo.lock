@@ -1765,6 +1765,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "seamless-input-platform-windows"
+version = "0.1.0"
+dependencies = [
+ "arboard",
+ "image",
+ "seamless-input-core",
+ "seamless-input-protocol",
+ "sha2",
+ "thiserror",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "seamless-input-protocol"
 version = "0.1.0"
 dependencies = [
