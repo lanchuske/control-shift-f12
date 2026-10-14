@@ -170,6 +170,13 @@
 - Create: `scripts/test-installers.py`
 - Create: `.github/workflows/ci.yml`
 - Create: `.github/workflows/release.yml`
+- Create: `.github/ISSUE_TEMPLATE/bug_report.yml`
+- Create: `.github/ISSUE_TEMPLATE/feature_request.yml`
+- Create: `.github/ISSUE_TEMPLATE/config.yml`
+- Create: `.github/pull_request_template.md`
+- Create: `CONTRIBUTING.md`
+- Create: `CODE_OF_CONDUCT.md`
+- Create: `SECURITY.md`
 - Create: `docs/runbook.md`
 - Create: `docs/evidence/e2e-template.md`
 - Modify: `README.md`
@@ -178,10 +185,16 @@
 - Produces per-user installation, PATH update, `doctor`, checksummed binaries, and public release evidence.
 
 - [ ] Write installer tests proving macOS uses `~/.local/bin`, Windows uses `%LOCALAPPDATA%\\SeamlessInput\\bin`, and only user shell/profile or user PATH is changed.
+- [ ] Write clean-user smoke tests for one copyable command per OS: download pinned bootstrap over HTTPS, select the native binary, verify published SHA-256, install to user PATH, reopen a terminal, run `doctor`, repeat idempotently, and uninstall without deleting identities by default.
 - [ ] Add negative tests that fail on elevation, system PATH, services, drivers, scheduled tasks, firewall commands, policy writes, SSH commands, or machine-specific values.
-- [ ] Implement idempotent installers with preview, rollback, and explicit PATH refresh guidance.
+- [ ] Implement idempotent terminal bootstrap scripts with preview, checksum verification, rollback, uninstall, and explicit PATH refresh guidance; do not ship a GUI installer, `.pkg`, `.dmg`, or `.msi`.
 - [ ] Implement `doctor` for permissions, discovery, QUIC reachability, pair pins, displays, clipboard, and enterprise blocks without evasion; distinguish user consent from administrator elevation.
 - [ ] Add Mac arm64/x64 and Windows x64 CI/release builds, checksums, dependency/license audit, and secret scan.
+- [ ] Add contributor guidance and templates that bind ordinary pull requests to the approved scope, require tests and security/permission impact notes, and route scope expansion through a separate design proposal.
+- [ ] Optimize repository discovery without keyword stuffing: concise GitHub description, accurate topics, search-oriented README title/opening, FAQ for software KVM and Mac/Windows input sharing, social preview image, and release notes that name supported platforms and limits.
+- [ ] Configure GitHub Discussions categories for Q&A, Ideas, Compatibility, and Show and Tell; pin a feedback guide explaining when to use a Discussion, Issue, or private vulnerability report.
+- [ ] Add `doctor --report` tests proving the generated copyable diagnostic report is opt-in, redacted, and contains no clipboard data, keys, usernames, network addresses, or stable machine identifiers.
+- [ ] Enable GitHub private vulnerability reporting when the public repository is created and link it from `SECURITY.md` and the Issue chooser.
 - [ ] Run two-peer and mixed three-peer real E2E; record every acceptance row as PASS, FAIL, or NO MEDIDO.
 - [ ] Create the public GitHub repository, push reviewed history, publish release assets, and verify clean per-user installation on both platforms.
 - [ ] Commit `release: publish SeamlessInput MVP`.

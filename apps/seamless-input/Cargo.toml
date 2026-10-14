@@ -1,0 +1,12 @@
+[package]
+name = "seamless-input"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+clap.workspace = true
+
+[[bin]]
+name = "seamless-input"
+path = "src/main.rs"
