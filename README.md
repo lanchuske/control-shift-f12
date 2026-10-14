@@ -39,6 +39,57 @@ smaller.
 
 The design supports two or more Macs and Windows PCs in the same topology.
 
+## How it works
+
+Every computer runs the same native peer. Nearby peers discover one another on
+the local network, but they exchange input only after the user pairs them with a
+short-lived code. Pairing pins both device identities; subsequent sessions use a
+mutually authenticated and encrypted QUIC connection.
+
+```mermaid
+flowchart LR
+    subgraph A["Mac peer"]
+        A1["Mouse and keyboard capture"]
+        A2["Clipboard adapter"]
+        A3["Peer runtime"]
+        A4["Input injection"]
+        A1 --> A3
+        A2 <--> A3
+        A3 --> A4
+    end
+
+    subgraph B["Windows peer"]
+        B1["Mouse and keyboard capture"]
+        B2["Clipboard adapter"]
+        B3["Peer runtime"]
+        B4["Input injection"]
+        B1 --> B3
+        B2 <--> B3
+        B3 --> B4
+    end
+
+    D["LAN discovery\nmDNS or manual address"]
+    P["One-time pairing\nshort code and PAKE"]
+    T["TUI topology\nleft · right · above · below"]
+
+    D -. finds .-> A3
+    D -. finds .-> B3
+    P -. pins both identities .-> A3
+    P -. pins both identities .-> B3
+    T --> A3
+    T --> B3
+    A3 <-->|"Mutual TLS over QUIC\nbounded input and clipboard frames"| B3
+```
+
+The topology decides which display touches each edge. When the pointer crosses
+a configured edge, the local peer stops applying that input locally and sends a
+bounded event stream to the selected peer. Keyboard focus follows the pointer.
+Clipboard updates use hashes to prevent loops. If the connection, permission,
+or peer disappears, all modifiers are released and control returns locally.
+
+The diagram shows two machines for clarity; the same identity, topology, and
+routing model extends to several Mac and Windows peers.
+
 ## Security and permission model
 
 SeamlessInput will not install a system service or driver, modify firewall or
