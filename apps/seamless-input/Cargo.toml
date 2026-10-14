@@ -10,6 +10,9 @@ ratatui.workspace = true
 serde.workspace = true
 toml.workspace = true
 seamless-input-core = { path = "../../crates/core" }
+seamless-input-protocol = { path = "../../crates/protocol" }
+seamless-transport = { path = "../../crates/transport" }
+tokio.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = ["Win32_Storage_FileSystem"] }

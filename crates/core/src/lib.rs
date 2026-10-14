@@ -6,6 +6,7 @@
 //! while continuing local cleanup even if a remote send fails. Call `tick`
 //! periodically using the same monotonic clock as crossings and heartbeats.
 
+pub mod clipboard;
 pub mod control;
 pub mod platform;
 pub mod topology;

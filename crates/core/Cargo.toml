@@ -7,6 +7,8 @@ license.workspace = true
 [dependencies]
 seamless-input-protocol = { path = "../protocol" }
 serde.workspace = true
+sha2.workspace = true
+crc32fast.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
