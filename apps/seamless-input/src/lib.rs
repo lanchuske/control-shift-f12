@@ -3,4 +3,5 @@
 pub mod config;
 pub mod peer;
 pub mod runtime;
+pub mod supervisor;
 pub mod tui;

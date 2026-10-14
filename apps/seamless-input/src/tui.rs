@@ -1,12 +1,48 @@
+use crate::config::{ConfigError, ConfigStore, ConfigV1, Placement};
+use crossterm::{
+    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
+    execute,
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
+};
 use ratatui::{
     Terminal,
-    backend::TestBackend,
+    backend::{CrosstermBackend, TestBackend},
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph},
 };
 use seamless_input_core::{Display, DisplayId, Edge, NodeId, Point, Topology};
+use std::{io, time::Duration};
+
+#[derive(Debug)]
+pub enum TuiError {
+    Io(io::Error),
+    Config(ConfigError),
+}
+
+impl std::fmt::Display for TuiError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Io(error) => write!(formatter, "terminal failed: {error}"),
+            Self::Config(error) => write!(formatter, "{error}"),
+        }
+    }
+}
+
+impl std::error::Error for TuiError {}
+
+impl From<io::Error> for TuiError {
+    fn from(value: io::Error) -> Self {
+        Self::Io(value)
+    }
+}
+
+impl From<ConfigError> for TuiError {
+    fn from(value: ConfigError) -> Self {
+        Self::Config(value)
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PeerState {
@@ -236,6 +272,144 @@ pub fn render(frame: &mut ratatui::Frame<'_>, model: &TuiModel) {
     render_available(frame, columns[0], model);
     render_canvas(frame, columns[1], model);
     render_help(frame, columns[2], model);
+}
+
+pub fn run_scripted(
+    store: &ConfigStore,
+    keys: impl IntoIterator<Item = EditorKey>,
+) -> Result<TuiModel, TuiError> {
+    let mut config = store.load_or_default()?;
+    let mut model = model_from_config(&config);
+    for key in keys {
+        match model.handle(key) {
+            EditorAction::Save => save_model(store, &mut config, &model)?,
+            EditorAction::Quit => break,
+            EditorAction::Changed | EditorAction::Rejected => {}
+        }
+    }
+    Ok(model)
+}
+
+pub fn run_terminal(store: &ConfigStore) -> Result<(), TuiError> {
+    let mut config = store.load_or_default()?;
+    let mut model = model_from_config(&config);
+    let mut guard = TerminalGuard::enter()?;
+    loop {
+        guard.terminal.draw(|frame| render(frame, &model))?;
+        if !event::poll(Duration::from_millis(250))? {
+            continue;
+        }
+        let Event::Key(key) = event::read()? else {
+            continue;
+        };
+        if key.kind != KeyEventKind::Press {
+            continue;
+        }
+        let Some(editor_key) = map_key(key.code, key.modifiers) else {
+            continue;
+        };
+        match model.handle(editor_key) {
+            EditorAction::Save => save_model(store, &mut config, &model)?,
+            EditorAction::Quit => break,
+            EditorAction::Changed | EditorAction::Rejected => {}
+        }
+    }
+    Ok(())
+}
+
+fn model_from_config(config: &ConfigV1) -> TuiModel {
+    let mut model = TuiModel::default();
+    for peer in &config.peers {
+        for display in &peer.displays {
+            let Ok(display_index) = display.parse::<u32>() else {
+                continue;
+            };
+            let key = format!("{}:{display_index}", peer.node_id);
+            if let Some(placement) = config.placements.iter().find(|item| item.display == key) {
+                model.tiles.push(DisplayTile {
+                    peer: peer.node_id.clone(),
+                    display: display_index,
+                    x: placement.x,
+                    y: placement.y,
+                    state: PeerState::Offline,
+                });
+            } else {
+                model.available.push(DisplayTile {
+                    peer: peer.node_id.clone(),
+                    display: display_index,
+                    x: 0,
+                    y: 0,
+                    state: PeerState::Paired,
+                });
+            }
+        }
+    }
+    model
+}
+
+fn save_model(
+    store: &ConfigStore,
+    config: &mut ConfigV1,
+    model: &TuiModel,
+) -> Result<(), TuiError> {
+    config.placements = model
+        .tiles
+        .iter()
+        .map(|tile| Placement {
+            display: format!("{}:{}", tile.peer, tile.display),
+            x: tile.x,
+            y: tile.y,
+        })
+        .collect();
+    store.save(config)?;
+    Ok(())
+}
+
+fn map_key(code: KeyCode, modifiers: KeyModifiers) -> Option<EditorKey> {
+    match code {
+        KeyCode::Left => Some(EditorKey::Left),
+        KeyCode::Right => Some(EditorKey::Right),
+        KeyCode::Up => Some(EditorKey::Up),
+        KeyCode::Down => Some(EditorKey::Down),
+        KeyCode::Enter => Some(EditorKey::Enter),
+        KeyCode::Delete | KeyCode::Backspace => Some(EditorKey::Delete),
+        KeyCode::Char('s') if modifiers.is_empty() || modifiers == KeyModifiers::SHIFT => {
+            Some(EditorKey::Save)
+        }
+        KeyCode::Char('q') | KeyCode::Esc => Some(EditorKey::Quit),
+        _ => None,
+    }
+}
+
+struct TerminalGuard {
+    terminal: Terminal<CrosstermBackend<io::Stdout>>,
+}
+
+impl TerminalGuard {
+    fn enter() -> Result<Self, io::Error> {
+        enable_raw_mode()?;
+        let mut stdout = io::stdout();
+        if let Err(error) = execute!(stdout, EnterAlternateScreen) {
+            let _ = disable_raw_mode();
+            return Err(error);
+        }
+        match Terminal::new(CrosstermBackend::new(stdout)) {
+            Ok(terminal) => Ok(Self { terminal }),
+            Err(error) => {
+                let _ = disable_raw_mode();
+                let _ = execute!(io::stdout(), LeaveAlternateScreen);
+                Err(error)
+            }
+        }
+    }
+}
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        let _ = disable_raw_mode();
+        let _ = execute!(self.terminal.backend_mut(), LeaveAlternateScreen);
+        let _ = self.terminal.show_cursor();
+    }
 }
 
 fn render_available(frame: &mut ratatui::Frame<'_>, area: Rect, model: &TuiModel) {
