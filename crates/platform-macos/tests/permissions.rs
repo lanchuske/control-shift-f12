@@ -7,6 +7,20 @@ use seamless_input_protocol::{InputEvent, MAX_PNG_BYTES, MAX_TEXT_BYTES, Modifie
 use std::cell::RefCell;
 use std::rc::Rc;
 
+fn png_with_dimensions(width: u32, height: u32) -> Vec<u8> {
+    let mut bytes = vec![
+        137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0, 1, 8, 6,
+        0, 0, 0, 31, 21, 196, 137, 0, 0, 0, 11, 73, 68, 65, 84, 120, 156, 99, 96, 0, 2, 0, 0, 5, 0,
+        1, 122, 94, 171, 63, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96, 130,
+    ];
+    bytes[16..20].copy_from_slice(&width.to_be_bytes());
+    bytes[20..24].copy_from_slice(&height.to_be_bytes());
+    let mut crc = crc32fast::Hasher::new();
+    crc.update(&bytes[12..29]);
+    bytes[29..33].copy_from_slice(&crc.finalize().to_be_bytes());
+    bytes
+}
+
 #[derive(Clone)]
 struct FakeAccess {
     state: Rc<RefCell<AccessState>>,
@@ -134,7 +148,8 @@ fn emergency_chord_returns_local_and_cleans_modifiers() {
         CaptureMode::Remote,
     );
     assert!(outcome.emergency);
-    assert_eq!(outcome.disposition, EventDisposition::Suppress);
+    assert_eq!(outcome.disposition, EventDisposition::PassThrough);
+    assert_eq!(outcome.event, None);
     assert_eq!(*releases.borrow(), 1);
     assert!(input.held_modifiers().is_empty());
 }
@@ -277,6 +292,10 @@ fn remote_clipboard_write_is_not_echoed_and_limits_fail_closed() {
         clipboard.write_remote(&ClipboardContent::Png(vec![0; MAX_PNG_BYTES + 1])),
         Err(clipboard::ClipboardError::TooLarge)
     ));
+    assert_eq!(
+        clipboard.write_remote(&ClipboardContent::Png(png_with_dimensions(8_192, 8_192))),
+        Err(clipboard::ClipboardError::TooLarge)
+    );
 }
 
 #[cfg(target_os = "macos")]

@@ -15,3 +15,6 @@ arboard = "3.6"
 core-foundation = "0.10"
 core-graphics = { version = "0.25", features = ["highsierra"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
+
+[dev-dependencies]
+crc32fast.workspace = true

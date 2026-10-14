@@ -173,6 +173,11 @@ impl WindowsInput {
             .all(|modifier| self.held_modifiers.contains(modifier));
         if emergency {
             let _ = self.release_all();
+            return CaptureOutcome {
+                disposition: EventDisposition::PassThrough,
+                event: None,
+                emergency: true,
+            };
         }
         CaptureOutcome {
             disposition: if mode == CaptureMode::Remote {
@@ -453,8 +458,9 @@ mod native {
     };
 
     struct HookSink {
-        sender: Sender<InputEvent>,
+        sender: Sender<CaptureOutcome>,
         remote: Arc<AtomicBool>,
+        held_modifiers: BTreeSet<Modifier>,
     }
     static HOOK_SINK: OnceLock<Mutex<Option<HookSink>>> = OnceLock::new();
 
@@ -465,7 +471,7 @@ mod native {
     }
 
     impl WindowsHooks {
-        pub fn install() -> Result<(Self, Receiver<InputEvent>), InputError> {
+        pub fn install() -> Result<(Self, Receiver<CaptureOutcome>), InputError> {
             let sink = HOOK_SINK.get_or_init(|| Mutex::new(None));
             let mut guard = sink.lock().map_err(|_| InputError::Backend)?;
             if guard.is_some() {
@@ -476,6 +482,7 @@ mod native {
             *guard = Some(HookSink {
                 sender,
                 remote: remote.clone(),
+                held_modifiers: BTreeSet::new(),
             });
             drop(guard);
             let (ready_tx, ready_rx) = mpsc::sync_channel(1);
@@ -561,14 +568,49 @@ mod native {
         let Some(sink) = HOOK_SINK.get() else {
             return false;
         };
-        let Ok(guard) = sink.lock() else {
+        let Ok(mut guard) = sink.lock() else {
             return false;
         };
-        let Some(sink) = guard.as_ref() else {
+        let Some(sink) = guard.as_mut() else {
             return false;
         };
-        let _ = sink.sender.send(event);
-        sink.remote.load(Ordering::Acquire)
+        if let InputEvent::Modifier { modifier, pressed } = &event {
+            if *pressed {
+                sink.held_modifiers.insert(*modifier);
+            } else {
+                sink.held_modifiers.remove(modifier);
+            }
+        }
+        let emergency = matches!(
+            event,
+            InputEvent::Key {
+                code: EMERGENCY_HID_USAGE,
+                pressed: true
+            }
+        ) && [Modifier::Control, Modifier::Alt, Modifier::Meta]
+            .iter()
+            .all(|modifier| sink.held_modifiers.contains(modifier));
+        if emergency {
+            sink.held_modifiers.clear();
+            sink.remote.store(false, Ordering::Release);
+            let _ = sink.sender.send(CaptureOutcome {
+                disposition: EventDisposition::PassThrough,
+                event: None,
+                emergency: true,
+            });
+            return false;
+        }
+        let remote = sink.remote.load(Ordering::Acquire);
+        let _ = sink.sender.send(CaptureOutcome {
+            disposition: if remote {
+                EventDisposition::Suppress
+            } else {
+                EventDisposition::PassThrough
+            },
+            event: Some(event),
+            emergency: false,
+        });
+        remote
     }
 
     unsafe extern "system" fn keyboard_hook(code: i32, wparam: usize, lparam: isize) -> isize {

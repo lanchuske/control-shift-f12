@@ -4,6 +4,12 @@ use seamless_input_protocol::{MAX_PNG_BYTES, MAX_TEXT_BYTES};
 use sha2::{Digest, Sha256};
 use std::collections::{HashSet, VecDeque};
 
+/// Decode limits are intentionally lower than the wire-size limit can imply.
+/// Native clipboard decoders expand every accepted image to RGBA.
+pub const MAX_PNG_DIMENSION: u32 = 16_384;
+pub const MAX_PNG_PIXELS: u64 = 16 * 1024 * 1024;
+pub const MAX_PNG_DECODED_BYTES: u64 = MAX_PNG_PIXELS * 4;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClipboardPayload {
     Text(String),
@@ -105,14 +111,16 @@ fn validate(payload: &ClipboardPayload) -> Result<(), ClipboardError> {
     match payload {
         ClipboardPayload::Text(v) if v.len() > MAX_TEXT_BYTES => Err(ClipboardError::TooLarge),
         ClipboardPayload::Png(v) if v.len() > MAX_PNG_BYTES => Err(ClipboardError::TooLarge),
-        ClipboardPayload::Png(v) if !valid_png(v) => Err(ClipboardError::MalformedPng),
+        ClipboardPayload::Png(v) => validate_png(v),
         _ => Ok(()),
     }
 }
 
-fn valid_png(bytes: &[u8]) -> bool {
+/// Validate PNG structure and decoded RGBA allocation bounds without invoking
+/// an image decoder. Call this before passing untrusted bytes to native APIs.
+pub fn validate_png(bytes: &[u8]) -> Result<(), ClipboardError> {
     if !bytes.starts_with(&[137, 80, 78, 71, 13, 10, 26, 10]) {
-        return false;
+        return Err(ClipboardError::MalformedPng);
     }
     let mut at = 8usize;
     let mut first = true;
@@ -121,18 +129,36 @@ fn valid_png(bytes: &[u8]) -> bool {
     while at.checked_add(12).is_some_and(|n| n <= bytes.len()) {
         let len = u32::from_be_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
         let Some(end) = at.checked_add(12).and_then(|n| n.checked_add(len)) else {
-            return false;
+            return Err(ClipboardError::MalformedPng);
         };
         if end > bytes.len() {
-            return false;
+            return Err(ClipboardError::MalformedPng);
         }
         let kind = &bytes[at + 4..at + 8];
         if first && (kind != b"IHDR" || len != 13) {
-            return false;
+            return Err(ClipboardError::MalformedPng);
+        }
+        if first {
+            let width = u32::from_be_bytes(bytes[at + 8..at + 12].try_into().unwrap());
+            let height = u32::from_be_bytes(bytes[at + 12..at + 16].try_into().unwrap());
+            if width == 0 || height == 0 {
+                return Err(ClipboardError::MalformedPng);
+            }
+            let pixels = u64::from(width)
+                .checked_mul(u64::from(height))
+                .ok_or(ClipboardError::TooLarge)?;
+            let decoded_bytes = pixels.checked_mul(4).ok_or(ClipboardError::TooLarge)?;
+            if width > MAX_PNG_DIMENSION
+                || height > MAX_PNG_DIMENSION
+                || pixels > MAX_PNG_PIXELS
+                || decoded_bytes > MAX_PNG_DECODED_BYTES
+            {
+                return Err(ClipboardError::TooLarge);
+            }
         }
         if kind == b"IEND" {
             if len != 0 || end != bytes.len() {
-                return false;
+                return Err(ClipboardError::MalformedPng);
             }
             ended = true;
         }
@@ -143,10 +169,14 @@ fn valid_png(bytes: &[u8]) -> bool {
         let mut crc = crc32fast::Hasher::new();
         crc.update(&bytes[at + 4..end - 4]);
         if crc.finalize() != expected {
-            return false;
+            return Err(ClipboardError::MalformedPng);
         }
         first = false;
         at = end;
     }
-    ended && image_data
+    if ended && image_data {
+        Ok(())
+    } else {
+        Err(ClipboardError::MalformedPng)
+    }
 }

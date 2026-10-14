@@ -182,11 +182,11 @@ fn incoming_clipboard_is_capability_checked_and_deduped() {
         transfer: transfer.clone(),
     };
     assert_eq!(
-        runtime.receive(node(2), message.clone()).unwrap(),
+        runtime.receive(node(2), message.clone(), 0).unwrap(),
         RuntimeReceive::Clipboard(ClipboardPayload::text("shared"))
     );
     assert_eq!(
-        runtime.receive(node(2), message),
+        runtime.receive(node(2), message, 0),
         Err(LeaseError::Stale.into())
     );
     let png = source
@@ -204,10 +204,85 @@ fn incoming_clipboard_is_capability_checked_and_deduped() {
                 epoch,
                 sequence: 2,
                 transfer: png
-            }
+            },
+            0,
         ),
         Err(LeaseError::CapabilityDenied.into())
     );
+}
+
+#[test]
+fn incoming_heartbeat_refreshes_the_active_controller_deadline() {
+    let mut runtime = Runtime::new(node(1), display(1).id, mesh3(), 1000).unwrap();
+    let epoch = admit(&mut runtime, 2, Capabilities::all());
+    runtime
+        .cross(Edge::Right, Point { x: 100.0, y: 50.0 }, 0)
+        .unwrap();
+
+    assert_eq!(
+        runtime
+            .receive(node(2), PeerMessage::Heartbeat { epoch }, 900)
+            .unwrap(),
+        RuntimeReceive::None
+    );
+    assert!(runtime.tick(1_500).unwrap().is_empty());
+    assert_eq!(runtime.active_peer(), node(2));
+    assert!(!runtime.tick(1_900).unwrap().is_empty());
+    assert_eq!(runtime.active_peer(), node(1));
+}
+
+#[test]
+fn emergency_return_recovers_local_and_tells_remote_to_release_held_input() {
+    let mut runtime = Runtime::new(node(1), display(1).id, mesh3(), 1000).unwrap();
+    let epoch = admit(&mut runtime, 2, Capabilities::all());
+    runtime
+        .cross(Edge::Right, Point { x: 100.0, y: 50.0 }, 0)
+        .unwrap();
+
+    let effects = runtime.emergency_return();
+    assert_eq!(runtime.active_peer(), node(1));
+    assert!(effects.iter().any(|effect| matches!(
+        effect,
+        RuntimeEffect::Send {
+            peer,
+            message: PeerMessage::ReleaseLease { epoch: sent_epoch }
+        } if peer == &node(2) && sent_epoch == &epoch
+    )));
+    assert!(
+        effects
+            .iter()
+            .any(|effect| matches!(effect, RuntimeEffect::ReleaseLocal))
+    );
+    assert!(
+        effects
+            .iter()
+            .any(|effect| matches!(effect, RuntimeEffect::WarpLocal { .. }))
+    );
+}
+
+#[test]
+fn incoming_release_lease_releases_injected_input_on_the_controlled_peer() {
+    let mut runtime = Runtime::new(node(1), display(1).id, mesh3(), 1000).unwrap();
+    let epoch = admit(&mut runtime, 2, Capabilities::all());
+    runtime
+        .receive(node(2), PeerMessage::AcquireLease { epoch }, 0)
+        .unwrap();
+    assert_eq!(
+        runtime
+            .receive(node(2), PeerMessage::ReleaseLease { epoch }, 1)
+            .unwrap(),
+        RuntimeReceive::ReleaseInput
+    );
+
+    let mut input = FakeInput::default();
+    let mut clipboard = FakeClipboard::default();
+    seamless_input::runtime::apply_receive(
+        &mut input,
+        &mut clipboard,
+        RuntimeReceive::ReleaseInput,
+    )
+    .unwrap();
+    assert_eq!(input.released, 1);
 }
 
 #[test]
