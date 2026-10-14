@@ -1,0 +1,16 @@
+name: Feature proposal
+description: Propose an improvement within the approved scope
+title: "[Proposal]: "
+body:
+  - type: textarea
+    attributes: { label: User problem }
+    validations: { required: true }
+  - type: checkboxes
+    attributes:
+      label: Scope
+      options:
+        - label: This remains within mouse, keyboard, text/PNG clipboard, TUI topology, pairing, discovery, diagnostics, or user-only installation.
+          required: true
+  - type: markdown
+    attributes:
+      value: Scope expansions belong in a GitHub Discussion before an implementation issue.

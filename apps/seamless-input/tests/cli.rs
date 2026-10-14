@@ -7,6 +7,18 @@ fn run(args: &[&str]) -> std::process::Output {
         .expect("CLI process should start")
 }
 
+fn run_with_sensitive_environment(args: &[&str]) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_seamless-input"))
+        .args(args)
+        .env("USER", "sensitive-user")
+        .env("USERNAME", "sensitive-user")
+        .env("COMPUTERNAME", "sensitive-machine")
+        .env("HOSTNAME", "sensitive-machine")
+        .env("SEAMLESS_INPUT_TEST_CLIPBOARD", "sensitive-clipboard")
+        .output()
+        .expect("CLI process should start")
+}
+
 fn assert_not_implemented(output: &std::process::Output, command: &str) {
     assert_eq!(output.status.code(), Some(1));
     assert_eq!(output.stdout, b"");
@@ -51,7 +63,38 @@ fn tui_routes_to_a_not_implemented_operational_error() {
 
 #[test]
 fn doctor_routes_to_a_not_implemented_operational_error() {
-    assert_not_implemented(&run(&["doctor"]), "doctor");
+    let output = run(&["doctor"]);
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("SeamlessInput doctor"));
+    assert!(stdout.contains("administrator elevation: not required"));
+    assert!(stdout.contains("NOT MEASURED"));
+}
+
+#[test]
+fn doctor_report_is_opt_in_redacted_and_stable_identifier_free() {
+    let output = run_with_sensitive_environment(&["doctor", "--report"]);
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    for forbidden in [
+        "clipboard content",
+        "private key",
+        "username",
+        "127.0.0.1",
+        "192.168.",
+        "machine id",
+        "sensitive-user",
+        "sensitive-machine",
+        "sensitive-clipboard",
+    ] {
+        assert!(
+            !stdout.to_lowercase().contains(forbidden),
+            "report leaked {forbidden}: {stdout}"
+        );
+    }
+    assert!(stdout.contains("privacy: redacted"));
+    assert!(stdout.contains("platform:"));
+    assert!(stdout.contains("permissions:"));
 }
 
 #[test]

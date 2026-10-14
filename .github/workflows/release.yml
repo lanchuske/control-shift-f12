@@ -1,0 +1,42 @@
+name: Release assets
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing reviewed tag to package
+        required: true
+permissions:
+  contents: read
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: macos-14
+            target: aarch64-apple-darwin
+          - os: macos-13
+            target: x86_64-apple-darwin
+          - os: windows-2022
+            target: x86_64-pc-windows-msvc
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with: { ref: "${{ inputs.tag }}" }
+      - uses: dtolnay/rust-toolchain@stable
+        with: { targets: "${{ matrix.target }}" }
+      - run: cargo test --workspace --target ${{ matrix.target }}
+      - run: cargo build --release --locked --target ${{ matrix.target }}
+      - shell: bash
+        run: |
+          set -eu
+          mkdir -p dist
+          suffix=""; [ "${{ runner.os }}" = "Windows" ] && suffix=".exe"
+          cp "target/${{ matrix.target }}/release/seamless-input${suffix}" "dist/seamless-input-${{ matrix.target }}${suffix}"
+          cd dist
+          if command -v shasum >/dev/null; then shasum -a 256 * > SHA256SUMS; else certutil -hashfile * SHA256 > SHA256SUMS; fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: seamless-input-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+# Deliberately packages reviewed assets only. Publishing a GitHub release is a separate, explicit action.

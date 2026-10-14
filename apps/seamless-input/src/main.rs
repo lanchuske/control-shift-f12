@@ -28,7 +28,11 @@ enum Commands {
     /// Open the topology interface.
     Tui,
     /// Check this machine's setup.
-    Doctor,
+    Doctor {
+        /// Print a copyable privacy-redacted diagnostic report.
+        #[arg(long)]
+        report: bool,
+    },
     /// Show or locate configuration.
     Config {
         #[command(subcommand)]
@@ -83,11 +87,33 @@ fn run(cli: Cli) -> Result<(), OperationalError> {
         Commands::Peers => "peers",
         Commands::Unpair { peer: _ } => "unpair",
         Commands::Tui => "tui",
-        Commands::Doctor => "doctor",
+        Commands::Doctor { report } => return doctor(report),
         Commands::Config { command } => match command {
             ConfigCommands::Show => "config show",
             ConfigCommands::Path => "config path",
         },
     };
     Err(OperationalError::NotImplemented(command))
+}
+
+fn doctor(report: bool) -> Result<(), OperationalError> {
+    if report {
+        println!("SeamlessInput diagnostic report");
+        println!("privacy: redacted");
+        println!("platform: {}", std::env::consts::OS);
+        println!("permissions: NOT MEASURED");
+        println!("discovery: NOT MEASURED");
+        println!("QUIC reachability: NOT MEASURED");
+        println!("paired identity pins: NOT MEASURED");
+        println!("displays: NOT MEASURED");
+        println!("clipboard capability: NOT MEASURED");
+        println!("enterprise restrictions: NOT MEASURED; no bypass attempted");
+    } else {
+        println!("SeamlessInput doctor");
+        println!("administrator elevation: not required");
+        println!("user consent: checked separately from administrator elevation");
+        println!("runtime readiness: NOT MEASURED");
+        println!("Use --report to generate a copyable redacted report.");
+    }
+    Ok(())
 }
