@@ -1735,8 +1735,11 @@ dependencies = [
  "insta",
  "ratatui",
  "seamless-input-core",
+ "seamless-input-protocol",
+ "seamless-transport",
  "serde",
  "tempfile",
+ "tokio",
  "toml",
  "windows-sys 0.59.0",
 ]
@@ -1745,9 +1748,11 @@ dependencies = [
 name = "seamless-input-core"
 version = "0.1.0"
 dependencies = [
+ "crc32fast",
  "proptest",
  "seamless-input-protocol",
  "serde",
+ "sha2",
 ]
 
 [[package]]
