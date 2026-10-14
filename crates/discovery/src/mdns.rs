@@ -67,16 +67,42 @@ pub fn manual_address(value: &str) -> Result<Vec<SocketAddr>, String> {
         .to_socket_addrs()
         .map_err(|_| "invalid or unresolved peer address")?
         .collect();
-    if addresses.is_empty()
-        || addresses
-            .iter()
-            .any(|addr| addr.port() == 0 || addr.ip().is_unspecified() || addr.ip().is_multicast())
-    {
+    if addresses.is_empty() || addresses.iter().any(|addr| !is_unicast_endpoint(*addr)) {
         return Err("peer address must be a unicast host with a nonzero port".into());
     }
     addresses.sort();
     addresses.dedup();
     Ok(addresses)
+}
+
+fn is_unicast_endpoint(address: SocketAddr) -> bool {
+    address.port() != 0
+        && !address.ip().is_unspecified()
+        && !address.ip().is_multicast()
+        && !matches!(address.ip(), std::net::IpAddr::V4(ip) if ip.is_broadcast())
+}
+
+fn resolved_addresses(info: &mdns_sd::ResolvedService) -> Vec<SocketAddr> {
+    let mut addresses: Vec<_> = info
+        .get_addresses()
+        .iter()
+        .filter_map(|ip| match ip {
+            mdns_sd::ScopedIp::V4(ip) => {
+                Some(SocketAddr::new((*ip.addr()).into(), info.get_port()))
+            }
+            mdns_sd::ScopedIp::V6(ip) => Some(SocketAddr::V6(std::net::SocketAddrV6::new(
+                *ip.addr(),
+                info.get_port(),
+                0,
+                ip.scope_id().index,
+            ))),
+            _ => None,
+        })
+        .filter(|address| is_unicast_endpoint(*address))
+        .collect();
+    addresses.sort();
+    addresses.dedup();
+    addresses
 }
 
 /// A browse result is an untrusted locator, never a paired identity.
@@ -114,7 +140,7 @@ impl Discovery {
                 "instance must be an opaque 128-bit random token, never a device name".into(),
             );
         }
-        if address.port() == 0 || address.ip().is_unspecified() || address.ip().is_multicast() {
+        if !is_unicast_endpoint(address) {
             return Err("publish requires a unicast interface address and nonzero port".into());
         }
         let hostname = format!("{instance}.local.");
@@ -186,31 +212,7 @@ impl Discovery {
                         Some("0") => false,
                         _ => continue,
                     };
-                    let mut addresses: Vec<_> = info
-                        .get_addresses()
-                        .iter()
-                        .filter_map(|ip| match ip {
-                            mdns_sd::ScopedIp::V4(ip) => {
-                                Some(SocketAddr::new((*ip.addr()).into(), info.get_port()))
-                            }
-                            mdns_sd::ScopedIp::V6(ip) => {
-                                Some(SocketAddr::V6(std::net::SocketAddrV6::new(
-                                    *ip.addr(),
-                                    info.get_port(),
-                                    0,
-                                    ip.scope_id().index,
-                                )))
-                            }
-                            _ => None,
-                        })
-                        .filter(|address| {
-                            address.port() != 0
-                                && !address.ip().is_unspecified()
-                                && !address.ip().is_multicast()
-                        })
-                        .collect();
-                    addresses.sort();
-                    addresses.dedup();
+                    let addresses = resolved_addresses(&info);
                     if addresses.is_empty() {
                         continue;
                     }
@@ -260,5 +262,39 @@ impl Drop for Discovery {
             let _ = self.daemon.stop_browse(SERVICE_TYPE);
         }
         let _ = self.daemon.shutdown();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn browse_rejects_broadcast_and_keeps_valid_unicast_from_resolved_service() {
+        let info = mdns_sd::ServiceInfo::new(
+            SERVICE_TYPE,
+            "b1111111111111111111111111111111",
+            "b1111111111111111111111111111111.local.",
+            "255.255.255.255,127.0.0.1",
+            7777,
+            None,
+        )
+        .unwrap()
+        .as_resolved_service();
+        assert_eq!(
+            resolved_addresses(&info),
+            vec!["127.0.0.1:7777".parse::<SocketAddr>().unwrap()]
+        );
+        let only_broadcast = mdns_sd::ServiceInfo::new(
+            SERVICE_TYPE,
+            "b2222222222222222222222222222222",
+            "b2222222222222222222222222222222.local.",
+            "255.255.255.255",
+            7777,
+            None,
+        )
+        .unwrap()
+        .as_resolved_service();
+        assert!(resolved_addresses(&only_broadcast).is_empty());
     }
 }

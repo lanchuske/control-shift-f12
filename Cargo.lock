@@ -950,6 +950,7 @@ dependencies = [
  "rcgen",
  "rustls",
  "seamless-discovery",
+ "seamless-input-protocol",
  "thiserror",
  "tokio",
 ]

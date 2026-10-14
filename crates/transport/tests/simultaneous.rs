@@ -1,3 +1,4 @@
+use seamless_input_protocol::NodeId;
 use seamless_transport::quic::*;
 use std::time::Duration;
 mod support;
@@ -114,6 +115,11 @@ async fn untrusted_tls_server_cannot_install_or_reconnect_a_session() {
 
 #[test]
 fn simultaneous_dials_choose_the_same_lower_node_on_both_peers() {
+    assert_eq!(
+        std::any::TypeId::of::<seamless_transport::NodeId>(),
+        std::any::TypeId::of::<NodeId>(),
+        "transport must consume the shared protocol identity type"
+    );
     let a = NodeId([1; 16]);
     let b = NodeId([2; 16]);
     assert_eq!(canonical_initiator(a, b), a);

@@ -65,6 +65,25 @@ fn manual_fallback_resolves_addresses_without_discovery() {
 }
 
 #[test]
+fn manual_fallback_rejects_ipv4_broadcast() {
+    assert!(manual_address("255.255.255.255:7777").is_err());
+}
+
+#[test]
+fn publishing_rejects_ipv4_broadcast() {
+    let mut discovery = Discovery::new(1).unwrap();
+    assert!(
+        discovery
+            .publish(
+                "b1111111111111111111111111111111",
+                "255.255.255.255:7777".parse().unwrap(),
+                false
+            )
+            .is_err()
+    );
+}
+
+#[test]
 fn publishing_rejects_human_machine_names_and_invalid_addresses() {
     let mut discovery = Discovery::new(1).unwrap();
     assert!(

@@ -1,4 +1,5 @@
 use seamless_discovery::mdns::Discovery;
+use seamless_input_protocol::NodeId;
 use seamless_transport::quic::*;
 use std::{
     io::{BufRead, BufReader, Write},

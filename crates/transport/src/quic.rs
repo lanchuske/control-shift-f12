@@ -1,5 +1,4 @@
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub struct NodeId(pub [u8; 16]);
+pub use seamless_input_protocol::NodeId;
 
 pub fn canonical_initiator(local: NodeId, remote: NodeId) -> NodeId {
     local.min(remote)
