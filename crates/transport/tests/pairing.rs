@@ -155,6 +155,41 @@ fn unpair_removes_only_selected_peer() {
     assert!(reopened.peer(carol.node_id()).is_some());
 }
 
+#[cfg(unix)]
+#[test]
+fn failed_pin_persistence_does_not_change_in_memory_or_on_disk() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (dir, mut alice) = identity("Alice");
+    let (_, bob) = identity("Bob");
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
+    let result = alice.pin_peer(PinnedPeer::from_identity(&bob));
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    assert!(matches!(result, Err(PairingError::Io(_))));
+    assert!(alice.peer(bob.node_id()).is_none());
+    let reopened = IdentityStore::open_or_create(dir.path(), "ignored").unwrap();
+    assert!(reopened.peer(bob.node_id()).is_none());
+}
+
+#[cfg(unix)]
+#[test]
+fn failed_unpair_persistence_keeps_trust_in_memory_and_on_disk() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (dir, mut alice) = identity("Alice");
+    let (_, bob) = identity("Bob");
+    alice.pin_peer(PinnedPeer::from_identity(&bob)).unwrap();
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
+    let result = alice.unpair(bob.node_id());
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    assert!(matches!(result, Err(PairingError::Io(_))));
+    assert!(alice.peer(bob.node_id()).is_some());
+    let reopened = IdentityStore::open_or_create(dir.path(), "ignored").unwrap();
+    assert!(reopened.peer(bob.node_id()).is_some());
+}
+
 #[test]
 fn peer_store_contains_only_public_pairing_material() {
     let (dir, mut alice) = identity("Alice");
@@ -399,4 +434,30 @@ async fn temporary_quic_stream_rejects_wrong_code() {
         accept_result,
         Err(PairingError::ConfirmationMismatch)
     ));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn temporary_pairing_is_bounded_when_the_peer_never_opens_a_stream() {
+    let (_alice_dir, mut alice) = identity("Alice");
+    let now = SystemTime::UNIX_EPOCH + Duration::from_secs(10);
+    let mut code = PairingCode::generate(now).unwrap();
+    let (server, client) = support::configs();
+    let server_endpoint = quinn::Endpoint::server(server, "127.0.0.1:0".parse().unwrap()).unwrap();
+    let mut client_endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+    client_endpoint.set_default_client_config(client);
+    let incoming = server_endpoint.accept();
+    let outgoing = client_endpoint
+        .connect(server_endpoint.local_addr().unwrap(), "localhost")
+        .unwrap();
+    let (_server_connection, client_connection) =
+        tokio::join!(async { incoming.await.unwrap().await.unwrap() }, outgoing);
+    let result = seamless_transport::pair_offer_over_quic_with_timeout(
+        &client_connection.unwrap(),
+        &mut alice,
+        &mut code,
+        now,
+        Duration::from_millis(20),
+    )
+    .await;
+    assert!(matches!(result, Err(PairingError::TimedOut)));
 }

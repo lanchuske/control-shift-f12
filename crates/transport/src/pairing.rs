@@ -12,6 +12,7 @@ use std::{
 use zeroize::Zeroize;
 
 const CODE_LIFETIME: Duration = Duration::from_secs(300);
+const PAIRING_OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
 const CONTEXT: &[u8] = b"seamless-input pairing v1";
 type ConfirmMac = Hmac<Sha256>;
 
@@ -43,6 +44,8 @@ pub enum PairingError {
     Tls,
     #[error("temporary pairing channel failed")]
     Network,
+    #[error("pairing operation timed out")]
+    TimedOut,
 }
 
 pub struct PairingCode {
@@ -286,12 +289,27 @@ pub async fn pair_offer_over_quic(
     code: &mut PairingCode,
     now: SystemTime,
 ) -> Result<PinnedPeer, PairingError> {
-    let session = PairingSession::offer(identity, code, now)?;
-    let (send, recv) = connection
-        .open_bi()
+    pair_offer_over_quic_with_timeout(connection, identity, code, now, PAIRING_OPERATION_TIMEOUT)
         .await
-        .map_err(|_| PairingError::Network)?;
-    let peer = exchange_pairing(send, recv, session).await?;
+}
+
+pub async fn pair_offer_over_quic_with_timeout(
+    connection: &quinn::Connection,
+    identity: &mut IdentityStore,
+    code: &mut PairingCode,
+    now: SystemTime,
+    timeout: Duration,
+) -> Result<PinnedPeer, PairingError> {
+    let session = PairingSession::offer(identity, code, now)?;
+    let peer = tokio::time::timeout(timeout, async {
+        let (send, recv) = connection
+            .open_bi()
+            .await
+            .map_err(|_| PairingError::Network)?;
+        exchange_pairing(send, recv, session).await
+    })
+    .await
+    .map_err(|_| PairingError::TimedOut)??;
     identity.pin_peer(peer.clone())?;
     Ok(peer)
 }
@@ -301,12 +319,26 @@ pub async fn pair_accept_over_quic(
     identity: &mut IdentityStore,
     phrase: &str,
 ) -> Result<PinnedPeer, PairingError> {
-    let session = PairingSession::accept(identity, phrase)?;
-    let (send, recv) = connection
-        .accept_bi()
+    pair_accept_over_quic_with_timeout(connection, identity, phrase, PAIRING_OPERATION_TIMEOUT)
         .await
-        .map_err(|_| PairingError::Network)?;
-    let peer = exchange_pairing(send, recv, session).await?;
+}
+
+pub async fn pair_accept_over_quic_with_timeout(
+    connection: &quinn::Connection,
+    identity: &mut IdentityStore,
+    phrase: &str,
+    timeout: Duration,
+) -> Result<PinnedPeer, PairingError> {
+    let session = PairingSession::accept(identity, phrase)?;
+    let peer = tokio::time::timeout(timeout, async {
+        let (send, recv) = connection
+            .accept_bi()
+            .await
+            .map_err(|_| PairingError::Network)?;
+        exchange_pairing(send, recv, session).await
+    })
+    .await
+    .map_err(|_| PairingError::TimedOut)??;
     identity.pin_peer(peer.clone())?;
     Ok(peer)
 }

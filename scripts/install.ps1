@@ -2,7 +2,9 @@ param(
     [switch]$Uninstall,
     [string]$AssetFile = $env:SEAMLESS_INPUT_ASSET_FILE,
     [string]$AssetUrl = $env:SEAMLESS_INPUT_ASSET_URL,
-    [string]$Sha256 = $env:SEAMLESS_INPUT_SHA256
+    [string]$Sha256 = $env:SEAMLESS_INPUT_SHA256,
+    [string]$AttestationFile = $env:SEAMLESS_INPUT_ATTESTATION_FILE,
+    [string]$AttestationUrl = $env:SEAMLESS_INPUT_ATTESTATION_URL
 )
 $ErrorActionPreference = 'Stop'
 $InstallDir = Join-Path $env:LOCALAPPDATA 'SeamlessInput\bin'
@@ -16,12 +18,16 @@ if ($Uninstall) {
     Write-Host 'Removed the SeamlessInput executable. Pairing identities and configuration were preserved.'
     exit 0
 }
-if ((-not $AssetFile -and -not $AssetUrl) -or -not $Sha256) {
-    throw 'Provide a pinned release asset (file or HTTPS URL) and its published SHA-256.'
+if ((-not $AssetFile -and -not $AssetUrl) -or -not $Sha256 -or (-not $AttestationFile -and -not $AttestationUrl)) {
+    throw 'Provide a release asset, its SHA-256, and its GitHub provenance attestation.'
+}
+if (-not (Get-Command gh -ErrorAction SilentlyContinue)) {
+    throw 'GitHub CLI is required to verify release provenance.'
 }
 New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
 $Temp = "$Target.new"
 $Backup = "$Target.rollback"
+$AttestationTemp = "$Target.attestation"
 if ($AssetFile) {
     Copy-Item -LiteralPath $AssetFile -Destination $Temp -Force
 } else {
@@ -30,10 +36,26 @@ if ($AssetFile) {
     }
     Invoke-WebRequest -Uri $AssetUrl -OutFile $Temp -UseBasicParsing
 }
+if ($AttestationFile) {
+    Copy-Item -LiteralPath $AttestationFile -Destination $AttestationTemp -Force
+} else {
+    if (-not $AttestationUrl.StartsWith('https://', [StringComparison]::OrdinalIgnoreCase)) {
+        throw 'Remote attestations must use HTTPS.'
+    }
+    Invoke-WebRequest -Uri $AttestationUrl -OutFile $AttestationTemp -UseBasicParsing
+}
 if ((Get-FileHash -Algorithm SHA256 -LiteralPath $Temp).Hash -ne $Sha256) {
     Remove-Item -LiteralPath $Temp -Force
+    Remove-Item -LiteralPath $AttestationTemp -Force -ErrorAction SilentlyContinue
     throw 'Checksum verification failed; existing installation was not changed.'
 }
+& gh attestation verify $Temp --repo lanchuske/seamless-input --bundle $AttestationTemp | Out-Null
+if ($LASTEXITCODE -ne 0) {
+    Remove-Item -LiteralPath $Temp -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $AttestationTemp -Force -ErrorAction SilentlyContinue
+    throw 'Provenance verification failed; existing installation was not changed.'
+}
+Remove-Item -LiteralPath $AttestationTemp -Force -ErrorAction SilentlyContinue
 if (Test-Path -LiteralPath $Target) { Copy-Item $Target $Backup -Force }
 try {
     Move-Item -LiteralPath $Temp -Destination $Target -Force

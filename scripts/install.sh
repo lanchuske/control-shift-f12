@@ -3,7 +3,13 @@ set -eu
 
 install_dir="${HOME}/.local/bin"
 target="${install_dir}/seamless-input"
-profile="${SEAMLESS_INPUT_PROFILE:-${HOME}/.profile}"
+if [ -n "${SEAMLESS_INPUT_PROFILE:-}" ]; then
+  profile="${SEAMLESS_INPUT_PROFILE}"
+elif [ "${SHELL##*/}" = "zsh" ]; then
+  profile="${ZDOTDIR:-${HOME}}/.zprofile"
+else
+  profile="${HOME}/.profile"
+fi
 marker="# SeamlessInput user PATH"
 
 if [ "${1:-}" = "--uninstall" ]; then
@@ -24,15 +30,22 @@ fi
 asset="${SEAMLESS_INPUT_ASSET_FILE:-}"
 asset_url="${SEAMLESS_INPUT_ASSET_URL:-}"
 checksum="${SEAMLESS_INPUT_SHA256:-}"
-if [ -z "${checksum}" ] || { [ -z "${asset}" ] && [ -z "${asset_url}" ]; }; then
-  printf '%s\n' "Provide a pinned release asset (file or HTTPS URL) and its published SHA-256." >&2
+attestation="${SEAMLESS_INPUT_ATTESTATION_FILE:-}"
+attestation_url="${SEAMLESS_INPUT_ATTESTATION_URL:-}"
+if [ -z "${checksum}" ] || { [ -z "${asset}" ] && [ -z "${asset_url}" ]; } || { [ -z "${attestation}" ] && [ -z "${attestation_url}" ]; }; then
+  printf '%s\n' "Provide a release asset, its SHA-256, and its GitHub provenance attestation." >&2
+  exit 2
+fi
+if ! command -v gh >/dev/null 2>&1; then
+  printf '%s\n' "GitHub CLI is required to verify release provenance." >&2
   exit 2
 fi
 
 mkdir -p "${install_dir}"
 tmp="${target}.new.$$"
 backup="${target}.rollback.$$"
-trap 'rm -f "${tmp}" "${backup}"' EXIT HUP INT TERM
+attestation_tmp="${target}.attestation.$$"
+trap 'rm -f "${tmp}" "${backup}" "${attestation_tmp}"' EXIT HUP INT TERM
 if [ -n "${asset}" ]; then
   cp "${asset}" "${tmp}"
 else
@@ -41,9 +54,21 @@ else
     *) printf '%s\n' "Remote assets must use HTTPS." >&2; exit 2 ;;
   esac
 fi
+if [ -n "${attestation}" ]; then
+  cp "${attestation}" "${attestation_tmp}"
+else
+  case "${attestation_url}" in
+    https://*) curl --fail --location --proto '=https' --tlsv1.2 --output "${attestation_tmp}" "${attestation_url}" ;;
+    *) printf '%s\n' "Remote attestations must use HTTPS." >&2; exit 2 ;;
+  esac
+fi
 actual="$(shasum -a 256 "${tmp}" | awk '{print $1}')"
 if [ "${actual}" != "${checksum}" ]; then
   printf '%s\n' "Checksum verification failed; existing installation was not changed." >&2
+  exit 1
+fi
+if ! gh attestation verify "${tmp}" --repo lanchuske/seamless-input --bundle "${attestation_tmp}" >/dev/null; then
+  printf '%s\n' "Provenance verification failed; existing installation was not changed." >&2
   exit 1
 fi
 chmod 755 "${tmp}"
