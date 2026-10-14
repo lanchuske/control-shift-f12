@@ -7,6 +7,8 @@ on:
         required: true
 permissions:
   contents: read
+  id-token: write
+  attestations: write
 jobs:
   build:
     strategy:
@@ -34,6 +36,9 @@ jobs:
           cp "target/${{ matrix.target }}/release/seamless-input${suffix}" "dist/seamless-input-${{ matrix.target }}${suffix}"
           cd dist
           if command -v shasum >/dev/null; then shasum -a 256 * > SHA256SUMS; else certutil -hashfile * SHA256 > SHA256SUMS; fi
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: dist/seamless-input-${{ matrix.target }}*
       - uses: actions/upload-artifact@v4
         with:
           name: seamless-input-${{ matrix.target }}

@@ -6,8 +6,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
-    fs::{self, OpenOptions},
-    io::Write,
+    fs,
     path::{Path, PathBuf},
 };
 
@@ -37,6 +36,7 @@ struct StoredIdentity {
     friendly_name: String,
     certificate_der: String,
     private_key_der: String,
+    private_key_protection: String,
 }
 #[derive(Serialize, Deserialize)]
 struct StoredPeer {
@@ -108,13 +108,18 @@ impl IdentityStore {
             let stored = StoredIdentity {
                 friendly_name: validate_name(friendly_name)?.to_owned(),
                 certificate_der: STANDARD.encode(certificate.der()),
-                private_key_der: STANDARD.encode(signing_key.serialize_der()),
+                private_key_der: STANDARD
+                    .encode(protect_private_key(&signing_key.serialize_der())?),
+                private_key_protection: private_key_protection().to_owned(),
             };
             write_private_json(&path, &stored)?;
             stored
         };
         let certificate_der = STANDARD.decode(stored.certificate_der)?;
-        let private_key_der = STANDARD.decode(stored.private_key_der)?;
+        if stored.private_key_protection != private_key_protection() {
+            return Err(PairingError::InvalidIdentity);
+        }
+        let private_key_der = unprotect_private_key(&STANDARD.decode(stored.private_key_der)?)?;
         let peers = read_peers(&root.join(PEERS_FILE))?;
         Ok(Self {
             root,
@@ -156,13 +161,18 @@ impl IdentityStore {
     }
     pub fn pin_peer(&mut self, peer: PinnedPeer) -> Result<(), PairingError> {
         validate_peer(&peer)?;
-        self.peers.insert(peer.node_id, peer);
-        self.save_peers()
+        let mut proposed = self.peers.clone();
+        proposed.insert(peer.node_id, peer);
+        self.save_peers(&proposed)?;
+        self.peers = proposed;
+        Ok(())
     }
     pub fn unpair(&mut self, id: NodeId) -> Result<bool, PairingError> {
-        let removed = self.peers.remove(&id).is_some();
+        let mut proposed = self.peers.clone();
+        let removed = proposed.remove(&id).is_some();
         if removed {
-            self.save_peers()?;
+            self.save_peers(&proposed)?;
+            self.peers = proposed;
         }
         Ok(removed)
     }
@@ -217,9 +227,8 @@ impl IdentityStore {
         ));
         Ok((server, client))
     }
-    fn save_peers(&self) -> Result<(), PairingError> {
-        let stored: Vec<_> = self
-            .peers
+    fn save_peers(&self, peers: &BTreeMap<NodeId, PinnedPeer>) -> Result<(), PairingError> {
+        let stored: Vec<_> = peers
             .values()
             .map(|p| StoredPeer {
                 node_id: p.node_id.0,
@@ -296,22 +305,153 @@ fn harden_private_file(path: &Path) -> Result<(), PairingError> {
 }
 fn write_private_json(path: &Path, value: &impl Serialize) -> Result<(), PairingError> {
     let bytes = serde_json::to_vec(value)?;
-    let tmp = path.with_extension("tmp");
+    let parent = path.parent().ok_or(PairingError::InvalidIdentity)?;
+    let mut random = [0u8; 8];
+    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut random);
+    let tmp = parent.join(format!(
+        ".seamless-input-{}.tmp",
+        u64::from_ne_bytes(random)
+    ));
+    let result = write_and_replace(&tmp, path, &bytes);
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    result?;
+    Ok(())
+}
+
+fn write_and_replace(tmp: &Path, path: &Path, bytes: &[u8]) -> Result<(), PairingError> {
+    use std::{fs::OpenOptions, io::Write};
     let mut options = OpenOptions::new();
-    options.create(true).truncate(true).write(true);
+    options.create_new(true).write(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    let mut file = options.open(&tmp)?;
-    file.write_all(&bytes)?;
+    let mut file = options.open(tmp)?;
+    file.write_all(bytes)?;
     file.sync_all()?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         file.set_permissions(fs::Permissions::from_mode(0o600))?;
     }
-    fs::rename(tmp, path)?;
+    drop(file);
+    atomic_replace(tmp, path)?;
+    #[cfg(unix)]
+    {
+        // The rename is the atomic commit point. Directory sync is best-effort:
+        // reporting failure after that point would leave disk and memory disagreeing.
+        if let Some(parent) = path.parent()
+            && let Ok(directory) = std::fs::File::open(parent)
+        {
+            let _ = directory.sync_all();
+        }
+    }
     Ok(())
+}
+
+#[cfg(unix)]
+fn atomic_replace(tmp: &Path, path: &Path) -> Result<(), std::io::Error> {
+    fs::rename(tmp, path)
+}
+
+#[cfg(windows)]
+fn atomic_replace(tmp: &Path, path: &Path) -> Result<(), std::io::Error> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+    };
+    let from: Vec<u16> = tmp.as_os_str().encode_wide().chain(Some(0)).collect();
+    let to: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    let result = unsafe {
+        MoveFileExW(
+            from.as_ptr(),
+            to.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if result == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(windows))]
+fn private_key_protection() -> &'static str {
+    "plaintext-owner-only"
+}
+
+#[cfg(windows)]
+fn private_key_protection() -> &'static str {
+    "dpapi-current-user"
+}
+
+#[cfg(not(windows))]
+fn protect_private_key(key: &[u8]) -> Result<Vec<u8>, PairingError> {
+    Ok(key.to_vec())
+}
+
+#[cfg(not(windows))]
+fn unprotect_private_key(key: &[u8]) -> Result<Vec<u8>, PairingError> {
+    Ok(key.to_vec())
+}
+
+#[cfg(windows)]
+fn protect_private_key(key: &[u8]) -> Result<Vec<u8>, PairingError> {
+    dpapi_transform(key, true)
+}
+
+#[cfg(windows)]
+fn unprotect_private_key(key: &[u8]) -> Result<Vec<u8>, PairingError> {
+    dpapi_transform(key, false)
+}
+
+#[cfg(windows)]
+fn dpapi_transform(data: &[u8], protect: bool) -> Result<Vec<u8>, PairingError> {
+    use std::ptr;
+    use windows_sys::Win32::{
+        Foundation::LocalFree,
+        Security::Cryptography::{
+            CRYPT_INTEGER_BLOB, CRYPTPROTECT_UI_FORBIDDEN, CryptProtectData, CryptUnprotectData,
+        },
+    };
+    let mut input = CRYPT_INTEGER_BLOB {
+        cbData: u32::try_from(data.len()).map_err(|_| PairingError::InvalidIdentity)?,
+        pbData: data.as_ptr().cast_mut(),
+    };
+    let mut output = CRYPT_INTEGER_BLOB::default();
+    let ok = unsafe {
+        if protect {
+            CryptProtectData(
+                &input,
+                ptr::null(),
+                ptr::null(),
+                ptr::null(),
+                ptr::null(),
+                CRYPTPROTECT_UI_FORBIDDEN,
+                &mut output,
+            )
+        } else {
+            CryptUnprotectData(
+                &input,
+                ptr::null_mut(),
+                ptr::null(),
+                ptr::null(),
+                ptr::null(),
+                CRYPTPROTECT_UI_FORBIDDEN,
+                &mut output,
+            )
+        }
+    };
+    if ok == 0 || output.pbData.is_null() {
+        return Err(PairingError::Io(std::io::Error::last_os_error()));
+    }
+    let result =
+        unsafe { std::slice::from_raw_parts(output.pbData, output.cbData as usize).to_vec() };
+    unsafe { LocalFree(output.pbData.cast()) };
+    input.pbData = ptr::null_mut();
+    Ok(result)
 }
