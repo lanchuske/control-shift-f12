@@ -326,6 +326,28 @@ fn unpaired_or_unauthenticated_sessions_never_connect() {
     );
 }
 
+#[test]
+fn hot_reloading_topology_releases_remote_control_before_switching() {
+    let mut runtime = Runtime::new(node(1), display(1).id, mesh3(), 1000).unwrap();
+    admit(&mut runtime, 2, Capabilities::all());
+    runtime
+        .cross(Edge::Right, Point { x: 100.0, y: 50.0 }, 1)
+        .unwrap();
+
+    let replacement = Topology::new(display(1)).unwrap();
+    let effects = runtime
+        .reconfigure(display(1).id, replacement, 1000)
+        .unwrap();
+
+    assert!(effects.iter().any(|effect| matches!(effect, RuntimeEffect::Send { peer, message: PeerMessage::ReleaseLease { .. } } if *peer == node(2))));
+    assert!(
+        effects
+            .iter()
+            .any(|effect| matches!(effect, RuntimeEffect::ReleaseLocal))
+    );
+    assert_eq!(runtime.active_peer(), node(1));
+}
+
 #[derive(Default)]
 struct FakeInput {
     injected: Vec<InputEvent>,

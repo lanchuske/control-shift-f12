@@ -129,6 +129,20 @@ impl Runtime {
         let actions = self.controller.disconnect(peer);
         self.effects(actions)
     }
+    /// Atomically replace display routing. Any remote lease is released before
+    /// the new topology becomes active so stale placement state cannot retain
+    /// control of local input.
+    pub fn reconfigure(
+        &mut self,
+        local_display: DisplayId,
+        topology: Topology,
+        timeout_ms: u64,
+    ) -> Result<Vec<RuntimeEffect>, ControlError> {
+        let actions = self.controller.emergency_return();
+        let effects = self.effects(actions);
+        self.controller = Controller::new(topology, local_display, timeout_ms)?;
+        Ok(effects)
+    }
     pub fn tick(&mut self, now_ms: u64) -> Result<Vec<RuntimeEffect>, ControlError> {
         let actions = self.controller.tick(now_ms)?;
         Ok(self.effects(actions))

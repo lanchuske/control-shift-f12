@@ -1,10 +1,8 @@
 name: Release assets
 on:
-  workflow_dispatch:
-    inputs:
-      tag:
-        description: Existing reviewed tag to package
-        required: true
+  push:
+    tags:
+      - 'v*.*.*'
 permissions:
   contents: read
   id-token: write
@@ -23,7 +21,17 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-        with: { ref: "${{ inputs.tag }}" }
+        with:
+          ref: "refs/tags/${{ github.ref_name }}"
+          fetch-depth: 0
+      - name: Bind build to immutable reviewed tag
+        shell: bash
+        run: |
+          set -eu
+          test "${GITHUB_REF_TYPE}" = "tag"
+          test "${GITHUB_REF}" = "refs/tags/${GITHUB_REF_NAME}"
+          printf '%s' "${GITHUB_REF_NAME}" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'
+          test "$(git rev-parse HEAD)" = "$(git rev-list -n 1 "refs/tags/${GITHUB_REF_NAME}")"
       - uses: dtolnay/rust-toolchain@stable
         with: { targets: "${{ matrix.target }}" }
       - run: cargo test --workspace --target ${{ matrix.target }}

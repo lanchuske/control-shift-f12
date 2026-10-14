@@ -1,6 +1,8 @@
 use std::{fs, path::Path};
 
 use seamless_input::config::{ConfigError, ConfigStore, ConfigV1, PeerConfig, Placement};
+use seamless_input::supervisor::topology_from_config;
+use seamless_input_core::{DisplayId, NodeId, platform::LogicalDisplay};
 
 fn sample() -> ConfigV1 {
     ConfigV1 {
@@ -108,4 +110,64 @@ fn default_path_is_below_a_user_owned_root() {
     assert!(path.ends_with(Path::new("seamless-input").join("config.toml")));
     assert!(!path.starts_with("/etc"));
     assert!(!path.starts_with("/usr"));
+}
+
+#[test]
+fn persisted_tui_placements_build_the_runtime_topology() {
+    let local = NodeId([1; 16]);
+    let remote = NodeId([2; 16]);
+    let config = ConfigV1 {
+        version: 1,
+        peers: vec![
+            PeerConfig {
+                node_id: hex(local),
+                name: "This Mac".into(),
+                displays: vec!["0".into()],
+            },
+            PeerConfig {
+                node_id: hex(remote),
+                name: "Office PC".into(),
+                displays: vec!["0".into()],
+            },
+        ],
+        placements: vec![
+            Placement {
+                display: format!("{}:0", hex(local)),
+                x: 0,
+                y: 0,
+            },
+            Placement {
+                display: format!("{}:0", hex(remote)),
+                x: 1,
+                y: 0,
+            },
+        ],
+    };
+    let local_displays = vec![LogicalDisplay {
+        index: 0,
+        origin_x: 0.0,
+        origin_y: 0.0,
+        width: 1920.0,
+        height: 1080.0,
+        scale: 2.0,
+    }];
+
+    let topology = topology_from_config(local, &local_displays, &config).unwrap();
+    assert_eq!(
+        topology.neighbor(
+            DisplayId {
+                node: local,
+                index: 0
+            },
+            seamless_input_core::Edge::Right
+        ),
+        Some(DisplayId {
+            node: remote,
+            index: 0
+        })
+    );
+}
+
+fn hex(node: NodeId) -> String {
+    node.0.iter().map(|byte| format!("{byte:02x}")).collect()
 }

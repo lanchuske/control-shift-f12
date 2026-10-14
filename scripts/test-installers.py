@@ -26,6 +26,7 @@ class InstallerContractTests(unittest.TestCase):
             "SEAMLESS_INPUT_ASSET_FILE": str(artifact),
             "SEAMLESS_INPUT_SHA256": digest,
             "SEAMLESS_INPUT_ATTESTATION_FILE": str(attestation),
+            "SEAMLESS_INPUT_EXPECTED_TAG": "v0.1.0",
         }
 
     def test_installers_never_contain_privileged_or_enterprise_mutations(self):
@@ -140,6 +141,18 @@ class InstallerContractTests(unittest.TestCase):
             self.assertIn("attestation", text)
             self.assertIn("gh", text)
             self.assertIn("lanchuske/seamless-input", text)
+
+    def test_release_and_installers_bind_provenance_to_the_exact_reviewed_tag(self):
+        release = (ROOT / ".github/workflows/release.yml").read_text().lower()
+        shell = (ROOT / "scripts/install.sh").read_text().lower()
+        powershell = (ROOT / "scripts/install.ps1").read_text().lower()
+        self.assertIn("tags:", release)
+        self.assertIn("github.ref_name", release)
+        self.assertNotIn("workflow_dispatch", release)
+        for text in (shell, powershell):
+            self.assertIn("expected_tag", text)
+            self.assertIn("--source-ref", text)
+            self.assertIn("refs/tags/", text)
 
     def test_windows_identity_uses_dpapi_and_refuses_unprotected_keys(self):
         source = (ROOT / "crates/transport/src/identity.rs").read_text().lower()

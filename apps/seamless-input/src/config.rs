@@ -200,6 +200,10 @@ pub struct LiveConfig {
 }
 
 impl LiveConfig {
+    pub fn store(&self) -> ConfigStore {
+        self.store.clone()
+    }
+
     /// Polling keeps the runtime dependency-free and works with atomic renames.
     pub fn poll(&mut self) -> Result<Option<ConfigV1>, ConfigError> {
         let candidate = self.store.load()?;
