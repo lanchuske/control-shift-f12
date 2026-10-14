@@ -1,0 +1,24 @@
+name: Bug report
+description: Report a reproducible in-scope defect
+title: "[Bug]: "
+labels: [bug]
+body:
+  - type: checkboxes
+    attributes:
+      label: Scope and privacy
+      options:
+        - label: This concerns mouse, keyboard, text/PNG clipboard, pairing, topology, discovery, or installation.
+          required: true
+        - label: I removed clipboard contents, keys, usernames, addresses, and machine identifiers.
+          required: true
+  - type: textarea
+    attributes: { label: Steps to reproduce }
+    validations: { required: true }
+  - type: textarea
+    attributes: { label: Expected and actual result }
+    validations: { required: true }
+  - type: dropdown
+    attributes:
+      label: Evidence
+      options: [PASS, FAIL, NOT MEASURED]
+    validations: { required: true }
