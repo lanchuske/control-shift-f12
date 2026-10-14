@@ -9,8 +9,18 @@ seamless-input-protocol = { path = "../protocol" }
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "io-util"] }
 thiserror = "2"
-
-[dev-dependencies]
+base64 = "0.22"
+bip39 = "2"
+hmac = "0.12"
+rand = "0.8"
 rcgen = "0.14"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+spake2 = "0.4"
+zeroize = "1"
+
+[dev-dependencies]
 seamless-discovery = { path = "../discovery" }
+tempfile = "3"
