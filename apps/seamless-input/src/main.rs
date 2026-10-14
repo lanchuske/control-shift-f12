@@ -1,4 +1,4 @@
-use std::process::ExitCode;
+use std::{fmt, process::ExitCode};
 
 use clap::{Args, Parser, Subcommand};
 
@@ -61,19 +61,33 @@ fn main() -> ExitCode {
     }
 }
 
-fn run(cli: Cli) -> Result<(), String> {
-    match cli.command {
-        Commands::Start => println!("Starting SeamlessInput peer"),
-        Commands::Pair(args) if args.code == "new" => println!("Creating pairing code"),
-        Commands::Pair(args) => println!("Pairing with code: {}", args.code),
-        Commands::Peers => println!("Listing peers"),
-        Commands::Unpair { peer } => println!("Unpairing peer: {peer}"),
-        Commands::Tui => println!("Opening topology interface"),
-        Commands::Doctor => println!("Running diagnostics"),
-        Commands::Config { command } => match command {
-            ConfigCommands::Show => println!("Showing configuration"),
-            ConfigCommands::Path => println!("Configuration path"),
-        },
+#[derive(Debug)]
+enum OperationalError {
+    NotImplemented(&'static str),
+}
+
+impl fmt::Display for OperationalError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotImplemented(command) => {
+                write!(formatter, "{command} is not implemented yet")
+            }
+        }
     }
-    Ok(())
+}
+
+fn run(cli: Cli) -> Result<(), OperationalError> {
+    let command = match cli.command {
+        Commands::Start => "start",
+        Commands::Pair(_args) => "pair",
+        Commands::Peers => "peers",
+        Commands::Unpair { peer: _ } => "unpair",
+        Commands::Tui => "tui",
+        Commands::Doctor => "doctor",
+        Commands::Config { command } => match command {
+            ConfigCommands::Show => "config show",
+            ConfigCommands::Path => "config path",
+        },
+    };
+    Err(OperationalError::NotImplemented(command))
 }

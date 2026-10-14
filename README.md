@@ -1,12 +1,12 @@
 # SeamlessInput
 
-SeamlessInput is a free, open-source, peer-to-peer terminal application for
-sharing keyboard and pointer control across macOS and Windows computers, with
-text and PNG clipboard synchronization planned.
+SeamlessInput is an open-source project in development. Its planned capability
+is peer-to-peer keyboard and pointer sharing across macOS and Windows, with
+text and PNG clipboard synchronization.
 
-Every machine uses the same `seamless-input start` command. Peers can discover
-one another on a local network or pair using a short-lived code; there are no
-permanent server or client roles.
+The intended workflow uses the same `seamless-input start` command on every
+machine, with local network discovery or short-lived-code pairing and no
+permanent server or client roles. These operations are not implemented yet.
 
 ## Build
 

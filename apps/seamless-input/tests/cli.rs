@@ -7,100 +7,61 @@ fn run(args: &[&str]) -> std::process::Output {
         .expect("CLI process should start")
 }
 
-#[test]
-fn start_is_a_symmetric_peer_command() {
-    let output = run(&["start"]);
-    assert!(output.status.success());
+fn assert_not_implemented(output: &std::process::Output, command: &str) {
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(output.stdout, b"");
     assert_eq!(
-        String::from_utf8(output.stdout).unwrap(),
-        "Starting SeamlessInput peer\n"
+        String::from_utf8_lossy(&output.stderr),
+        format!("error: {command} is not implemented yet\n")
     );
-    assert_eq!(output.stderr, b"");
 }
 
 #[test]
-fn pair_new_creates_a_pairing_code() {
-    let output = run(&["pair", "new"]);
-    assert!(output.status.success());
-    assert_eq!(
-        String::from_utf8(output.stdout).unwrap(),
-        "Creating pairing code\n"
-    );
-    assert_eq!(output.stderr, b"");
+fn start_routes_to_a_not_implemented_operational_error() {
+    assert_not_implemented(&run(&["start"]), "start");
 }
 
 #[test]
-fn pair_code_joins_the_symmetric_pairing_flow() {
-    let output = run(&["pair", "amber-cedar-dawn-field-grove-harbor"]);
-    assert!(output.status.success());
-    assert_eq!(
-        String::from_utf8(output.stdout).unwrap(),
-        "Pairing with code: amber-cedar-dawn-field-grove-harbor\n"
-    );
-    assert_eq!(output.stderr, b"");
+fn pair_new_routes_to_a_not_implemented_operational_error() {
+    assert_not_implemented(&run(&["pair", "new"]), "pair");
 }
 
 #[test]
-fn peers_lists_known_peers() {
-    let output = run(&["peers"]);
-    assert!(output.status.success());
-    assert_eq!(String::from_utf8(output.stdout).unwrap(), "Listing peers\n");
-    assert_eq!(output.stderr, b"");
+fn pair_code_is_never_echoed_when_pairing_is_not_implemented() {
+    let code = "amber-cedar-dawn-field-grove-harbor";
+    let output = run(&["pair", code]);
+    assert_not_implemented(&output, "pair");
+    assert!(!String::from_utf8(output.stdout).unwrap().contains(code));
 }
 
 #[test]
-fn unpair_takes_a_peer_name() {
-    let output = run(&["unpair", "office-mac"]);
-    assert!(output.status.success());
-    assert_eq!(
-        String::from_utf8(output.stdout).unwrap(),
-        "Unpairing peer: office-mac\n"
-    );
-    assert_eq!(output.stderr, b"");
+fn peers_routes_to_a_not_implemented_operational_error() {
+    assert_not_implemented(&run(&["peers"]), "peers");
 }
 
 #[test]
-fn tui_opens_the_topology_interface() {
-    let output = run(&["tui"]);
-    assert!(output.status.success());
-    assert_eq!(
-        String::from_utf8(output.stdout).unwrap(),
-        "Opening topology interface\n"
-    );
-    assert_eq!(output.stderr, b"");
+fn unpair_routes_to_a_not_implemented_operational_error() {
+    assert_not_implemented(&run(&["unpair", "office-mac"]), "unpair");
 }
 
 #[test]
-fn doctor_runs_diagnostics() {
-    let output = run(&["doctor"]);
-    assert!(output.status.success());
-    assert_eq!(
-        String::from_utf8(output.stdout).unwrap(),
-        "Running diagnostics\n"
-    );
-    assert_eq!(output.stderr, b"");
+fn tui_routes_to_a_not_implemented_operational_error() {
+    assert_not_implemented(&run(&["tui"]), "tui");
 }
 
 #[test]
-fn config_show_displays_configuration() {
-    let output = run(&["config", "show"]);
-    assert!(output.status.success());
-    assert_eq!(
-        String::from_utf8(output.stdout).unwrap(),
-        "Showing configuration\n"
-    );
-    assert_eq!(output.stderr, b"");
+fn doctor_routes_to_a_not_implemented_operational_error() {
+    assert_not_implemented(&run(&["doctor"]), "doctor");
 }
 
 #[test]
-fn config_path_displays_configuration_location() {
-    let output = run(&["config", "path"]);
-    assert!(output.status.success());
-    assert_eq!(
-        String::from_utf8(output.stdout).unwrap(),
-        "Configuration path\n"
-    );
-    assert_eq!(output.stderr, b"");
+fn config_show_routes_to_a_not_implemented_operational_error() {
+    assert_not_implemented(&run(&["config", "show"]), "config show");
+}
+
+#[test]
+fn config_path_routes_to_a_not_implemented_operational_error() {
+    assert_not_implemented(&run(&["config", "path"]), "config path");
 }
 
 #[test]
