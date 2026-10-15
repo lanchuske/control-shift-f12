@@ -385,11 +385,11 @@ fn create_private_directory(path: &Path) -> Result<(), PairingError> {
     }
     Ok(())
 }
-fn harden_private_file(path: &Path) -> Result<(), PairingError> {
+fn harden_private_file(_path: &Path) -> Result<(), PairingError> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+        fs::set_permissions(_path, fs::Permissions::from_mode(0o600))?;
     }
     Ok(())
 }
@@ -508,7 +508,7 @@ fn dpapi_transform(data: &[u8], protect: bool) -> Result<Vec<u8>, PairingError> 
             CRYPT_INTEGER_BLOB, CRYPTPROTECT_UI_FORBIDDEN, CryptProtectData, CryptUnprotectData,
         },
     };
-    let mut input = CRYPT_INTEGER_BLOB {
+    let input = CRYPT_INTEGER_BLOB {
         cbData: u32::try_from(data.len()).map_err(|_| PairingError::InvalidIdentity)?,
         pbData: data.as_ptr().cast_mut(),
     };
@@ -542,6 +542,5 @@ fn dpapi_transform(data: &[u8], protect: bool) -> Result<Vec<u8>, PairingError> 
     let result =
         unsafe { std::slice::from_raw_parts(output.pbData, output.cbData as usize).to_vec() };
     unsafe { LocalFree(output.pbData.cast()) };
-    input.pbData = ptr::null_mut();
     Ok(result)
 }
