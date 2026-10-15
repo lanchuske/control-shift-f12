@@ -9,9 +9,12 @@ end-to-end test occurred.
 3. Publish SHA-256 checksums beside every binary.
 4. On clean non-admin accounts, install twice, open a new terminal, run
    `seamless-input doctor`, uninstall, and verify identities remain.
-5. Exercise two-peer and mixed three-peer scenarios on real machines.
-6. Copy `docs/qa/e2e-evidence-template.md` and mark every row PASS, FAIL, or NOT
-   MEASURED. A CI build is not physical-platform evidence.
+5. Copy `docs/qa/physical-qa-matrix.md` and run the two-machine installation,
+   safety-shortcut, pairing, bidirectional input, clipboard, crossing, and
+   recovery checks on real hardware.
+6. Copy `docs/qa/e2e-evidence-template.md` for the broader acceptance summary
+   and mark every row PASS, FAIL, or NOT MEASURED. A CI build is not
+   physical-platform evidence.
 7. Only after independent review and explicit publication approval, publish
    release assets and verify the public installation commands.
 
