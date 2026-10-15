@@ -134,7 +134,7 @@ pub enum SupervisorError {
 struct PeerLink {
     peer: NodeId,
     endpoint: PeerEndpoint,
-    _instance: String,
+    instance: String,
 }
 
 struct InboundPacket {
@@ -185,6 +185,10 @@ pub struct NativeSupervisor {
     last_heartbeat_ms: u64,
     local_display: Display,
     capture: Option<NativeCapture>,
+    #[cfg(test)]
+    suppress_native_apply: bool,
+    #[cfg(test)]
+    observed_received: Vec<crate::runtime::RuntimeReceive>,
 }
 
 impl NativeSupervisor {
@@ -216,27 +220,7 @@ impl NativeSupervisor {
 
         let mut links = Vec::new();
         for peer in identity.peers() {
-            let (server, client) = identity.quic_configs_for(peer)?;
-            let endpoint = PeerEndpoint::bind(
-                SocketAddr::new(local_lan_ip(), 0),
-                identity.node_id(),
-                server,
-                client,
-                EndpointOptions {
-                    verifier: Some(Arc::new(identity.verifier())),
-                    ..EndpointOptions::default()
-                },
-            )
-            .map_err(|_| SupervisorError::Runtime)?;
-            let instance = random_instance();
-            discovery
-                .publish(&instance, endpoint.local_addr(), false)
-                .map_err(SupervisorError::Discovery)?;
-            links.push(PeerLink {
-                peer: peer.node_id,
-                endpoint,
-                _instance: instance,
-            });
+            links.push(create_peer_link(&identity, &mut discovery, peer)?);
         }
         let (inbound_tx, inbound_rx) = mpsc::unbounded_channel();
         let capture = NativeCapture::install().ok();
@@ -258,11 +242,15 @@ impl NativeSupervisor {
             last_heartbeat_ms: 0,
             local_display,
             capture,
+            #[cfg(test)]
+            suppress_native_apply: false,
+            #[cfg(test)]
+            observed_received: Vec::new(),
         })
     }
 
     pub async fn tick(&mut self) -> Result<SupervisorStatus, SupervisorError> {
-        self.refresh_revocations().await?;
+        self.refresh_peer_membership().await?;
         if let Ok(Some(config)) = self.live_config.poll() {
             let displays = self.platform.displays()?;
             if let Ok(topology) = topology_from_config(self.identity.node_id(), &displays, &config)
@@ -287,7 +275,8 @@ impl NativeSupervisor {
             .browse(Duration::from_millis(25))
             .map_err(SupervisorError::Discovery)?;
         let discovered = discovered_peers.len();
-        let displays = self.platform.displays()?.len();
+        let local_displays = self.platform.displays()?;
+        let displays = local_displays.len();
         let now_ms = self.started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
         let clipboard = match self.platform.poll_clipboard(now_ms)? {
             ClipboardOutcome::Changed(content) => {
@@ -350,16 +339,26 @@ impl NativeSupervisor {
             self.spawn_reader(session);
         }
         for peer in newly_admitted {
-            self.execute_effects(vec![RuntimeEffect::Send {
-                peer,
-                message: crate::peer::PeerMessage::Capabilities {
-                    epoch: self
-                        .runtime
-                        .peer_epoch(peer)
-                        .ok_or(SupervisorError::Runtime)?,
-                    capabilities: Capabilities::all(),
+            let epoch = self
+                .runtime
+                .peer_epoch(peer)
+                .ok_or(SupervisorError::Runtime)?;
+            self.execute_effects(vec![
+                RuntimeEffect::Send {
+                    peer,
+                    message: crate::peer::PeerMessage::Capabilities {
+                        epoch,
+                        capabilities: Capabilities::all(),
+                    },
                 },
-            }])
+                RuntimeEffect::Send {
+                    peer,
+                    message: crate::peer::PeerMessage::Displays {
+                        epoch,
+                        displays: local_displays.iter().map(|display| display.index).collect(),
+                    },
+                },
+            ])
             .await?;
         }
 
@@ -381,11 +380,14 @@ impl NativeSupervisor {
         self.platform.input_access()
     }
 
-    async fn refresh_revocations(&mut self) -> Result<(), SupervisorError> {
+    async fn refresh_peer_membership(&mut self) -> Result<(), SupervisorError> {
         let fresh = IdentityStore::open_or_create(&self.identity_root, "SeamlessInput peer")?;
-        let current: BTreeSet<_> = self.identity.peers().map(|peer| peer.node_id).collect();
+        // Links are the live resource inventory. Comparing the durable store
+        // against them also retries a partially failed add on the next tick.
+        let current: BTreeSet<_> = self.links.iter().map(|link| link.peer).collect();
         let retained: BTreeSet<_> = fresh.peers().map(|peer| peer.node_id).collect();
         let revoked: Vec<_> = current.difference(&retained).copied().collect();
+        let added: Vec<_> = retained.difference(&current).copied().collect();
         for peer in revoked.iter().copied() {
             for link in &self.links {
                 link.endpoint.revoke(peer);
@@ -398,8 +400,21 @@ impl NativeSupervisor {
             let effects = self.runtime.disconnect(peer);
             self.execute_effects(effects).await?;
         }
+        for peer in &revoked {
+            if let Some(index) = self.links.iter().position(|link| link.peer == *peer) {
+                let link = self.links.remove(index);
+                // Revocation and endpoint teardown already happened. A stale
+                // mDNS advertisement must not keep a revoked peer admitted.
+                let _ = self.discovery.unpublish(&link.instance);
+            }
+        }
+        for peer in added.iter().copied() {
+            let pinned = fresh.peer(peer).ok_or(SupervisorError::Runtime)?;
+            self.links
+                .push(create_peer_link(&fresh, &mut self.discovery, pinned)?);
+        }
         self.identity = fresh;
-        if !revoked.is_empty() {
+        if !revoked.is_empty() || !added.is_empty() {
             let displays = self.platform.displays()?;
             synchronize_known_displays(&self.live_config.store(), &self.identity, &displays)?;
         }
@@ -468,6 +483,19 @@ impl NativeSupervisor {
         while let Ok(inbound) = self.inbound_rx.try_recv() {
             match process_peer_packet(&mut self.runtime, inbound.peer, inbound.packet, now_ms) {
                 PeerPacketOutcome::Received(received) => {
+                    if let crate::runtime::RuntimeReceive::Displays(displays) = &received {
+                        synchronize_peer_displays(
+                            &self.live_config.store(),
+                            inbound.peer,
+                            displays,
+                        )?;
+                    }
+                    #[cfg(test)]
+                    self.observed_received.push(received.clone());
+                    #[cfg(test)]
+                    if self.suppress_native_apply {
+                        continue;
+                    }
                     apply_receive(
                         &mut self.platform.input,
                         &mut self.platform.clipboard,
@@ -607,6 +635,34 @@ impl NativeSupervisor {
     }
 }
 
+fn create_peer_link(
+    identity: &IdentityStore,
+    discovery: &mut Discovery,
+    peer: &seamless_transport::PinnedPeer,
+) -> Result<PeerLink, SupervisorError> {
+    let (server, client) = identity.quic_configs_for(peer)?;
+    let endpoint = PeerEndpoint::bind(
+        SocketAddr::new(local_lan_ip(), 0),
+        identity.node_id(),
+        server,
+        client,
+        EndpointOptions {
+            verifier: Some(Arc::new(identity.verifier())),
+            ..EndpointOptions::default()
+        },
+    )
+    .map_err(|_| SupervisorError::Runtime)?;
+    let instance = random_instance();
+    discovery
+        .publish(&instance, endpoint.local_addr(), false)
+        .map_err(SupervisorError::Discovery)?;
+    Ok(PeerLink {
+        peer: peer.node_id,
+        endpoint,
+        instance,
+    })
+}
+
 /// Build runtime routing from the exact topology persisted by the TUI. Local
 /// display geometry is measured; remote geometry remains conservative until a
 /// peer advertises its real display list.
@@ -732,6 +788,33 @@ fn synchronize_known_displays(
             y: 0,
         });
     }
+    store.save(&config)
+}
+
+fn synchronize_peer_displays(
+    store: &ConfigStore,
+    peer: NodeId,
+    displays: &[u32],
+) -> Result<(), ConfigError> {
+    let mut normalized: Vec<_> = displays.iter().copied().take(32).collect();
+    normalized.sort_unstable();
+    normalized.dedup();
+    if normalized.is_empty() {
+        return Ok(());
+    }
+    let mut config = store.load_or_default()?;
+    let id = node_hex(peer);
+    let Some(configured) = config.peers.iter_mut().find(|value| value.node_id == id) else {
+        return Ok(());
+    };
+    let normalized: Vec<_> = normalized
+        .into_iter()
+        .map(|index| index.to_string())
+        .collect();
+    if configured.displays == normalized {
+        return Ok(());
+    }
+    configured.displays = normalized;
     store.save(&config)
 }
 
@@ -1151,5 +1234,275 @@ mod fault_isolation_tests {
             process_peer_packet(&mut runtime, remote, Ok(packet), 1),
             PeerPacketOutcome::Isolated { .. }
         ));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use seamless_transport::PinnedPeer;
+
+    fn test_paths(root: &Path, name: &str) -> AppPaths {
+        let root = root.join(name);
+        AppPaths {
+            config: root.join("config.toml"),
+            identity: root.join("identity"),
+            root,
+        }
+    }
+
+    fn pin_each_other(a: &AppPaths, b: &AppPaths) -> (NodeId, NodeId) {
+        let mut a_identity = IdentityStore::open_or_create(&a.identity, "a").unwrap();
+        let mut b_identity = IdentityStore::open_or_create(&b.identity, "b").unwrap();
+        let a_id = a_identity.node_id();
+        let b_id = b_identity.node_id();
+        a_identity
+            .pin_peer(PinnedPeer::from_identity(&b_identity))
+            .unwrap();
+        b_identity
+            .pin_peer(PinnedPeer::from_identity(&a_identity))
+            .unwrap();
+        (a_id, b_id)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn running_supervisor_adds_a_newly_paired_peer_and_synchronizes_config() {
+        let root = tempfile::tempdir().unwrap();
+        let a_paths = test_paths(root.path(), "a");
+        let b_paths = test_paths(root.path(), "b");
+        let mut a = NativeSupervisor::bootstrap(&a_paths).unwrap();
+        assert!(a.links.is_empty());
+
+        let (_, b_id) = pin_each_other(&a_paths, &b_paths);
+        a.refresh_peer_membership().await.unwrap();
+
+        assert_eq!(a.links.len(), 1);
+        assert_eq!(a.links[0].peer, b_id);
+        let config = a_paths.config_store().unwrap().load().unwrap();
+        assert!(
+            config
+                .peers
+                .iter()
+                .any(|peer| peer.node_id == node_hex(b_id))
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn running_supervisor_removes_link_reader_session_and_config_for_unpaired_peer() {
+        let root = tempfile::tempdir().unwrap();
+        let a_paths = test_paths(root.path(), "a");
+        let b_paths = test_paths(root.path(), "b");
+        let (_, b_id) = pin_each_other(&a_paths, &b_paths);
+        let mut a = NativeSupervisor::bootstrap(&a_paths).unwrap();
+        assert_eq!(a.links.len(), 1);
+
+        a.admitted.insert(b_id);
+        a.readers.insert(b_id, tokio::spawn(async {}));
+        IdentityStore::open_or_create(&a_paths.identity, "a")
+            .unwrap()
+            .unpair(b_id)
+            .unwrap();
+        a.refresh_peer_membership().await.unwrap();
+
+        assert!(a.links.is_empty());
+        assert!(!a.admitted.contains(&b_id));
+        assert!(!a.readers.contains_key(&b_id));
+        let config = a_paths.config_store().unwrap().load().unwrap();
+        assert!(
+            !config
+                .peers
+                .iter()
+                .any(|peer| peer.node_id == node_hex(b_id))
+        );
+    }
+
+    fn place_remote(paths: &AppPaths, remote: NodeId, display: u32, x: i32) {
+        let store = paths.config_store().unwrap();
+        let mut config = store.load().unwrap();
+        config
+            .placements
+            .retain(|placement| placement.display != format!("{}:{display}", node_hex(remote)));
+        config.placements.push(crate::config::Placement {
+            display: format!("{}:{display}", node_hex(remote)),
+            x,
+            y: 0,
+        });
+        store.save(&config).unwrap();
+    }
+
+    async fn connect_supervisors(a: &mut NativeSupervisor, b: &mut NativeSupervisor) {
+        let b_id = b.identity.node_id();
+        a.links[0]
+            .endpoint
+            .dial(
+                b.links[0].endpoint.local_addr(),
+                "seamless-input.local",
+                Some(b_id),
+            )
+            .await
+            .unwrap();
+        for _ in 0..20 {
+            a.tick().await.unwrap();
+            b.tick().await.unwrap();
+            if a.admitted.len() == 1 && b.admitted.len() == 1 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("supervisors did not admit their authenticated sessions");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn two_running_supervisors_pair_route_input_and_clipboard_then_reconnect() {
+        let root = tempfile::tempdir().unwrap();
+        let a_paths = test_paths(root.path(), "a");
+        let b_paths = test_paths(root.path(), "b");
+        let mut a = NativeSupervisor::bootstrap(&a_paths).unwrap();
+        let mut b = NativeSupervisor::bootstrap(&b_paths).unwrap();
+        a.suppress_native_apply = true;
+        b.suppress_native_apply = true;
+
+        let (a_id, b_id) = pin_each_other(&a_paths, &b_paths);
+        a.refresh_peer_membership().await.unwrap();
+        b.refresh_peer_membership().await.unwrap();
+        let a_display = a.platform.displays().unwrap()[0].index;
+        let b_display = b.platform.displays().unwrap()[0].index;
+        place_remote(&a_paths, b_id, b_display, 1);
+        place_remote(&b_paths, a_id, a_display, -1);
+        a.tick().await.unwrap();
+        b.tick().await.unwrap();
+        let a_store = a_paths.config_store().unwrap();
+        let mut stale = a_store.load().unwrap();
+        stale
+            .peers
+            .iter_mut()
+            .find(|peer| peer.node_id == node_hex(b_id))
+            .unwrap()
+            .displays = vec!["99".into()];
+        a_store.save(&stale).unwrap();
+        connect_supervisors(&mut a, &mut b).await;
+
+        for _ in 0..10 {
+            a.tick().await.unwrap();
+            b.tick().await.unwrap();
+            let a_config = a_paths.config_store().unwrap().load().unwrap();
+            let b_displays = a_config
+                .peers
+                .iter()
+                .find(|peer| peer.node_id == node_hex(b_id))
+                .map(|peer| peer.displays.clone())
+                .unwrap_or_default();
+            if b_displays != vec!["99"] {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let expected_b_displays: Vec<_> = b
+            .platform
+            .displays()
+            .unwrap()
+            .into_iter()
+            .map(|display| display.index.to_string())
+            .collect();
+        let a_config = a_paths.config_store().unwrap().load().unwrap();
+        assert_eq!(
+            a_config
+                .peers
+                .iter()
+                .find(|peer| peer.node_id == node_hex(b_id))
+                .unwrap()
+                .displays,
+            expected_b_displays
+        );
+        a.tick().await.unwrap();
+
+        let now_ms = a.started.elapsed().as_millis() as u64;
+        let crossing = Point {
+            x: a.local_display.origin.x + a.local_display.width,
+            y: a.local_display.origin.y + a.local_display.height / 2.0,
+        };
+        let effects = a
+            .runtime
+            .cross(seamless_input_core::Edge::Right, crossing, now_ms)
+            .unwrap();
+        assert_eq!(
+            a.runtime.active_peer(),
+            b_id,
+            "cross must activate the paired peer"
+        );
+        a.execute_effects(effects).await.unwrap();
+        let effects = a
+            .runtime
+            .route(seamless_input_protocol::InputEvent::Key {
+                code: 4,
+                pressed: true,
+            })
+            .unwrap();
+        a.execute_effects(effects).await.unwrap();
+        let effects = a
+            .runtime
+            .offer_clipboard(ClipboardPayload::text("dynamic clipboard"))
+            .unwrap();
+        a.execute_effects(effects).await.unwrap();
+        for _ in 0..10 {
+            b.tick().await.unwrap();
+            let has_input = b.observed_received.iter().any(|received| {
+                matches!(
+                    received,
+                    crate::runtime::RuntimeReceive::Input(
+                        seamless_input_protocol::InputEvent::Key {
+                            code: 4,
+                            pressed: true
+                        }
+                    )
+                )
+            });
+            let has_clipboard = b.observed_received.iter().any(|received| {
+                matches!(
+                    received,
+                    crate::runtime::RuntimeReceive::Clipboard(ClipboardPayload::Text(text))
+                        if text == "dynamic clipboard"
+                )
+            });
+            if has_input && has_clipboard {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            b.observed_received.iter().any(|received| matches!(
+                received,
+                crate::runtime::RuntimeReceive::Input(seamless_input_protocol::InputEvent::Key {
+                    code: 4,
+                    pressed: true
+                })
+            )),
+            "received: {:?}",
+            b.observed_received
+        );
+        assert!(b.observed_received.iter().any(|received| matches!(
+            received,
+            crate::runtime::RuntimeReceive::Clipboard(ClipboardPayload::Text(text))
+                if text == "dynamic clipboard"
+        )));
+
+        IdentityStore::open_or_create(&a_paths.identity, "a")
+            .unwrap()
+            .unpair(b_id)
+            .unwrap();
+        IdentityStore::open_or_create(&b_paths.identity, "b")
+            .unwrap()
+            .unpair(a_id)
+            .unwrap();
+        a.refresh_peer_membership().await.unwrap();
+        b.refresh_peer_membership().await.unwrap();
+        assert!(a.admitted.is_empty() && b.admitted.is_empty());
+
+        pin_each_other(&a_paths, &b_paths);
+        a.refresh_peer_membership().await.unwrap();
+        b.refresh_peer_membership().await.unwrap();
+        connect_supervisors(&mut a, &mut b).await;
+        assert_eq!(a.admitted, BTreeSet::from([b_id]));
+        assert_eq!(b.admitted, BTreeSet::from([a_id]));
     }
 }

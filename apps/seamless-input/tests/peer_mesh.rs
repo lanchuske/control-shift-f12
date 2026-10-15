@@ -13,6 +13,10 @@ fn peer_messages_round_trip_for_the_production_data_plane() {
             epoch: 7,
             capabilities: Capabilities::all(),
         },
+        PeerMessage::Displays {
+            epoch: 7,
+            displays: vec![0, 2],
+        },
         PeerMessage::AcquireLease { epoch: 7 },
         PeerMessage::Heartbeat { epoch: 7 },
         PeerMessage::Input {

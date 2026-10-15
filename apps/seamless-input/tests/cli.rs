@@ -208,7 +208,17 @@ fn start_bootstraps_the_real_supervisor_and_stays_running() {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    thread::sleep(Duration::from_millis(700));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline
+        && (!home.join("config.toml").is_file()
+            || !home.join("identity").join("identity.json").is_file())
+    {
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "start exited before supervision began"
+        );
+        thread::sleep(Duration::from_millis(25));
+    }
     assert!(
         child.try_wait().unwrap().is_none(),
         "start exited before supervision began"
