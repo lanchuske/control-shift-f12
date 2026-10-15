@@ -1,4 +1,4 @@
-# SeamlessInput MVP Specification
+# SeamlessInput MVP specification
 
 ## Goal
 

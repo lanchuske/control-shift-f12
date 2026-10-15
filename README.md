@@ -1,219 +1,191 @@
-# SeamlessInput — cross-platform mouse, keyboard, and clipboard sharing
+# SeamlessInput
 
-SeamlessInput is an open-source, terminal-first software KVM for sharing one
-mouse, keyboard, and clipboard across nearby macOS and Windows computers. It is
-designed as a lightweight, peer-to-peer alternative for people searching for
-cross-platform input sharing, seamless cursor movement, and clipboard sync
-without administrator privileges.
+### One mouse and keyboard. Every Mac and Windows PC on your desk.
 
-## Download the QA Preview
+[![CI](https://github.com/lanchuske/seamless-input/actions/workflows/ci.yml/badge.svg)](https://github.com/lanchuske/seamless-input/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![QA Preview](https://img.shields.io/badge/release-QA%20Preview-orange.svg)](https://github.com/lanchuske/seamless-input/releases/tag/v0.1.0)
 
-The first public QA preview is available from the
-**[SeamlessInput v0.1.0 release page](https://github.com/lanchuske/seamless-input/releases/tag/v0.1.0)**.
+SeamlessInput is an open-source software KVM that lets one mouse, keyboard, and
+clipboard move across nearby macOS and Windows computers. It is peer to peer,
+encrypted, terminal first, and designed to run without administrator access or
+a cloud account.
 
-| Platform | Download |
+> **Early QA preview.** The automated suite runs on Apple Silicon, Intel Mac,
+> and Windows x64. Physical end-to-end behavior between a real Mac and Windows
+> PC is still **NOT MEASURED**. Help us test it, but do not treat this build as
+> production ready.
+
+[Download the QA Preview](https://github.com/lanchuske/seamless-input/releases/tag/v0.1.0)
+· [Report a bug](https://github.com/lanchuske/seamless-input/issues/new/choose)
+· [Share an idea](https://github.com/lanchuske/seamless-input/discussions)
+· [Star the project](https://github.com/lanchuske/seamless-input)
+
+## Download
+
+Choose the current binary for your computer. Friendly universal installers are
+[the next release priority](https://github.com/lanchuske/seamless-input/issues/9).
+
+| Computer | QA Preview download |
 | --- | --- |
-| macOS — Apple Silicon (M1, M2, M3, M4) | [Download for Apple Silicon](https://github.com/lanchuske/seamless-input/releases/download/v0.1.0/seamless-input-aarch64-apple-darwin) |
-| macOS — Intel | [Download for Intel Mac](https://github.com/lanchuske/seamless-input/releases/download/v0.1.0/seamless-input-x86_64-apple-darwin) |
-| Windows — x64 | [Download for Windows](https://github.com/lanchuske/seamless-input/releases/download/v0.1.0/seamless-input-x86_64-pc-windows-msvc.exe) |
+| Mac with Apple Silicon — M1, M2, M3, M4 | [Download macOS arm64](https://github.com/lanchuske/seamless-input/releases/download/v0.1.0/seamless-input-aarch64-apple-darwin) |
+| Mac with Intel processor | [Download macOS Intel](https://github.com/lanchuske/seamless-input/releases/download/v0.1.0/seamless-input-x86_64-apple-darwin) |
+| Windows x64 | [Download Windows](https://github.com/lanchuske/seamless-input/releases/download/v0.1.0/seamless-input-x86_64-pc-windows-msvc.exe) |
 
-> **QA preview — not a stable release.** Automated checks pass on Apple Silicon,
-> Intel Mac, and Windows x64. Physical end-to-end behavior between a real Mac
-> and Windows PC is still being validated. See the release page for checksums,
-> provenance attestations, and the exact measured scope.
+Checksums, provenance attestations, and source archives are on the
+[release page](https://github.com/lanchuske/seamless-input/releases/tag/v0.1.0).
+The current macOS downloads are command-line binaries, not DMG installers.
 
-SeamlessInput is an independent project and is not affiliated with Apple or
-Microsoft. It is designed as a lightweight cross-platform alternative for
-workflows commonly associated with Apple Universal Control and Microsoft Mouse
-Without Borders, while keeping a single purpose and a no-admin installation.
+## Why SeamlessInput
 
-## Why this project exists
-
-Moving between two computers should feel like moving between two monitors. You
-should be able to push the pointer through an edge, continue typing on the other
-machine, and copy and paste without deploying remote-desktop software, opening
-an administrative installer, or changing enterprise security policies.
-
-Existing solutions can be powerful, but they often bring permanent
-client/server roles, graphical setup, privileged services, broad permissions,
-or features unrelated to this simple workflow. SeamlessInput is deliberately
-smaller.
-
-## What we are building
-
-- Seamless mouse movement between macOS and Windows screens.
-- A shared keyboard that follows the active pointer.
-- Bidirectional text and PNG clipboard synchronization.
-- Equal peer roles: every computer runs the same program.
-- Automatic peer discovery on the local network, with manual addressing as a
+- **One continuous desk.** Push the pointer through a screen edge and keep
+  typing on the other computer.
+- **Mac and Windows together.** Use the same symmetric peer on every machine;
+  there are no permanent server and client roles.
+- **Private by design.** Input and clipboard traffic stays on your local
+  network over mutually authenticated, encrypted connections.
+- **No cloud account.** Discovery happens locally, with manual addressing as a
   fallback.
-- One-time pairing with a short code and mutually verified device identities.
-- A simple terminal UI for placing screens above, below, left, or right.
-- One copyable installation command for macOS and one for Windows.
-- Per-user installation and PATH configuration with no administrator password.
-- A native Rust implementation with its own encrypted peer channel; no SSH
-  dependency.
+- **No administrator install.** SeamlessInput stays in the signed-in user's
+  account and does not add a service, driver, or firewall rule.
+- **Open source.** Inspect the protocol, contribute fixes, and help validate
+  real hardware under the MIT license.
 
-The design supports two or more Macs and Windows PCs in the same topology.
+## What works today
+
+| Capability | Implemented | Automated coverage | Real Mac–Windows QA |
+| --- | --- | --- | --- |
+| Peer discovery and manual fallback | Yes | PASS | NOT MEASURED |
+| One-time pairing and pinned identities | Yes | PASS | NOT MEASURED |
+| Mouse and keyboard routing | Yes | PASS | NOT MEASURED |
+| Text and PNG clipboard sync | Yes | PASS | NOT MEASURED |
+| Multi-display topology and cursor crossing | Yes | PASS | NOT MEASURED |
+| Safe disconnect and emergency return | Yes | PASS | NOT MEASURED |
+| User-only install and diagnostics | Yes | PASS | NOT MEASURED |
+
+PASS here means automated behavior passed on the supported CI targets. It does
+not substitute for a physical two-machine result. We record every hardware row
+as **PASS**, **FAIL**, or **NOT MEASURED** in the
+[QA evidence template](docs/qa/e2e-evidence-template.md).
 
 ## How it works
 
-Every computer runs the same native peer. Nearby peers discover one another on
-the local network, but they exchange input only after the user pairs them with a
-short-lived code. Pairing pins both device identities; subsequent sessions use a
-mutually authenticated and encrypted QUIC connection.
+Every computer runs the same native Rust peer. Nearby machines discover each
+other with mDNS or a manual LAN address. A short-lived six-word code performs a
+password-authenticated pairing and pins both device identities. Later sessions
+use mutual TLS over QUIC.
 
 ```mermaid
 flowchart LR
-    subgraph A["Mac peer"]
-        A1["Mouse and keyboard capture"]
-        A2["Clipboard adapter"]
-        A3["Peer runtime"]
-        A4["Input injection"]
-        A1 --> A3
-        A2 <--> A3
-        A3 --> A4
-    end
-
-    subgraph B["Windows peer"]
-        B1["Mouse and keyboard capture"]
-        B2["Clipboard adapter"]
-        B3["Peer runtime"]
-        B4["Input injection"]
-        B1 --> B3
-        B2 <--> B3
-        B3 --> B4
-    end
-
-    D["LAN discovery\nmDNS or manual address"]
-    P["One-time pairing\nshort code and PAKE"]
-    T["TUI topology\nleft · right · above · below"]
-
-    D -. finds .-> A3
-    D -. finds .-> B3
-    P -. pins both identities .-> A3
-    P -. pins both identities .-> B3
-    T --> A3
-    T --> B3
-    A3 <-->|"Mutual TLS over QUIC\nbounded input and clipboard frames"| B3
+    M["Mac peer\nmouse · keyboard · clipboard"]
+    W["Windows peer\nmouse · keyboard · clipboard"]
+    P["One-time pairing\nand pinned identities"]
+    T["Encrypted peer-to-peer\nQUIC connection"]
+    M --> P --> T --> W
+    W --> P
 ```
 
-The topology decides which display touches each edge. When the pointer crosses
-a configured edge, the local peer stops applying that input locally and sends a
-bounded event stream to the selected peer. Keyboard focus follows the pointer.
-Clipboard updates use hashes to prevent loops. If the connection, permission,
-or peer disappears, all modifiers are released and control returns locally.
+The terminal UI places displays left, right, above, or below each other. When
+the pointer crosses a configured edge, keyboard focus follows it. Clipboard
+hashing prevents loops. If a connection or permission disappears, held input is
+released and control returns to the local machine.
 
-The diagram shows two machines for clarity; the same identity, topology, and
-routing model extends to several Mac and Windows peers.
+## Try the QA Preview
 
-## Security and permission model
+1. Download the matching binary on each computer.
+2. On macOS, allow the binary to run and grant Accessibility permission when
+   prompted. On Windows, run it as the current user; do not elevate it.
+3. Run `seamless-input doctor` on both computers.
+4. Pair the computers with `seamless-input pair new` on one and
+   `seamless-input pair <six-word-code>` on the other.
+5. Arrange the displays with `seamless-input tui`, then start both peers with
+   `seamless-input start`.
+6. Record the result with the [QA template](docs/qa/e2e-evidence-template.md)
+   and open a bug if anything fails.
 
-SeamlessInput will not install a system service or driver, modify firewall or
-enterprise policies, request administrator elevation, or attempt to bypass a
-restriction.
+Never paste pairing codes, clipboard contents, keys, usernames, network
+addresses, or stable machine identifiers into a public issue.
 
-macOS requires the user to grant Accessibility permission before any third-party
-app can capture and inject global input. SeamlessInput will explain that request
-once and degrade safely when permission is denied. Clipboard access follows the
-operating system's consent model. Windows support is limited to the signed-in
-user's normal desktop; login screens, UAC prompts, elevated applications, and
-other users are outside the project scope.
+## Security and privacy
 
-Pairing and transport are designed around short-lived password-authenticated
-pairing, pinned device identities, and mutually authenticated TLS over QUIC.
-Clipboard contents and cryptographic keys must never appear in logs or feedback
-reports.
+SeamlessInput does not install a system service or driver, change firewall or
+enterprise policy, request administrator elevation, or bypass an operating
+system restriction. macOS requires explicit Accessibility permission for
+global input. Windows support is limited to the current user's normal desktop;
+login screens, UAC prompts, elevated apps, and other users are outside scope.
 
-## Deliberate non-goals
-
-The MVP will not provide remote desktop, screen sharing, screenshots, general
-file transfer, audio, video, mobile or Linux support, login-screen control, or
-enterprise-policy evasion.
-
-Keeping this boundary small is part of the product: contributions should make
-the core experience safer, clearer, or more reliable rather than quietly add a
-new product category.
-
-## Planned experience
-
-The intended workflow is:
-
-1. Run one terminal installation command on each computer.
-2. Start `seamless-input` on every machine.
-3. Discover nearby peers and pair them with a short code.
-4. Open the TUI and place each display in its physical position.
-5. Move the pointer through an edge and keep working.
-
-Exact one-line installation commands will be published only with a checksummed release.
-Do not run installation commands posted in issues, comments, or unofficial
-forks.
-
-## Frequently asked questions
-
-### Is SeamlessInput a software KVM?
-
-Yes. It aims to provide the keyboard, video-layout, and mouse workflow commonly
-associated with a software KVM, but it does not stream video or mirror screens.
-Each computer continues to use its own display.
-
-### Does it work between Mac and Windows?
-
-That is the primary target. The same peer model is also intended to support
-Mac-to-Mac, Windows-to-Windows, and mixed multi-computer layouts.
-
-### Does it require administrator privileges?
-
-No. Installation and runtime stay within the current user's account. macOS does
-require explicit Accessibility consent for global mouse and keyboard control;
-that is an operating-system permission, not an administrator installation.
-
-### Does it use SSH or remote desktop?
-
-No. SeamlessInput uses its own authenticated and encrypted peer connection. It
-does not depend on SSH and does not provide remote desktop or screen sharing.
+Clipboard payloads are bounded, memory only, hash deduplicated, and never
+logged. Pairing codes expire and are not advertised. Suspected vulnerabilities
+belong in [private vulnerability reporting](SECURITY.md), never a public issue.
 
 ## Roadmap
 
-The current implementation plan progresses through:
+The core mouse, keyboard, clipboard, topology, discovery, pairing, transport,
+and recovery paths are implemented. The immediate priorities are:
 
-1. Native Rust workspace and stable CLI contract.
-2. Bounded protocol, topology, discovery, pairing, and encrypted transport.
-3. Terminal topology editor.
-4. macOS and Windows input and clipboard adapters.
-5. Failure-safe multi-peer runtime.
-6. User-only installation commands, diagnostics, CI, and real-device evidence.
-7. Public beta releases after independent review.
+- universal signed and notarized macOS DMG;
+- signed Windows installer with a simple first-run experience;
+- physical Mac–Windows QA and compatibility evidence;
+- clearer onboarding and an end-to-end demo;
+- file drag and drop, mobile clients, application continuity, and optional
+  pointer assistance after the core experience is proven.
 
-Completion is reported with evidence as **PASS**, **FAIL**, or **NOT MEASURED**.
-A green unit-test suite alone is not proof that a platform interaction works on
-real hardware.
+Follow the [open roadmap issues](https://github.com/lanchuske/seamless-input/issues)
+or join a [design discussion](https://github.com/lanchuske/seamless-input/discussions).
 
 ## Contributing
 
-Contributions are welcome, including:
+You can help without writing Rust:
 
-- Reproducible bug reports.
-- Tests and compatibility results from real Macs and Windows PCs.
-- Documentation and accessibility improvements.
-- Focused implementation pull requests within the defined scope.
-- Design feedback in GitHub Discussions.
+- test on real Mac and Windows hardware;
+- improve setup and accessibility documentation;
+- report a reproducible bug with redacted diagnostics;
+- propose focused product improvements;
+- contribute tests, platform fixes, or small reviewed pull requests.
 
-Before opening a large pull request, start a Discussion so the approach and
-scope can be agreed first. Every behavior change will need tests and a short
-description of its impact on permissions, networking, privacy, and supported
-platforms. Pull requests do not bypass review or CI, and a feature outside the
-MVP must be proposed separately rather than bundled into an unrelated change.
+Read [CONTRIBUTING.md](CONTRIBUTING.md) before opening a pull request. Large
+features should begin as a Discussion so scope and security boundaries are
+clear. All changes go through review and the protected CI matrix.
 
-- [Ask a question or propose an idea](https://github.com/lanchuske/seamless-input/discussions)
-- [Report a reproducible bug](https://github.com/lanchuske/seamless-input/issues)
-- [Read the MVP specification](docs/specs/seamless-input-mvp.md)
-- [Choose the right feedback channel](docs/feedback.md)
+## Documentation
 
-- [Read the contributor guide](CONTRIBUTING.md)
-- [Read the security policy](SECURITY.md)
-- [Use the release and QA runbook](docs/runbook.md)
+- [Documentation index](docs/README.md)
+- [MVP architecture and behavior](docs/architecture/mvp-specification.md)
+- [Release and QA runbook](docs/qa/release-and-qa-runbook.md)
+- [End-to-end QA evidence template](docs/qa/e2e-evidence-template.md)
+- [Community feedback guide](docs/community/feedback.md)
+- [Security policy](SECURITY.md)
+- [Code of conduct](CODE_OF_CONDUCT.md)
+
+## Frequently asked questions
+
+### Is this like Apple Universal Control or Microsoft Mouse Without Borders?
+
+SeamlessInput targets the same multi-computer mouse and keyboard workflow, but
+it is an independent open-source project built for mixed Mac and Windows desks.
+It is not affiliated with Apple or Microsoft.
+
+### Is SeamlessInput a remote desktop app?
+
+No. It does not stream screens, audio, or video. Each computer keeps using its
+own display; SeamlessInput shares input and clipboard data only.
+
+### Does it require administrator privileges?
+
+No. macOS still requires the user to grant Accessibility permission. That is an
+operating-system consent prompt, not an administrator installation.
+
+### Does it work with more than two computers?
+
+The topology and routing model supports multiple peers. The automated suite
+covers multi-peer routing; mixed three-machine physical QA is still not
+measured.
+
+### Does it support Linux, iPhone, iPad, or Android?
+
+Not yet. The current target is macOS and Windows. Mobile and broader platform
+support belong to the post-QA roadmap.
 
 ## License
 
-SeamlessInput is available under the MIT License. See [LICENSE](LICENSE).
+SeamlessInput is available under the [MIT License](LICENSE).

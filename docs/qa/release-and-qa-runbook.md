@@ -10,7 +10,7 @@ end-to-end test occurred.
 4. On clean non-admin accounts, install twice, open a new terminal, run
    `seamless-input doctor`, uninstall, and verify identities remain.
 5. Exercise two-peer and mixed three-peer scenarios on real machines.
-6. Copy `docs/evidence/e2e-template.md` and mark every row PASS, FAIL, or NOT
+6. Copy `docs/qa/e2e-evidence-template.md` and mark every row PASS, FAIL, or NOT
    MEASURED. A CI build is not physical-platform evidence.
 7. Only after independent review and explicit publication approval, publish
    release assets and verify the public installation commands.
