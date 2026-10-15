@@ -6,9 +6,21 @@ designed as a lightweight, peer-to-peer alternative for people searching for
 cross-platform input sharing, seamless cursor movement, and clipboard sync
 without administrator privileges.
 
-> **Project status: early development.** The architecture and MVP scope are
-> defined, but there is no supported release to install yet. Follow the
-> repository or join a Discussion if you want to help shape and test it.
+## Download the QA Preview
+
+The first public QA preview is available from the
+**[SeamlessInput v0.1.0 release page](https://github.com/lanchuske/seamless-input/releases/tag/v0.1.0)**.
+
+| Platform | Download |
+| --- | --- |
+| macOS — Apple Silicon (M1, M2, M3, M4) | [Download for Apple Silicon](https://github.com/lanchuske/seamless-input/releases/download/v0.1.0/seamless-input-aarch64-apple-darwin) |
+| macOS — Intel | [Download for Intel Mac](https://github.com/lanchuske/seamless-input/releases/download/v0.1.0/seamless-input-x86_64-apple-darwin) |
+| Windows — x64 | [Download for Windows](https://github.com/lanchuske/seamless-input/releases/download/v0.1.0/seamless-input-x86_64-pc-windows-msvc.exe) |
+
+> **QA preview — not a stable release.** Automated checks pass on Apple Silicon,
+> Intel Mac, and Windows x64. Physical end-to-end behavior between a real Mac
+> and Windows PC is still being validated. See the release page for checksums,
+> provenance attestations, and the exact measured scope.
 
 SeamlessInput is an independent project and is not affiliated with Apple or
 Microsoft. It is designed as a lightweight cross-platform alternative for
