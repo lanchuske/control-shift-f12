@@ -6,7 +6,7 @@ use std::{
 };
 
 use clap::{Args, Parser, Subcommand};
-use seamless_discovery::Discovery;
+use seamless_discovery::{Discovery, manual_address};
 use seamless_input::{
     supervisor::{AppPaths, CapabilityReport, NativeSupervisor},
     tui,
@@ -58,6 +58,9 @@ struct PairArgs {
     /// Pair using `new` or a six-word pairing code.
     #[arg(value_name = "CODE")]
     code: String,
+    /// Connect directly when mDNS discovery is unavailable.
+    #[arg(long, value_name = "HOST:PORT")]
+    address: Option<String>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -98,7 +101,7 @@ async fn run(cli: Cli) -> Result<(), OperationalError> {
     let paths = AppPaths::discover()?;
     match cli.command {
         Commands::Start => start(&paths).await,
-        Commands::Pair(args) => pair(&paths, &args.code).await,
+        Commands::Pair(args) => pair(&paths, &args.code, args.address.as_deref()).await,
         Commands::Peers => peers(&paths),
         Commands::Unpair { peer } => unpair(&paths, &peer),
         Commands::Tui => Ok(tui::run_terminal(&paths.config_store()?)?),
@@ -132,10 +135,19 @@ async fn start(paths: &AppPaths) -> Result<(), OperationalError> {
     }
 }
 
-async fn pair(paths: &AppPaths, value: &str) -> Result<(), OperationalError> {
+async fn pair(
+    paths: &AppPaths,
+    value: &str,
+    manual_peer: Option<&str>,
+) -> Result<(), OperationalError> {
     let mut identity = IdentityStore::open_or_create(&paths.identity, "SeamlessInput peer")?;
     let mut discovery = Discovery::new(VERSION).map_err(OperationalError)?;
     if value == "new" {
+        if manual_peer.is_some() {
+            return Err(OperationalError(
+                "--address is used with a six-word code, not with `pair new`".into(),
+            ));
+        }
         let mut code = PairingCode::generate(SystemTime::now())?;
         let phrase = code.phrase().to_owned();
         let server = identity.temporary_pairing_server_config()?;
@@ -153,7 +165,11 @@ async fn pair(paths: &AppPaths, value: &str) -> Result<(), OperationalError> {
                 true,
             )
             .map_err(OperationalError)?;
+        let pairing_address = endpoint
+            .local_addr()
+            .map_err(|_| OperationalError("temporary pairing listener has no address".into()))?;
         println!("Pairing code: {phrase}");
+        println!("Pairing address: {pairing_address}");
         println!("The code expires in five minutes and is accepted only once.");
         io::stdout()
             .flush()
@@ -195,32 +211,38 @@ async fn pair(paths: &AppPaths, value: &str) -> Result<(), OperationalError> {
         // Validate before touching the network. The session is intentionally
         // discarded; the real PAKE session is created after QUIC connects.
         let _validation = PairingSession::accept(&identity, value)?;
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        let mut pairable = Vec::new();
-        while tokio::time::Instant::now() < deadline && pairable.is_empty() {
-            pairable = discovery
-                .browse(Duration::from_millis(200))
+        let address = if let Some(value) = manual_peer {
+            *manual_address(value)
                 .map_err(OperationalError)?
-                .into_iter()
-                .filter(|peer| peer.compatible && peer.advertisement.pairable)
-                .collect();
-        }
-        if pairable.is_empty() {
-            return Err(OperationalError(
-                "no compatible pairable peer was discovered; the pairing code was not logged"
-                    .into(),
-            ));
-        }
-        if pairable.len() != 1 {
-            return Err(OperationalError(
-                "multiple pairable peers were discovered; wait until only the intended peer is pairable"
-                    .into(),
-            ));
-        }
-        let address =
+                .first()
+                .ok_or_else(|| OperationalError("manual peer address did not resolve".into()))?
+        } else {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            let mut pairable = Vec::new();
+            while tokio::time::Instant::now() < deadline && pairable.is_empty() {
+                pairable = discovery
+                    .browse(Duration::from_millis(200))
+                    .map_err(OperationalError)?
+                    .into_iter()
+                    .filter(|peer| peer.compatible && peer.advertisement.pairable)
+                    .collect();
+            }
+            if pairable.is_empty() {
+                return Err(OperationalError(
+                    "no compatible pairable peer was discovered; use --address HOST:PORT for manual fallback"
+                        .into(),
+                ));
+            }
+            if pairable.len() != 1 {
+                return Err(OperationalError(
+                    "multiple pairable peers were discovered; wait until only the intended peer is pairable"
+                        .into(),
+                ));
+            }
             *pairable[0].advertisement.addresses.first().ok_or_else(|| {
                 OperationalError("pairable peer advertised no usable address".into())
-            })?;
+            })?
+        };
         let bind = if address.is_ipv4() {
             "0.0.0.0:0".parse().unwrap()
         } else {

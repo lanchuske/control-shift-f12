@@ -21,9 +21,12 @@ synchronizes text and PNG clipboards.
 ## Pairing
 
 - `seamless-input pair new` creates a short-lived six-word code and advertises
-  only that the node is pairable, never the code itself.
+  only that the node is pairable, never the code itself. It also prints the
+  temporary LAN address locally for manual fallback.
 - `seamless-input pair <six-word-code>` on another discovered machine runs a
   password-authenticated key exchange and mutually pins both device identities.
+- If mDNS is unavailable, `seamless-input pair <six-word-code> --address
+  <host:port>` runs the same authenticated exchange against the printed address.
 - Pairing is one-time. Later connections use mutual TLS 1.3 identities stored in
   the current user's config directory.
 - `seamless-input peers` lists paired, available, unavailable, and incompatible
@@ -50,6 +53,7 @@ synchronizes text and PNG clipboards.
 seamless-input start
 seamless-input pair new
 seamless-input pair <six-word-code>
+seamless-input pair <six-word-code> --address <host:port>
 seamless-input peers
 seamless-input unpair <peer>
 seamless-input tui

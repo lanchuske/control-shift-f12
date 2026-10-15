@@ -13,7 +13,9 @@ static TEST_HOME_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 fn pairing_lock() -> MutexGuard<'static, ()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+    LOCK.get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 struct ChildGuard(std::process::Child);
@@ -112,10 +114,19 @@ fn two_cli_processes_pair_and_persist_reciprocal_peers() {
         .strip_prefix("Pairing code: ")
         .expect("offer should print a pairing code")
         .to_owned();
+    line.clear();
+    reader.read_line(&mut line).unwrap();
+    let address = line
+        .trim()
+        .strip_prefix("Pairing address: ")
+        .expect("offer should print a manual fallback address")
+        .to_owned();
 
     let accept = Command::new(env!("CARGO_BIN_EXE_seamless-input"))
         .arg("pair")
         .arg(&code)
+        .arg("--address")
+        .arg(&address)
         .env("SEAMLESS_INPUT_HOME", &accept_home)
         .output()
         .expect("pairing acceptor should finish");
@@ -172,11 +183,20 @@ fn wrong_code_fails_both_cli_processes_without_persisting_peers() {
         "abandon"
     };
     let wrong_code = words.join(" ");
+    line.clear();
+    reader.read_line(&mut line).unwrap();
+    let address = line
+        .trim()
+        .strip_prefix("Pairing address: ")
+        .expect("offer should print a manual fallback address")
+        .to_owned();
 
     let started = Instant::now();
     let accept = Command::new(env!("CARGO_BIN_EXE_seamless-input"))
         .arg("pair")
         .arg(&wrong_code)
+        .arg("--address")
+        .arg(&address)
         .env("SEAMLESS_INPUT_HOME", &accept_home)
         .output()
         .unwrap();
