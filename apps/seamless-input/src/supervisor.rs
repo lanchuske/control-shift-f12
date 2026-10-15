@@ -142,6 +142,32 @@ struct InboundPacket {
     packet: Result<Vec<u8>, String>,
 }
 
+enum PeerPacketOutcome {
+    Received(crate::runtime::RuntimeReceive),
+    Isolated { recovery: Vec<RuntimeEffect> },
+}
+
+fn process_peer_packet(
+    runtime: &mut Runtime,
+    peer: NodeId,
+    packet: Result<Vec<u8>, String>,
+    now_ms: u64,
+) -> PeerPacketOutcome {
+    let received = packet
+        .and_then(|bytes| decode_peer_message(&bytes))
+        .and_then(|message| {
+            runtime
+                .receive(peer, message, now_ms)
+                .map_err(|_| "peer packet violates runtime policy".into())
+        });
+    match received {
+        Ok(received) => PeerPacketOutcome::Received(received),
+        Err(_) => PeerPacketOutcome::Isolated {
+            recovery: runtime.disconnect(peer),
+        },
+    }
+}
+
 pub struct NativeSupervisor {
     identity: IdentityStore,
     identity_root: PathBuf,
@@ -440,14 +466,8 @@ impl NativeSupervisor {
 
     async fn drain_inbound(&mut self, now_ms: u64) -> Result<(), SupervisorError> {
         while let Ok(inbound) = self.inbound_rx.try_recv() {
-            match inbound.packet {
-                Ok(bytes) => {
-                    let message =
-                        decode_peer_message(&bytes).map_err(SupervisorError::DataPlane)?;
-                    let received = self
-                        .runtime
-                        .receive(inbound.peer, message, now_ms)
-                        .map_err(|_| SupervisorError::Runtime)?;
+            match process_peer_packet(&mut self.runtime, inbound.peer, inbound.packet, now_ms) {
+                PeerPacketOutcome::Received(received) => {
                     apply_receive(
                         &mut self.platform.input,
                         &mut self.platform.clipboard,
@@ -455,14 +475,15 @@ impl NativeSupervisor {
                     )
                     .map_err(|_| SupervisorError::Runtime)?;
                 }
-                Err(_) => {
-                    self.sessions.remove(&inbound.peer);
+                PeerPacketOutcome::Isolated { recovery } => {
+                    if let Some(session) = self.sessions.remove(&inbound.peer) {
+                        session.close(b"peer packet rejected");
+                    }
                     self.admitted.remove(&inbound.peer);
                     if let Some(task) = self.readers.remove(&inbound.peer) {
                         task.abort();
                     }
-                    let effects = self.runtime.disconnect(inbound.peer);
-                    self.execute_effects(effects).await?;
+                    self.execute_effects(recovery).await?;
                 }
             }
         }
@@ -953,5 +974,182 @@ fn access_label(state: AccessState) -> &'static str {
         AccessState::Granted => "PASS",
         AccessState::Denied => "FAIL (user permission denied)",
         AccessState::NotDetermined => "FAIL (user permission not determined)",
+    }
+}
+
+#[cfg(test)]
+mod fault_isolation_tests {
+    use super::*;
+    use crate::peer::PeerMessage;
+    use seamless_input_core::Edge;
+    use seamless_input_protocol::InputEvent;
+    use seamless_transport::{PinnedPeer, SessionTrust};
+
+    fn node(value: u8) -> NodeId {
+        NodeId([value; 16])
+    }
+
+    fn test_runtime(caps: Capabilities) -> (Runtime, NodeId, u64) {
+        let local = node(1);
+        let remote = node(2);
+        let local_display = Display {
+            id: DisplayId {
+                node: local,
+                index: 0,
+            },
+            origin: Point { x: 0.0, y: 0.0 },
+            width: 100.0,
+            height: 100.0,
+            scale: 1.0,
+        };
+        let remote_display = Display {
+            id: DisplayId {
+                node: remote,
+                index: 0,
+            },
+            origin: Point { x: 0.0, y: 0.0 },
+            width: 100.0,
+            height: 100.0,
+            scale: 1.0,
+        };
+        let local_id = local_display.id;
+        let mut topology = Topology::new(local_display).unwrap();
+        topology
+            .place(local_id, Edge::Right, remote_display)
+            .unwrap();
+        let mut runtime = Runtime::new(local, local_id, topology, 1_000).unwrap();
+        let pin = PinnedPeer {
+            node_id: remote,
+            friendly_name: "peer".into(),
+            public_identity: vec![2],
+            certificate_pin: [2; 32],
+        };
+        let epoch = runtime
+            .connect_admitted(remote, caps, Some(&pin), SessionTrust::Authenticated)
+            .unwrap();
+        runtime
+            .receive(
+                remote,
+                PeerMessage::Capabilities {
+                    epoch,
+                    capabilities: caps,
+                },
+                0,
+            )
+            .unwrap();
+        (runtime, remote, epoch)
+    }
+
+    #[test]
+    fn malformed_packet_isolates_peer_and_recovers_local_control() {
+        let (mut runtime, remote, _) = test_runtime(Capabilities::all());
+        runtime
+            .cross(Edge::Right, Point { x: 100.0, y: 50.0 }, 1)
+            .unwrap();
+        assert_eq!(runtime.active_peer(), remote);
+
+        let outcome = process_peer_packet(&mut runtime, remote, Ok(vec![0xc1]), 2);
+        let PeerPacketOutcome::Isolated { recovery } = outcome else {
+            panic!("malformed packet must isolate its peer")
+        };
+        assert_eq!(runtime.active_peer(), node(1));
+        assert!(
+            recovery
+                .iter()
+                .any(|effect| matches!(effect, RuntimeEffect::ReleaseLocal))
+        );
+
+        let pin = PinnedPeer {
+            node_id: remote,
+            friendly_name: "peer".into(),
+            public_identity: vec![2],
+            certificate_pin: [2; 32],
+        };
+        assert!(
+            runtime
+                .connect_admitted(
+                    remote,
+                    Capabilities::all(),
+                    Some(&pin),
+                    SessionTrust::Authenticated
+                )
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn wrong_epoch_stale_and_capability_violations_are_peer_scoped() {
+        let scenarios = [
+            PeerMessage::Input {
+                epoch: 999,
+                sequence: 1,
+                event: InputEvent::Key {
+                    code: 4,
+                    pressed: true,
+                },
+            },
+            PeerMessage::Input {
+                epoch: 1,
+                sequence: 0,
+                event: InputEvent::Key {
+                    code: 4,
+                    pressed: true,
+                },
+            },
+        ];
+        for message in scenarios {
+            let (mut runtime, remote, epoch) = test_runtime(Capabilities::all());
+            if matches!(message, PeerMessage::Input { sequence: 0, .. }) {
+                runtime
+                    .receive(remote, PeerMessage::AcquireLease { epoch }, 0)
+                    .unwrap();
+                runtime
+                    .receive(
+                        remote,
+                        PeerMessage::Input {
+                            epoch,
+                            sequence: 1,
+                            event: InputEvent::Key {
+                                code: 4,
+                                pressed: true,
+                            },
+                        },
+                        0,
+                    )
+                    .unwrap();
+            }
+            assert!(matches!(
+                process_peer_packet(
+                    &mut runtime,
+                    remote,
+                    Ok(encode_peer_message(&message).unwrap()),
+                    1,
+                ),
+                PeerPacketOutcome::Isolated { .. }
+            ));
+        }
+
+        let denied = Capabilities {
+            input: false,
+            text: true,
+            png: true,
+        };
+        let (mut runtime, remote, epoch) = test_runtime(denied);
+        runtime
+            .receive(remote, PeerMessage::AcquireLease { epoch }, 0)
+            .unwrap();
+        let packet = encode_peer_message(&PeerMessage::Input {
+            epoch,
+            sequence: 1,
+            event: InputEvent::Key {
+                code: 4,
+                pressed: true,
+            },
+        })
+        .unwrap();
+        assert!(matches!(
+            process_peer_packet(&mut runtime, remote, Ok(packet), 1),
+            PeerPacketOutcome::Isolated { .. }
+        ));
     }
 }

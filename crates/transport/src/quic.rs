@@ -43,6 +43,10 @@ pub struct EndpointOptions {
     pub handshake_timeout: Duration,
     pub heartbeat_interval: Duration,
     pub idle_timeout: Duration,
+    /// One absolute deadline covers stream acceptance, the length prefix, and
+    /// the body. A peer cannot retain a reader indefinitely with a partial
+    /// application packet.
+    pub packet_read_timeout: Duration,
     pub verifier: Option<Arc<dyn PeerIdentityVerifier>>,
 }
 impl Default for EndpointOptions {
@@ -52,6 +56,7 @@ impl Default for EndpointOptions {
             handshake_timeout: Duration::from_secs(5),
             heartbeat_interval: Duration::from_secs(2),
             idle_timeout: Duration::from_secs(8),
+            packet_read_timeout: Duration::from_secs(6),
             verifier: None,
         }
     }
@@ -71,6 +76,7 @@ pub struct PeerSession {
     trust: SessionTrust,
     connection: quinn::Connection,
     send_lock: Arc<tokio::sync::Mutex<()>>,
+    packet_read_timeout: Duration,
 }
 impl PeerSession {
     pub fn peer(&self) -> NodeId {
@@ -90,6 +96,9 @@ impl PeerSession {
     }
     pub fn authenticated_connection(&self) -> Option<&quinn::Connection> {
         (self.trust == SessionTrust::Authenticated).then_some(&self.connection)
+    }
+    pub fn close(&self, reason: &'static [u8]) {
+        self.connection.close(3u32.into(), reason);
     }
 
     /// Send one bounded application packet on its own QUIC stream. Streams
@@ -121,16 +130,31 @@ impl PeerSession {
     /// fail closed; callers then run the runtime disconnect recovery path.
     pub async fn read_packet(&self) -> Result<Vec<u8>, TransportError> {
         const MAX_PACKET_BYTES: usize = 8 * 1024 * 1024 + 64 * 1024;
-        let mut stream = self
-            .connection
-            .accept_uni()
-            .await
-            .map_err(|_| TransportError::Unavailable)?;
+        let deadline = tokio::time::Instant::now() + self.packet_read_timeout;
+        let mut stream = match tokio::time::timeout_at(deadline, self.connection.accept_uni()).await
+        {
+            Ok(Ok(stream)) => stream,
+            Ok(Err(_)) => return Err(TransportError::Unavailable),
+            Err(_) => {
+                self.connection
+                    .close(3u32.into(), b"application packet timed out");
+                return Err(TransportError::Timeout);
+            }
+        };
         let mut prefix = [0_u8; 4];
-        stream
-            .read_exact(&mut prefix)
-            .await
-            .map_err(|_| TransportError::Unavailable)?;
+        match tokio::time::timeout_at(deadline, stream.read_exact(&mut prefix)).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(_)) => {
+                self.connection
+                    .close(3u32.into(), b"invalid application packet");
+                return Err(TransportError::Unavailable);
+            }
+            Err(_) => {
+                self.connection
+                    .close(3u32.into(), b"application packet timed out");
+                return Err(TransportError::Timeout);
+            }
+        }
         let length = u32::from_be_bytes(prefix) as usize;
         if length > MAX_PACKET_BYTES {
             self.connection
@@ -138,10 +162,19 @@ impl PeerSession {
             return Err(TransportError::InvalidOptions);
         }
         let mut payload = vec![0_u8; length];
-        stream
-            .read_exact(&mut payload)
-            .await
-            .map_err(|_| TransportError::Unavailable)?;
+        match tokio::time::timeout_at(deadline, stream.read_exact(&mut payload)).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(_)) => {
+                self.connection
+                    .close(3u32.into(), b"invalid application packet");
+                return Err(TransportError::Unavailable);
+            }
+            Err(_) => {
+                self.connection
+                    .close(3u32.into(), b"application packet timed out");
+                return Err(TransportError::Timeout);
+            }
+        }
         Ok(payload)
     }
 }
@@ -207,6 +240,7 @@ impl PeerEndpoint {
         if options.handshake_timeout.is_zero()
             || options.heartbeat_interval.is_zero()
             || options.heartbeat_interval >= options.idle_timeout
+            || options.packet_read_timeout.is_zero()
         {
             return Err(TransportError::InvalidOptions);
         }
@@ -433,6 +467,7 @@ async fn negotiate_inner(
         trust,
         connection: connection.clone(),
         send_lock: Arc::new(tokio::sync::Mutex::new(())),
+        packet_read_timeout: state.options.packet_read_timeout,
     };
     let rank = |session: &PeerSession| {
         (

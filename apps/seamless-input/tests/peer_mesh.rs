@@ -27,6 +27,21 @@ fn peer_messages_round_trip_for_the_production_data_plane() {
         assert_eq!(decode_peer_message(&encoded).unwrap(), message);
     }
 }
+
+#[test]
+fn deeply_nested_or_allocation_amplifying_messagepack_is_rejected() {
+    // More nesting than the peer protocol needs must be rejected before
+    // serde walks attacker-controlled recursive structure.
+    let mut deeply_nested = vec![0x91; 33]; // fixarray(1)
+    deeply_nested.push(0xc0); // nil
+    assert!(decode_peer_message(&deeply_nested).is_err());
+
+    // array32 with a declared item count larger than the entire wire budget.
+    // The body is intentionally absent: decoding must fail without attempting
+    // an allocation based on the declared count.
+    let allocation_amplifier = [0xdd, 0xff, 0xff, 0xff, 0xff];
+    assert!(decode_peer_message(&allocation_amplifier).is_err());
+}
 use seamless_input_core::clipboard::{ClipboardDeduper, ClipboardPayload};
 use seamless_input_core::platform::{
     AccessState, ClipboardContent, ClipboardOutcome, PlatformClipboard, PlatformInput,
