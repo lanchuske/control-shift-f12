@@ -75,6 +75,11 @@ impl Controller {
     pub fn active_display(&self) -> DisplayId {
         self.active
     }
+    pub fn active_geometry(&self) -> &crate::Display {
+        self.topology
+            .display(self.active)
+            .expect("active display is always part of validated topology")
+    }
     pub fn route(&mut self, event: InputEvent) -> Result<Vec<Action>, ControlError> {
         if self.stopped {
             return Err(ControlError::Stopped);

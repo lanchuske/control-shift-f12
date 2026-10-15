@@ -1,6 +1,7 @@
 use crate::{
     config::{ConfigError, ConfigStore, ConfigV1, LiveConfig, PeerConfig},
-    peer::{Capabilities, decode_peer_message, encode_peer_message},
+    cursor::CursorContinuity,
+    peer::{Capabilities, RemoteDisplay, decode_peer_message, encode_peer_message},
     runtime::{Runtime, RuntimeEffect, RuntimeError, apply_receive},
 };
 use rand::{RngCore, rngs::OsRng};
@@ -129,6 +130,10 @@ pub enum SupervisorError {
     Platform(String),
     #[error("peer data plane failed: {0}")]
     DataPlane(String),
+    #[error(
+        "native input capture could not start: {0}. Enable input access for SeamlessInput and restart it"
+    )]
+    Capture(String),
 }
 
 struct PeerLink {
@@ -157,8 +162,10 @@ pub struct NativeSupervisor {
     admitted: BTreeSet<NodeId>,
     started: Instant,
     last_heartbeat_ms: u64,
-    local_display: Display,
-    capture: Option<NativeCapture>,
+    local_displays: Vec<LogicalDisplay>,
+    remote_displays: BTreeMap<NodeId, Vec<RemoteDisplay>>,
+    cursor: CursorContinuity,
+    capture: NativeCapture,
 }
 
 impl NativeSupervisor {
@@ -174,9 +181,16 @@ impl NativeSupervisor {
         let first = displays.first().ok_or(SupervisorError::NoDisplay)?;
         synchronize_known_displays(&store, &identity, &displays)?;
         let live_config = store.live_reload()?;
-        let topology = topology_from_config(identity.node_id(), &displays, live_config.current())
-            .map_err(|_| SupervisorError::Runtime)?;
+        let remote_displays = BTreeMap::new();
+        let topology = topology_from_config(
+            identity.node_id(),
+            &displays,
+            &remote_displays,
+            live_config.current(),
+        )
+        .map_err(|_| SupervisorError::Runtime)?;
         let local_display = display(identity.node_id(), first);
+        let cursor = CursorContinuity::new(local_display.id);
         let runtime = Runtime::new(
             identity.node_id(),
             DisplayId {
@@ -213,7 +227,8 @@ impl NativeSupervisor {
             });
         }
         let (inbound_tx, inbound_rx) = mpsc::unbounded_channel();
-        let capture = NativeCapture::install().ok();
+        let capture = NativeCapture::install()
+            .map_err(|error| SupervisorError::Capture(error.to_string()))?;
 
         Ok(Self {
             identity,
@@ -230,7 +245,9 @@ impl NativeSupervisor {
             admitted: BTreeSet::new(),
             started: Instant::now(),
             last_heartbeat_ms: 0,
-            local_display,
+            local_displays: displays,
+            remote_displays,
+            cursor,
             capture,
         })
     }
@@ -239,8 +256,13 @@ impl NativeSupervisor {
         self.refresh_revocations().await?;
         if let Ok(Some(config)) = self.live_config.poll() {
             let displays = self.platform.displays()?;
-            if let Ok(topology) = topology_from_config(self.identity.node_id(), &displays, &config)
-            {
+            self.local_displays = displays.clone();
+            if let Ok(topology) = topology_from_config(
+                self.identity.node_id(),
+                &displays,
+                &self.remote_displays,
+                &config,
+            ) {
                 let first = displays.first().ok_or(SupervisorError::NoDisplay)?;
                 let effects = self
                     .runtime
@@ -324,7 +346,7 @@ impl NativeSupervisor {
             self.spawn_reader(session);
         }
         for peer in newly_admitted {
-            self.execute_effects(vec![RuntimeEffect::Send {
+            let mut effects = vec![RuntimeEffect::Send {
                 peer,
                 message: crate::peer::PeerMessage::Capabilities {
                     epoch: self
@@ -333,15 +355,24 @@ impl NativeSupervisor {
                         .ok_or(SupervisorError::Runtime)?,
                     capabilities: Capabilities::all(),
                 },
-            }])
-            .await?;
+            }];
+            effects.push(RuntimeEffect::Send {
+                peer,
+                message: crate::peer::PeerMessage::DisplayGeometry {
+                    epoch: self
+                        .runtime
+                        .peer_epoch(peer)
+                        .ok_or(SupervisorError::Runtime)?,
+                    displays: self.local_displays.iter().map(remote_display).collect(),
+                },
+            });
+            self.execute_effects(effects).await?;
         }
 
         self.drain_inbound(now_ms).await?;
         self.drain_capture(now_ms).await?;
-        if let Some(capture) = &self.capture {
-            capture.set_remote(self.runtime.active_peer() != self.identity.node_id());
-        }
+        self.capture
+            .set_remote(self.runtime.active_peer() != self.identity.node_id());
 
         Ok(SupervisorStatus {
             discovered,
@@ -448,12 +479,46 @@ impl NativeSupervisor {
                         .runtime
                         .receive(inbound.peer, message, now_ms)
                         .map_err(|_| SupervisorError::Runtime)?;
-                    apply_receive(
-                        &mut self.platform.input,
-                        &mut self.platform.clipboard,
-                        received,
-                    )
-                    .map_err(|_| SupervisorError::Runtime)?;
+                    if let crate::runtime::RuntimeReceive::DisplayGeometry(displays) = received {
+                        record_remote_display_indices(
+                            &self.live_config.store(),
+                            inbound.peer,
+                            &displays
+                                .iter()
+                                .map(|display| display.index)
+                                .collect::<Vec<_>>(),
+                        )?;
+                        self.remote_displays.insert(inbound.peer, displays);
+                        let local = self.platform.displays()?;
+                        self.local_displays = local.clone();
+                        let first = local.first().ok_or(SupervisorError::NoDisplay)?;
+                        let topology = topology_from_config(
+                            self.identity.node_id(),
+                            &local,
+                            &self.remote_displays,
+                            self.live_config.current(),
+                        )?;
+                        let effects = self
+                            .runtime
+                            .reconfigure(
+                                DisplayId {
+                                    node: self.identity.node_id(),
+                                    index: first.index,
+                                },
+                                topology,
+                                8_000,
+                            )
+                            .map_err(|_| SupervisorError::Runtime)?;
+                        self.execute_effects(effects).await?;
+                    } else {
+                        let received = self.platform.prepare_remote_receive(received)?;
+                        apply_receive(
+                            &mut self.platform.input,
+                            &mut self.platform.clipboard,
+                            received,
+                        )
+                        .map_err(|_| SupervisorError::Runtime)?;
+                    }
                 }
                 Err(_) => {
                     self.sessions.remove(&inbound.peer);
@@ -470,27 +535,41 @@ impl NativeSupervisor {
     }
 
     async fn drain_capture(&mut self, now_ms: u64) -> Result<(), SupervisorError> {
-        let captured = self
-            .capture
-            .as_ref()
-            .map(NativeCapture::drain)
-            .unwrap_or_default();
+        let captured = self.capture.drain();
         for captured in captured {
             let effects = if captured.emergency {
                 self.runtime.emergency_return()
             } else if let Some(event) = captured.event {
                 let mut effects = Vec::new();
                 if let seamless_input_protocol::InputEvent::Pointer { x, y } = event {
-                    if let Some(edge) = pointer_edge(&self.local_display, x, y) {
+                    let native = Point { x, y };
+                    let logical = capture_point_to_logical(native, &self.local_displays)
+                        .ok_or_else(|| {
+                            SupervisorError::Platform(
+                                "captured pointer is outside the measured local display geometry"
+                                    .into(),
+                            )
+                        })?;
+                    let active = self.runtime.active_geometry().clone();
+                    let point = self.cursor.observe(logical, &active);
+                    if let Some(edge) = pointer_edge(&active, point.x, point.y) {
                         effects = self
                             .runtime
-                            .cross(edge, Point { x, y }, now_ms)
+                            .cross(edge, point, now_ms)
                             .map_err(|_| SupervisorError::Runtime)?;
+                        if self.runtime.active_display() != active.id
+                            && let Some(mapped) = effect_pointer(&effects)
+                        {
+                            self.cursor.warp(self.runtime.active_display(), mapped);
+                        }
                     }
                     if effects.is_empty() {
                         effects.extend(
                             self.runtime
-                                .route(seamless_input_protocol::InputEvent::Pointer { x, y })
+                                .route(seamless_input_protocol::InputEvent::Pointer {
+                                    x: point.x,
+                                    y: point.y,
+                                })
                                 .map_err(|_| SupervisorError::Runtime)?,
                         );
                     }
@@ -526,14 +605,7 @@ impl NativeSupervisor {
                     .input
                     .release_all()
                     .map_err(|error| error.to_string()),
-                RuntimeEffect::WarpLocal { point, .. } => self
-                    .platform
-                    .input
-                    .inject(&seamless_input_protocol::InputEvent::Pointer {
-                        x: point.x,
-                        y: point.y,
-                    })
-                    .map_err(|error| error.to_string()),
+                RuntimeEffect::WarpLocal { point, .. } => self.platform.warp_local(point),
                 RuntimeEffect::Send { peer, message } => {
                     let packet = encode_peer_message(&message);
                     let result = match (self.sessions.get(&peer), packet) {
@@ -572,12 +644,8 @@ impl NativeSupervisor {
                         .map_err(|error| SupervisorError::DataPlane(error.to_string()))?,
                     RuntimeEffect::WarpLocal { point, .. } => self
                         .platform
-                        .input
-                        .inject(&seamless_input_protocol::InputEvent::Pointer {
-                            x: point.x,
-                            y: point.y,
-                        })
-                        .map_err(|error| SupervisorError::DataPlane(error.to_string()))?,
+                        .warp_local(point)
+                        .map_err(SupervisorError::DataPlane)?,
                     RuntimeEffect::Local(_) | RuntimeEffect::Send { .. } => {}
                 }
             }
@@ -587,11 +655,12 @@ impl NativeSupervisor {
 }
 
 /// Build runtime routing from the exact topology persisted by the TUI. Local
-/// display geometry is measured; remote geometry remains conservative until a
-/// peer advertises its real display list.
+/// display geometry is measured; remote displays are omitted until an
+/// authenticated peer advertises its real geometry.
 pub fn topology_from_config(
     local: NodeId,
     local_displays: &[LogicalDisplay],
+    remote_displays: &BTreeMap<NodeId, Vec<RemoteDisplay>>,
     config: &ConfigV1,
 ) -> Result<Topology, ConfigError> {
     let first = local_displays
@@ -611,20 +680,25 @@ pub fn topology_from_config(
             display(local, value),
         );
     }
-    for peer in &config.peers {
-        let node = parse_node(&peer.node_id)?;
-        for index in peer
-            .displays
-            .iter()
-            .filter_map(|value| value.parse::<u32>().ok())
-        {
-            known.entry(DisplayId { node, index }).or_insert(Display {
-                id: DisplayId { node, index },
-                origin: Point { x: 0.0, y: 0.0 },
-                width: 1.0,
-                height: 1.0,
-                scale: 1.0,
-            });
+    for (node, displays) in remote_displays {
+        for value in displays {
+            let candidate = Display {
+                id: DisplayId {
+                    node: *node,
+                    index: value.index,
+                },
+                origin: Point {
+                    x: value.origin_x,
+                    y: value.origin_y,
+                },
+                width: value.width,
+                height: value.height,
+                scale: value.scale,
+            };
+            candidate
+                .validate()
+                .map_err(|error| ConfigError::Invalid(error.to_string()))?;
+            known.insert(candidate.id, candidate);
         }
     }
     let mut positions = BTreeMap::new();
@@ -714,6 +788,28 @@ fn synchronize_known_displays(
     store.save(&config)
 }
 
+pub fn record_remote_display_indices(
+    store: &ConfigStore,
+    peer: NodeId,
+    indices: &[u32],
+) -> Result<(), ConfigError> {
+    let mut config = store.load_or_default()?;
+    let peer_id = node_hex(peer);
+    let mut displays = indices.to_vec();
+    displays.sort_unstable();
+    displays.dedup();
+    let configured = config
+        .peers
+        .iter_mut()
+        .find(|configured| configured.node_id == peer_id)
+        .ok_or_else(|| ConfigError::Invalid("authenticated peer is missing from config".into()))?;
+    configured.displays = displays
+        .into_iter()
+        .map(|index| index.to_string())
+        .collect();
+    store.save(&config)
+}
+
 fn node_hex(node: NodeId) -> String {
     node.0.iter().map(|byte| format!("{byte:02x}")).collect()
 }
@@ -770,6 +866,31 @@ fn pointer_edge(display: &Display, x: f64, y: f64) -> Option<seamless_input_core
     } else {
         None
     }
+}
+
+fn effect_pointer(effects: &[RuntimeEffect]) -> Option<Point> {
+    effects.iter().rev().find_map(|effect| match effect {
+        RuntimeEffect::WarpLocal { point, .. } => Some(*point),
+        RuntimeEffect::Send {
+            message:
+                crate::peer::PeerMessage::Input {
+                    event: seamless_input_protocol::InputEvent::Pointer { x, y },
+                    ..
+                },
+            ..
+        } => Some(Point { x: *x, y: *y }),
+        _ => None,
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn capture_point_to_logical(point: Point, _displays: &[LogicalDisplay]) -> Option<Point> {
+    (point.x.is_finite() && point.y.is_finite()).then_some(point)
+}
+
+#[cfg(target_os = "windows")]
+fn capture_point_to_logical(point: Point, displays: &[LogicalDisplay]) -> Option<Point> {
+    crate::cursor::physical_to_logical(point, displays)
 }
 
 struct CapturedInput {
@@ -856,6 +977,17 @@ fn display(node: NodeId, value: &LogicalDisplay) -> Display {
     }
 }
 
+fn remote_display(value: &LogicalDisplay) -> RemoteDisplay {
+    RemoteDisplay {
+        index: value.index,
+        origin_x: value.origin_x,
+        origin_y: value.origin_y,
+        width: value.width,
+        height: value.height,
+        scale: value.scale,
+    }
+}
+
 fn random_instance() -> String {
     let mut bytes = [0_u8; 16];
     OsRng.fill_bytes(&mut bytes);
@@ -908,6 +1040,20 @@ impl NativePlatform {
             .poll(now_ms)
             .map_err(|error| SupervisorError::Platform(error.to_string()))
     }
+    fn prepare_remote_receive(
+        &mut self,
+        received: crate::runtime::RuntimeReceive,
+    ) -> Result<crate::runtime::RuntimeReceive, SupervisorError> {
+        Ok(received)
+    }
+    fn warp_local(&mut self, point: Point) -> Result<(), String> {
+        self.input
+            .inject(&seamless_input_protocol::InputEvent::Pointer {
+                x: point.x,
+                y: point.y,
+            })
+            .map_err(|error| error.to_string())
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -941,6 +1087,43 @@ impl NativePlatform {
         self.clipboard
             .poll(now_ms)
             .map_err(|error| SupervisorError::Platform(error.to_string()))
+    }
+    fn prepare_remote_receive(
+        &mut self,
+        received: crate::runtime::RuntimeReceive,
+    ) -> Result<crate::runtime::RuntimeReceive, SupervisorError> {
+        if let crate::runtime::RuntimeReceive::Input(
+            seamless_input_protocol::InputEvent::Pointer { x, y },
+        ) = received
+        {
+            let displays = self.displays()?;
+            let point =
+                crate::cursor::logical_to_physical(Point { x, y }, &displays).ok_or_else(|| {
+                    SupervisorError::Platform(
+                        "remote pointer is outside the measured Windows display geometry".into(),
+                    )
+                })?;
+            Ok(crate::runtime::RuntimeReceive::Input(
+                seamless_input_protocol::InputEvent::Pointer {
+                    x: point.x,
+                    y: point.y,
+                },
+            ))
+        } else {
+            Ok(received)
+        }
+    }
+    fn warp_local(&mut self, point: Point) -> Result<(), String> {
+        let displays = self.displays().map_err(|error| error.to_string())?;
+        let point = crate::cursor::logical_to_physical(point, &displays).ok_or_else(|| {
+            "local warp is outside the measured Windows display geometry".to_string()
+        })?;
+        self.input
+            .inject(&seamless_input_protocol::InputEvent::Pointer {
+                x: point.x,
+                y: point.y,
+            })
+            .map_err(|error| error.to_string())
     }
 }
 

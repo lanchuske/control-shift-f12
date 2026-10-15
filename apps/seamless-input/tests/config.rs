@@ -1,7 +1,8 @@
 use std::{fs, path::Path};
 
 use seamless_input::config::{ConfigError, ConfigStore, ConfigV1, PeerConfig, Placement};
-use seamless_input::supervisor::topology_from_config;
+use seamless_input::peer::RemoteDisplay;
+use seamless_input::supervisor::{record_remote_display_indices, topology_from_config};
 use seamless_input_core::{DisplayId, NodeId, platform::LogicalDisplay};
 
 fn sample() -> ConfigV1 {
@@ -152,7 +153,18 @@ fn persisted_tui_placements_build_the_runtime_topology() {
         scale: 2.0,
     }];
 
-    let topology = topology_from_config(local, &local_displays, &config).unwrap();
+    let remote_displays = std::collections::BTreeMap::from([(
+        remote,
+        vec![RemoteDisplay {
+            index: 0,
+            origin_x: -2560.0,
+            origin_y: 120.0,
+            width: 2560.0,
+            height: 1440.0,
+            scale: 1.25,
+        }],
+    )]);
+    let topology = topology_from_config(local, &local_displays, &remote_displays, &config).unwrap();
     assert_eq!(
         topology.neighbor(
             DisplayId {
@@ -166,6 +178,54 @@ fn persisted_tui_placements_build_the_runtime_topology() {
             index: 0
         })
     );
+    let remote_geometry = topology
+        .display(DisplayId {
+            node: remote,
+            index: 0,
+        })
+        .unwrap();
+    assert_eq!(
+        remote_geometry.origin,
+        seamless_input_core::Point {
+            x: -2560.0,
+            y: 120.0
+        }
+    );
+    assert_eq!(
+        (
+            remote_geometry.width,
+            remote_geometry.height,
+            remote_geometry.scale
+        ),
+        (2560.0, 1440.0, 1.25)
+    );
+}
+
+#[test]
+fn received_multi_monitor_geometry_becomes_available_to_the_tui() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = ConfigStore::new(temp.path().join("config.toml")).unwrap();
+    let local = NodeId([1; 16]);
+    let remote = NodeId([2; 16]);
+    let config = ConfigV1 {
+        peers: vec![
+            PeerConfig {
+                node_id: hex(local),
+                name: "This Mac".into(),
+                displays: vec!["0".into()],
+            },
+            PeerConfig {
+                node_id: hex(remote),
+                name: "Office PC".into(),
+                displays: vec!["0".into()],
+            },
+        ],
+        ..ConfigV1::default()
+    };
+    store.save(&config).unwrap();
+    record_remote_display_indices(&store, remote, &[0, 1]).unwrap();
+    let saved = store.load().unwrap();
+    assert_eq!(saved.peers[1].displays, vec!["0", "1"]);
 }
 
 fn hex(node: NodeId) -> String {

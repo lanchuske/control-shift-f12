@@ -1,4 +1,4 @@
-use crate::peer::{Capabilities, PeerMessage, PeerRegistry};
+use crate::peer::{Capabilities, PeerMessage, PeerRegistry, RemoteDisplay};
 use seamless_input_core::clipboard::{ClipboardDeduper, ClipboardError, ClipboardPayload};
 use seamless_input_core::platform::{ClipboardContent, PlatformClipboard, PlatformInput};
 use seamless_input_core::{
@@ -21,6 +21,7 @@ pub enum RuntimeReceive {
     Input(InputEvent),
     Clipboard(ClipboardPayload),
     ReleaseInput,
+    DisplayGeometry(Vec<RemoteDisplay>),
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RuntimeError {
@@ -44,6 +45,7 @@ pub fn apply_receive<I: PlatformInput, C: PlatformClipboard>(
     match received {
         RuntimeReceive::None => Ok(()),
         RuntimeReceive::ReleaseInput => input.release_all().map_err(ApplyError::Input),
+        RuntimeReceive::DisplayGeometry(_) => Ok(()),
         RuntimeReceive::Input(event) => input.inject(&event).map_err(ApplyError::Input),
         RuntimeReceive::Clipboard(ClipboardPayload::Text(text)) => clipboard
             .write_remote(&ClipboardContent::Text(text))
@@ -111,6 +113,12 @@ impl Runtime {
     pub fn active_peer(&self) -> NodeId {
         self.controller.active_target()
     }
+    pub fn active_display(&self) -> DisplayId {
+        self.controller.active_display()
+    }
+    pub fn active_geometry(&self) -> &seamless_input_core::Display {
+        self.controller.active_geometry()
+    }
     pub fn peer_epoch(&self, peer: NodeId) -> Option<u64> {
         self.peers.epoch(peer)
     }
@@ -169,6 +177,9 @@ impl Runtime {
                 Ok(RuntimeReceive::None)
             }
             PeerMessage::ReleaseLease { .. } => Ok(RuntimeReceive::ReleaseInput),
+            PeerMessage::DisplayGeometry { displays, .. } => {
+                Ok(RuntimeReceive::DisplayGeometry(displays))
+            }
             PeerMessage::Capabilities { .. } | PeerMessage::AcquireLease { .. } => {
                 Ok(RuntimeReceive::None)
             }
@@ -215,6 +226,18 @@ impl Runtime {
             .map(|(peer, epoch, _)| RuntimeEffect::Send {
                 peer,
                 message: PeerMessage::Heartbeat { epoch },
+            })
+            .collect()
+    }
+    pub fn display_geometry_effects(&self, displays: Vec<RemoteDisplay>) -> Vec<RuntimeEffect> {
+        self.peers
+            .peers()
+            .map(|(peer, epoch, _)| RuntimeEffect::Send {
+                peer,
+                message: PeerMessage::DisplayGeometry {
+                    epoch,
+                    displays: displays.clone(),
+                },
             })
             .collect()
     }
