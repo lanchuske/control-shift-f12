@@ -1,4 +1,58 @@
-use seamless_input_core::{Display, DisplayId, Point, platform::LogicalDisplay};
+use seamless_input_core::{Display, DisplayId, Edge, Point, platform::LogicalDisplay};
+
+/// Native absolute pointers cannot report `origin + extent`: the last
+/// reachable sample is one physical pixel inside the display. Project that
+/// bounded sample onto the logical edge before asking topology to cross it.
+pub fn bounded_edge_crossing(display: &Display, point: Point) -> Option<(Edge, Point)> {
+    if !point.x.is_finite() || !point.y.is_finite() || display.scale <= 0.0 {
+        return None;
+    }
+    let right = display.origin.x + display.width;
+    let bottom = display.origin.y + display.height;
+    let quantum = 1.0 / display.scale;
+    if point.x <= display.origin.x {
+        Some((
+            Edge::Left,
+            Point {
+                x: display.origin.x,
+                y: point.y,
+            },
+        ))
+    } else if point.x >= right - quantum {
+        Some((
+            Edge::Right,
+            Point {
+                x: right,
+                y: point.y,
+            },
+        ))
+    } else if point.y <= display.origin.y {
+        Some((
+            Edge::Top,
+            Point {
+                x: point.x,
+                y: display.origin.y,
+            },
+        ))
+    } else if point.y >= bottom - quantum {
+        Some((
+            Edge::Bottom,
+            Point {
+                x: point.x,
+                y: bottom,
+            },
+        ))
+    } else {
+        None
+    }
+}
+
+pub fn display_center(display: &Display) -> Point {
+    Point {
+        x: display.origin.x + display.width / 2.0,
+        y: display.origin.y + display.height / 2.0,
+    }
+}
 
 /// Convert a Windows hook's physical virtual-desktop coordinate to the
 /// logical coordinate space shared by topology and the remote protocol.
@@ -77,5 +131,12 @@ impl CursorContinuity {
 
     pub fn warp(&mut self, _display: DisplayId, point: Point) {
         self.logical = Some(point);
+    }
+
+    /// Record a local recenter warp as the new native baseline without moving
+    /// the remote logical pointer. Injected warp events are filtered by both
+    /// native adapters, so the next physical sample is a real relative delta.
+    pub fn recenter_native(&mut self, point: Point) {
+        self.last_native = Some(point);
     }
 }
