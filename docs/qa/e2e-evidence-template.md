@@ -1,4 +1,4 @@
-# SeamlessInput end-to-end evidence
+# SeamlessInput end-to-end evidence template
 
 Date:
 Reviewed commit/tag:

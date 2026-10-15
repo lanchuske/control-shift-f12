@@ -1,4 +1,4 @@
-# Feedback guide
+# Community feedback guide
 
 - **Q&A:** installation questions and how the documented behavior works.
 - **Ideas:** design exploration and proposed scope changes before implementation.
