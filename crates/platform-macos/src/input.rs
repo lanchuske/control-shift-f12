@@ -1,5 +1,7 @@
 use seamless_input_core::platform::{AccessState, CaptureMode, EventDisposition, PlatformInput};
-use seamless_input_protocol::{Button, InputEvent, Modifier};
+#[cfg(target_os = "macos")]
+use seamless_input_protocol::Button;
+use seamless_input_protocol::{InputEvent, Modifier};
 use std::collections::BTreeSet;
 
 pub const EMERGENCY_HID_USAGE: u16 = 0x29;
