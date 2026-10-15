@@ -291,7 +291,7 @@ fn doctor_measures_real_local_capabilities() {
     let output = run(&["doctor"]);
     assert!(output.status.success());
     let stdout = String::from_utf8(output.stdout).unwrap();
-    assert!(stdout.contains("SeamlessInput doctor"));
+    assert!(stdout.contains("Control Shift F12 doctor"));
     assert!(stdout.contains("administrator elevation: not required"));
     assert!(stdout.contains("input access:"));
     assert!(stdout.contains("displays:"));

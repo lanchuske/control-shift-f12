@@ -2,7 +2,8 @@ use seamless_input_core::platform::{AccessState, CaptureMode, EventDisposition, 
 use seamless_input_protocol::{Button, InputEvent, Modifier};
 use std::collections::BTreeSet;
 
-pub const EMERGENCY_HID_USAGE: u16 = 0x29;
+/// USB HID usage for F12. The public recovery shortcut is Control+Shift+F12.
+pub const EMERGENCY_HID_USAGE: u16 = 0x45;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DesktopState {
@@ -168,7 +169,7 @@ impl WindowsInput {
                 code: EMERGENCY_HID_USAGE,
                 pressed: true
             }
-        ) && [Modifier::Control, Modifier::Alt, Modifier::Meta]
+        ) && [Modifier::Control, Modifier::Shift]
             .iter()
             .all(|modifier| self.held_modifiers.contains(modifier));
         if emergency {
@@ -587,7 +588,7 @@ mod native {
                 code: EMERGENCY_HID_USAGE,
                 pressed: true
             }
-        ) && [Modifier::Control, Modifier::Alt, Modifier::Meta]
+        ) && [Modifier::Control, Modifier::Shift]
             .iter()
             .all(|modifier| sink.held_modifiers.contains(modifier));
         if emergency {

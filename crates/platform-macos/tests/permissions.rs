@@ -131,7 +131,7 @@ fn emergency_chord_returns_local_and_cleans_modifiers() {
     let events = FakeEvents::default();
     let releases = events.releases.clone();
     let mut input = input::MacInput::with_backends(FakeAccess::new(AccessState::Granted), events);
-    for modifier in [Modifier::Control, Modifier::Alt, Modifier::Meta] {
+    for modifier in [Modifier::Control, Modifier::Shift] {
         input.capture_local(
             InputEvent::Modifier {
                 modifier,
@@ -142,7 +142,7 @@ fn emergency_chord_returns_local_and_cleans_modifiers() {
     }
     let outcome = input.capture_local(
         InputEvent::Key {
-            code: 0x29,
+            code: input::EMERGENCY_HID_USAGE,
             pressed: true,
         },
         CaptureMode::Remote,

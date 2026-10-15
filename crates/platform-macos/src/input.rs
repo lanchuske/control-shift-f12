@@ -4,7 +4,8 @@ use seamless_input_protocol::Button;
 use seamless_input_protocol::{InputEvent, Modifier};
 use std::collections::BTreeSet;
 
-pub const EMERGENCY_HID_USAGE: u16 = 0x29;
+/// USB HID usage for F12. The public recovery shortcut is Control+Shift+F12.
+pub const EMERGENCY_HID_USAGE: u16 = 0x45;
 
 pub trait AccessibilityBackend {
     fn state(&self) -> AccessState;
@@ -92,7 +93,7 @@ impl MacInput {
                 code: EMERGENCY_HID_USAGE,
                 pressed: true
             }
-        ) && [Modifier::Control, Modifier::Alt, Modifier::Meta]
+        ) && [Modifier::Control, Modifier::Shift]
             .iter()
             .all(|modifier| self.held.contains(modifier));
         if emergency {
@@ -183,7 +184,7 @@ mod native {
         }
         fn show_guidance(&mut self) {
             eprintln!(
-                "SeamlessInput needs macOS Accessibility permission for mouse and keyboard sharing. Enable it in System Settings > Privacy & Security > Accessibility; pairing and topology remain available if you decline."
+                "Control Shift F12 needs macOS Accessibility permission for mouse and keyboard sharing. Enable it in System Settings > Privacy & Security > Accessibility; pairing and topology remain available if you decline."
             );
         }
     }
@@ -341,7 +342,7 @@ mod native {
                                 code: EMERGENCY_HID_USAGE,
                                 pressed: true
                             })
-                        ) && [Modifier::Control, Modifier::Alt, Modifier::Meta]
+                        ) && [Modifier::Control, Modifier::Shift]
                             .iter()
                             .all(|modifier| held.contains(modifier))
                         {
