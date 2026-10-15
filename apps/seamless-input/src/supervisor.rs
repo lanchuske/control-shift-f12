@@ -1,7 +1,7 @@
 use crate::{
     config::{ConfigError, ConfigStore, LiveConfig},
-    peer::Capabilities,
-    runtime::{Runtime, RuntimeError},
+    peer::{Capabilities, decode_peer_message, encode_peer_message},
+    runtime::{Runtime, RuntimeEffect, RuntimeError, apply_receive},
 };
 use rand::{RngCore, rngs::OsRng};
 use seamless_discovery::Discovery;
@@ -14,14 +14,17 @@ use seamless_input_core::{
     },
 };
 use seamless_input_protocol::VERSION;
-use seamless_transport::{EndpointOptions, IdentityStore, PairingError, PeerEndpoint};
+use seamless_transport::{
+    EndpointOptions, IdentityStore, PairingError, PeerEndpoint, PeerSession, ReconnectPolicy,
+};
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket},
     path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, Instant},
 };
+use tokio::{sync::mpsc, task::JoinHandle};
 
 #[derive(Clone, Debug)]
 pub struct AppPaths {
@@ -124,17 +127,37 @@ pub enum SupervisorError {
     Runtime,
     #[error("platform probe failed: {0}")]
     Platform(String),
+    #[error("peer data plane failed: {0}")]
+    DataPlane(String),
+}
+
+struct PeerLink {
+    peer: NodeId,
+    endpoint: PeerEndpoint,
+    _instance: String,
+}
+
+struct InboundPacket {
+    peer: NodeId,
+    packet: Result<Vec<u8>, String>,
 }
 
 pub struct NativeSupervisor {
     identity: IdentityStore,
     discovery: Discovery,
     live_config: LiveConfig,
-    endpoints: Vec<PeerEndpoint>,
+    links: Vec<PeerLink>,
+    sessions: BTreeMap<NodeId, PeerSession>,
+    readers: BTreeMap<NodeId, JoinHandle<()>>,
+    inbound_tx: mpsc::UnboundedSender<InboundPacket>,
+    inbound_rx: mpsc::UnboundedReceiver<InboundPacket>,
     runtime: Runtime,
     platform: NativePlatform,
     admitted: BTreeSet<NodeId>,
     started: Instant,
+    last_heartbeat_ms: u64,
+    local_display: Display,
+    capture: Option<NativeCapture>,
 }
 
 impl NativeSupervisor {
@@ -150,7 +173,8 @@ impl NativeSupervisor {
         let displays = platform.displays()?;
         let first = displays.first().ok_or(SupervisorError::NoDisplay)?;
         let local_display = display(identity.node_id(), first);
-        let topology = Topology::new(local_display).map_err(|_| SupervisorError::Runtime)?;
+        let topology =
+            Topology::new(local_display.clone()).map_err(|_| SupervisorError::Runtime)?;
         let runtime = Runtime::new(
             identity.node_id(),
             DisplayId {
@@ -162,7 +186,7 @@ impl NativeSupervisor {
         )
         .map_err(|_| SupervisorError::Runtime)?;
 
-        let mut endpoints = Vec::new();
+        let mut links = Vec::new();
         for peer in identity.peers() {
             let (server, client) = identity.quic_configs_for(peer)?;
             let endpoint = PeerEndpoint::bind(
@@ -176,33 +200,47 @@ impl NativeSupervisor {
                 },
             )
             .map_err(|_| SupervisorError::Runtime)?;
+            let instance = random_instance();
             discovery
-                .publish(&random_instance(), endpoint.local_addr(), false)
+                .publish(&instance, endpoint.local_addr(), false)
                 .map_err(SupervisorError::Discovery)?;
-            endpoints.push(endpoint);
+            links.push(PeerLink {
+                peer: peer.node_id,
+                endpoint,
+                _instance: instance,
+            });
         }
+        let (inbound_tx, inbound_rx) = mpsc::unbounded_channel();
+        let capture = NativeCapture::install().ok();
 
         Ok(Self {
             identity,
             discovery,
             live_config,
-            endpoints,
+            links,
+            sessions: BTreeMap::new(),
+            readers: BTreeMap::new(),
+            inbound_tx,
+            inbound_rx,
             runtime,
             platform,
             admitted: BTreeSet::new(),
             started: Instant::now(),
+            last_heartbeat_ms: 0,
+            local_display,
+            capture,
         })
     }
 
-    pub fn tick(&mut self) -> Result<SupervisorStatus, SupervisorError> {
+    pub async fn tick(&mut self) -> Result<SupervisorStatus, SupervisorError> {
         if self.live_config.poll().is_err() {
             // Atomic replacement may be briefly invisible; the last good config remains active.
         }
-        let discovered = self
+        let discovered_peers = self
             .discovery
             .browse(Duration::from_millis(25))
-            .map_err(SupervisorError::Discovery)?
-            .len();
+            .map_err(SupervisorError::Discovery)?;
+        let discovered = discovered_peers.len();
         let displays = self.platform.displays()?.len();
         let now_ms = self.started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
         let clipboard = match self.platform.poll_clipboard(now_ms)? {
@@ -211,22 +249,38 @@ impl NativeSupervisor {
                     ClipboardContent::Text(text) => ClipboardPayload::Text(text),
                     ClipboardContent::Png(bytes) => ClipboardPayload::Png(bytes),
                 };
-                let _effects = self
+                let effects = self
                     .runtime
                     .offer_clipboard(payload)
                     .map_err(|_| SupervisorError::Runtime)?;
+                self.execute_effects(effects).await?;
                 "changed"
             }
             ClipboardOutcome::Disabled => "disabled",
             ClipboardOutcome::Pending => "pending",
             ClipboardOutcome::Unchanged => "unchanged",
         };
-        let _ = self
+        let effects = self
             .runtime
             .tick(now_ms)
             .map_err(|_| SupervisorError::Runtime)?;
+        self.execute_effects(effects).await?;
 
-        for session in self.endpoints.iter().flat_map(PeerEndpoint::sessions) {
+        if now_ms.saturating_sub(self.last_heartbeat_ms) >= 2_000 {
+            self.last_heartbeat_ms = now_ms;
+            self.execute_effects(self.runtime.heartbeat_effects())
+                .await?;
+        }
+
+        self.dial_discovered(&discovered_peers).await;
+
+        let available: Vec<_> = self
+            .links
+            .iter()
+            .flat_map(|link| link.endpoint.sessions())
+            .collect();
+        let mut newly_admitted = Vec::new();
+        for session in available {
             if self.admitted.contains(&session.peer()) {
                 continue;
             }
@@ -245,6 +299,28 @@ impl NativeSupervisor {
                     _ => SupervisorError::Runtime,
                 })?;
             self.admitted.insert(session.peer());
+            self.sessions.insert(session.peer(), session.clone());
+            newly_admitted.push(session.peer());
+            self.spawn_reader(session);
+        }
+        for peer in newly_admitted {
+            self.execute_effects(vec![RuntimeEffect::Send {
+                peer,
+                message: crate::peer::PeerMessage::Capabilities {
+                    epoch: self
+                        .runtime
+                        .peer_epoch(peer)
+                        .ok_or(SupervisorError::Runtime)?,
+                    capabilities: Capabilities::all(),
+                },
+            }])
+            .await?;
+        }
+
+        self.drain_inbound(now_ms).await?;
+        self.drain_capture(now_ms).await?;
+        if let Some(capture) = &self.capture {
+            capture.set_remote(self.runtime.active_peer() != self.identity.node_id());
         }
 
         Ok(SupervisorStatus {
@@ -257,6 +333,294 @@ impl NativeSupervisor {
 
     pub fn input_access(&self) -> AccessState {
         self.platform.input_access()
+    }
+
+    async fn dial_discovered(&mut self, discovered: &[seamless_discovery::DiscoveredPeer]) {
+        let policy = ReconnectPolicy {
+            initial_delay: Duration::from_millis(50),
+            max_delay: Duration::from_millis(50),
+            max_attempts: 1,
+        };
+        for link in &self.links {
+            if self
+                .sessions
+                .get(&link.peer)
+                .is_some_and(|session| !session.is_closed())
+            {
+                continue;
+            }
+            'candidate: for peer in discovered
+                .iter()
+                .filter(|peer| peer.compatible && !peer.advertisement.pairable)
+            {
+                for address in &peer.advertisement.addresses {
+                    let attempt = tokio::time::timeout(
+                        Duration::from_millis(250),
+                        link.endpoint.reconnect(
+                            *address,
+                            "seamless-input.local",
+                            Some(link.peer),
+                            &policy,
+                        ),
+                    )
+                    .await;
+                    if let Ok(Ok(_)) = attempt {
+                        break 'candidate;
+                    }
+                }
+            }
+        }
+    }
+
+    fn spawn_reader(&mut self, session: PeerSession) {
+        if self.readers.contains_key(&session.peer()) {
+            return;
+        }
+        let peer = session.peer();
+        let sender = self.inbound_tx.clone();
+        let task = tokio::spawn(async move {
+            loop {
+                let packet = session
+                    .read_packet()
+                    .await
+                    .map_err(|error| error.to_string());
+                let closed = packet.is_err();
+                if sender.send(InboundPacket { peer, packet }).is_err() || closed {
+                    break;
+                }
+            }
+        });
+        self.readers.insert(peer, task);
+    }
+
+    async fn drain_inbound(&mut self, now_ms: u64) -> Result<(), SupervisorError> {
+        while let Ok(inbound) = self.inbound_rx.try_recv() {
+            match inbound.packet {
+                Ok(bytes) => {
+                    let message =
+                        decode_peer_message(&bytes).map_err(SupervisorError::DataPlane)?;
+                    let received = self
+                        .runtime
+                        .receive(inbound.peer, message, now_ms)
+                        .map_err(|_| SupervisorError::Runtime)?;
+                    apply_receive(
+                        &mut self.platform.input,
+                        &mut self.platform.clipboard,
+                        received,
+                    )
+                    .map_err(|_| SupervisorError::Runtime)?;
+                }
+                Err(_) => {
+                    self.sessions.remove(&inbound.peer);
+                    self.admitted.remove(&inbound.peer);
+                    if let Some(task) = self.readers.remove(&inbound.peer) {
+                        task.abort();
+                    }
+                    let effects = self.runtime.disconnect(inbound.peer);
+                    self.execute_effects(effects).await?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn drain_capture(&mut self, now_ms: u64) -> Result<(), SupervisorError> {
+        let captured = self
+            .capture
+            .as_ref()
+            .map(NativeCapture::drain)
+            .unwrap_or_default();
+        for captured in captured {
+            let effects = if captured.emergency {
+                self.runtime.emergency_return()
+            } else if let Some(event) = captured.event {
+                let mut effects = Vec::new();
+                if let seamless_input_protocol::InputEvent::Pointer { x, y } = event {
+                    if let Some(edge) = pointer_edge(&self.local_display, x, y) {
+                        effects = self
+                            .runtime
+                            .cross(edge, Point { x, y }, now_ms)
+                            .map_err(|_| SupervisorError::Runtime)?;
+                    }
+                    if effects.is_empty() {
+                        effects.extend(
+                            self.runtime
+                                .route(seamless_input_protocol::InputEvent::Pointer { x, y })
+                                .map_err(|_| SupervisorError::Runtime)?,
+                        );
+                    }
+                } else {
+                    effects.extend(
+                        self.runtime
+                            .route(event)
+                            .map_err(|_| SupervisorError::Runtime)?,
+                    );
+                }
+                effects
+            } else {
+                Vec::new()
+            };
+            self.execute_effects(effects).await?;
+        }
+        Ok(())
+    }
+
+    async fn execute_effects(
+        &mut self,
+        effects: Vec<RuntimeEffect>,
+    ) -> Result<(), SupervisorError> {
+        let mut first_error = None;
+        let mut failed_peers = BTreeSet::new();
+        for effect in effects {
+            let result = match effect {
+                // A captured local event is already being delivered by the OS;
+                // executing this effect means deliberately leaving it alone.
+                RuntimeEffect::Local(_) => Ok(()),
+                RuntimeEffect::ReleaseLocal => self
+                    .platform
+                    .input
+                    .release_all()
+                    .map_err(|error| error.to_string()),
+                RuntimeEffect::WarpLocal { point, .. } => self
+                    .platform
+                    .input
+                    .inject(&seamless_input_protocol::InputEvent::Pointer {
+                        x: point.x,
+                        y: point.y,
+                    })
+                    .map_err(|error| error.to_string()),
+                RuntimeEffect::Send { peer, message } => {
+                    let packet = encode_peer_message(&message);
+                    let result = match (self.sessions.get(&peer), packet) {
+                        (Some(session), Ok(packet)) => session
+                            .send_packet(&packet)
+                            .await
+                            .map_err(|error| error.to_string()),
+                        (None, _) => Err("peer session is unavailable".into()),
+                        (_, Err(error)) => Err(error),
+                    };
+                    if result.is_err() {
+                        failed_peers.insert(peer);
+                    }
+                    Ok(())
+                }
+            };
+            if first_error.is_none() {
+                first_error = result.err();
+            }
+        }
+        if let Some(error) = first_error {
+            return Err(SupervisorError::DataPlane(error));
+        }
+        for peer in failed_peers {
+            self.sessions.remove(&peer);
+            self.admitted.remove(&peer);
+            if let Some(task) = self.readers.remove(&peer) {
+                task.abort();
+            }
+            for recovery in self.runtime.disconnect(peer) {
+                match recovery {
+                    RuntimeEffect::ReleaseLocal => self
+                        .platform
+                        .input
+                        .release_all()
+                        .map_err(|error| SupervisorError::DataPlane(error.to_string()))?,
+                    RuntimeEffect::WarpLocal { point, .. } => self
+                        .platform
+                        .input
+                        .inject(&seamless_input_protocol::InputEvent::Pointer {
+                            x: point.x,
+                            y: point.y,
+                        })
+                        .map_err(|error| SupervisorError::DataPlane(error.to_string()))?,
+                    RuntimeEffect::Local(_) | RuntimeEffect::Send { .. } => {}
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+fn pointer_edge(display: &Display, x: f64, y: f64) -> Option<seamless_input_core::Edge> {
+    use seamless_input_core::Edge;
+    if x <= display.origin.x {
+        Some(Edge::Left)
+    } else if x >= display.origin.x + display.width {
+        Some(Edge::Right)
+    } else if y <= display.origin.y {
+        Some(Edge::Top)
+    } else if y >= display.origin.y + display.height {
+        Some(Edge::Bottom)
+    } else {
+        None
+    }
+}
+
+struct CapturedInput {
+    event: Option<seamless_input_protocol::InputEvent>,
+    emergency: bool,
+}
+
+#[cfg(target_os = "macos")]
+struct NativeCapture {
+    tap: seamless_input_platform_macos::input::MacEventTap,
+    receiver: std::sync::mpsc::Receiver<seamless_input_platform_macos::input::CaptureOutcome>,
+}
+
+#[cfg(target_os = "macos")]
+impl NativeCapture {
+    fn install() -> Result<Self, seamless_input_platform_macos::input::InputError> {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let tap = seamless_input_platform_macos::input::MacEventTap::install(
+            seamless_input_core::platform::CaptureMode::Local,
+            move |event| {
+                let _ = sender.send(event);
+            },
+        )?;
+        Ok(Self { tap, receiver })
+    }
+    fn drain(&self) -> Vec<CapturedInput> {
+        self.tap.poll();
+        self.receiver
+            .try_iter()
+            .map(|outcome| CapturedInput {
+                event: outcome.event,
+                emergency: outcome.emergency,
+            })
+            .collect()
+    }
+    fn set_remote(&self, remote: bool) {
+        self.tap.set_mode(if remote {
+            seamless_input_core::platform::CaptureMode::Remote
+        } else {
+            seamless_input_core::platform::CaptureMode::Local
+        });
+    }
+}
+
+#[cfg(target_os = "windows")]
+struct NativeCapture {
+    hooks: seamless_input_platform_windows::input::WindowsHooks,
+    receiver: std::sync::mpsc::Receiver<seamless_input_platform_windows::input::CaptureOutcome>,
+}
+
+#[cfg(target_os = "windows")]
+impl NativeCapture {
+    fn install() -> Result<Self, seamless_input_platform_windows::input::InputError> {
+        let (hooks, receiver) = seamless_input_platform_windows::input::WindowsHooks::install()?;
+        Ok(Self { hooks, receiver })
+    }
+    fn drain(&self) -> Vec<CapturedInput> {
+        self.receiver
+            .try_iter()
+            .map(|outcome| CapturedInput {
+                event: outcome.event,
+                emergency: outcome.emergency,
+            })
+            .collect()
+    }
+    fn set_remote(&self, remote: bool) {
+        self.hooks.set_remote_capture(remote);
     }
 }
 

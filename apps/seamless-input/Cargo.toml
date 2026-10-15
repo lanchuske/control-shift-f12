@@ -10,6 +10,7 @@ ratatui.workspace = true
 crossterm.workspace = true
 rand.workspace = true
 serde.workspace = true
+rmp-serde.workspace = true
 toml.workspace = true
 seamless-input-core = { path = "../../crates/core" }
 seamless-input-protocol = { path = "../../crates/protocol" }

@@ -389,6 +389,15 @@ mod native {
         pub fn set_mode(&self, mode: CaptureMode) {
             self.mode.store(mode as u8, Ordering::Relaxed);
         }
+        /// Service pending tap callbacks without taking ownership of the
+        /// application's main loop. The supervisor calls this on every tick.
+        pub fn poll(&self) {
+            let _ = core_foundation::runloop::CFRunLoop::run_in_mode(
+                unsafe { core_foundation::runloop::kCFRunLoopDefaultMode },
+                std::time::Duration::ZERO,
+                true,
+            );
+        }
     }
 
     fn normalize_event(kind: CGEventType, event: &CGEvent) -> Option<InputEvent> {

@@ -1,7 +1,32 @@
 use seamless_input::{
-    peer::{Capabilities, LeaseError, PeerMessage, PeerRegistry},
+    peer::{
+        Capabilities, LeaseError, PeerMessage, PeerRegistry, decode_peer_message,
+        encode_peer_message,
+    },
     runtime::{Runtime, RuntimeEffect, RuntimeReceive},
 };
+
+#[test]
+fn peer_messages_round_trip_for_the_production_data_plane() {
+    let messages = [
+        PeerMessage::Capabilities {
+            epoch: 7,
+            capabilities: Capabilities::all(),
+        },
+        PeerMessage::AcquireLease { epoch: 7 },
+        PeerMessage::Heartbeat { epoch: 7 },
+        PeerMessage::Input {
+            epoch: 7,
+            sequence: 8,
+            event: InputEvent::Pointer { x: 12.0, y: 14.0 },
+        },
+        PeerMessage::ReleaseLease { epoch: 7 },
+    ];
+    for message in messages {
+        let encoded = encode_peer_message(&message).unwrap();
+        assert_eq!(decode_peer_message(&encoded).unwrap(), message);
+    }
+}
 use seamless_input_core::clipboard::{ClipboardDeduper, ClipboardPayload};
 use seamless_input_core::platform::{
     AccessState, ClipboardContent, ClipboardOutcome, PlatformClipboard, PlatformInput,
@@ -38,9 +63,20 @@ fn admit(runtime: &mut Runtime, n: u8, caps: Capabilities) -> u64 {
         public_identity: vec![n],
         certificate_pin: [n; 32],
     };
-    runtime
+    let epoch = runtime
         .connect_admitted(node(n), caps, Some(&pin), SessionTrust::Authenticated)
-        .unwrap()
+        .unwrap();
+    runtime
+        .receive(
+            node(n),
+            PeerMessage::Capabilities {
+                epoch,
+                capabilities: caps,
+            },
+            0,
+        )
+        .unwrap();
+    epoch
 }
 
 #[test]
@@ -78,6 +114,24 @@ fn exclusive_lease_rejects_second_controller_and_stale_events() {
     let mut peers = PeerRegistry::new(node(3));
     let first = peers.connected(node(1), Capabilities::all());
     let second = peers.connected(node(2), Capabilities::all());
+    peers
+        .receive(
+            node(1),
+            PeerMessage::Capabilities {
+                epoch: first,
+                capabilities: Capabilities::all(),
+            },
+        )
+        .unwrap();
+    peers
+        .receive(
+            node(2),
+            PeerMessage::Capabilities {
+                epoch: second,
+                capabilities: Capabilities::all(),
+            },
+        )
+        .unwrap();
     assert!(
         peers
             .receive(node(1), PeerMessage::AcquireLease { epoch: first })
@@ -160,6 +214,25 @@ async fn reconnect_replaces_session_without_reviving_old_epoch() {
 }
 
 #[test]
+fn remote_epoch_is_negotiated_instead_of_assuming_reconnect_counters_match() {
+    let mut peers = PeerRegistry::new(node(1));
+    let local_epoch = peers.connected(node(2), Capabilities::all());
+    assert_eq!(local_epoch, 1);
+    peers
+        .receive(
+            node(2),
+            PeerMessage::Capabilities {
+                epoch: 41,
+                capabilities: Capabilities::all(),
+            },
+        )
+        .unwrap();
+    peers
+        .receive(node(2), PeerMessage::AcquireLease { epoch: 41 })
+        .unwrap();
+}
+
+#[test]
 fn incoming_clipboard_is_capability_checked_and_deduped() {
     let mut runtime = Runtime::new(node(1), display(1).id, mesh3(), 1000).unwrap();
     let epoch = admit(
@@ -229,6 +302,22 @@ fn incoming_heartbeat_refreshes_the_active_controller_deadline() {
     assert_eq!(runtime.active_peer(), node(2));
     assert!(!runtime.tick(1_900).unwrap().is_empty());
     assert_eq!(runtime.active_peer(), node(1));
+}
+
+#[test]
+fn heartbeat_effects_are_emitted_for_every_connected_peer() {
+    let mut runtime = Runtime::new(node(1), display(1).id, mesh3(), 1000).unwrap();
+    let epoch2 = admit(&mut runtime, 2, Capabilities::all());
+    let epoch3 = admit(&mut runtime, 3, Capabilities::all());
+    let effects = runtime.heartbeat_effects();
+    assert!(effects.contains(&RuntimeEffect::Send {
+        peer: node(2),
+        message: PeerMessage::Heartbeat { epoch: epoch2 },
+    }));
+    assert!(effects.contains(&RuntimeEffect::Send {
+        peer: node(3),
+        message: PeerMessage::Heartbeat { epoch: epoch3 },
+    }));
 }
 
 #[test]

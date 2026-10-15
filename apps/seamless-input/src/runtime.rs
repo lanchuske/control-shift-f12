@@ -111,6 +111,9 @@ impl Runtime {
     pub fn active_peer(&self) -> NodeId {
         self.controller.active_target()
     }
+    pub fn peer_epoch(&self, peer: NodeId) -> Option<u64> {
+        self.peers.epoch(peer)
+    }
     pub fn route(&mut self, event: InputEvent) -> Result<Vec<RuntimeEffect>, ControlError> {
         let actions = self.controller.route(event)?;
         Ok(self.effects(actions))
@@ -152,7 +155,9 @@ impl Runtime {
                 Ok(RuntimeReceive::None)
             }
             PeerMessage::ReleaseLease { .. } => Ok(RuntimeReceive::ReleaseInput),
-            _ => Ok(RuntimeReceive::None),
+            PeerMessage::Capabilities { .. } | PeerMessage::AcquireLease { .. } => {
+                Ok(RuntimeReceive::None)
+            }
         }
     }
     /// Recover local control without waiting for the remote peer. The returned
@@ -189,6 +194,15 @@ impl Runtime {
             }
         }
         Ok(out)
+    }
+    pub fn heartbeat_effects(&self) -> Vec<RuntimeEffect> {
+        self.peers
+            .peers()
+            .map(|(peer, epoch, _)| RuntimeEffect::Send {
+                peer,
+                message: PeerMessage::Heartbeat { epoch },
+            })
+            .collect()
     }
     fn effects(&mut self, actions: Vec<Action>) -> Vec<RuntimeEffect> {
         let mut out = vec![];

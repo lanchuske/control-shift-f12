@@ -1,6 +1,7 @@
 //! Bounded clipboard validation and content-hash loop suppression.
 
 use seamless_input_protocol::{MAX_PNG_BYTES, MAX_TEXT_BYTES};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{HashSet, VecDeque};
 
@@ -10,7 +11,7 @@ pub const MAX_PNG_DIMENSION: u32 = 16_384;
 pub const MAX_PNG_PIXELS: u64 = 16 * 1024 * 1024;
 pub const MAX_PNG_DECODED_BYTES: u64 = MAX_PNG_PIXELS * 4;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ClipboardPayload {
     Text(String),
     Png(Vec<u8>),
@@ -31,7 +32,7 @@ impl ClipboardPayload {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClipboardTransfer {
     pub hash: [u8; 32],
     pub payload: ClipboardPayload,
