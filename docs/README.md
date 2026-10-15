@@ -23,8 +23,8 @@ and the quickest path to testing.
 
 - [Release and QA runbook](qa/release-and-qa-runbook.md) — the required release
   checks and physical test procedure.
-- [End-to-end evidence template](qa/e2e-evidence-template.md) — record every
-  physical result as PASS, FAIL, or NOT MEASURED.
+- [Physical QA matrix](qa/physical-qa-matrix.md) — the single authoritative
+  release-candidate record for PASS, FAIL, and NOT MEASURED physical results.
 
 ## Community
 
