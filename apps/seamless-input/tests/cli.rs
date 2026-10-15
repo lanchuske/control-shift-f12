@@ -1,8 +1,24 @@
 use std::{
+    io::{BufRead, BufReader, Read},
     process::{Command, Stdio},
+    sync::{Mutex, MutexGuard, OnceLock},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
+
+fn pairing_lock() -> MutexGuard<'static, ()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+}
+
+struct ChildGuard(std::process::Child);
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
 
 fn run(args: &[&str]) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_seamless-input"))
@@ -37,16 +53,138 @@ fn run_with_sensitive_environment(args: &[&str]) -> std::process::Output {
 
 #[test]
 fn pair_new_creates_a_real_redacted_pairing_offer() {
-    let output = run(&["pair", "new"]);
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
+    let _pairing = pairing_lock();
+    let home = test_home();
+    let mut offer = ChildGuard(
+        Command::new(env!("CARGO_BIN_EXE_seamless-input"))
+            .args(["pair", "new"])
+            .env("SEAMLESS_INPUT_HOME", &home)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("pairing offer should start"),
     );
-    let stdout = String::from_utf8(output.stdout).unwrap();
+    let mut reader = BufReader::new(offer.0.stdout.take().unwrap());
+    let mut stdout = String::new();
+    reader.read_line(&mut stdout).unwrap();
+    assert!(
+        offer.0.try_wait().unwrap().is_none(),
+        "pair new must remain pairable while it waits for a peer"
+    );
+    offer.0.kill().unwrap();
+    reader.read_to_string(&mut stdout).unwrap();
+    offer.0.wait().unwrap();
     assert!(stdout.contains("Pairing code:"));
     assert_eq!(stdout.split_whitespace().skip(2).take(6).count(), 6);
     assert!(!stdout.contains("not implemented"));
+}
+
+#[test]
+fn two_cli_processes_pair_and_persist_reciprocal_peers() {
+    let _pairing = pairing_lock();
+    let offer_home = test_home().join("offer");
+    let accept_home = test_home().join("accept");
+    let mut offer = ChildGuard(
+        Command::new(env!("CARGO_BIN_EXE_seamless-input"))
+            .args(["pair", "new"])
+            .env("SEAMLESS_INPUT_HOME", &offer_home)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("pairing offer should start"),
+    );
+    let mut reader = BufReader::new(offer.0.stdout.take().unwrap());
+    let mut line = String::new();
+    reader.read_line(&mut line).unwrap();
+    let code = line
+        .trim()
+        .strip_prefix("Pairing code: ")
+        .expect("offer should print a pairing code")
+        .to_owned();
+
+    let accept = Command::new(env!("CARGO_BIN_EXE_seamless-input"))
+        .arg("pair")
+        .arg(&code)
+        .env("SEAMLESS_INPUT_HOME", &accept_home)
+        .output()
+        .expect("pairing acceptor should finish");
+    assert!(
+        accept.status.success(),
+        "accept stderr: {}",
+        String::from_utf8_lossy(&accept.stderr)
+    );
+    assert!(!String::from_utf8_lossy(&accept.stdout).contains(&code));
+
+    let status = offer.0.wait().unwrap();
+    assert!(
+        status.success(),
+        "offer process should finish after one pairing"
+    );
+
+    for home in [&offer_home, &accept_home] {
+        let peers = Command::new(env!("CARGO_BIN_EXE_seamless-input"))
+            .arg("peers")
+            .env("SEAMLESS_INPUT_HOME", home)
+            .output()
+            .unwrap();
+        assert!(peers.status.success());
+        assert!(
+            String::from_utf8_lossy(&peers.stdout).contains("Paired peers: 1"),
+            "{}",
+            String::from_utf8_lossy(&peers.stdout)
+        );
+    }
+}
+
+#[test]
+fn wrong_code_fails_both_cli_processes_without_persisting_peers() {
+    let _pairing = pairing_lock();
+    let offer_home = test_home().join("wrong-offer");
+    let accept_home = test_home().join("wrong-accept");
+    let mut offer = ChildGuard(
+        Command::new(env!("CARGO_BIN_EXE_seamless-input"))
+            .args(["pair", "new"])
+            .env("SEAMLESS_INPUT_HOME", &offer_home)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let mut reader = BufReader::new(offer.0.stdout.take().unwrap());
+    let mut line = String::new();
+    reader.read_line(&mut line).unwrap();
+    let offered = line.trim().strip_prefix("Pairing code: ").unwrap();
+    let mut words: Vec<_> = offered.split_whitespace().collect();
+    words[0] = if words[0] == "abandon" {
+        "ability"
+    } else {
+        "abandon"
+    };
+    let wrong_code = words.join(" ");
+
+    let started = Instant::now();
+    let accept = Command::new(env!("CARGO_BIN_EXE_seamless-input"))
+        .arg("pair")
+        .arg(&wrong_code)
+        .env("SEAMLESS_INPUT_HOME", &accept_home)
+        .output()
+        .unwrap();
+    let server = offer.0.wait().unwrap();
+    assert!(!accept.status.success());
+    assert!(!server.success());
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "wrong-code rejection must be bounded"
+    );
+
+    for home in [&offer_home, &accept_home] {
+        let peers = Command::new(env!("CARGO_BIN_EXE_seamless-input"))
+            .arg("peers")
+            .env("SEAMLESS_INPUT_HOME", home)
+            .output()
+            .unwrap();
+        assert!(String::from_utf8_lossy(&peers.stdout).contains("Paired peers: 0"));
+    }
 }
 
 #[test]
@@ -73,6 +211,7 @@ fn start_bootstraps_the_real_supervisor_and_stays_running() {
 
 #[test]
 fn pair_code_is_validated_without_echoing_the_secret() {
+    let _pairing = pairing_lock();
     let code = "abandon abandon abandon abandon abandon abandon";
     let output = run(&["pair", code]);
     let combined = format!(

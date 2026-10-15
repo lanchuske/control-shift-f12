@@ -13,6 +13,7 @@ use seamless_input::{
 };
 use seamless_input_protocol::{NodeId, VERSION};
 use seamless_transport::{IdentityStore, PairingCode, PairingSession};
+use seamless_transport::{pair_accept_over_quic, pair_offer_over_quic};
 
 const EXIT_OPERATIONAL_FAILURE: u8 = 1;
 
@@ -97,7 +98,7 @@ async fn run(cli: Cli) -> Result<(), OperationalError> {
     let paths = AppPaths::discover()?;
     match cli.command {
         Commands::Start => start(&paths).await,
-        Commands::Pair(args) => pair(&paths, &args.code),
+        Commands::Pair(args) => pair(&paths, &args.code).await,
         Commands::Peers => peers(&paths),
         Commands::Unpair { peer } => unpair(&paths, &peer),
         Commands::Tui => Ok(tui::run_terminal(&paths.config_store()?)?),
@@ -131,43 +132,134 @@ async fn start(paths: &AppPaths) -> Result<(), OperationalError> {
     }
 }
 
-fn pair(paths: &AppPaths, value: &str) -> Result<(), OperationalError> {
-    let identity = IdentityStore::open_or_create(&paths.identity, "SeamlessInput peer")?;
+async fn pair(paths: &AppPaths, value: &str) -> Result<(), OperationalError> {
+    let mut identity = IdentityStore::open_or_create(&paths.identity, "SeamlessInput peer")?;
     let mut discovery = Discovery::new(VERSION).map_err(OperationalError)?;
     if value == "new" {
         let mut code = PairingCode::generate(SystemTime::now())?;
         let phrase = code.phrase().to_owned();
-        let _session = PairingSession::offer(&identity, &mut code, SystemTime::now())?;
-        let nearby = discovery
-            .browse(Duration::from_millis(150))
+        let server = identity.temporary_pairing_server_config()?;
+        let endpoint =
+            quinn::Endpoint::server(server, std::net::SocketAddr::new(local_lan_ip(), 0)).map_err(
+                |_| OperationalError("temporary pairing listener could not start".into()),
+            )?;
+        let instance = random_instance();
+        discovery
+            .publish(
+                &instance,
+                endpoint.local_addr().map_err(|_| {
+                    OperationalError("temporary pairing listener has no address".into())
+                })?,
+                true,
+            )
             .map_err(OperationalError)?;
         println!("Pairing code: {phrase}");
-        println!(
-            "Pairable peers currently discovered: {}",
-            nearby
-                .iter()
-                .filter(|peer| peer.advertisement.pairable)
-                .count()
-        );
         println!("The code expires in five minutes and is accepted only once.");
+        io::stdout()
+            .flush()
+            .map_err(|error| OperationalError(error.to_string()))?;
+        let incoming = tokio::time::timeout(Duration::from_secs(300), endpoint.accept())
+            .await
+            .map_err(|_| OperationalError("pairing code expired before a peer connected".into()))?
+            .ok_or_else(|| OperationalError("temporary pairing listener stopped".into()))?;
+        let connection = tokio::time::timeout(Duration::from_secs(10), incoming)
+            .await
+            .map_err(|_| OperationalError("pairing connection timed out".into()))?
+            .map_err(|_| OperationalError("pairing connection failed".into()))?;
+        let peer =
+            match pair_offer_over_quic(&connection, &mut identity, &mut code, SystemTime::now())
+                .await
+            {
+                Ok(peer) => peer,
+                Err(error) => {
+                    // A failed confirmation is still a protocol response the
+                    // dialing side must receive. Briefly retain the endpoint so
+                    // encrypted error-path frames survive process teardown.
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    connection.close(1u32.into(), b"pairing rejected");
+                    return Err(error.into());
+                }
+            };
+        // The dialing CLI closes only after it has received and persisted our
+        // confirmation. Waiting for that close prevents this short-lived
+        // listener from tearing down the final QUIC packet too early.
+        if tokio::time::timeout(Duration::from_secs(2), connection.closed())
+            .await
+            .is_err()
+        {
+            connection.close(0u32.into(), b"pairing complete");
+        }
+        println!("Paired with {}.", peer.friendly_name);
         Ok(())
     } else {
-        let _session = PairingSession::accept(&identity, value)?;
-        let pairable = discovery
-            .browse(Duration::from_millis(250))
-            .map_err(OperationalError)?
-            .into_iter()
-            .filter(|peer| peer.compatible && peer.advertisement.pairable)
-            .count();
-        if pairable == 0 {
+        // Validate before touching the network. The session is intentionally
+        // discarded; the real PAKE session is created after QUIC connects.
+        let _validation = PairingSession::accept(&identity, value)?;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let mut pairable = Vec::new();
+        while tokio::time::Instant::now() < deadline && pairable.is_empty() {
+            pairable = discovery
+                .browse(Duration::from_millis(200))
+                .map_err(OperationalError)?
+                .into_iter()
+                .filter(|peer| peer.compatible && peer.advertisement.pairable)
+                .collect();
+        }
+        if pairable.is_empty() {
             return Err(OperationalError(
                 "no compatible pairable peer was discovered; the pairing code was not logged"
                     .into(),
             ));
         }
-        println!("Pairing request prepared for {pairable} compatible peer(s).");
+        if pairable.len() != 1 {
+            return Err(OperationalError(
+                "multiple pairable peers were discovered; wait until only the intended peer is pairable"
+                    .into(),
+            ));
+        }
+        let address =
+            *pairable[0].advertisement.addresses.first().ok_or_else(|| {
+                OperationalError("pairable peer advertised no usable address".into())
+            })?;
+        let bind = if address.is_ipv4() {
+            "0.0.0.0:0".parse().unwrap()
+        } else {
+            "[::]:0".parse().unwrap()
+        };
+        let mut endpoint = quinn::Endpoint::client(bind)
+            .map_err(|_| OperationalError("temporary pairing client could not start".into()))?;
+        endpoint.set_default_client_config(IdentityStore::temporary_pairing_client_config()?);
+        let connection = tokio::time::timeout(
+            Duration::from_secs(10),
+            endpoint
+                .connect(address, "seamless-input.local")
+                .map_err(|_| OperationalError("pairing connection could not start".into()))?,
+        )
+        .await
+        .map_err(|_| OperationalError("pairing connection timed out".into()))?
+        .map_err(|_| OperationalError("pairing connection failed".into()))?;
+        let peer = pair_accept_over_quic(&connection, &mut identity, value).await?;
+        connection.close(0u32.into(), b"pairing complete");
+        let _ = tokio::time::timeout(Duration::from_secs(2), endpoint.wait_idle()).await;
+        println!("Paired with {}.", peer.friendly_name);
         Ok(())
     }
+}
+
+fn local_lan_ip() -> std::net::IpAddr {
+    std::net::UdpSocket::bind("0.0.0.0:0")
+        .and_then(|socket| {
+            socket.connect("192.0.2.1:9")?;
+            socket.local_addr().map(|address| address.ip())
+        })
+        .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST))
+}
+
+fn random_instance() -> String {
+    use rand::RngCore;
+    let mut token = [0u8; 16];
+    rand::rngs::OsRng.fill_bytes(&mut token);
+    token.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 fn peers(paths: &AppPaths) -> Result<(), OperationalError> {

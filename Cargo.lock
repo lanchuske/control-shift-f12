@@ -1734,6 +1734,7 @@ dependencies = [
  "clap",
  "crossterm",
  "insta",
+ "quinn",
  "rand 0.8.8",
  "ratatui",
  "seamless-discovery",
