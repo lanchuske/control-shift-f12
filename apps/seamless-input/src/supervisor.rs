@@ -602,10 +602,12 @@ impl NativeSupervisor {
                         })?;
                     let active = self.runtime.active_geometry().clone();
                     let point = self.cursor.observe(logical, &active);
-                    if let Some(edge) = pointer_edge(&active, point.x, point.y) {
+                    if let Some((edge, crossing)) =
+                        crate::cursor::bounded_edge_crossing(&active, point)
+                    {
                         effects = self
                             .runtime
-                            .cross(edge, point, now_ms)
+                            .cross(edge, crossing, now_ms)
                             .map_err(|_| SupervisorError::Runtime)?;
                         if self.runtime.active_display() != active.id
                             && let Some(mapped) = effect_pointer(&effects)
@@ -622,6 +624,25 @@ impl NativeSupervisor {
                                 })
                                 .map_err(|_| SupervisorError::Runtime)?,
                         );
+                    }
+                    if self.runtime.active_peer() != self.identity.node_id() {
+                        let first = self
+                            .local_displays
+                            .first()
+                            .ok_or(SupervisorError::NoDisplay)?;
+                        let anchor =
+                            crate::cursor::display_center(&display(self.identity.node_id(), first));
+                        self.platform
+                            .warp_local(anchor)
+                            .map_err(SupervisorError::Platform)?;
+                        self.cursor.recenter_native(anchor);
+                    } else if self.runtime.active_display() != active.id
+                        && let Some(mapped) = effect_pointer(&effects)
+                    {
+                        // The local Warp effect is injected and therefore
+                        // filtered by both native capture hooks. Record its
+                        // destination explicitly as the next physical baseline.
+                        self.cursor.recenter_native(mapped);
                     }
                 } else {
                     effects.extend(
@@ -933,21 +954,6 @@ fn edge_between(anchor: (i32, i32), candidate: (i32, i32)) -> Option<seamless_in
         (0, -1) => Some(Edge::Top),
         (0, 1) => Some(Edge::Bottom),
         _ => None,
-    }
-}
-
-fn pointer_edge(display: &Display, x: f64, y: f64) -> Option<seamless_input_core::Edge> {
-    use seamless_input_core::Edge;
-    if x <= display.origin.x {
-        Some(Edge::Left)
-    } else if x >= display.origin.x + display.width {
-        Some(Edge::Right)
-    } else if y <= display.origin.y {
-        Some(Edge::Top)
-    } else if y >= display.origin.y + display.height {
-        Some(Edge::Bottom)
-    } else {
-        None
     }
 }
 
