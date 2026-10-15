@@ -4,12 +4,13 @@
 
 [![CI](https://github.com/lanchuske/control-shift-f12/actions/workflows/ci.yml/badge.svg)](https://github.com/lanchuske/control-shift-f12/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![QA Preview](https://img.shields.io/badge/release-QA%20Preview-orange.svg)](https://github.com/lanchuske/control-shift-f12/releases/tag/v0.1.0)
+[![QA Preview](https://img.shields.io/badge/release-QA%20Preview-orange.svg)](https://github.com/lanchuske/control-shift-f12/releases)
 
 Control Shift F12 is an open-source software KVM that lets one mouse, keyboard, and
 clipboard move across nearby macOS and Windows computers. It is peer to peer,
-encrypted, terminal first, and designed to run without administrator access or
-a cloud account.
+encrypted, provides visible native first-run guidance, and is designed to run
+without administrator access or a cloud account. Command-line diagnostics stay
+available for advanced troubleshooting.
 
 Press **Control + Shift + F12** on either computer to recover local control at
 any time. The shortcut is also the product name, so it is easy to remember.
@@ -19,24 +20,39 @@ any time. The shortcut is also the product name, so it is easy to remember.
 > PC is still **NOT MEASURED**. Help us test it, but do not treat this build as
 > production ready.
 
-[Download Control Shift F12 v0.1.0 QA Preview](https://github.com/lanchuske/control-shift-f12/releases/tag/v0.1.0)
+[Download Control Shift F12 v0.1.1 QA Preview](https://github.com/lanchuske/control-shift-f12/releases)
 · [Report a bug](https://github.com/lanchuske/control-shift-f12/issues/new/choose)
 · [Share an idea](https://github.com/lanchuske/control-shift-f12/discussions)
 · [Star the project](https://github.com/lanchuske/control-shift-f12)
 
-## Download Control Shift F12 v0.1.0 QA Preview
+## Download Control Shift F12 v0.1.1 QA Preview
 
-Version **v0.1.0** is the current public QA Preview. Choose one of the two
-installers below.
+Control Shift F12 **v0.1.1 QA Preview** is the next candidate. The durable
+[Releases page](https://github.com/lanchuske/control-shift-f12/releases) always
+shows the newest published preview. When v0.1.1 is published, choose one of
+these two installers:
 
 | Computer | QA Preview download |
 | --- | --- |
-| Mac — Universal for Apple Silicon and Intel | [Download the universal DMG](https://github.com/lanchuske/control-shift-f12/releases/download/v0.1.0/SeamlessInput-v0.1.0-universal.dmg) |
-| Windows — x64 | [Download the Windows installer](https://github.com/lanchuske/control-shift-f12/releases/download/v0.1.0/SeamlessInput-v0.1.0-windows-x64.exe) |
+| Mac — Universal for Apple Silicon and Intel | [Control-Shift-F12-v0.1.1-universal.dmg](https://github.com/lanchuske/control-shift-f12/releases) |
+| Windows — x64 | [Control-Shift-F12-v0.1.1-windows-x64.exe](https://github.com/lanchuske/control-shift-f12/releases) |
 
-Checksums, provenance attestations, source archives, and older raw binaries are
-on the [release page](https://github.com/lanchuske/control-shift-f12/releases/tag/v0.1.0).
-For the current QA, use the two installers linked above.
+The release workflow publishes exactly those two installers plus one
+`SHA256SUMS` file. It removes obsolete downloadable assets before exposing the
+preview, so testers do not have to choose between old binaries.
+
+### Install and open it
+
+- **Mac:** open the DMG, drag **Control Shift F12** to Applications, and open it
+  there. The first-run window explains why Accessibility is needed, opens the
+  correct macOS setting, and waits in safe mode until you grant permission.
+- **Windows:** run the installer as your current user. The first-run window
+  starts the peer visibly; the Start menu and optional desktop shortcuts open
+  the product instead of exiting silently. Remove it later from **Installed
+  apps**, where it appears as **Control Shift F12**.
+
+No separate Rust, Python, driver, service, or administrator installation is
+required.
 
 ## Why Control Shift F12
 
@@ -94,10 +110,12 @@ released and control returns to the local machine.
 
 ## Try the QA Preview
 
-1. Download the matching binary on each computer.
-2. On macOS, allow the binary to run and grant Accessibility permission when
-   prompted. On Windows, run it as the current user; do not elevate it.
-3. Run `seamless-input doctor` on both computers.
+1. Install and open Control Shift F12 on both computers.
+2. On macOS, grant Accessibility when the first-run window opens the system
+   setting. On Windows, keep the visible app running as the current user; do
+   not elevate it.
+3. Use the diagnostics shortcut on Windows or run `seamless-input doctor` from
+   a terminal on either computer when you need detailed local diagnostics.
 4. Pair the computers with `seamless-input pair new` on one and
    `seamless-input pair <six-word-code>` on the other.
 5. Arrange the displays with `seamless-input tui`, then start both peers with
@@ -125,8 +143,8 @@ belong in [private vulnerability reporting](SECURITY.md), never a public issue.
 The core mouse, keyboard, clipboard, topology, discovery, pairing, transport,
 and recovery paths are implemented. The immediate priorities are:
 
-- universal signed and notarized macOS DMG;
-- signed Windows installer with a simple first-run experience;
+- physical verification of the signed, notarized universal macOS DMG;
+- physical verification of the signed Windows installer and first-run flow;
 - physical Mac–Windows QA and compatibility evidence;
 - clearer onboarding and an end-to-end demo;
 - file drag and drop, mobile clients, application continuity, and optional

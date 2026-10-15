@@ -1722,14 +1722,14 @@ checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 
 [[package]]
 name = "seamless-discovery"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "mdns-sd",
 ]
 
 [[package]]
 name = "seamless-input"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "clap",
  "crossterm",
@@ -1754,7 +1754,7 @@ dependencies = [
 
 [[package]]
 name = "seamless-input-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "crc32fast",
  "proptest",
@@ -1765,7 +1765,7 @@ dependencies = [
 
 [[package]]
 name = "seamless-input-platform-macos"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "arboard",
  "core-foundation",
@@ -1780,7 +1780,7 @@ dependencies = [
 
 [[package]]
 name = "seamless-input-platform-windows"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "arboard",
  "crc32fast",
@@ -1794,7 +1794,7 @@ dependencies = [
 
 [[package]]
 name = "seamless-input-protocol"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "rmp-serde",
  "serde",
@@ -1803,7 +1803,7 @@ dependencies = [
 
 [[package]]
 name = "seamless-transport"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "base64 0.22.1",
  "bip39",
