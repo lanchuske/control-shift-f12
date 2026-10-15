@@ -9,11 +9,18 @@ end-to-end test occurred.
 3. Publish SHA-256 checksums beside every binary.
 4. On clean non-admin accounts, install twice, open a new terminal, run
    `seamless-input doctor`, uninstall, and verify identities remain.
-5. Exercise two-peer and mixed three-peer scenarios on real machines.
-6. Copy `docs/qa/e2e-evidence-template.md` and mark every row PASS, FAIL, or NOT
-   MEASURED. A CI build is not physical-platform evidence.
-7. Only after independent review and explicit publication approval, publish
-   release assets and verify the public installation commands.
+5. Copy the authoritative `docs/qa/physical-qa-matrix.md` and run the
+   artifact-provenance, two-machine installation,
+   safety-shortcut, pairing, bidirectional input, clipboard, crossing, and
+   recovery checks on real hardware.
+6. Complete every matrix row with PASS evidence, FAIL evidence plus an issue,
+   or a reason for NOT MEASURED. A CI build is not physical-platform evidence.
+7. After independent review and explicit publication approval, an explicitly
+   labeled QA Preview may publish the installers needed to execute the physical
+   matrix. Its notes must keep physical QA as NOT MEASURED and must not claim
+   physical validation.
+8. Promote to stable/GA only after every authoritative matrix row is PASS with
+   evidence, then verify the public installation links again.
 
 Never weaken permissions, open a firewall, install a service or driver, alter
 policy, or use SSH to make a row pass.

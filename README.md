@@ -68,7 +68,7 @@ For the current QA, use the two installers linked above.
 PASS here means automated behavior passed on the supported CI targets. It does
 not substitute for a physical two-machine result. We record every hardware row
 as **PASS**, **FAIL**, or **NOT MEASURED** in the
-[QA evidence template](docs/qa/e2e-evidence-template.md).
+[physical QA matrix](docs/qa/physical-qa-matrix.md).
 
 ## How it works
 
@@ -102,7 +102,7 @@ released and control returns to the local machine.
    `seamless-input pair <six-word-code>` on the other.
 5. Arrange the displays with `seamless-input tui`, then start both peers with
    `seamless-input start`.
-6. Record the result with the [QA template](docs/qa/e2e-evidence-template.md)
+6. Record the result with the [physical QA matrix](docs/qa/physical-qa-matrix.md)
    and open a bug if anything fails.
 
 Never paste pairing codes, clipboard contents, keys, usernames, network
@@ -155,7 +155,7 @@ clear. All changes go through review and the protected CI matrix.
 - [Repository layout and root-file rationale](docs/repository-layout.md)
 - [MVP architecture and behavior](docs/architecture/mvp-specification.md)
 - [Release and QA runbook](docs/qa/release-and-qa-runbook.md)
-- [End-to-end QA evidence template](docs/qa/e2e-evidence-template.md)
+- [Physical QA matrix](docs/qa/physical-qa-matrix.md)
 - [Community feedback guide](docs/community/feedback.md)
 - [Security policy](SECURITY.md)
 - [Code of conduct](CODE_OF_CONDUCT.md)
