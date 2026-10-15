@@ -152,6 +152,7 @@ clear. All changes go through review and the protected CI matrix.
 ## Documentation
 
 - [Documentation index](docs/README.md)
+- [Repository layout and root-file rationale](docs/repository-layout.md)
 - [MVP architecture and behavior](docs/architecture/mvp-specification.md)
 - [Release and QA runbook](docs/qa/release-and-qa-runbook.md)
 - [End-to-end QA evidence template](docs/qa/e2e-evidence-template.md)

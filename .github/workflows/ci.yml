@@ -34,6 +34,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: python3 scripts/test-installers.py
+  public-repository-contract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 scripts/check-public-repo.py
   secret-scan:
     runs-on: ubuntu-latest
     steps:

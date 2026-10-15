@@ -1,8 +1,8 @@
-# SeamlessInput MVP specification
+# Control Shift F12 MVP specification
 
 ## Goal
 
-SeamlessInput is a free, open-source, peer-to-peer terminal application that
+Control Shift F12 is a free, open-source, peer-to-peer terminal application that
 lets one keyboard and mouse move across multiple macOS and Windows computers and
 synchronizes text and PNG clipboards.
 

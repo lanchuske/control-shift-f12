@@ -14,3 +14,8 @@ body:
   - type: markdown
     attributes:
       value: Scope expansions belong in a GitHub Discussion before an implementation issue.
+  - type: textarea
+    attributes:
+      label: Acceptance evidence
+      description: Explain how the improvement can be tested without exposing private data.
+    validations: { required: true }

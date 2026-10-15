@@ -1,8 +1,8 @@
 blank_issues_enabled: false
 contact_links:
   - name: Questions, ideas, compatibility, and show-and-tell
-    url: https://github.com/lanchuske/seamless-input/discussions
+    url: https://github.com/lanchuske/control-shift-f12/discussions
     about: Use Discussions for support, design exploration, and scope proposals.
   - name: Private security report
-    url: https://github.com/lanchuske/seamless-input/security/advisories/new
+    url: https://github.com/lanchuske/control-shift-f12/security/advisories/new
     about: Privately report a suspected vulnerability.
