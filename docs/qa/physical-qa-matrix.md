@@ -6,9 +6,12 @@ signature produced by CI, or a remote process check does not make any row pass.
 
 Allowed status values are **PASS**, **FAIL**, and **NOT MEASURED**. Start every
 row as **NOT MEASURED** and change it only after observing the expected result
-on the named machines. **Every row in this matrix blocks release of the tested
-candidate** until it is PASS. A FAIL or NOT MEASURED result means the candidate
-must not be promoted or represented as physically validated.
+on the named machines. **Every row in this matrix blocks promotion to a stable
+or generally available release** until it is PASS. NOT MEASURED rows are
+allowed in an explicitly labeled QA Preview whose purpose is to run this
+physical matrix, but that preview must not be represented as physically
+validated. A FAIL also blocks stable/GA promotion and must be resolved before
+the affected behavior can be represented as working.
 
 For every row:
 
@@ -137,6 +140,9 @@ evidence.
 - Follow-up issue links:
 
 Overall **PASS** requires every row above to be **PASS** with the required
-evidence. All rows are release-blocking for this candidate. Any **FAIL** or
-**NOT MEASURED** keeps the candidate out of release and must remain explicit;
-it cannot be represented as passing or complete coverage.
+evidence. All rows block promotion to stable/GA and any claim of complete
+physical validation. NOT MEASURED rows may remain only in an explicitly
+labeled QA Preview used to execute this matrix; they must stay visible and
+cannot be represented as passing coverage. Any FAIL must remain explicit, link
+to its follow-up issue, and blocks the affected behavior from being represented
+as working.

@@ -15,8 +15,12 @@ end-to-end test occurred.
    recovery checks on real hardware.
 6. Complete every matrix row with PASS evidence, FAIL evidence plus an issue,
    or a reason for NOT MEASURED. A CI build is not physical-platform evidence.
-7. Only after independent review and explicit publication approval, publish
-   release assets and verify the public installation commands.
+7. After independent review and explicit publication approval, an explicitly
+   labeled QA Preview may publish the installers needed to execute the physical
+   matrix. Its notes must keep physical QA as NOT MEASURED and must not claim
+   physical validation.
+8. Promote to stable/GA only after every authoritative matrix row is PASS with
+   evidence, then verify the public installation links again.
 
 Never weaken permissions, open a firewall, install a service or driver, alter
 policy, or use SSH to make a row pass.
