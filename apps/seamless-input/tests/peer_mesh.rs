@@ -117,6 +117,86 @@ fn invalid_or_duplicate_geometry_is_rejected_inside_the_authenticated_epoch() {
         Err(LeaseError::InvalidGeometry)
     );
 }
+
+#[test]
+fn geometry_that_collapses_at_floating_point_precision_is_rejected() {
+    let mut peers = PeerRegistry::new(node(1));
+    peers.connected(node(2), Capabilities::all());
+    peers
+        .receive(
+            node(2),
+            PeerMessage::Capabilities {
+                epoch: 9,
+                capabilities: Capabilities::all(),
+            },
+        )
+        .unwrap();
+
+    let collapsed = RemoteDisplay {
+        index: 0,
+        origin_x: f64::MAX / 2.0,
+        origin_y: 0.0,
+        width: f64::MIN_POSITIVE,
+        height: 100.0,
+        scale: 1.0,
+    };
+    assert_eq!(
+        peers.receive(
+            node(2),
+            PeerMessage::DisplayGeometry {
+                epoch: 9,
+                displays: vec![collapsed],
+            },
+        ),
+        Err(LeaseError::InvalidGeometry)
+    );
+}
+
+#[test]
+fn legacy_display_indices_require_the_negotiated_epoch_and_bounded_unique_values() {
+    let mut peers = PeerRegistry::new(node(1));
+    peers.connected(node(2), Capabilities::all());
+    peers
+        .receive(
+            node(2),
+            PeerMessage::Capabilities {
+                epoch: 9,
+                capabilities: Capabilities::all(),
+            },
+        )
+        .unwrap();
+
+    assert_eq!(
+        peers.receive(
+            node(2),
+            PeerMessage::Displays {
+                epoch: 10,
+                displays: vec![0],
+            },
+        ),
+        Err(LeaseError::WrongEpoch)
+    );
+    assert_eq!(
+        peers.receive(
+            node(2),
+            PeerMessage::Displays {
+                epoch: 9,
+                displays: vec![0, 0],
+            },
+        ),
+        Err(LeaseError::InvalidGeometry)
+    );
+    assert_eq!(
+        peers.receive(
+            node(2),
+            PeerMessage::Displays {
+                epoch: 9,
+                displays: (0..33).collect(),
+            },
+        ),
+        Err(LeaseError::InvalidGeometry)
+    );
+}
 use seamless_input_core::clipboard::{ClipboardDeduper, ClipboardPayload};
 use seamless_input_core::platform::{
     AccessState, ClipboardContent, ClipboardOutcome, PlatformClipboard, PlatformInput,

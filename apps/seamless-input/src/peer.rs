@@ -1,4 +1,4 @@
-use seamless_input_core::clipboard::ClipboardTransfer;
+use seamless_input_core::{Display, DisplayId, Point, clipboard::ClipboardTransfer};
 use seamless_input_protocol::{InputEvent, NodeId};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -38,16 +38,21 @@ pub struct RemoteDisplay {
 
 impl RemoteDisplay {
     pub fn is_valid(&self) -> bool {
-        self.origin_x.is_finite()
-            && self.origin_y.is_finite()
-            && self.width.is_finite()
-            && self.height.is_finite()
-            && self.scale.is_finite()
-            && self.width > 0.0
-            && self.height > 0.0
-            && self.scale > 0.0
-            && (self.origin_x + self.width).is_finite()
-            && (self.origin_y + self.height).is_finite()
+        Display {
+            id: DisplayId {
+                node: NodeId([0; 16]),
+                index: self.index,
+            },
+            origin: Point {
+                x: self.origin_x,
+                y: self.origin_y,
+            },
+            width: self.width,
+            height: self.height,
+            scale: self.scale,
+        }
+        .validate()
+        .is_ok()
     }
 }
 
@@ -296,10 +301,8 @@ impl PeerRegistry {
             | PeerMessage::Input { epoch, .. }
             | PeerMessage::Clipboard { epoch, .. } => *epoch,
         };
-        if !matches!(
-            &message,
-            PeerMessage::Capabilities { .. } | PeerMessage::Displays { .. }
-        ) && state.remote_epoch != Some(epoch)
+        if !matches!(&message, PeerMessage::Capabilities { .. })
+            && state.remote_epoch != Some(epoch)
         {
             return Err(LeaseError::WrongEpoch);
         }
@@ -311,7 +314,11 @@ impl PeerRegistry {
                 state.remote_epoch = Some(epoch);
                 state.negotiated = state.remote.intersect(capabilities);
             }
-            PeerMessage::Displays { .. } => {}
+            PeerMessage::Displays { displays, .. } => {
+                if !valid_unique_display_indices(&displays) {
+                    return Err(LeaseError::InvalidGeometry);
+                }
+            }
             PeerMessage::DisplayGeometry { displays, .. } => {
                 if displays.is_empty()
                     || displays.len() > 32
@@ -376,6 +383,15 @@ impl PeerRegistry {
         Ok(())
     }
 }
+
+fn valid_unique_display_indices(displays: &[u32]) -> bool {
+    if displays.is_empty() || displays.len() > 32 {
+        return false;
+    }
+    let mut indexes = std::collections::BTreeSet::new();
+    displays.iter().all(|index| indexes.insert(*index))
+}
+
 fn require_lease(lease: Option<(NodeId, u64)>, peer: NodeId, epoch: u64) -> Result<(), LeaseError> {
     if lease == Some((peer, epoch)) {
         Ok(())
