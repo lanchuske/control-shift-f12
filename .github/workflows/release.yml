@@ -1,0 +1,55 @@
+name: Release assets
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+permissions:
+  contents: read
+  id-token: write
+  attestations: write
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: macos-14
+            target: aarch64-apple-darwin
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+          - os: windows-2022
+            target: x86_64-pc-windows-msvc
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: "refs/tags/${{ github.ref_name }}"
+          fetch-depth: 0
+      - name: Bind build to immutable reviewed tag
+        shell: bash
+        run: |
+          set -eu
+          test "${GITHUB_REF_TYPE}" = "tag"
+          test "${GITHUB_REF}" = "refs/tags/${GITHUB_REF_NAME}"
+          printf '%s' "${GITHUB_REF_NAME}" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'
+          test "$(git rev-parse HEAD)" = "$(git rev-list -n 1 "refs/tags/${GITHUB_REF_NAME}")"
+      - uses: dtolnay/rust-toolchain@stable
+        with: { targets: "${{ matrix.target }}" }
+      - run: cargo test --workspace --target ${{ matrix.target }}
+      - run: cargo build --release --locked --target ${{ matrix.target }}
+      - shell: bash
+        run: |
+          set -eu
+          mkdir -p dist
+          suffix=""; [ "${{ runner.os }}" = "Windows" ] && suffix=".exe"
+          cp "target/${{ matrix.target }}/release/seamless-input${suffix}" "dist/seamless-input-${{ matrix.target }}${suffix}"
+          cd dist
+          if command -v shasum >/dev/null; then shasum -a 256 * > SHA256SUMS; else certutil -hashfile * SHA256 > SHA256SUMS; fi
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: dist/seamless-input-${{ matrix.target }}*
+      - uses: actions/upload-artifact@v4
+        with:
+          name: seamless-input-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+# Deliberately packages reviewed assets only. Publishing a GitHub release is a separate, explicit action.

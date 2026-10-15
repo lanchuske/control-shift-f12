@@ -1,0 +1,44 @@
+---
+source: apps/seamless-input/tests/tui_snapshots.rs
+expression: "render_to_string(&model, width, height)"
+---
+┌ Available peers ───────────────┐┌ Topology canvas ──────────────────────────────────────┐┌ Help ─────────────────────┐
+│No discovered peers             ││Topology                                               ││Arrows  position           │
+│                                ││No displays placed                                     ││Enter   place              │
+│                                ││Select a paired peer and press Enter                   ││Delete  remove             │
+│                                ││Error: That position is already occupied               ││S       save               │
+│                                ││                                                       ││Q       quit               │
+│                                ││                                                       ││                           │
+│                                ││                                                       ││No administrator           │
+│                                ││                                                       ││permissions needed.        │
+│                                ││                                                       ││                           │
+│                                ││                                                       ││                           │
+│                                ││                                                       ││                           │
+│                                ││                                                       ││                           │
+│                                ││                                                       ││                           │
+│                                ││                                                       ││                           │
+│                                ││                                                       ││                           │
+│                                ││                                                       ││                           │
+│                                ││                                                       ││                           │
+│                                ││                                                       ││                           │
+│                                ││                                                       ││                           │
+│                                ││                                                       ││                           │
+│                                ││                                                       ││                           │
+│                                ││                                                       ││                           │
+│                                ││                                                       ││                           │
+│                                ││                                                       ││                           │
+│                                ││                                                       ││                           │
+│                                ││                                                       ││                           │
+│                                ││                                                       ││                           │
+│                                ││                                                       ││                           │
+│                                ││                                                       ││                           │
+│                                ││                                                       ││                           │
+│                                ││                                                       ││                           │
+│                                ││                                                       ││                           │
+│                                ││                                                       ││                           │
+│                                ││                                                       ││                           │
+│                                ││                                                       ││                           │
+│                                ││                                                       ││                           │
+│                                ││                                                       ││                           │
+│                                ││                                                       ││                           │
+└────────────────────────────────┘└───────────────────────────────────────────────────────┘└───────────────────────────┘

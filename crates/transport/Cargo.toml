@@ -1,0 +1,29 @@
+[package]
+name = "seamless-transport"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+seamless-input-protocol = { path = "../protocol" }
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "io-util"] }
+thiserror = "2"
+base64 = "0.22"
+bip39 = "2"
+hmac = "0.12"
+rand = "0.8"
+rcgen = "0.14"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+spake2 = "0.4"
+zeroize = "1"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security_Cryptography", "Win32_Storage_FileSystem"] }
+
+[dev-dependencies]
+seamless-discovery = { path = "../discovery" }
+tempfile = "3"

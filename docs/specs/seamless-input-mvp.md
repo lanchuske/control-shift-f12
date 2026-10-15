@@ -12,7 +12,7 @@ synchronizes text and PNG clipboards.
 - Every machine can capture local input, inject remote input, accept a connection,
   and initiate one. There are no permanent server or client roles.
 - Peers on the same LAN are discovered with mDNS/DNS-SD under
-  `_seamless-input._tcp.local`.
+  `_seamless-input._udp.local`, matching the QUIC transport.
 - A deterministic node-ID tie-breaker collapses simultaneous connections to one
   authenticated session.
 - If discovery is unavailable, users may connect by address. All peers use the
@@ -21,9 +21,12 @@ synchronizes text and PNG clipboards.
 ## Pairing
 
 - `seamless-input pair new` creates a short-lived six-word code and advertises
-  only that the node is pairable, never the code itself.
+  only that the node is pairable, never the code itself. It also prints the
+  temporary LAN address locally for manual fallback.
 - `seamless-input pair <six-word-code>` on another discovered machine runs a
   password-authenticated key exchange and mutually pins both device identities.
+- If mDNS is unavailable, `seamless-input pair <six-word-code> --address
+  <host:port>` runs the same authenticated exchange against the printed address.
 - Pairing is one-time. Later connections use mutual TLS 1.3 identities stored in
   the current user's config directory.
 - `seamless-input peers` lists paired, available, unavailable, and incompatible
@@ -50,6 +53,7 @@ synchronizes text and PNG clipboards.
 seamless-input start
 seamless-input pair new
 seamless-input pair <six-word-code>
+seamless-input pair <six-word-code> --address <host:port>
 seamless-input peers
 seamless-input unpair <peer>
 seamless-input tui
@@ -68,6 +72,14 @@ seamless-input config path
 
 ## Installation and permissions
 
+- Installation is one copyable terminal command per operating system. There is
+  no graphical wizard, `.pkg`, `.dmg`, `.msi`, or machine-wide package.
+- The bootstrap command downloads a pinned release installer over HTTPS; the
+  installer selects the native binary, verifies its published SHA-256 checksum,
+  installs it in the current user's directory, and updates only the user PATH.
+- Running the command again is idempotent. `seamless-input uninstall` removes
+  the user installation and its PATH entry without deleting paired identities
+  unless the user explicitly requests a full data removal.
 - macOS installer writes the binary under `~/.local/bin` and adds that directory
   to the user's shell PATH when missing.
 - Windows installer writes under `%LOCALAPPDATA%\\SeamlessInput\\bin` and updates
@@ -118,6 +130,27 @@ One Rust workspace produces one `seamless-input` binary and focused libraries:
 - Screenshots, general file transfer, audio, video, remote desktop, web UI,
   mobile platforms, Linux, login-screen control, and enterprise-policy evasion.
 
+## Open-source governance
+
+- The repository is public under the MIT license and welcomes issues, design
+  discussions, documentation, tests, and pull requests.
+- Contributions must preserve this specification's scope and security model.
+  A feature request outside the MVP belongs in a separate proposal and cannot
+  silently expand an implementation pull request.
+- Every behavior change requires tests, platform impact notes, and an explicit
+  statement about administrator privileges, user consent, networking, and data
+  handling.
+- Maintainers review and merge changes; public collaboration never grants
+  direct write access or bypasses CI, review, or release evidence.
+- GitHub Discussions receives questions, ideas, hardware compatibility reports,
+  and open-ended product feedback. Confirmed reproducible work is promoted to a
+  scoped Issue rather than leaving Discussions as an execution backlog.
+- Structured Issue Forms collect bugs and feature proposals. Security findings
+  use GitHub private vulnerability reporting and must not be filed publicly.
+- `seamless-input doctor --report` produces a local, redacted, copyable report;
+  it never uploads automatically and excludes clipboard contents, keys, user
+  names, addresses, and stable machine identifiers.
+
 ## Acceptance evidence
 
 - Unit tests cover framing limits, PAKE expiry/replay, identity pinning, discovery
@@ -125,6 +158,9 @@ One Rust workspace produces one `seamless-input` binary and focused libraries:
   clipboard-loop prevention.
 - TUI snapshot tests cover every cardinal placement and multi-display peers.
 - Installer tests prove user-only destinations and PATH updates with no elevation.
+- Clean-user smoke tests prove each operating system installs from exactly one
+  terminal command, verifies the checksum, works from a new terminal, upgrades
+  idempotently, and uninstalls without a GUI or administrator prompt.
 - Platform integration tests prove normal-session capture/injection and safe
   permission-denied behavior, including a degraded mode when macOS Accessibility
   or pasteboard consent is unavailable.

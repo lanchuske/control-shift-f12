@@ -10,6 +10,11 @@ without administrator privileges.
 > defined, but there is no supported release to install yet. Follow the
 > repository or join a Discussion if you want to help shape and test it.
 
+SeamlessInput is an independent project and is not affiliated with Apple or
+Microsoft. It is designed as a lightweight cross-platform alternative for
+workflows commonly associated with Apple Universal Control and Microsoft Mouse
+Without Borders, while keeping a single purpose and a no-admin installation.
+
 ## Why this project exists
 
 Moving between two computers should feel like moving between two monitors. You
@@ -128,7 +133,7 @@ The intended workflow is:
 4. Open the TUI and place each display in its physical position.
 5. Move the pointer through an edge and keep working.
 
-Exact installation commands will be published only with a checksummed release.
+Exact one-line installation commands will be published only with a checksummed release.
 Do not run installation commands posted in issues, comments, or unofficial
 forks.
 
@@ -191,11 +196,12 @@ MVP must be proposed separately rather than bundled into an unrelated change.
 - [Ask a question or propose an idea](https://github.com/lanchuske/seamless-input/discussions)
 - [Report a reproducible bug](https://github.com/lanchuske/seamless-input/issues)
 - [Read the MVP specification](docs/specs/seamless-input-mvp.md)
+- [Choose the right feedback channel](docs/feedback.md)
 
-Contributor guidelines, issue forms, the security policy, and the code of
-conduct will be added before the first public beta.
+- [Read the contributor guide](CONTRIBUTING.md)
+- [Read the security policy](SECURITY.md)
+- [Use the release and QA runbook](docs/runbook.md)
 
 ## License
 
-SeamlessInput is intended to be released under the MIT License. The license file
-will be included before the first source release.
+SeamlessInput is available under the MIT License. See [LICENSE](LICENSE).

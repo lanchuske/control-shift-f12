@@ -1,0 +1,36 @@
+[package]
+name = "seamless-input"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+clap.workspace = true
+ratatui.workspace = true
+crossterm.workspace = true
+rand.workspace = true
+serde.workspace = true
+rmp-serde.workspace = true
+toml.workspace = true
+seamless-input-core = { path = "../../crates/core" }
+seamless-input-protocol = { path = "../../crates/protocol" }
+seamless-discovery = { path = "../../crates/discovery" }
+seamless-transport = { path = "../../crates/transport" }
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
+tokio.workspace = true
+thiserror = "2"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+seamless-input-platform-macos = { path = "../../crates/platform-macos" }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Storage_FileSystem"] }
+seamless-input-platform-windows = { path = "../../crates/platform-windows" }
+
+[dev-dependencies]
+insta = "1.42"
+tempfile = "3.14"
+
+[[bin]]
+name = "seamless-input"
+path = "src/main.rs"
