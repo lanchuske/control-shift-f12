@@ -70,6 +70,7 @@ pub struct PeerSession {
     dial_nonce: u64,
     trust: SessionTrust,
     connection: quinn::Connection,
+    send_lock: Arc<tokio::sync::Mutex<()>>,
 }
 impl PeerSession {
     pub fn peer(&self) -> NodeId {
@@ -89,6 +90,59 @@ impl PeerSession {
     }
     pub fn authenticated_connection(&self) -> Option<&quinn::Connection> {
         (self.trust == SessionTrust::Authenticated).then_some(&self.connection)
+    }
+
+    /// Send one bounded application packet on its own QUIC stream. Streams
+    /// avoid head-of-line blocking between input and clipboard traffic while
+    /// the application protocol retains ordering and lease validation.
+    pub async fn send_packet(&self, payload: &[u8]) -> Result<(), TransportError> {
+        const MAX_PACKET_BYTES: usize = 8 * 1024 * 1024 + 64 * 1024;
+        if payload.len() > MAX_PACKET_BYTES {
+            return Err(TransportError::InvalidOptions);
+        }
+        let _guard = self.send_lock.lock().await;
+        let mut stream = self
+            .connection
+            .open_uni()
+            .await
+            .map_err(|_| TransportError::Unavailable)?;
+        stream
+            .write_all(&(payload.len() as u32).to_be_bytes())
+            .await
+            .map_err(|_| TransportError::Unavailable)?;
+        stream
+            .write_all(payload)
+            .await
+            .map_err(|_| TransportError::Unavailable)?;
+        stream.finish().map_err(|_| TransportError::Unavailable)
+    }
+
+    /// Read one bounded application packet. Peer close and malformed lengths
+    /// fail closed; callers then run the runtime disconnect recovery path.
+    pub async fn read_packet(&self) -> Result<Vec<u8>, TransportError> {
+        const MAX_PACKET_BYTES: usize = 8 * 1024 * 1024 + 64 * 1024;
+        let mut stream = self
+            .connection
+            .accept_uni()
+            .await
+            .map_err(|_| TransportError::Unavailable)?;
+        let mut prefix = [0_u8; 4];
+        stream
+            .read_exact(&mut prefix)
+            .await
+            .map_err(|_| TransportError::Unavailable)?;
+        let length = u32::from_be_bytes(prefix) as usize;
+        if length > MAX_PACKET_BYTES {
+            self.connection
+                .close(1u32.into(), b"application packet too large");
+            return Err(TransportError::InvalidOptions);
+        }
+        let mut payload = vec![0_u8; length];
+        stream
+            .read_exact(&mut payload)
+            .await
+            .map_err(|_| TransportError::Unavailable)?;
+        Ok(payload)
     }
 }
 
@@ -165,7 +219,7 @@ impl PeerEndpoint {
                 .map_err(|_| TransportError::InvalidOptions)?,
         ));
         transport.max_concurrent_bidi_streams(8u32.into());
-        transport.max_concurrent_uni_streams(0u32.into());
+        transport.max_concurrent_uni_streams(32u32.into());
         let transport = Arc::new(transport);
         server.transport_config(transport.clone());
         client.transport_config(transport);
@@ -378,6 +432,7 @@ async fn negotiate_inner(
         dial_nonce,
         trust,
         connection: connection.clone(),
+        send_lock: Arc::new(tokio::sync::Mutex::new(())),
     };
     let rank = |session: &PeerSession| {
         (

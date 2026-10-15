@@ -130,6 +130,49 @@ async fn exercise(discovery_enabled: bool) {
     reader.join().unwrap();
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn authenticated_session_carries_application_packets_in_both_directions() {
+    let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+    let der = cert.cert.der().to_vec();
+    let key = cert.signing_key.serialize_der();
+    let (server_a, client_a) = support::configs_from_der(der.clone(), key.clone());
+    let (server_b, client_b) = support::configs_from_der(der, key);
+    let a = PeerEndpoint::bind(
+        "127.0.0.1:0".parse().unwrap(),
+        NodeId([1; 16]),
+        server_a,
+        client_a,
+        EndpointOptions::default(),
+    )
+    .unwrap();
+    let b = PeerEndpoint::bind(
+        "127.0.0.1:0".parse().unwrap(),
+        NodeId([2; 16]),
+        server_b,
+        client_b,
+        EndpointOptions::default(),
+    )
+    .unwrap();
+
+    let a_session = a
+        .dial(b.local_addr(), "localhost", Some(NodeId([2; 16])))
+        .await
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let b_session = loop {
+        if let Some(session) = b.sessions().into_iter().next() {
+            break session;
+        }
+        assert!(Instant::now() < deadline);
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    };
+
+    a_session.send_packet(b"input-event").await.unwrap();
+    assert_eq!(b_session.read_packet().await.unwrap(), b"input-event");
+    b_session.send_packet(b"heartbeat").await.unwrap();
+    assert_eq!(a_session.read_packet().await.unwrap(), b"heartbeat");
+}
+
 // Invoked only as a separate process by the two parent tests above.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "subprocess helper"]

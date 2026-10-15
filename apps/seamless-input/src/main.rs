@@ -112,7 +112,7 @@ async fn run(cli: Cli) -> Result<(), OperationalError> {
 
 async fn start(paths: &AppPaths) -> Result<(), OperationalError> {
     let mut supervisor = NativeSupervisor::bootstrap(paths)?;
-    let state = supervisor.tick()?;
+    let state = supervisor.tick().await?;
     println!(
         "SeamlessInput running: {} display(s), {} authenticated session(s)",
         state.displays, state.authenticated_sessions
@@ -123,7 +123,7 @@ async fn start(paths: &AppPaths) -> Result<(), OperationalError> {
     let mut interval = tokio::time::interval(Duration::from_millis(250));
     loop {
         tokio::select! {
-            _ = interval.tick() => { supervisor.tick()?; }
+            _ = interval.tick() => { supervisor.tick().await?; }
             result = tokio::signal::ctrl_c() => {
                 result.map_err(|error| OperationalError(error.to_string()))?;
                 return Ok(());

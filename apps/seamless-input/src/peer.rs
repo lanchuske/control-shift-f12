@@ -1,8 +1,9 @@
 use seamless_input_core::clipboard::ClipboardTransfer;
 use seamless_input_protocol::{InputEvent, NodeId};
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Capabilities {
     pub input: bool,
     pub text: bool,
@@ -25,9 +26,12 @@ impl Capabilities {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum PeerMessage {
-    Capabilities(Capabilities),
+    Capabilities {
+        epoch: u64,
+        capabilities: Capabilities,
+    },
     AcquireLease {
         epoch: u64,
     },
@@ -49,6 +53,17 @@ pub enum PeerMessage {
     },
 }
 
+pub fn encode_peer_message(message: &PeerMessage) -> Result<Vec<u8>, String> {
+    rmp_serde::to_vec(message).map_err(|_| "peer message encoding failed".into())
+}
+
+pub fn decode_peer_message(bytes: &[u8]) -> Result<PeerMessage, String> {
+    if bytes.len() > seamless_input_protocol::MAX_FRAME_BYTES + 64 * 1024 {
+        return Err("peer message exceeds the wire limit".into());
+    }
+    rmp_serde::from_slice(bytes).map_err(|_| "peer message decoding failed".into())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LeaseError {
     UnknownPeer,
@@ -61,7 +76,8 @@ pub enum LeaseError {
 
 #[derive(Debug, Clone)]
 struct PeerState {
-    epoch: u64,
+    local_epoch: u64,
+    remote_epoch: Option<u64>,
     remote: Capabilities,
     negotiated: Capabilities,
     last_sequence: Option<u64>,
@@ -93,7 +109,8 @@ impl PeerRegistry {
         self.peers.insert(
             peer,
             PeerState {
-                epoch,
+                local_epoch: epoch,
+                remote_epoch: None,
                 remote,
                 negotiated: remote,
                 last_sequence: None,
@@ -111,12 +128,12 @@ impl PeerRegistry {
         Ok(p.negotiated)
     }
     pub fn epoch(&self, peer: NodeId) -> Option<u64> {
-        self.peers.get(&peer).map(|p| p.epoch)
+        self.peers.get(&peer).map(|p| p.local_epoch)
     }
     pub fn peers(&self) -> impl Iterator<Item = (NodeId, u64, Capabilities)> + '_ {
         self.peers
             .iter()
-            .map(|(id, p)| (*id, p.epoch, p.negotiated))
+            .map(|(id, p)| (*id, p.local_epoch, p.negotiated))
     }
     pub fn disconnected(&mut self, peer: NodeId) {
         self.peers.remove(&peer);
@@ -127,19 +144,25 @@ impl PeerRegistry {
     pub fn receive(&mut self, peer: NodeId, message: PeerMessage) -> Result<(), LeaseError> {
         let state = self.peers.get_mut(&peer).ok_or(LeaseError::UnknownPeer)?;
         let epoch = match &message {
-            PeerMessage::Capabilities(_) => state.epoch,
+            PeerMessage::Capabilities { epoch, .. } => *epoch,
             PeerMessage::AcquireLease { epoch }
             | PeerMessage::ReleaseLease { epoch }
             | PeerMessage::Heartbeat { epoch }
             | PeerMessage::Input { epoch, .. }
             | PeerMessage::Clipboard { epoch, .. } => *epoch,
         };
-        if epoch != state.epoch {
+        if !matches!(&message, PeerMessage::Capabilities { .. })
+            && state.remote_epoch != Some(epoch)
+        {
             return Err(LeaseError::WrongEpoch);
         }
         match message {
-            PeerMessage::Capabilities(c) => {
-                state.negotiated = state.remote.intersect(c);
+            PeerMessage::Capabilities {
+                epoch,
+                capabilities,
+            } => {
+                state.remote_epoch = Some(epoch);
+                state.negotiated = state.remote.intersect(capabilities);
             }
             PeerMessage::AcquireLease { .. } => match self.lease {
                 None => self.lease = Some((peer, epoch)),

@@ -2,8 +2,8 @@ use std::{
     io::{BufRead, BufReader, Read},
     process::{Command, Stdio},
     sync::{
-        atomic::{AtomicU64, Ordering},
         Mutex, MutexGuard, OnceLock,
+        atomic::{AtomicU64, Ordering},
     },
     thread,
     time::{Duration, Instant},
