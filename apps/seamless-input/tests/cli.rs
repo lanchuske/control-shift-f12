@@ -356,7 +356,10 @@ fn server_and_client_roles_are_rejected_as_usage_errors() {
             "unexpected stderr: {stderr}"
         );
         assert!(
-            stderr.contains("Usage: seamless-input <COMMAND>"),
+            stderr.contains(&format!(
+                "Usage: seamless-input{} <COMMAND>",
+                std::env::consts::EXE_SUFFIX
+            )),
             "unexpected stderr: {stderr}"
         );
     }
