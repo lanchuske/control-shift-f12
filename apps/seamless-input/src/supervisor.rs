@@ -133,7 +133,7 @@ pub enum SupervisorError {
     #[error("peer data plane failed: {0}")]
     DataPlane(String),
     #[error(
-        "native input capture could not start: {0}. Enable input access for SeamlessInput and restart it"
+        "native input capture could not start: {0}. Enable input access for Control Shift F12 and restart it"
     )]
     Capture(String),
 }

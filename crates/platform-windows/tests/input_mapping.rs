@@ -310,7 +310,7 @@ fn low_level_mouse_hook_maps_buttons_wheel_and_pointer() {
 #[test]
 fn emergency_chord_returns_local_and_releases_held_state() {
     let (mut input, injected) = windows_input(input::DesktopState::Interactive);
-    for modifier in [Modifier::Control, Modifier::Alt, Modifier::Meta] {
+    for modifier in [Modifier::Control, Modifier::Shift] {
         input.capture_local(
             InputEvent::Modifier {
                 modifier,

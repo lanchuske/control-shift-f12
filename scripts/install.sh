@@ -72,7 +72,7 @@ if [ "${actual}" != "${checksum}" ]; then
   printf '%s\n' "Checksum verification failed; existing installation was not changed." >&2
   exit 1
 fi
-if ! gh attestation verify "${tmp}" --repo lanchuske/seamless-input --bundle "${attestation_tmp}" --source-ref "refs/tags/${expected_tag}" >/dev/null; then
+if ! gh attestation verify "${tmp}" --repo lanchuske/control-shift-f12 --bundle "${attestation_tmp}" --source-ref "refs/tags/${expected_tag}" >/dev/null; then
   printf '%s\n' "Provenance verification failed; existing installation was not changed." >&2
   exit 1
 fi

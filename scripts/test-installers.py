@@ -140,7 +140,7 @@ class InstallerContractTests(unittest.TestCase):
         for text in (shell, powershell):
             self.assertIn("attestation", text)
             self.assertIn("gh", text)
-            self.assertIn("lanchuske/seamless-input", text)
+            self.assertIn("lanchuske/control-shift-f12", text)
 
     def test_release_and_installers_bind_provenance_to_the_exact_reviewed_tag(self):
         release = (ROOT / ".github/workflows/release.yml").read_text().lower()

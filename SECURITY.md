@@ -1,7 +1,7 @@
 # Security policy
 
 Please do not open a public Issue for a suspected vulnerability. Use GitHub's
-[private vulnerability reporting](https://github.com/lanchuske/seamless-input/security/advisories/new).
+[private vulnerability reporting](https://github.com/lanchuske/control-shift-f12/security/advisories/new).
 
 Include the affected version, platform, impact, and minimal reproduction. Never
 send private keys, credentials, clipboard contents, or unrelated machine data.

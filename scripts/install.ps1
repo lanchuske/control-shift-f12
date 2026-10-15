@@ -53,7 +53,7 @@ if ((Get-FileHash -Algorithm SHA256 -LiteralPath $Temp).Hash -ne $Sha256) {
     Remove-Item -LiteralPath $AttestationTemp -Force -ErrorAction SilentlyContinue
     throw 'Checksum verification failed; existing installation was not changed.'
 }
-& gh attestation verify $Temp --repo lanchuske/seamless-input --bundle $AttestationTemp --source-ref "refs/tags/$ExpectedTag" | Out-Null
+& gh attestation verify $Temp --repo lanchuske/control-shift-f12 --bundle $AttestationTemp --source-ref "refs/tags/$ExpectedTag" | Out-Null
 if ($LASTEXITCODE -ne 0) {
     Remove-Item -LiteralPath $Temp -Force -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath $AttestationTemp -Force -ErrorAction SilentlyContinue

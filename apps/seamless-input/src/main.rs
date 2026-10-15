@@ -21,7 +21,7 @@ const EXIT_OPERATIONAL_FAILURE: u8 = 1;
 #[command(
     name = "seamless-input",
     version,
-    about = "Symmetric peer input sharing"
+    about = "Control Shift F12 — symmetric peer input sharing"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -30,7 +30,7 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
-    /// Start this machine as a SeamlessInput peer.
+    /// Start this machine as a Control Shift F12 peer.
     Start,
     /// Pair this machine with another peer.
     Pair(PairArgs),
@@ -117,7 +117,7 @@ async fn start(paths: &AppPaths) -> Result<(), OperationalError> {
     let mut supervisor = NativeSupervisor::bootstrap(paths)?;
     let state = supervisor.tick().await?;
     println!(
-        "SeamlessInput running: {} display(s), {} authenticated session(s)",
+        "Control Shift F12 running: {} display(s), {} authenticated session(s)",
         state.displays, state.authenticated_sessions
     );
     io::stdout()
@@ -332,12 +332,12 @@ fn config(paths: &AppPaths, command: ConfigCommands) -> Result<(), OperationalEr
 fn doctor(paths: &AppPaths, report: bool) {
     let measured = CapabilityReport::measure(paths);
     if report {
-        println!("SeamlessInput diagnostic report");
+        println!("Control Shift F12 diagnostic report");
         println!("privacy: redacted");
         println!("platform: {}", std::env::consts::OS);
         println!("permissions: measured in current user session");
     } else {
-        println!("SeamlessInput doctor");
+        println!("Control Shift F12 doctor");
         println!("administrator elevation: not required");
         println!("user consent: checked separately from administrator elevation");
     }

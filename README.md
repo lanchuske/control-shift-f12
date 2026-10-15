@@ -1,41 +1,44 @@
-# SeamlessInput
+# Control Shift F12
 
 ### One mouse and keyboard. Every Mac and Windows PC on your desk.
 
-[![CI](https://github.com/lanchuske/seamless-input/actions/workflows/ci.yml/badge.svg)](https://github.com/lanchuske/seamless-input/actions/workflows/ci.yml)
+[![CI](https://github.com/lanchuske/control-shift-f12/actions/workflows/ci.yml/badge.svg)](https://github.com/lanchuske/control-shift-f12/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![QA Preview](https://img.shields.io/badge/release-QA%20Preview-orange.svg)](https://github.com/lanchuske/seamless-input/releases/tag/v0.1.0)
+[![QA Preview](https://img.shields.io/badge/release-QA%20Preview-orange.svg)](https://github.com/lanchuske/control-shift-f12/releases/tag/v0.1.0)
 
-SeamlessInput is an open-source software KVM that lets one mouse, keyboard, and
+Control Shift F12 is an open-source software KVM that lets one mouse, keyboard, and
 clipboard move across nearby macOS and Windows computers. It is peer to peer,
 encrypted, terminal first, and designed to run without administrator access or
 a cloud account.
+
+Press **Control + Shift + F12** on either computer to recover local control at
+any time. The shortcut is also the product name, so it is easy to remember.
 
 > **Early QA preview.** The automated suite runs on Apple Silicon, Intel Mac,
 > and Windows x64. Physical end-to-end behavior between a real Mac and Windows
 > PC is still **NOT MEASURED**. Help us test it, but do not treat this build as
 > production ready.
 
-[Download SeamlessInput v0.1.0 QA Preview](https://github.com/lanchuske/seamless-input/releases/tag/v0.1.0)
-· [Report a bug](https://github.com/lanchuske/seamless-input/issues/new/choose)
-· [Share an idea](https://github.com/lanchuske/seamless-input/discussions)
-· [Star the project](https://github.com/lanchuske/seamless-input)
+[Download Control Shift F12 v0.1.0 QA Preview](https://github.com/lanchuske/control-shift-f12/releases/tag/v0.1.0)
+· [Report a bug](https://github.com/lanchuske/control-shift-f12/issues/new/choose)
+· [Share an idea](https://github.com/lanchuske/control-shift-f12/discussions)
+· [Star the project](https://github.com/lanchuske/control-shift-f12)
 
-## Download SeamlessInput v0.1.0 QA Preview
+## Download Control Shift F12 v0.1.0 QA Preview
 
 Version **v0.1.0** is the current public QA Preview. Choose one of the two
 installers below.
 
 | Computer | QA Preview download |
 | --- | --- |
-| Mac — Universal for Apple Silicon and Intel | [Download the universal DMG](https://github.com/lanchuske/seamless-input/releases/download/v0.1.0/SeamlessInput-v0.1.0-universal.dmg) |
-| Windows — x64 | [Download the Windows installer](https://github.com/lanchuske/seamless-input/releases/download/v0.1.0/SeamlessInput-v0.1.0-windows-x64.exe) |
+| Mac — Universal for Apple Silicon and Intel | [Download the universal DMG](https://github.com/lanchuske/control-shift-f12/releases/download/v0.1.0/SeamlessInput-v0.1.0-universal.dmg) |
+| Windows — x64 | [Download the Windows installer](https://github.com/lanchuske/control-shift-f12/releases/download/v0.1.0/SeamlessInput-v0.1.0-windows-x64.exe) |
 
 Checksums, provenance attestations, source archives, and older raw binaries are
-on the [release page](https://github.com/lanchuske/seamless-input/releases/tag/v0.1.0).
+on the [release page](https://github.com/lanchuske/control-shift-f12/releases/tag/v0.1.0).
 For the current QA, use the two installers linked above.
 
-## Why SeamlessInput
+## Why Control Shift F12
 
 - **One continuous desk.** Push the pointer through a screen edge and keep
   typing on the other computer.
@@ -45,7 +48,7 @@ For the current QA, use the two installers linked above.
   network over mutually authenticated, encrypted connections.
 - **No cloud account.** Discovery happens locally, with manual addressing as a
   fallback.
-- **No administrator install.** SeamlessInput stays in the signed-in user's
+- **No administrator install.** Control Shift F12 stays in the signed-in user's
   account and does not add a service, driver, or firewall rule.
 - **Open source.** Inspect the protocol, contribute fixes, and help validate
   real hardware under the MIT license.
@@ -107,7 +110,7 @@ addresses, or stable machine identifiers into a public issue.
 
 ## Security and privacy
 
-SeamlessInput does not install a system service or driver, change firewall or
+Control Shift F12 does not install a system service or driver, change firewall or
 enterprise policy, request administrator elevation, or bypass an operating
 system restriction. macOS requires explicit Accessibility permission for
 global input. Windows support is limited to the current user's normal desktop;
@@ -129,8 +132,8 @@ and recovery paths are implemented. The immediate priorities are:
 - file drag and drop, mobile clients, application continuity, and optional
   pointer assistance after the core experience is proven.
 
-Follow the [open roadmap issues](https://github.com/lanchuske/seamless-input/issues)
-or join a [design discussion](https://github.com/lanchuske/seamless-input/discussions).
+Follow the [open roadmap issues](https://github.com/lanchuske/control-shift-f12/issues)
+or join a [design discussion](https://github.com/lanchuske/control-shift-f12/discussions).
 
 ## Contributing
 
@@ -160,14 +163,14 @@ clear. All changes go through review and the protected CI matrix.
 
 ### Is this like Apple Universal Control or Microsoft Mouse Without Borders?
 
-SeamlessInput targets the same multi-computer mouse and keyboard workflow, but
+Control Shift F12 targets the same multi-computer mouse and keyboard workflow, but
 it is an independent open-source project built for mixed Mac and Windows desks.
 It is not affiliated with Apple or Microsoft.
 
-### Is SeamlessInput a remote desktop app?
+### Is Control Shift F12 a remote desktop app?
 
 No. It does not stream screens, audio, or video. Each computer keeps using its
-own display; SeamlessInput shares input and clipboard data only.
+own display; Control Shift F12 shares input and clipboard data only.
 
 ### Does it require administrator privileges?
 
@@ -187,4 +190,4 @@ support belong to the post-QA roadmap.
 
 ## License
 
-SeamlessInput is available under the [MIT License](LICENSE).
+Control Shift F12 is available under the [MIT License](LICENSE).
