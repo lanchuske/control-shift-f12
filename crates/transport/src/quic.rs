@@ -5,7 +5,7 @@ pub fn canonical_initiator(local: NodeId, remote: NodeId) -> NodeId {
 }
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     net::SocketAddr,
     sync::{
         Arc, Mutex,
@@ -131,6 +131,7 @@ struct EndpointState {
     id: NodeId,
     options: EndpointOptions,
     sessions: Mutex<BTreeMap<NodeId, PeerSession>>,
+    revoked: Mutex<BTreeSet<NodeId>>,
     nonce: AtomicU64,
 }
 
@@ -175,6 +176,7 @@ impl PeerEndpoint {
             id,
             options,
             sessions: Mutex::new(BTreeMap::new()),
+            revoked: Mutex::new(BTreeSet::new()),
             nonce: AtomicU64::new(1),
         });
         let incoming_endpoint = endpoint.clone();
@@ -246,6 +248,15 @@ impl PeerEndpoint {
         let mut sessions = self.state.sessions.lock().unwrap();
         sessions.retain(|_, session| !session.is_closed());
         sessions.values().cloned().collect()
+    }
+    /// Revoke admission immediately: close and forget any live connection and
+    /// reject subsequent handshakes even if this endpoint's TLS verifier was
+    /// built before the durable pairing store changed.
+    pub fn revoke(&self, peer: NodeId) {
+        self.state.revoked.lock().unwrap().insert(peer);
+        if let Some(session) = self.state.sessions.lock().unwrap().remove(&peer) {
+            session.connection.close(1u32.into(), b"peer unpaired");
+        }
     }
     /// Retry only transient reachability errors. Trust/version failures never
     /// trigger another attempt. The caller decides when a disconnect warrants
@@ -327,7 +338,10 @@ async fn negotiate_inner(
         return Err(TransportError::VersionMismatch);
     }
     let peer = NodeId(remote[2..18].try_into().unwrap());
-    if peer == state.id || expected.is_some_and(|id| id != peer) {
+    if peer == state.id
+        || expected.is_some_and(|id| id != peer)
+        || state.revoked.lock().unwrap().contains(&peer)
+    {
         return Err(TransportError::IdentityRejected);
     }
     let trust = if let Some(verifier) = &state.options.verifier {

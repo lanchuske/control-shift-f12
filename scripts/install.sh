@@ -32,8 +32,13 @@ asset_url="${SEAMLESS_INPUT_ASSET_URL:-}"
 checksum="${SEAMLESS_INPUT_SHA256:-}"
 attestation="${SEAMLESS_INPUT_ATTESTATION_FILE:-}"
 attestation_url="${SEAMLESS_INPUT_ATTESTATION_URL:-}"
-if [ -z "${checksum}" ] || { [ -z "${asset}" ] && [ -z "${asset_url}" ]; } || { [ -z "${attestation}" ] && [ -z "${attestation_url}" ]; }; then
+expected_tag="${SEAMLESS_INPUT_EXPECTED_TAG:-}"
+if [ -z "${checksum}" ] || [ -z "${expected_tag}" ] || { [ -z "${asset}" ] && [ -z "${asset_url}" ]; } || { [ -z "${attestation}" ] && [ -z "${attestation_url}" ]; }; then
   printf '%s\n' "Provide a release asset, its SHA-256, and its GitHub provenance attestation." >&2
+  exit 2
+fi
+if ! printf '%s' "${expected_tag}" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+  printf '%s\n' "Expected tag must be a reviewed semantic release tag." >&2
   exit 2
 fi
 if ! command -v gh >/dev/null 2>&1; then
@@ -67,7 +72,7 @@ if [ "${actual}" != "${checksum}" ]; then
   printf '%s\n' "Checksum verification failed; existing installation was not changed." >&2
   exit 1
 fi
-if ! gh attestation verify "${tmp}" --repo lanchuske/seamless-input --bundle "${attestation_tmp}" >/dev/null; then
+if ! gh attestation verify "${tmp}" --repo lanchuske/seamless-input --bundle "${attestation_tmp}" --source-ref "refs/tags/${expected_tag}" >/dev/null; then
   printf '%s\n' "Provenance verification failed; existing installation was not changed." >&2
   exit 1
 fi

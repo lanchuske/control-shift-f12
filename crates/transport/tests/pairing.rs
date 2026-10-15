@@ -371,6 +371,20 @@ async fn peer_endpoint_marks_mutually_pinned_session_authenticated() {
         assert!(tokio::time::Instant::now() < deadline);
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
+
+    alice_endpoint.revoke(bob.node_id());
+    assert!(alice_endpoint.sessions().is_empty());
+    assert!(
+        bob_endpoint
+            .dial(
+                alice_endpoint.local_addr(),
+                "seamless-input.local",
+                Some(alice.node_id()),
+            )
+            .await
+            .is_err(),
+        "a revoked peer must not be readmitted by a stale endpoint verifier"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

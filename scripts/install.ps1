@@ -4,7 +4,8 @@ param(
     [string]$AssetUrl = $env:SEAMLESS_INPUT_ASSET_URL,
     [string]$Sha256 = $env:SEAMLESS_INPUT_SHA256,
     [string]$AttestationFile = $env:SEAMLESS_INPUT_ATTESTATION_FILE,
-    [string]$AttestationUrl = $env:SEAMLESS_INPUT_ATTESTATION_URL
+    [string]$AttestationUrl = $env:SEAMLESS_INPUT_ATTESTATION_URL,
+    [string]$ExpectedTag = $env:SEAMLESS_INPUT_EXPECTED_TAG
 )
 $ErrorActionPreference = 'Stop'
 $InstallDir = Join-Path $env:LOCALAPPDATA 'SeamlessInput\bin'
@@ -18,8 +19,11 @@ if ($Uninstall) {
     Write-Host 'Removed the SeamlessInput executable. Pairing identities and configuration were preserved.'
     exit 0
 }
-if ((-not $AssetFile -and -not $AssetUrl) -or -not $Sha256 -or (-not $AttestationFile -and -not $AttestationUrl)) {
+if ((-not $AssetFile -and -not $AssetUrl) -or -not $Sha256 -or -not $ExpectedTag -or (-not $AttestationFile -and -not $AttestationUrl)) {
     throw 'Provide a release asset, its SHA-256, and its GitHub provenance attestation.'
+}
+if ($ExpectedTag -notmatch '^v[0-9]+\.[0-9]+\.[0-9]+$') {
+    throw 'Expected tag must be a reviewed semantic release tag.'
 }
 if (-not (Get-Command gh -ErrorAction SilentlyContinue)) {
     throw 'GitHub CLI is required to verify release provenance.'
@@ -49,7 +53,7 @@ if ((Get-FileHash -Algorithm SHA256 -LiteralPath $Temp).Hash -ne $Sha256) {
     Remove-Item -LiteralPath $AttestationTemp -Force -ErrorAction SilentlyContinue
     throw 'Checksum verification failed; existing installation was not changed.'
 }
-& gh attestation verify $Temp --repo lanchuske/seamless-input --bundle $AttestationTemp | Out-Null
+& gh attestation verify $Temp --repo lanchuske/seamless-input --bundle $AttestationTemp --source-ref "refs/tags/$ExpectedTag" | Out-Null
 if ($LASTEXITCODE -ne 0) {
     Remove-Item -LiteralPath $Temp -Force -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath $AttestationTemp -Force -ErrorAction SilentlyContinue

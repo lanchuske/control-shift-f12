@@ -1,8 +1,11 @@
 use std::{
     process::{Command, Stdio},
+    sync::atomic::{AtomicU64, Ordering},
     thread,
     time::Duration,
 };
+
+static TEST_HOME_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 fn run(args: &[&str]) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_seamless-input"))
@@ -14,12 +17,18 @@ fn run(args: &[&str]) -> std::process::Output {
 
 fn test_home() -> std::path::PathBuf {
     let path = std::env::temp_dir().join(format!(
-        "seamless-input-cli-{}-{}",
+        "seamless-input-cli-{}-{}-{}",
         std::process::id(),
-        std::thread::current().name().unwrap_or("test")
+        std::thread::current().name().unwrap_or("test"),
+        TEST_HOME_SEQUENCE.fetch_add(1, Ordering::Relaxed),
     ));
     let _ = std::fs::remove_dir_all(&path);
     path
+}
+
+#[test]
+fn concurrent_cli_tests_receive_distinct_homes() {
+    assert_ne!(test_home(), test_home());
 }
 
 fn run_with_sensitive_environment(args: &[&str]) -> std::process::Output {
