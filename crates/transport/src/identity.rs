@@ -227,6 +227,37 @@ impl IdentityStore {
         ));
         Ok((server, client))
     }
+
+    /// TLS for the temporary pairing channel deliberately authenticates no
+    /// peer certificate. Peer identity is authenticated by the PAKE transcript
+    /// before either certificate is persisted as a pin.
+    pub fn temporary_pairing_server_config(&self) -> Result<quinn::ServerConfig, PairingError> {
+        use quinn::crypto::rustls::QuicServerConfig;
+        use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
+
+        let crypto = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![CertificateDer::from(self.certificate_der.clone())],
+                PrivatePkcs8KeyDer::from(self.private_key_der.clone()).into(),
+            )
+            .map_err(|_| PairingError::Tls)?;
+        Ok(quinn::ServerConfig::with_crypto(std::sync::Arc::new(
+            QuicServerConfig::try_from(crypto).map_err(|_| PairingError::Tls)?,
+        )))
+    }
+
+    pub fn temporary_pairing_client_config() -> Result<quinn::ClientConfig, PairingError> {
+        use quinn::crypto::rustls::QuicClientConfig;
+
+        let crypto = rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(PakeServerVerifier::new())
+            .with_no_client_auth();
+        Ok(quinn::ClientConfig::new(std::sync::Arc::new(
+            QuicClientConfig::try_from(crypto).map_err(|_| PairingError::Tls)?,
+        )))
+    }
     fn save_peers(&self, peers: &BTreeMap<NodeId, PinnedPeer>) -> Result<(), PairingError> {
         let stored: Vec<_> = peers
             .values()
@@ -238,6 +269,65 @@ impl IdentityStore {
             })
             .collect();
         write_private_json(&self.root.join(PEERS_FILE), &stored)
+    }
+}
+
+/// The certificate received here remains untrusted until PAKE confirms the
+/// certificate embedded in the pairing transcript. TLS signatures are still
+/// checked so the encrypted channel is internally consistent.
+#[derive(Debug)]
+struct PakeServerVerifier(std::sync::Arc<rustls::crypto::CryptoProvider>);
+
+impl PakeServerVerifier {
+    fn new() -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self(std::sync::Arc::new(
+            rustls::crypto::ring::default_provider(),
+        )))
+    }
+}
+
+impl rustls::client::danger::ServerCertVerifier for PakeServerVerifier {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        signature: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            signature,
+            &self.0.signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        signature: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            signature,
+            &self.0.signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.0.signature_verification_algorithms.supported_schemes()
     }
 }
 
