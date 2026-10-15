@@ -1,6 +1,6 @@
 use seamless_input::{
     peer::{
-        Capabilities, LeaseError, PeerMessage, PeerRegistry, decode_peer_message,
+        Capabilities, LeaseError, PeerMessage, PeerRegistry, RemoteDisplay, decode_peer_message,
         encode_peer_message,
     },
     runtime::{Runtime, RuntimeEffect, RuntimeReceive},
@@ -19,6 +19,17 @@ fn peer_messages_round_trip_for_the_production_data_plane() {
         },
         PeerMessage::AcquireLease { epoch: 7 },
         PeerMessage::Heartbeat { epoch: 7 },
+        PeerMessage::DisplayGeometry {
+            epoch: 7,
+            displays: vec![RemoteDisplay {
+                index: 3,
+                origin_x: -1920.0,
+                origin_y: 100.0,
+                width: 1920.0,
+                height: 1080.0,
+                scale: 1.25,
+            }],
+        },
         PeerMessage::Input {
             epoch: 7,
             sequence: 8,
@@ -45,6 +56,66 @@ fn deeply_nested_or_allocation_amplifying_messagepack_is_rejected() {
     // an allocation based on the declared count.
     let allocation_amplifier = [0xdd, 0xff, 0xff, 0xff, 0xff];
     assert!(decode_peer_message(&allocation_amplifier).is_err());
+}
+
+#[test]
+fn authenticated_geometry_is_validated_and_delivered_to_the_runtime() {
+    let mut runtime = Runtime::new(node(1), display(1).id, mesh3(), 1000).unwrap();
+    let epoch = admit(&mut runtime, 2, Capabilities::all());
+    let displays = vec![RemoteDisplay {
+        index: 0,
+        origin_x: -2560.0,
+        origin_y: -200.0,
+        width: 2560.0,
+        height: 1440.0,
+        scale: 1.5,
+    }];
+    assert_eq!(
+        runtime
+            .receive(
+                node(2),
+                PeerMessage::DisplayGeometry {
+                    epoch,
+                    displays: displays.clone()
+                },
+                0
+            )
+            .unwrap(),
+        RuntimeReceive::DisplayGeometry(displays)
+    );
+}
+
+#[test]
+fn invalid_or_duplicate_geometry_is_rejected_inside_the_authenticated_epoch() {
+    let mut peers = PeerRegistry::new(node(1));
+    peers.connected(node(2), Capabilities::all());
+    peers
+        .receive(
+            node(2),
+            PeerMessage::Capabilities {
+                epoch: 9,
+                capabilities: Capabilities::all(),
+            },
+        )
+        .unwrap();
+    let invalid = RemoteDisplay {
+        index: 0,
+        origin_x: 0.0,
+        origin_y: 0.0,
+        width: 0.0,
+        height: 100.0,
+        scale: 1.0,
+    };
+    assert_eq!(
+        peers.receive(
+            node(2),
+            PeerMessage::DisplayGeometry {
+                epoch: 9,
+                displays: vec![invalid]
+            }
+        ),
+        Err(LeaseError::InvalidGeometry)
+    );
 }
 use seamless_input_core::clipboard::{ClipboardDeduper, ClipboardPayload};
 use seamless_input_core::platform::{

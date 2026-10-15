@@ -27,6 +27,31 @@ impl Capabilities {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RemoteDisplay {
+    pub index: u32,
+    pub origin_x: f64,
+    pub origin_y: f64,
+    pub width: f64,
+    pub height: f64,
+    pub scale: f64,
+}
+
+impl RemoteDisplay {
+    pub fn is_valid(&self) -> bool {
+        self.origin_x.is_finite()
+            && self.origin_y.is_finite()
+            && self.width.is_finite()
+            && self.height.is_finite()
+            && self.scale.is_finite()
+            && self.width > 0.0
+            && self.height > 0.0
+            && self.scale > 0.0
+            && (self.origin_x + self.width).is_finite()
+            && (self.origin_y + self.height).is_finite()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum PeerMessage {
     Capabilities {
         epoch: u64,
@@ -56,6 +81,10 @@ pub enum PeerMessage {
     Displays {
         epoch: u64,
         displays: Vec<u32>,
+    },
+    DisplayGeometry {
+        epoch: u64,
+        displays: Vec<RemoteDisplay>,
     },
 }
 
@@ -186,6 +215,7 @@ pub enum LeaseError {
     Stale,
     CapabilityDenied,
     InvalidInput,
+    InvalidGeometry,
 }
 
 #[derive(Debug, Clone)]
@@ -259,6 +289,7 @@ impl PeerRegistry {
         let state = self.peers.get_mut(&peer).ok_or(LeaseError::UnknownPeer)?;
         let epoch = match &message {
             PeerMessage::Capabilities { epoch, .. } | PeerMessage::Displays { epoch, .. } => *epoch,
+            PeerMessage::DisplayGeometry { epoch, .. } => *epoch,
             PeerMessage::AcquireLease { epoch }
             | PeerMessage::ReleaseLease { epoch }
             | PeerMessage::Heartbeat { epoch }
@@ -281,6 +312,21 @@ impl PeerRegistry {
                 state.negotiated = state.remote.intersect(capabilities);
             }
             PeerMessage::Displays { .. } => {}
+            PeerMessage::DisplayGeometry { displays, .. } => {
+                if displays.is_empty()
+                    || displays.len() > 32
+                    || displays.iter().any(|display| !display.is_valid())
+                {
+                    return Err(LeaseError::InvalidGeometry);
+                }
+                let mut indexes = std::collections::BTreeSet::new();
+                if displays
+                    .iter()
+                    .any(|display| !indexes.insert(display.index))
+                {
+                    return Err(LeaseError::InvalidGeometry);
+                }
+            }
             PeerMessage::AcquireLease { .. } => match self.lease {
                 None => self.lease = Some((peer, epoch)),
                 Some((p, e)) if p == peer && e == epoch => {}
