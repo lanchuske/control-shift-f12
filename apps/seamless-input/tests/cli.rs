@@ -355,7 +355,7 @@ fn version_is_available() {
     assert!(output.status.success());
     assert_eq!(
         String::from_utf8(output.stdout).unwrap(),
-        "seamless-input 0.1.0\n"
+        format!("seamless-input {}\n", env!("CARGO_PKG_VERSION"))
     );
     assert_eq!(output.stderr, b"");
 }
