@@ -16,25 +16,24 @@ a cloud account.
 > PC is still **NOT MEASURED**. Help us test it, but do not treat this build as
 > production ready.
 
-[Download the QA Preview](https://github.com/lanchuske/seamless-input/releases/tag/v0.1.0)
+[Download SeamlessInput v0.1.0 QA Preview](https://github.com/lanchuske/seamless-input/releases/tag/v0.1.0)
 · [Report a bug](https://github.com/lanchuske/seamless-input/issues/new/choose)
 · [Share an idea](https://github.com/lanchuske/seamless-input/discussions)
 · [Star the project](https://github.com/lanchuske/seamless-input)
 
-## Download
+## Download SeamlessInput v0.1.0 QA Preview
 
-Choose the current binary for your computer. Friendly universal installers are
-[the next release priority](https://github.com/lanchuske/seamless-input/issues/9).
+Version **v0.1.0** is the current public QA Preview. Choose one of the two
+installers below.
 
 | Computer | QA Preview download |
 | --- | --- |
-| Mac with Apple Silicon — M1, M2, M3, M4 | [Download macOS arm64](https://github.com/lanchuske/seamless-input/releases/download/v0.1.0/seamless-input-aarch64-apple-darwin) |
-| Mac with Intel processor | [Download macOS Intel](https://github.com/lanchuske/seamless-input/releases/download/v0.1.0/seamless-input-x86_64-apple-darwin) |
-| Windows x64 | [Download Windows](https://github.com/lanchuske/seamless-input/releases/download/v0.1.0/seamless-input-x86_64-pc-windows-msvc.exe) |
+| Mac — Universal for Apple Silicon and Intel | [Download the universal DMG](https://github.com/lanchuske/seamless-input/releases/download/v0.1.0/SeamlessInput-v0.1.0-universal.dmg) |
+| Windows — x64 | [Download the Windows installer](https://github.com/lanchuske/seamless-input/releases/download/v0.1.0/SeamlessInput-v0.1.0-windows-x64.exe) |
 
-Checksums, provenance attestations, and source archives are on the
-[release page](https://github.com/lanchuske/seamless-input/releases/tag/v0.1.0).
-The current macOS downloads are command-line binaries, not DMG installers.
+Checksums, provenance attestations, source archives, and older raw binaries are
+on the [release page](https://github.com/lanchuske/seamless-input/releases/tag/v0.1.0).
+For the current QA, use the two installers linked above.
 
 ## Why SeamlessInput
 
