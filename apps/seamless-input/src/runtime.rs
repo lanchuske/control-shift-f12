@@ -21,6 +21,7 @@ pub enum RuntimeReceive {
     Input(InputEvent),
     Clipboard(ClipboardPayload),
     ReleaseInput,
+    Displays(Vec<u32>),
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RuntimeError {
@@ -44,6 +45,7 @@ pub fn apply_receive<I: PlatformInput, C: PlatformClipboard>(
     match received {
         RuntimeReceive::None => Ok(()),
         RuntimeReceive::ReleaseInput => input.release_all().map_err(ApplyError::Input),
+        RuntimeReceive::Displays(_) => Ok(()),
         RuntimeReceive::Input(event) => input.inject(&event).map_err(ApplyError::Input),
         RuntimeReceive::Clipboard(ClipboardPayload::Text(text)) => clipboard
             .write_remote(&ClipboardContent::Text(text))
@@ -168,6 +170,7 @@ impl Runtime {
                 self.controller.heartbeat(peer, now_ms)?;
                 Ok(RuntimeReceive::None)
             }
+            PeerMessage::Displays { displays, .. } => Ok(RuntimeReceive::Displays(displays)),
             PeerMessage::ReleaseLease { .. } => Ok(RuntimeReceive::ReleaseInput),
             PeerMessage::Capabilities { .. } | PeerMessage::AcquireLease { .. } => {
                 Ok(RuntimeReceive::None)

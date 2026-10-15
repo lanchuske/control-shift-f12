@@ -51,6 +51,12 @@ pub enum PeerMessage {
     Heartbeat {
         epoch: u64,
     },
+    /// Appended to preserve the MessagePack discriminants of the original
+    /// production data-plane messages.
+    Displays {
+        epoch: u64,
+        displays: Vec<u32>,
+    },
 }
 
 pub fn encode_peer_message(message: &PeerMessage) -> Result<Vec<u8>, String> {
@@ -144,15 +150,17 @@ impl PeerRegistry {
     pub fn receive(&mut self, peer: NodeId, message: PeerMessage) -> Result<(), LeaseError> {
         let state = self.peers.get_mut(&peer).ok_or(LeaseError::UnknownPeer)?;
         let epoch = match &message {
-            PeerMessage::Capabilities { epoch, .. } => *epoch,
+            PeerMessage::Capabilities { epoch, .. } | PeerMessage::Displays { epoch, .. } => *epoch,
             PeerMessage::AcquireLease { epoch }
             | PeerMessage::ReleaseLease { epoch }
             | PeerMessage::Heartbeat { epoch }
             | PeerMessage::Input { epoch, .. }
             | PeerMessage::Clipboard { epoch, .. } => *epoch,
         };
-        if !matches!(&message, PeerMessage::Capabilities { .. })
-            && state.remote_epoch != Some(epoch)
+        if !matches!(
+            &message,
+            PeerMessage::Capabilities { .. } | PeerMessage::Displays { .. }
+        ) && state.remote_epoch != Some(epoch)
         {
             return Err(LeaseError::WrongEpoch);
         }
@@ -164,6 +172,7 @@ impl PeerRegistry {
                 state.remote_epoch = Some(epoch);
                 state.negotiated = state.remote.intersect(capabilities);
             }
+            PeerMessage::Displays { .. } => {}
             PeerMessage::AcquireLease { .. } => match self.lease {
                 None => self.lease = Some((peer, epoch)),
                 Some((p, e)) if p == peer && e == epoch => {}
