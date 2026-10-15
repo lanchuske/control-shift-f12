@@ -6,12 +6,14 @@ use crate::{
 };
 use rand::{RngCore, rngs::OsRng};
 use seamless_discovery::Discovery;
+#[cfg(not(test))]
+use seamless_input_core::platform::PlatformDisplays;
 use seamless_input_core::{
     Display, DisplayId, NodeId, Point, Topology,
     clipboard::ClipboardPayload,
     platform::{
         AccessState, ClipboardContent, ClipboardOutcome, LogicalDisplay, PlatformClipboard,
-        PlatformDisplays, PlatformInput,
+        PlatformInput,
     },
 };
 use seamless_input_protocol::VERSION;
@@ -987,13 +989,13 @@ struct CapturedInput {
     emergency: bool,
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", not(test)))]
 struct NativeCapture {
     tap: seamless_input_platform_macos::input::MacEventTap,
     receiver: std::sync::mpsc::Receiver<seamless_input_platform_macos::input::CaptureOutcome>,
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", not(test)))]
 impl NativeCapture {
     fn install() -> Result<Self, seamless_input_platform_macos::input::InputError> {
         let (sender, receiver) = std::sync::mpsc::channel();
@@ -1024,13 +1026,13 @@ impl NativeCapture {
     }
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(all(target_os = "windows", not(test)))]
 struct NativeCapture {
     hooks: seamless_input_platform_windows::input::WindowsHooks,
     receiver: std::sync::mpsc::Receiver<seamless_input_platform_windows::input::CaptureOutcome>,
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(all(target_os = "windows", not(test)))]
 impl NativeCapture {
     fn install() -> Result<Self, seamless_input_platform_windows::input::InputError> {
         let (hooks, receiver) = seamless_input_platform_windows::input::WindowsHooks::install()?;
@@ -1048,6 +1050,28 @@ impl NativeCapture {
     fn set_remote(&self, remote: bool) {
         self.hooks.set_remote_capture(remote);
     }
+}
+
+// Supervisor unit tests exercise orchestration, topology, and the peer data
+// plane. Installing process-global OS input hooks in each parallel test both
+// requires user permissions and makes the native hook lifecycle race across
+// test threads, so tests use an inert capture boundary instead. Platform hook
+// behavior remains covered by the platform crates and production builds still
+// compile the native implementations above.
+#[cfg(test)]
+struct NativeCapture;
+
+#[cfg(test)]
+impl NativeCapture {
+    fn install() -> Result<Self, std::convert::Infallible> {
+        Ok(Self)
+    }
+
+    fn drain(&self) -> Vec<CapturedInput> {
+        Vec::new()
+    }
+
+    fn set_remote(&self, _remote: bool) {}
 }
 
 fn display(node: NodeId, value: &LogicalDisplay) -> Display {
@@ -1097,14 +1121,14 @@ fn local_lan_ip() -> IpAddr {
         .unwrap_or(fallback)
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", not(test)))]
 struct NativePlatform {
     input: seamless_input_platform_macos::MacInput,
     displays: seamless_input_platform_macos::MacDisplays,
     clipboard: seamless_input_platform_macos::MacClipboard,
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", not(test)))]
 impl NativePlatform {
     fn new() -> Self {
         Self {
@@ -1145,14 +1169,14 @@ impl NativePlatform {
     }
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(all(target_os = "windows", not(test)))]
 struct NativePlatform {
     input: seamless_input_platform_windows::WindowsInput,
     displays: seamless_input_platform_windows::WindowsDisplays,
     clipboard: seamless_input_platform_windows::WindowsClipboard,
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(all(target_os = "windows", not(test)))]
 impl NativePlatform {
     fn new() -> Self {
         Self {
@@ -1213,6 +1237,104 @@ impl NativePlatform {
                 y: point.y,
             })
             .map_err(|error| error.to_string())
+    }
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct TestInput;
+
+#[cfg(test)]
+impl PlatformInput for TestInput {
+    type Error = std::convert::Infallible;
+
+    fn access_state(&self) -> AccessState {
+        AccessState::Granted
+    }
+
+    fn inject(&mut self, _event: &seamless_input_protocol::InputEvent) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
+    fn release_all(&mut self) -> Result<(), Self::Error> {
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct TestClipboard;
+
+#[cfg(test)]
+impl PlatformClipboard for TestClipboard {
+    type Error = std::convert::Infallible;
+
+    fn access_state(&self) -> AccessState {
+        AccessState::Granted
+    }
+
+    fn poll(&mut self, _now_ms: u64) -> Result<ClipboardOutcome, Self::Error> {
+        Ok(ClipboardOutcome::Unchanged)
+    }
+
+    fn write_remote(&mut self, _content: &ClipboardContent) -> Result<(), Self::Error> {
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+struct NativePlatform {
+    input: TestInput,
+    clipboard: TestClipboard,
+}
+
+#[cfg(test)]
+impl NativePlatform {
+    fn new() -> Self {
+        Self {
+            input: TestInput,
+            clipboard: TestClipboard,
+        }
+    }
+
+    fn input_access(&self) -> AccessState {
+        self.input.access_state()
+    }
+
+    fn clipboard_access(&self) -> AccessState {
+        self.clipboard.access_state()
+    }
+
+    fn displays(&mut self) -> Result<Vec<LogicalDisplay>, SupervisorError> {
+        Ok(vec![LogicalDisplay {
+            index: 0,
+            origin_x: 0.0,
+            origin_y: 0.0,
+            width: 1920.0,
+            height: 1080.0,
+            scale: 1.0,
+        }])
+    }
+
+    fn poll_clipboard(&mut self, now_ms: u64) -> Result<ClipboardOutcome, SupervisorError> {
+        Ok(self.clipboard.poll(now_ms).unwrap())
+    }
+
+    fn prepare_remote_receive(
+        &mut self,
+        received: crate::runtime::RuntimeReceive,
+    ) -> Result<crate::runtime::RuntimeReceive, SupervisorError> {
+        Ok(received)
+    }
+
+    fn warp_local(&mut self, point: Point) -> Result<(), String> {
+        self.input
+            .inject(&seamless_input_protocol::InputEvent::Pointer {
+                x: point.x,
+                y: point.y,
+            })
+            .unwrap();
+        Ok(())
     }
 }
 

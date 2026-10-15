@@ -1,9 +1,12 @@
 use std::{
     env,
-    fs::{self, File, OpenOptions},
+    fs::{self, OpenOptions},
     io::{self, Write},
     path::{Component, Path, PathBuf},
 };
+
+#[cfg(unix)]
+use std::fs::File;
 
 use serde::{Deserialize, Serialize};
 
@@ -257,9 +260,9 @@ fn lexical_normalize(path: &Path) -> PathBuf {
     result
 }
 
-fn sync_parent(path: &Path) -> Result<(), ConfigError> {
+fn sync_parent(_path: &Path) -> Result<(), ConfigError> {
     #[cfg(unix)]
-    if let Some(parent) = path.parent() {
+    if let Some(parent) = _path.parent() {
         File::open(parent)?.sync_all()?;
     }
     Ok(())
