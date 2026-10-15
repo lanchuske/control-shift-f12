@@ -1520,6 +1520,96 @@ mod tests {
         panic!("supervisors did not admit their authenticated sessions");
     }
 
+    async fn assert_hostile_display_message_isolates_before_config_mutation<F>(build: F)
+    where
+        F: FnOnce(u64) -> crate::peer::PeerMessage,
+    {
+        let root = tempfile::tempdir().unwrap();
+        let a_paths = test_paths(root.path(), "a");
+        let b_paths = test_paths(root.path(), "b");
+        let (_, b_id) = pin_each_other(&a_paths, &b_paths);
+        let mut a = NativeSupervisor::bootstrap(&a_paths).unwrap();
+        let pin = a.identity.peer(b_id).unwrap().clone();
+        a.runtime
+            .connect_admitted(
+                b_id,
+                Capabilities::all(),
+                Some(&pin),
+                seamless_transport::SessionTrust::Authenticated,
+            )
+            .unwrap();
+        let remote_epoch = 41;
+        a.runtime
+            .receive(
+                b_id,
+                crate::peer::PeerMessage::Capabilities {
+                    epoch: remote_epoch,
+                    capabilities: Capabilities::all(),
+                },
+                0,
+            )
+            .unwrap();
+        a.admitted.insert(b_id);
+        let config_before = std::fs::read(&a_paths.config).unwrap();
+
+        a.inbound_tx
+            .send(InboundPacket {
+                peer: b_id,
+                packet: Ok(encode_peer_message(&build(remote_epoch)).unwrap()),
+            })
+            .unwrap();
+        a.drain_inbound(1).await.unwrap();
+
+        assert!(!a.admitted.contains(&b_id), "hostile peer must be dropped");
+        assert_eq!(a.runtime.peer_epoch(b_id), None);
+        assert!(!a.remote_displays.contains_key(&b_id));
+        assert_eq!(std::fs::read(&a_paths.config).unwrap(), config_before);
+        a.tick().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn hostile_remote_geometry_is_peer_scoped_before_configuration_changes() {
+        assert_hostile_display_message_isolates_before_config_mutation(|epoch| {
+            crate::peer::PeerMessage::DisplayGeometry {
+                epoch,
+                displays: vec![RemoteDisplay {
+                    index: 0,
+                    origin_x: f64::MAX / 2.0,
+                    origin_y: 0.0,
+                    width: f64::MIN_POSITIVE,
+                    height: 100.0,
+                    scale: 1.0,
+                }],
+            }
+        })
+        .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn oversized_duplicate_and_wrong_epoch_legacy_displays_are_peer_scoped() {
+        assert_hostile_display_message_isolates_before_config_mutation(|epoch| {
+            crate::peer::PeerMessage::Displays {
+                epoch,
+                displays: (0..33).collect(),
+            }
+        })
+        .await;
+        assert_hostile_display_message_isolates_before_config_mutation(|epoch| {
+            crate::peer::PeerMessage::Displays {
+                epoch,
+                displays: vec![0, 0],
+            }
+        })
+        .await;
+        assert_hostile_display_message_isolates_before_config_mutation(|epoch| {
+            crate::peer::PeerMessage::Displays {
+                epoch: epoch + 1,
+                displays: vec![0],
+            }
+        })
+        .await;
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn two_running_supervisors_pair_route_input_and_clipboard_then_reconnect() {
         let root = tempfile::tempdir().unwrap();
