@@ -88,7 +88,10 @@ async fn exercise(wrong: bool) {
         .unwrap();
     let result = pair_offer_over_quic(&connection, &mut alice, &mut code, now).await;
     if wrong {
-        assert!(matches!(result, Err(PairingError::ConfirmationMismatch)));
+        assert!(
+            matches!(result, Err(PairingError::ConfirmationMismatch)),
+            "unexpected offer-side result: {result:?}"
+        );
     } else {
         assert_eq!(result.unwrap().friendly_name, "Bob");
     }
@@ -100,6 +103,7 @@ async fn exercise(wrong: bool) {
             break;
         }
     }
+    writeln!(child.0.stdin.as_mut().unwrap(), "DONE").unwrap();
     assert!(child.0.wait().unwrap().success());
 }
 
@@ -130,4 +134,8 @@ async fn pairing_process_worker() {
         Err(PairingError::ConfirmationMismatch) => println!("EXPECTED_FAIL"),
         Err(error) => panic!("unexpected pairing error: {error}"),
     }
+    std::io::stdout().flush().unwrap();
+    let mut done = String::new();
+    std::io::stdin().read_line(&mut done).unwrap();
+    assert_eq!(done.trim(), "DONE");
 }
