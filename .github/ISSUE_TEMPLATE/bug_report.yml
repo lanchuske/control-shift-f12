@@ -19,6 +19,16 @@ body:
     validations: { required: true }
   - type: dropdown
     attributes:
+      label: Platform
+      options: [macOS Apple Silicon, macOS Intel, Windows x64, Mac and Windows]
+    validations: { required: true }
+  - type: input
+    attributes:
+      label: Control Shift F12 version
+      description: Use the release version or reviewed commit. Do not include a machine identifier.
+    validations: { required: true }
+  - type: dropdown
+    attributes:
       label: Evidence
       options: [PASS, FAIL, NOT MEASURED]
     validations: { required: true }

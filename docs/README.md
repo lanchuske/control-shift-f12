@@ -1,4 +1,4 @@
-# SeamlessInput documentation
+# Control Shift F12 documentation
 
 Start with the [project README](../README.md) for downloads, current support,
 and the quickest path to testing.
@@ -7,6 +7,17 @@ and the quickest path to testing.
 
 - [MVP specification](architecture/mvp-specification.md) — product boundaries,
   peer model, pairing, transport, topology, permissions, and acceptance evidence.
+- [Repository layout](repository-layout.md) — where product code,
+  platform adapters, tests, scripts, and community files live.
+
+## Development
+
+- [Contributor guide](../CONTRIBUTING.md) — development setup, scope, local
+  verification, and pull-request expectations.
+- [Open issues](https://github.com/lanchuske/control-shift-f12/issues) —
+  actionable defects and agreed work.
+- [`good first issue`](https://github.com/lanchuske/control-shift-f12/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22)
+  — focused entry points for new contributors.
 
 ## Quality assurance
 
@@ -19,6 +30,5 @@ and the quickest path to testing.
 
 - [Feedback guide](community/feedback.md) — where to ask questions, propose
   ideas, report compatibility, and disclose security problems.
-- [Contributor guide](../CONTRIBUTING.md) — development expectations and local
-  verification commands.
 - [Security policy](../SECURITY.md) — private vulnerability reporting.
+- [Code of conduct](../CODE_OF_CONDUCT.md) — participation expectations.

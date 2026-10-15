@@ -1,4 +1,4 @@
-# SeamlessInput end-to-end evidence template
+# Control Shift F12 end-to-end evidence template
 
 Date:
 Reviewed commit/tag:

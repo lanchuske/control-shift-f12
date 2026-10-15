@@ -3,7 +3,7 @@
 - **Q&A:** installation questions and how the documented behavior works.
 - **Ideas:** design exploration and proposed scope changes before implementation.
 - **Compatibility:** real Mac and Windows hardware results, with sensitive data removed.
-- **Show and Tell:** in-scope ways people use SeamlessInput.
+- **Show and Tell:** in-scope ways people use Control Shift F12.
 - **Issues:** reproducible, actionable defects and agreed in-scope changes.
 - **Private vulnerability report:** suspected security defects; never use a public Issue.
 

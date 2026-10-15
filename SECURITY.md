@@ -11,4 +11,5 @@ reviewed correction is available.
 The project does not request administrator elevation, create services or
 drivers, change firewall or enterprise policy, or use SSH. A report that
 depends on bypassing those boundaries is outside the supported threat model,
-but evidence that SeamlessInput accidentally crosses one is security-critical.
+but evidence that Control Shift F12 accidentally crosses one is
+security-critical.
