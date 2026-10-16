@@ -7,9 +7,7 @@
 
 use std::{
     collections::BTreeMap,
-    io::{self, Read, Write},
-    sync::mpsc,
-    thread,
+    io::{self, Write},
     time::{Duration, Instant},
 };
 
@@ -422,54 +420,56 @@ fn contains_sas_field(value: &Value) -> bool {
     }
 }
 
+/// A bounded event source owned by the engine runner. The concrete inherited
+/// pipe owner must honor its timeout and synchronously release on `cancel`.
+/// This avoids a detached reader that can outlive a failed stdout writer.
+pub trait TimedRequestReader {
+    fn receive_until(&mut self, timeout: Duration) -> io::Result<StdioReadEvent>;
+    fn cancel(&mut self);
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum StdioReadEvent {
+    Request(Request),
+    Timeout,
+    Eof,
+}
+
 /// Runs the bounded inherited-pipe adapter. It deliberately has no listener,
-/// shell, process spawning, or network path.
-pub fn run_stdio<R: Read + Send + 'static>(reader: R, writer: &mut impl Write) -> io::Result<()> {
-    let started = Instant::now();
-    run_stdio_with_adapter_at(reader, writer, UiStdioAdapter::new(0), started)
+/// shell, process spawning, or network path. The caller owns the cancellable
+/// framed-pipe reader, so a writer failure cannot strand a background read.
+pub fn run_stdio(reader: &mut impl TimedRequestReader, writer: &mut impl Write) -> io::Result<()> {
+    run_stdio_with_adapter(reader, writer, UiStdioAdapter::new(0))
 }
 
-/// Runs a previously admitted adapter over the inherited pipe. This is kept
-/// engine-side so a host cannot construct relationship or SAS state from it.
-pub fn run_stdio_with_adapter<R: Read + Send + 'static>(
-    reader: R,
-    writer: &mut impl Write,
-    adapter: UiStdioAdapter,
-) -> io::Result<()> {
-    run_stdio_with_adapter_at(reader, writer, adapter, Instant::now())
-}
-
-fn run_stdio_with_adapter_at<R: Read + Send + 'static>(
-    reader: R,
+/// Runs a previously admitted adapter over the owned cancellable pipe reader.
+pub fn run_stdio_with_adapter(
+    reader: &mut impl TimedRequestReader,
     writer: &mut impl Write,
     mut adapter: UiStdioAdapter,
-    started: Instant,
 ) -> io::Result<()> {
-    let (sender, receiver) = mpsc::sync_channel(1);
-    thread::spawn(move || {
-        let mut reader = reader;
-        loop {
-            let result = control_api::read_request(&mut reader);
-            let eof = matches!(result, Ok(None));
-            if sender.send(result).is_err() || eof {
-                return;
-            }
-        }
-    });
+    let started = Instant::now();
     loop {
-        let now_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
-        match receiver.recv_timeout(adapter.wait_until_next_deadline()) {
-            Ok(Ok(Some(request))) => {
+        match reader.receive_until(adapter.wait_until_next_deadline())? {
+            StdioReadEvent::Request(request) => {
+                // Time is sampled after the blocking receive returns, so an
+                // overdue request cannot confirm or refresh a stale SAS.
+                let now_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
                 for frame in adapter.handle_host_request_at(now_ms, &request) {
-                    control_api::write_message(writer, &frame)?;
+                    if let Err(error) = control_api::write_message(writer, &frame) {
+                        reader.cancel();
+                        return Err(error);
+                    }
                 }
             }
-            Ok(Ok(None)) | Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
-            Ok(Err(error)) => return Err(error),
-            Err(mpsc::RecvTimeoutError::Timeout) => {
+            StdioReadEvent::Eof => return Ok(()),
+            StdioReadEvent::Timeout => {
                 let now_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
                 for frame in adapter.poll_at(now_ms) {
-                    control_api::write_message(writer, &frame)?;
+                    if let Err(error) = control_api::write_message(writer, &frame) {
+                        reader.cancel();
+                        return Err(error);
+                    }
                 }
             }
         }

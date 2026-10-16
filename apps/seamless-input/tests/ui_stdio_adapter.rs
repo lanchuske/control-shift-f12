@@ -2,11 +2,12 @@ use seamless_input::{
     control_api::{self, Request},
     ui_contract::{RemainingDuration, SasCode, V01View},
     ui_stdio_adapter::{
-        AuthoritativeUiEvent, ChildFrame, UiStdioAdapter, run_stdio, run_stdio_with_adapter,
+        AuthoritativeUiEvent, ChildFrame, StdioReadEvent, TimedRequestReader, UiStdioAdapter,
+        run_stdio_with_adapter,
     },
 };
 use serde_json::json;
-use std::{io::Read, time::Duration};
+use std::{io::Write, time::Duration};
 
 fn request(id: &str, command: &str, args: serde_json::Value) -> Request {
     Request {
@@ -217,25 +218,31 @@ fn framed_stdio_rejects_malformed_and_oversized_requests_before_dispatch() {
     let mut malformed = Vec::new();
     malformed.extend_from_slice(&3u32.to_be_bytes());
     malformed.extend_from_slice(b"{");
-    assert!(run_stdio(std::io::Cursor::new(malformed), &mut Vec::new()).is_err());
+    assert!(control_api::read_request(&mut malformed.as_slice()).is_err());
 
     let mut oversized = Vec::new();
     oversized.extend_from_slice(&((control_api::MAX_FRAME_BYTES + 1) as u32).to_be_bytes());
-    assert!(run_stdio(std::io::Cursor::new(oversized), &mut Vec::new()).is_err());
+    assert!(control_api::read_request(&mut oversized.as_slice()).is_err());
 }
 
 #[derive(Default)]
 struct DelayedEof {
     waited: bool,
+    cancelled: bool,
 }
 
-impl Read for DelayedEof {
-    fn read(&mut self, _buffer: &mut [u8]) -> std::io::Result<usize> {
+impl TimedRequestReader for DelayedEof {
+    fn receive_until(&mut self, _timeout: Duration) -> std::io::Result<StdioReadEvent> {
         if !self.waited {
             self.waited = true;
             std::thread::sleep(Duration::from_millis(20));
+            return Ok(StdioReadEvent::Timeout);
         }
-        Ok(0)
+        Ok(StdioReadEvent::Eof)
+    }
+
+    fn cancel(&mut self) {
+        self.cancelled = true;
     }
 }
 
@@ -251,7 +258,78 @@ fn stdio_poll_emits_terminal_sas_invalidation_while_host_is_idle() {
         },
     );
     let mut output = Vec::new();
-    run_stdio_with_adapter(DelayedEof::default(), &mut output, adapter).unwrap();
+    run_stdio_with_adapter(&mut DelayedEof::default(), &mut output, adapter).unwrap();
     assert!(String::from_utf8_lossy(&output).contains("sas_display_v1"));
     assert!(String::from_utf8_lossy(&output).contains("\"current\":false"));
+}
+
+struct DelayedRequest {
+    request: Option<Request>,
+    cancelled: bool,
+}
+
+impl TimedRequestReader for DelayedRequest {
+    fn receive_until(&mut self, _timeout: Duration) -> std::io::Result<StdioReadEvent> {
+        if let Some(request) = self.request.take() {
+            std::thread::sleep(Duration::from_millis(20));
+            Ok(StdioReadEvent::Request(request))
+        } else {
+            Ok(StdioReadEvent::Eof)
+        }
+    }
+
+    fn cancel(&mut self) {
+        self.cancelled = true;
+    }
+}
+
+#[test]
+fn delayed_request_is_measured_after_receive_and_cannot_confirm_an_expired_sas() {
+    let mut adapter = UiStdioAdapter::new(0);
+    adapter.on_authoritative_at(0, AuthoritativeUiEvent::RelationshipVerified);
+    adapter.on_authoritative_at(
+        0,
+        AuthoritativeUiEvent::V01SasReady {
+            view: v01(),
+            remaining_ms: 1,
+        },
+    );
+    let mut reader = DelayedRequest {
+        request: Some(request("late", "ui.confirm_v01", json!({"matches": true}))),
+        cancelled: false,
+    };
+    let mut output = Vec::new();
+    run_stdio_with_adapter(&mut reader, &mut output, adapter).unwrap();
+    assert!(String::from_utf8_lossy(&output).contains("\"current\":false"));
+    assert!(String::from_utf8_lossy(&output).contains("invalid_state"));
+    assert!(!reader.cancelled);
+}
+
+#[derive(Default)]
+struct FailingWriter;
+
+impl Write for FailingWriter {
+    fn write(&mut self, _buffer: &[u8]) -> std::io::Result<usize> {
+        Err(std::io::Error::other("closed"))
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn writer_failure_cancels_the_owned_reader_before_returning() {
+    let mut adapter = UiStdioAdapter::new(0);
+    adapter.on_authoritative_at(0, AuthoritativeUiEvent::RelationshipVerified);
+    adapter.on_authoritative_at(
+        0,
+        AuthoritativeUiEvent::V01SasReady {
+            view: v01(),
+            remaining_ms: 1,
+        },
+    );
+    let mut reader = DelayedEof::default();
+    let mut writer = FailingWriter;
+    assert!(run_stdio_with_adapter(&mut reader, &mut writer, adapter).is_err());
+    assert!(reader.cancelled);
 }
