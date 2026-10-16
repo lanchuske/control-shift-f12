@@ -53,15 +53,22 @@ pub enum RuntimeStatusError {
 #[derive(Debug, Clone)]
 pub struct RuntimeStatusStore {
     path: PathBuf,
+    owner_pid: Option<u32>,
 }
 
 impl RuntimeStatusStore {
     pub fn new(path: PathBuf) -> Self {
-        Self { path }
+        Self {
+            path,
+            owner_pid: None,
+        }
     }
 
-    pub fn within(root: &Path) -> Self {
-        Self::new(root.join("runtime-status.v1"))
+    pub fn within(root: &Path, owner_pid: u32) -> Self {
+        Self {
+            path: root.join(format!("runtime-status.{owner_pid}.v1")),
+            owner_pid: Some(owner_pid),
+        }
     }
 
     pub fn path(&self) -> &Path {
@@ -69,6 +76,12 @@ impl RuntimeStatusStore {
     }
 
     pub fn publish(&self, status: &RuntimeStatus) -> Result<(), RuntimeStatusError> {
+        if self
+            .owner_pid
+            .is_some_and(|owner| owner != status.process_id)
+        {
+            return Err(RuntimeStatusError::Invalid);
+        }
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -116,11 +129,33 @@ impl RuntimeStatusStore {
         Ok(Some(status))
     }
 
-    pub fn clear(&self) -> Result<(), RuntimeStatusError> {
+    pub fn clear_owned(&self, owner_pid: u32) -> Result<(), RuntimeStatusError> {
+        if self.owner_pid != Some(owner_pid) {
+            return Err(RuntimeStatusError::Invalid);
+        }
+        let text = match fs::read_to_string(&self.path) {
+            Ok(text) => text,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+        };
+        if decode(&text)?.process_id != owner_pid {
+            return Err(RuntimeStatusError::Invalid);
+        }
         match fs::remove_file(&self.path) {
             Ok(()) => Ok(()),
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
             Err(error) => Err(error.into()),
+        }
+    }
+
+    pub fn clear(&self) -> Result<(), RuntimeStatusError> {
+        match self.owner_pid {
+            Some(owner_pid) => self.clear_owned(owner_pid),
+            None => match fs::remove_file(&self.path) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(error.into()),
+            },
         }
     }
 }

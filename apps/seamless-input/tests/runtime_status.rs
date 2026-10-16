@@ -61,3 +61,81 @@ fn clearing_runtime_status_removes_the_live_claim() {
             .is_none()
     );
 }
+
+#[test]
+fn an_old_process_cannot_clear_a_new_process_status() {
+    let root = tempfile::tempdir().unwrap();
+    let old = RuntimeStatusStore::within(root.path(), 1001);
+    let new = RuntimeStatusStore::within(root.path(), 2002);
+    old.publish(&RuntimeStatus {
+        process_id: 1001,
+        ..snapshot(100_000, 1)
+    })
+    .unwrap();
+    new.publish(&RuntimeStatus {
+        process_id: 2002,
+        ..snapshot(100_000, 2)
+    })
+    .unwrap();
+
+    old.clear_owned(1001).unwrap();
+
+    assert!(
+        old.read_current(UNIX_EPOCH + Duration::from_secs(100))
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        new.read_current(UNIX_EPOCH + Duration::from_secs(100))
+            .unwrap()
+            .unwrap()
+            .authenticated_sessions,
+        2
+    );
+}
+
+#[test]
+fn ownership_mismatch_cannot_clear_or_publish_a_status() {
+    let root = tempfile::tempdir().unwrap();
+    let store = RuntimeStatusStore::within(root.path(), 4242);
+    assert!(
+        store
+            .publish(&RuntimeStatus {
+                process_id: 7,
+                ..snapshot(100_000, 1)
+            })
+            .is_err()
+    );
+    store.publish(&snapshot(100_000, 1)).unwrap();
+    assert!(store.clear_owned(7).is_err());
+    assert!(store.path().exists());
+
+    let foreign =
+        "version=1\nprocess_id=7\nupdated_unix_ms=100000\ndisplays=1\nauthenticated_sessions=9\n";
+    std::fs::write(store.path(), foreign).unwrap();
+    assert!(store.clear_owned(4242).is_err());
+    assert!(
+        store.path().exists(),
+        "compare-and-clear must preserve a foreign owner"
+    );
+}
+
+#[test]
+fn failed_replace_does_not_destroy_the_last_good_heartbeat() {
+    let root = tempfile::tempdir().unwrap();
+    let store = RuntimeStatusStore::within(root.path(), 4242);
+    store.publish(&snapshot(100_000, 1)).unwrap();
+    let mut temp_name = store.path().as_os_str().to_owned();
+    temp_name.push(".tmp");
+    std::fs::create_dir(std::path::PathBuf::from(temp_name)).unwrap();
+
+    assert!(store.publish(&snapshot(101_000, 9)).is_err());
+    assert_eq!(
+        store
+            .read_current(UNIX_EPOCH + Duration::from_secs(100))
+            .unwrap()
+            .unwrap()
+            .authenticated_sessions,
+        1
+    );
+}

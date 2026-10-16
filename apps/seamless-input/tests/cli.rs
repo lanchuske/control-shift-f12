@@ -243,6 +243,35 @@ fn start_bootstraps_the_real_supervisor_and_stays_running() {
         child.try_wait().unwrap().is_none(),
         "start exited before supervision began"
     );
+    let status_deadline = Instant::now() + Duration::from_secs(5);
+    let live = loop {
+        let status = Command::new(env!("CARGO_BIN_EXE_seamless-input"))
+            .args(["status", "--pid", &child.id().to_string(), "--machine"])
+            .env("SEAMLESS_INPUT_HOME", &home)
+            .output()
+            .unwrap();
+        let snapshot = String::from_utf8(status.stdout).unwrap();
+        if snapshot.starts_with("state=running\t") || Instant::now() >= status_deadline {
+            break snapshot;
+        }
+        assert!(child.try_wait().unwrap().is_none());
+        thread::sleep(Duration::from_millis(25));
+    };
+    assert!(live.starts_with("state=running\t"), "{live}");
+    assert!(
+        live.contains(&format!("\tprocess_id={}\t", child.id())),
+        "{live}"
+    );
+
+    let foreign = Command::new(env!("CARGO_BIN_EXE_seamless-input"))
+        .args(["status", "--pid", "1", "--machine"])
+        .env("SEAMLESS_INPUT_HOME", &home)
+        .output()
+        .unwrap();
+    assert_eq!(
+        String::from_utf8(foreign.stdout).unwrap().trim(),
+        "state=stopped\tprocess_id=1\tdisplays=0\tauthenticated_sessions=0"
+    );
     child.kill().unwrap();
     let output = child.wait_with_output().unwrap();
     assert!(home.join("config.toml").is_file());
@@ -327,13 +356,23 @@ fn doctor_report_is_opt_in_redacted_and_stable_identifier_free() {
 
 #[test]
 fn status_fails_closed_when_no_live_runtime_heartbeat_exists() {
-    let output = run(&["status"]);
+    let output = run(&["status", "--pid", "4242"]);
     assert!(output.status.success());
     assert_eq!(
         String::from_utf8(output.stdout).unwrap().trim(),
         "Control Shift F12 stopped: 0 authenticated session(s)"
     );
     assert_eq!(output.stderr, b"");
+}
+
+#[test]
+fn machine_status_is_stable_and_filtered_by_process_id() {
+    let output = run(&["status", "--pid", "8123", "--machine"]);
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap().trim(),
+        "state=stopped\tprocess_id=8123\tdisplays=0\tauthenticated_sessions=0"
+    );
 }
 
 #[test]
