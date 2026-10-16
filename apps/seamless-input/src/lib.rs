@@ -16,3 +16,4 @@ pub mod tui;
 pub mod ui_contract;
 pub mod ui_controller;
 pub mod ui_projection;
+pub mod ui_stdio_adapter;

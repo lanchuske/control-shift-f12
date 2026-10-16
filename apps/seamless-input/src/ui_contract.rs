@@ -125,6 +125,13 @@ impl TryFrom<Vec<String>> for SasCode {
     }
 }
 
+impl SasCode {
+    /// Returns display-safe groups only. This never exposes a raw V01 attempt.
+    pub fn groups(&self) -> &[String] {
+        &self.0
+    }
+}
+
 impl<'de> Deserialize<'de> for SasCode {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where

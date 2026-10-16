@@ -13,6 +13,9 @@ const V01_MAX_MS: u64 = 30_000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UiRuntimeEvent {
+    /// A reviewed engine owner has verified an existing local relationship.
+    /// This reports a fact; it does not create trust or grant a capability.
+    RelationshipVerified,
     Candidates(Vec<CandidateView>),
     BootstrapSasReady,
     BootstrapReceiptVerified,
@@ -189,6 +192,9 @@ impl UiController {
     pub fn on_runtime_at(&mut self, now_ms: u64, event: UiRuntimeEvent) {
         self.advance_to(now_ms);
         match event {
+            UiRuntimeEvent::RelationshipVerified if self.snapshot.state == UiState::NotStarted => {
+                self.snapshot.state = UiState::ConfirmedRelationship;
+            }
             UiRuntimeEvent::Candidates(candidates) if self.snapshot.state == UiState::Browsing => {
                 self.snapshot.candidates = candidates;
             }
@@ -225,6 +231,9 @@ impl UiController {
             }
             UiRuntimeEvent::Diagnostics(rows) => self.snapshot.diagnostics = rows,
             UiRuntimeEvent::PermissionRevoked => {
+                if self.snapshot.state == UiState::V01Pending {
+                    self.clear_v01_to_confirmed();
+                }
                 self.snapshot.capabilities = CapabilityView::all_disabled();
             }
             UiRuntimeEvent::ReceiptRevoked => self.reset_to_not_started(),
