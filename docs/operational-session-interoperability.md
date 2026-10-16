@@ -321,7 +321,10 @@ The fixture names these mandatory negative mutations:
 `reconnect-reuse`, and `post-revocation-reconnect`.
 
 Each must fail closed in a future independently written parser. The static
-fixture verifier proves only that frozen bytes and declared mutations stay
+fixture verifier executes every declared mutation and checks its intended stage
+matrix (metadata, frame, preflight, exporter, Accept or Confirm); wire-version
+and remote-receipt mutations alter actual framed bytes rather than only fixture
+metadata. It proves only that frozen bytes and declared mutations stay
 internally consistent. It does not prove TLS exporter behavior, QUIC semantics,
 storage atomicity, native UI behavior, network policy, hardware key security,
 or Mac–Windows interoperability. Independent security/protocol review is a
