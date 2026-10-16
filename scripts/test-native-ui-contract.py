@@ -65,6 +65,12 @@ ADMITTED_WINDOWS_SHELL_PATHS = frozenset(
         "native/windows/ControlShiftF12App/DesktopShellForm.cs",
     }
 )
+ADMITTED_WINDOWS_PIPE_OWNER_PATHS = frozenset(
+    {
+        "native/windows/ControlShiftF12App/WindowsUiChildOwner.cs",
+        "native/windows/ControlShiftF12App.Tests/WindowsUiChildOwnerTests.cs",
+    }
+)
 HOST_SOURCE_SUFFIXES = (".swift", ".cs", ".m", ".mm", ".h")
 BUILD_OUTPUT_SUFFIXES = (
     ".dll",
@@ -105,6 +111,7 @@ def is_nonshipping_native_path(path):
         | ADMITTED_MACOS_HOST_PATHS
         | ADMITTED_WINDOWS_CONTRACT_PATHS
         | ADMITTED_WINDOWS_SHELL_PATHS
+        | ADMITTED_WINDOWS_PIPE_OWNER_PATHS
     )
 
 
@@ -227,6 +234,7 @@ class NativeHostBoundaryTests(unittest.TestCase):
             | ADMITTED_MACOS_HOST_PATHS
             | ADMITTED_WINDOWS_CONTRACT_PATHS
             | ADMITTED_WINDOWS_SHELL_PATHS
+            | ADMITTED_WINDOWS_PIPE_OWNER_PATHS
         )
         unexpected = sorted(tracked - admitted)
         self.assertEqual(
@@ -342,6 +350,7 @@ class NativeHostBoundaryTests(unittest.TestCase):
             for path in tracked_native_paths()
             if path.endswith((".swift", ".cs", ".csproj")) or path.endswith("Package.swift")
             if "/Tests/" not in path and ".Tests/" not in path
+            if path not in ADMITTED_WINDOWS_PIPE_OWNER_PATHS
         ]
         native_text = "\n".join(path.read_text() for path in native_production_sources)
         forbidden = (
@@ -434,6 +443,27 @@ class NativeHostBoundaryTests(unittest.TestCase):
         ):
             self.assertNotIn(forbidden, shell, forbidden)
 
+    def test_windows_pipe_owner_has_one_fixed_local_child_boundary(self):
+        owner = (ROOT / "native/windows/ControlShiftF12App/WindowsUiChildOwner.cs").read_text()
+        for expected in (
+            "new ProcessStartInfo(spec.ExecutablePath)",
+            "UseShellExecute = false",
+            "RedirectStandardInput = true",
+            "RedirectStandardOutput = true",
+            "RedirectStandardError = true",
+            "start.Environment.Clear()",
+            "start.ArgumentList.Add(argument)",
+            "UiChildSession.InitialRefreshFrame()",
+            "child.StandardInput.Close()",
+            "child.Kill(entireProcessTree: false)",
+        ):
+            self.assertIn(expected, owner)
+        for forbidden in (
+            "cmd.exe", "powershell", "pwsh", "http://", "https://", "Socket",
+            "System.IO.Pipes", "NamedPipe", "Clipboard", "SendKeys", "UseShellExecute = true",
+        ):
+            self.assertNotIn(forbidden, owner, forbidden)
+
     def test_hosts_are_declared_as_nonshipping_pipe_clients_of_the_existing_engine(self):
         macos_manifest = MACOS_MANIFEST.read_text()
         windows_manifest = WINDOWS_MANIFEST.read_text()
@@ -507,8 +537,8 @@ class NativeHostBoundaryTests(unittest.TestCase):
             "ui.confirm_v01",
             "terminal `sas_display_v1 current:false`",
             "Platform-specific reader cancellation is intentionally not unified",
-            "only the guarded AppKit",
-            "no additional pipe-owning native host source,",
+            "the guarded AppKit diagnostics",
+            "no additional pipe-owning native host source beyond",
         )
         for invariant in required:
             self.assertIn(invariant, design)

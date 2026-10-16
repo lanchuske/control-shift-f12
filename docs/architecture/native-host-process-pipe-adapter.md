@@ -3,28 +3,32 @@
 ## Status, scope, and admission gate
 
 This is a reviewed boundary record for Tasks 6 and 7. The admitted Rust child
-entrypoint, one guarded AppKit diagnostics projection source, and one
-presentation-only WinForms shell do not add a product bundle, a Windows pipe
-owner, network, or product sharing UI. The WinForms shell renders only local,
-unavailable states and owns no engine process or capability. In particular,
-these sources do not make either manifest under `native/` shippable.
+entrypoint, one guarded AppKit diagnostics projection source, one
+presentation-only WinForms shell, and one nonshipping Windows child owner do
+not add a product bundle, network, or product sharing UI. The Windows owner
+can only start the reviewed local engine, send its initial refresh, validate
+the first projection and close/reap that child; it exposes no capability API.
+In particular, these sources do not make either manifest under `native/`
+shippable.
 
 The candidate contains a bounded Rust `UiStdioAdapter`, a process-owned
 inherited-stdin reader for the Rust child, and a `TimedRequestReader`
-abstraction. It contains the narrowly admitted AppKit diagnostics host, but no
-WinForms host. Moreover,
+abstraction. It contains the narrowly admitted AppKit diagnostics host, a
+presentation-only WinForms shell, and an initial-projection Windows child
+owner. Moreover,
 `main.rs` routes `seamless-input control --stdio` to the foundations
 `control_engine::run_stdio`, not to `ui_stdio_adapter::run_stdio`. The separate
 `seamless-input control --ui-stdio` entrypoint is admitted for the Rust-only
 adapter while preserving foundations `--stdio` behavior. A native host remains
 blocked until its own target-platform owner/tests are admitted.
 
-The UI entrypoint is admitted. In particular, only the guarded AppKit
-diagnostics source may use this document as authority to launch its fixed child
-process. The admitted WinForms shell is a local presentation-only surface: it
+The UI entrypoint is admitted. In particular, the guarded AppKit diagnostics
+source and nonshipping Windows initial-projection owner may use this document
+as authority to launch their fixed child process. The admitted WinForms shell is a local presentation-only surface: it
 may render unavailable onboarding, display-map and sharing controls, but it
 cannot launch a child, open a pipe, enable a control, or claim a connection.
-A Windows diagnostics parser/test pair and platform-neutral lifecycle,
+A Windows diagnostics parser/test pair, the target-tested nonshipping initial
+projection child owner, and platform-neutral lifecycle,
 journey-state, fixed child-launch specification, or closed initial-snapshot
 projection may validate redacted frames, terminal projection clearing,
 unavailable product actions, the immutable package-child command/environment
@@ -141,8 +145,9 @@ Normal close is ordered as follows:
 A write failure, read failure, malformed frame, EOF, child exit, application
 termination, app deactivation that ends the session, or timeout follows the
 same clear-and-reap path. There is no foundations shutdown command on the
-host-to-child path: its exact allowlist remains `ui.refresh` and
-`ui.confirm_v01`. Closing pipes and owning/reaping the child never permits a
+host-to-child path: its exact allowlist remains `ui.refresh`,
+`ui.start_discovery`, `ui.stop_discovery`, and `ui.confirm_v01`. Closing pipes
+and owning/reaping the child never permits a
 detached child, background reader, or a UI that still claims the engine is
 running.
 
@@ -187,7 +192,7 @@ current `PipeSession` and projection generation; the main thread drops an
 update from a closed session, stale generation, or terminal SAS binding. It may
 coalesce ordinary snapshots and diagnostics while preserving their newest
 generation, but it must never coalesce away a terminal SAS invalidation. UI
-events only create the two allowlisted typed requests; they never invoke a
+events only create the four allowlisted typed requests; they never invoke a
 runtime command, process API, shell, socket, clipboard operation, or input
 operation.
 
@@ -247,14 +252,16 @@ simulated pipe never proves the target platform.
 | Accessibility | Platform UI tests verify keyboard-only operation, focus order, semantic status, focused SAS exposure, and terminal clearing. | No global SAS announcement/history; documented OS visibility limits remain visible to reviewers. |
 | Physical QA | Signed package tests on a real Mac and a real Windows target measure start/stop/restart, permission loss, process cleanup, memory/CPU, and no-network-endpoint behavior. | Record PASS/FAIL/NOT MEASURED separately; no stable release claim from a harness-only pass. |
 
-Until this evidence exists, no additional pipe-owning native host source,
-product build, signing, packaging, or release is permitted. The guarded AppKit
-diagnostics source and presentation-only WinForms shell are non-shipping test
-material only; neither satisfies full platform parity or release evidence.
+Until this evidence exists, no additional pipe-owning native host source beyond
+the reviewed Windows initial-projection owner, product build, signing,
+packaging, or release is permitted. The guarded AppKit diagnostics source,
+presentation-only WinForms shell, and Windows owner are non-shipping test
+material only; none satisfies full platform parity or release evidence.
 
 ## Non-goals
 
-This design does not add a pipe-owning GUI, process spawning code, an IPC
-implementation, networking, transport, discovery, pairing, a layout save,
-input sharing, clipboard sharing, a CI workflow, or a publication path. It
-does not resolve the separately paused post-V01 operational-layout protocol.
+This design does not add a capability-owning GUI, an IPC implementation beyond
+the bounded initial Windows projection exchange, networking, transport,
+discovery, pairing, a layout save, input sharing, clipboard sharing, a CI
+workflow, or a publication path. It does not resolve the separately paused
+post-V01 operational-layout protocol.
