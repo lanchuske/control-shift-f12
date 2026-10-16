@@ -40,10 +40,12 @@ ADMITTED_WINDOWS_CONTRACT_PATHS = frozenset(
     {
         "native/windows/ControlShiftF12App.Core/ControlShiftF12App.Core.csproj",
         "native/windows/ControlShiftF12App.Core/ChildSessionState.cs",
+        "native/windows/ControlShiftF12App.Core/ChildLaunchSpec.cs",
         "native/windows/ControlShiftF12App.Core/DesktopJourneyState.cs",
         "native/windows/ControlShiftF12App.Core/DiagnosticsProjection.cs",
         "native/windows/ControlShiftF12App.Tests/ControlShiftF12App.Tests.csproj",
         "native/windows/ControlShiftF12App.Tests/ChildSessionStateTests.cs",
+        "native/windows/ControlShiftF12App.Tests/ChildLaunchSpecTests.cs",
         "native/windows/ControlShiftF12App.Tests/DesktopJourneyStateTests.cs",
         "native/windows/ControlShiftF12App.Tests/WindowsDiagnosticsProjectionTests.cs",
     }
@@ -236,6 +238,7 @@ class NativeHostBoundaryTests(unittest.TestCase):
     def test_windows_contract_is_parser_and_tests_only(self):
         parser = (ROOT / "native/windows/ControlShiftF12App.Core/DiagnosticsProjection.cs").read_text()
         lifecycle = (ROOT / "native/windows/ControlShiftF12App.Core/ChildSessionState.cs").read_text()
+        launch_spec = (ROOT / "native/windows/ControlShiftF12App.Core/ChildLaunchSpec.cs").read_text()
         journey = (ROOT / "native/windows/ControlShiftF12App.Core/DesktopJourneyState.cs").read_text()
         tests = (ROOT / "native/windows/ControlShiftF12App.Tests/WindowsDiagnosticsProjectionTests.cs").read_text()
         for required in ("Encoding.UTF8.GetByteCount", "TryGetUInt64", "EnumerateObject"):
@@ -246,11 +249,14 @@ class NativeHostBoundaryTests(unittest.TestCase):
         ):
             self.assertNotIn(forbidden, parser, forbidden)
             self.assertNotIn(forbidden, lifecycle, forbidden)
+            self.assertNotIn(forbidden, launch_spec, forbidden)
             self.assertNotIn(forbidden, journey, forbidden)
         self.assertIn("ChildSessionPhase.Terminal", lifecycle)
         self.assertIn("EndOfFile", lifecycle)
         self.assertIn("Set up another computer", journey)
         self.assertIn("Not measured", journey)
+        self.assertIn('"--ui-stdio"', launch_spec)
+        self.assertIn("AllowedEnvironmentNames", launch_spec)
         for expected in (
             "Duplicate_frame_field_is_rejected", "Frame_larger_than_the_engine_limit",
             "Negative_generation_is_rejected", "Extra_or_sensitive_frame_field_is_rejected",
