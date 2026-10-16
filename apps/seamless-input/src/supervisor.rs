@@ -22,6 +22,7 @@ use seamless_transport::{
 };
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
+    future::Future,
     net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
@@ -31,6 +32,27 @@ use tokio::{sync::mpsc, task::JoinHandle};
 
 pub const INPUT_SERVICE_INTERVAL: Duration = Duration::from_millis(5);
 const CAPTURE_DRAIN_BUDGET: usize = 64;
+
+async fn interleave_maintenance<T, E, F, S>(
+    maintenance: F,
+    cadence: Duration,
+    mut service: S,
+) -> Result<T, E>
+where
+    F: Future<Output = T>,
+    S: AsyncFnMut() -> Result<(), E>,
+{
+    let mut maintenance = std::pin::pin!(maintenance);
+    let mut interval = tokio::time::interval(cadence);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    interval.reset();
+    loop {
+        tokio::select! {
+            result = &mut maintenance => return Ok(result),
+            _ = interval.tick() => service().await?,
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct AppPaths {
@@ -185,7 +207,7 @@ pub enum SupervisorError {
 
 struct PeerLink {
     peer: NodeId,
-    endpoint: PeerEndpoint,
+    endpoint: Arc<PeerEndpoint>,
     instance: String,
 }
 
@@ -339,10 +361,7 @@ impl NativeSupervisor {
                 self.execute_effects(effects).await?;
             }
         }
-        let discovered_peers = self
-            .discovery
-            .browse(Duration::from_millis(25))
-            .map_err(SupervisorError::Discovery)?;
+        let discovered_peers = self.discovery.poll().map_err(SupervisorError::Discovery)?;
         let discovered = discovered_peers.len();
         let local_displays = self.platform.displays()?;
         self.local_displays = local_displays.clone();
@@ -377,7 +396,7 @@ impl NativeSupervisor {
                 .await?;
         }
 
-        self.dial_discovered(&discovered_peers).await;
+        self.dial_discovered(&discovered_peers).await?;
 
         let available: Vec<_> = self
             .links
@@ -502,16 +521,19 @@ impl NativeSupervisor {
         Ok(())
     }
 
-    async fn dial_discovered(&mut self, discovered: &[seamless_discovery::DiscoveredPeer]) {
-        let policy = ReconnectPolicy {
-            initial_delay: Duration::from_millis(50),
-            max_delay: Duration::from_millis(50),
-            max_attempts: 1,
-        };
-        for link in &self.links {
+    async fn dial_discovered(
+        &mut self,
+        discovered: &[seamless_discovery::DiscoveredPeer],
+    ) -> Result<(), SupervisorError> {
+        let links = self
+            .links
+            .iter()
+            .map(|link| (link.peer, Arc::clone(&link.endpoint)))
+            .collect::<Vec<_>>();
+        for (peer_id, endpoint) in links {
             if self
                 .sessions
-                .get(&link.peer)
+                .get(&peer_id)
                 .is_some_and(|session| !session.is_closed())
             {
                 continue;
@@ -521,22 +543,37 @@ impl NativeSupervisor {
                 .filter(|peer| peer.compatible && !peer.advertisement.pairable)
             {
                 for address in &peer.advertisement.addresses {
-                    let attempt = tokio::time::timeout(
-                        Duration::from_millis(250),
-                        link.endpoint.reconnect(
-                            *address,
-                            "seamless-input.local",
-                            Some(link.peer),
-                            &policy,
-                        ),
-                    )
-                    .await;
+                    let endpoint = Arc::clone(&endpoint);
+                    let address = *address;
+                    let reconnect = async move {
+                        let policy = ReconnectPolicy {
+                            initial_delay: Duration::from_millis(50),
+                            max_delay: Duration::from_millis(50),
+                            max_attempts: 1,
+                        };
+                        tokio::time::timeout(
+                            Duration::from_millis(250),
+                            endpoint.reconnect(
+                                address,
+                                "seamless-input.local",
+                                Some(peer_id),
+                                &policy,
+                            ),
+                        )
+                        .await
+                    };
+                    let attempt =
+                        interleave_maintenance(reconnect, INPUT_SERVICE_INTERVAL, async || {
+                            self.service_input().await
+                        })
+                        .await?;
                     if let Ok(Ok(_)) = attempt {
                         break 'candidate;
                     }
                 }
             }
         }
+        Ok(())
     }
 
     fn spawn_reader(&mut self, session: PeerSession) {
@@ -816,7 +853,7 @@ fn create_peer_link(
         .map_err(SupervisorError::Discovery)?;
     Ok(PeerLink {
         peer: peer.node_id,
-        endpoint,
+        endpoint: Arc::new(endpoint),
         instance,
     })
 }
@@ -1148,9 +1185,16 @@ impl CaptureBuffer {
 mod capture_buffer_tests {
     use super::{
         CAPTURE_DRAIN_BUDGET, CaptureBuffer, CaptureEnqueueAction, CapturedInput,
-        INPUT_SERVICE_INTERVAL, acknowledge_recovery_after,
+        INPUT_SERVICE_INTERVAL, acknowledge_recovery_after, interleave_maintenance,
     };
     use seamless_input_protocol::{Button, InputEvent, Modifier};
+    use std::{
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+        time::{Duration, Instant},
+    };
 
     fn captured(event: InputEvent) -> CapturedInput {
         CapturedInput {
@@ -1322,6 +1366,30 @@ mod capture_buffer_tests {
     fn input_service_has_a_small_fixed_time_and_work_budget() {
         assert!(INPUT_SERVICE_INTERVAL < std::time::Duration::from_millis(250));
         assert!((1..=64).contains(&CAPTURE_DRAIN_BUDGET));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn slow_maintenance_does_not_block_input_service_cadence() {
+        let serviced = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&serviced);
+        let started = Instant::now();
+
+        interleave_maintenance(
+            async { tokio::time::sleep(Duration::from_millis(45)).await },
+            Duration::from_millis(5),
+            async || {
+                observed.fetch_add(1, Ordering::SeqCst);
+                Ok::<(), ()>(())
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(started.elapsed() >= Duration::from_millis(40));
+        assert!(
+            serviced.load(Ordering::SeqCst) >= 6,
+            "input service did not interleave with slow maintenance"
+        );
     }
 
     #[test]
