@@ -42,11 +42,13 @@ ADMITTED_WINDOWS_CONTRACT_PATHS = frozenset(
         "native/windows/ControlShiftF12App.Core/ChildSessionState.cs",
         "native/windows/ControlShiftF12App.Core/ChildLaunchSpec.cs",
         "native/windows/ControlShiftF12App.Core/DesktopJourneyState.cs",
+        "native/windows/ControlShiftF12App.Core/DesktopSnapshotProjection.cs",
         "native/windows/ControlShiftF12App.Core/DiagnosticsProjection.cs",
         "native/windows/ControlShiftF12App.Tests/ControlShiftF12App.Tests.csproj",
         "native/windows/ControlShiftF12App.Tests/ChildSessionStateTests.cs",
         "native/windows/ControlShiftF12App.Tests/ChildLaunchSpecTests.cs",
         "native/windows/ControlShiftF12App.Tests/DesktopJourneyStateTests.cs",
+        "native/windows/ControlShiftF12App.Tests/DesktopSnapshotProjectionTests.cs",
         "native/windows/ControlShiftF12App.Tests/WindowsDiagnosticsProjectionTests.cs",
     }
 )
@@ -240,6 +242,7 @@ class NativeHostBoundaryTests(unittest.TestCase):
         lifecycle = (ROOT / "native/windows/ControlShiftF12App.Core/ChildSessionState.cs").read_text()
         launch_spec = (ROOT / "native/windows/ControlShiftF12App.Core/ChildLaunchSpec.cs").read_text()
         journey = (ROOT / "native/windows/ControlShiftF12App.Core/DesktopJourneyState.cs").read_text()
+        snapshot = (ROOT / "native/windows/ControlShiftF12App.Core/DesktopSnapshotProjection.cs").read_text()
         tests = (ROOT / "native/windows/ControlShiftF12App.Tests/WindowsDiagnosticsProjectionTests.cs").read_text()
         for required in ("Encoding.UTF8.GetByteCount", "TryGetUInt64", "EnumerateObject"):
             self.assertIn(required, parser)
@@ -251,10 +254,13 @@ class NativeHostBoundaryTests(unittest.TestCase):
             self.assertNotIn(forbidden, lifecycle, forbidden)
             self.assertNotIn(forbidden, launch_spec, forbidden)
             self.assertNotIn(forbidden, journey, forbidden)
+            self.assertNotIn(forbidden, snapshot, forbidden)
         self.assertIn("ChildSessionPhase.Terminal", lifecycle)
         self.assertIn("EndOfFile", lifecycle)
         self.assertIn("Set up another computer", journey)
         self.assertIn("Not measured", journey)
+        self.assertIn("ui_snapshot_v1", snapshot)
+        self.assertIn("HasExactly", snapshot)
         self.assertIn('"--ui-stdio"', launch_spec)
         self.assertIn("AllowedEnvironmentNames", launch_spec)
         for expected in (
