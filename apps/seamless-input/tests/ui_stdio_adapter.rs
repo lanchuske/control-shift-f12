@@ -2,12 +2,30 @@ use seamless_input::{
     control_api::{self, Request},
     ui_contract::{RemainingDuration, SasCode, V01View},
     ui_stdio_adapter::{
-        AuthoritativeUiEvent, ChildFrame, StdioReadEvent, TimedRequestReader, UiStdioAdapter,
-        run_stdio_with_adapter,
+        AuthoritativeUiEvent, ChildFrame, MonotonicClock, StdioReadEvent, TimedRequestReader,
+        UiStdioAdapter, run_stdio_with_adapter,
     },
 };
 use serde_json::json;
 use std::{io::Write, time::Duration};
+
+struct ManualClock {
+    readings: std::collections::VecDeque<u64>,
+}
+
+impl ManualClock {
+    fn new(readings: impl IntoIterator<Item = u64>) -> Self {
+        Self {
+            readings: readings.into_iter().collect(),
+        }
+    }
+}
+
+impl MonotonicClock for ManualClock {
+    fn now_ms(&mut self) -> u64 {
+        self.readings.pop_front().unwrap_or(u64::MAX)
+    }
+}
 
 fn request(id: &str, command: &str, args: serde_json::Value) -> Request {
     Request {
@@ -258,7 +276,13 @@ fn stdio_poll_emits_terminal_sas_invalidation_while_host_is_idle() {
         },
     );
     let mut output = Vec::new();
-    run_stdio_with_adapter(&mut DelayedEof::default(), &mut output, adapter).unwrap();
+    run_stdio_with_adapter(
+        &mut DelayedEof::default(),
+        &mut output,
+        adapter,
+        &mut ManualClock::new([20]),
+    )
+    .unwrap();
     assert!(String::from_utf8_lossy(&output).contains("sas_display_v1"));
     assert!(String::from_utf8_lossy(&output).contains("\"current\":false"));
 }
@@ -266,6 +290,30 @@ fn stdio_poll_emits_terminal_sas_invalidation_while_host_is_idle() {
 struct DelayedRequest {
     request: Option<Request>,
     cancelled: bool,
+}
+
+struct ScriptedReader {
+    events: std::collections::VecDeque<StdioReadEvent>,
+    cancelled: bool,
+}
+
+impl ScriptedReader {
+    fn new(events: impl IntoIterator<Item = StdioReadEvent>) -> Self {
+        Self {
+            events: events.into_iter().collect(),
+            cancelled: false,
+        }
+    }
+}
+
+impl TimedRequestReader for ScriptedReader {
+    fn receive_until(&mut self, _timeout: Duration) -> std::io::Result<StdioReadEvent> {
+        Ok(self.events.pop_front().unwrap_or(StdioReadEvent::Eof))
+    }
+
+    fn cancel(&mut self) {
+        self.cancelled = true;
+    }
 }
 
 impl TimedRequestReader for DelayedRequest {
@@ -299,7 +347,13 @@ fn delayed_request_is_measured_after_receive_and_cannot_confirm_an_expired_sas()
         cancelled: false,
     };
     let mut output = Vec::new();
-    run_stdio_with_adapter(&mut reader, &mut output, adapter).unwrap();
+    run_stdio_with_adapter(
+        &mut reader,
+        &mut output,
+        adapter,
+        &mut ManualClock::new([20]),
+    )
+    .unwrap();
     assert!(String::from_utf8_lossy(&output).contains("\"current\":false"));
     assert!(String::from_utf8_lossy(&output).contains("invalid_state"));
     assert!(!reader.cancelled);
@@ -330,6 +384,45 @@ fn writer_failure_cancels_the_owned_reader_before_returning() {
     );
     let mut reader = DelayedEof::default();
     let mut writer = FailingWriter;
-    assert!(run_stdio_with_adapter(&mut reader, &mut writer, adapter).is_err());
+    assert!(
+        run_stdio_with_adapter(
+            &mut reader,
+            &mut writer,
+            adapter,
+            &mut ManualClock::new([20])
+        )
+        .is_err()
+    );
     assert!(reader.cancelled);
+}
+
+#[test]
+fn late_runner_uses_the_admission_epoch_and_repeated_requests_cannot_extend_sas() {
+    let mut adapter = UiStdioAdapter::new(0);
+    adapter.on_authoritative_at(0, AuthoritativeUiEvent::RelationshipVerified);
+    adapter.on_authoritative_at(
+        0,
+        AuthoritativeUiEvent::V01SasReady {
+            view: v01(),
+            remaining_ms: 30_000,
+        },
+    );
+    let first = request("late-one", "ui.confirm_v01", json!({"matches": true}));
+    let second = request("late-two", "ui.confirm_v01", json!({"matches": true}));
+    let mut reader = ScriptedReader::new([
+        StdioReadEvent::Request(first),
+        StdioReadEvent::Request(second),
+        StdioReadEvent::Eof,
+    ]);
+    let mut output = Vec::new();
+    run_stdio_with_adapter(
+        &mut reader,
+        &mut output,
+        adapter,
+        &mut ManualClock::new([30_001, 30_002]),
+    )
+    .unwrap();
+    let output = String::from_utf8_lossy(&output);
+    assert_eq!(output.matches("\"current\":false").count(), 1);
+    assert_eq!(output.matches("invalid_state").count(), 2);
 }

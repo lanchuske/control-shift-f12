@@ -435,26 +435,59 @@ pub enum StdioReadEvent {
     Eof,
 }
 
+/// The single monotonic epoch shared by admission, authoritative updates and
+/// the stdio runner. A runner never manufactures a second epoch for an
+/// already-admitted adapter.
+pub trait MonotonicClock {
+    fn now_ms(&mut self) -> u64;
+}
+
+pub struct InstantEpoch {
+    origin: Instant,
+}
+
+impl InstantEpoch {
+    pub fn new() -> Self {
+        Self {
+            origin: Instant::now(),
+        }
+    }
+}
+
+impl Default for InstantEpoch {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl MonotonicClock for InstantEpoch {
+    fn now_ms(&mut self) -> u64 {
+        self.origin.elapsed().as_millis().min(u128::from(u64::MAX)) as u64
+    }
+}
+
 /// Runs the bounded inherited-pipe adapter. It deliberately has no listener,
 /// shell, process spawning, or network path. The caller owns the cancellable
 /// framed-pipe reader, so a writer failure cannot strand a background read.
 pub fn run_stdio(reader: &mut impl TimedRequestReader, writer: &mut impl Write) -> io::Result<()> {
-    run_stdio_with_adapter(reader, writer, UiStdioAdapter::new(0))
+    let mut clock = InstantEpoch::new();
+    let adapter = UiStdioAdapter::new(clock.now_ms());
+    run_stdio_with_adapter(reader, writer, adapter, &mut clock)
 }
 
 /// Runs a previously admitted adapter over the owned cancellable pipe reader.
-pub fn run_stdio_with_adapter(
+pub fn run_stdio_with_adapter<C: MonotonicClock>(
     reader: &mut impl TimedRequestReader,
     writer: &mut impl Write,
     mut adapter: UiStdioAdapter,
+    clock: &mut C,
 ) -> io::Result<()> {
-    let started = Instant::now();
     loop {
         match reader.receive_until(adapter.wait_until_next_deadline())? {
             StdioReadEvent::Request(request) => {
                 // Time is sampled after the blocking receive returns, so an
                 // overdue request cannot confirm or refresh a stale SAS.
-                let now_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+                let now_ms = clock.now_ms();
                 for frame in adapter.handle_host_request_at(now_ms, &request) {
                     if let Err(error) = control_api::write_message(writer, &frame) {
                         reader.cancel();
@@ -464,7 +497,7 @@ pub fn run_stdio_with_adapter(
             }
             StdioReadEvent::Eof => return Ok(()),
             StdioReadEvent::Timeout => {
-                let now_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+                let now_ms = clock.now_ms();
                 for frame in adapter.poll_at(now_ms) {
                     if let Err(error) = control_api::write_message(writer, &frame) {
                         reader.cancel();
