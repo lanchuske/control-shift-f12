@@ -37,12 +37,31 @@ def validate(handshake: str, provisional: str, authority: str, pending: str) -> 
     assert "connection.close(APPLICATION_ERROR.into(), b\"pairing ingress frozen\")" in watcher
     assert watcher.find("scope.freeze(revoker)") < watcher.find("connection.close")
     assert "if state.phase != ConsentPhase::Active" in provisional
+    freeze_scope = provisional.split("fn freeze(&self", 1)[1].split("fn revoke(&self)", 1)[0]
+    assert freeze_scope.find("revoker.arm()") < freeze_scope.find("ConsentPhase::Frozen")
     drop_body = provisional.split("impl Drop for ProvisionalEndpoint", 1)[1].split("impl Drop for ProvisionalChannel", 1)[0]
     revoke_scope_at = drop_body.find("let revoker = self.scope.revoke()")
     revoke_store_at = drop_body.find("revoker.revoke()")
     close_at = drop_body.find("self.endpoint.close")
     assert 0 <= revoke_scope_at < close_at
     assert 0 <= revoke_store_at < close_at
+    assert "self.store.resolve_admission_guard(attempt)?" in authority
+    assert re.search(
+        r"self\.ledger_dir\s*\.replace\(&admission_guard_filename\(attempt\), &bytes\)\?",
+        pending,
+    )
+    resolver = pending.split("fn resolve_admission_guard", 1)[1].split("fn revoke_current", 1)[0]
+    assert "contains(&guard.token)" in resolver
+    assert "armed: true" in resolver
+    assert "revoker.revoke()" in resolver
+    revocation = pending.split("fn revoke_current", 1)[1].split("fn reconcile_pairing", 1)[0]
+    revocation_before_save = revocation.split("self.save(&ledger)?", 1)[0]
+    assert "ledger.active_pins.retain(|pin| pin.peer != peer)" in revocation_before_save
+    assert re.search(
+        r"ledger\s*\.pending\s*\.retain\(\|entry\| entry\.record\.peer_fingerprint != peer\)",
+        revocation_before_save,
+    )
+    assert "ledger.tombstones.extend(&removed)" in revocation_before_save
     assert "use crate::identity_store::IdentityStore" not in authority
     assert ": IdentityStore" not in authority
     assert "pub(crate) async fn commit_sealed_foundation" in authority
@@ -94,7 +113,9 @@ def main() -> None:
         "freeze-without-closing-ingress": ("handshake", "connection.close(APPLICATION_ERROR.into(), b\"pairing ingress frozen\");", "let _ = &connection;"),
         "drop-scope-check": ("provisional", "if state.phase != ConsentPhase::Active", "if false"),
         "freeze-before-scope-cas": ("handshake", "if scope.freeze(revoker).is_err()", "connection.close(APPLICATION_ERROR.into(), b\"pairing ingress frozen\");\n                    if scope.freeze(revoker).is_err()"),
-        "omit-durable-drop-revocation": ("provisional", "let _ = revoker.revoke();", "let _ = revoker;"),
+        "omit-durable-drop-revocation": ("provisional", "let _revocation_result = revoker.revoke();", "let _revocation_result = Ok::<(), crate::pairing_pending::StoreError>(());"),
+        "omit-revocation-guard": ("pending", "self.ledger_dir\n                .replace(&admission_guard_filename(attempt), &bytes)?;", "let _ = bytes;"),
+        "consume-revocation-retry": ("pending", "armed: true", "armed: false"),
         "frozen-retains-runtime-channel": ("handshake", "pub(crate) struct FrozenPromotionEvidence {", "pub(crate) struct FrozenPromotionEvidence {\n    channel: ProvisionalChannel,"),
         "return-before-durability": ("pending", "self.save(&ledger)?;\n            self.pending_dir.remove(&filename(receipt.attempt))?;", "return Ok(receipt.clone());\n            self.save(&ledger)?;\n            self.pending_dir.remove(&filename(receipt.attempt))?;"),
         "legacy-identity-owner": ("authority", "use std::path::Path;", "use std::path::Path;\nuse crate::identity_store::IdentityStore;"),
@@ -119,7 +140,31 @@ def main() -> None:
         except AssertionError:
             continue
         raise AssertionError(f"mutant {name} survived")
-    print(f"PASS: base contract and {len(mutants)} mutants rejected")
+    revocation_at = sources["pending"].find("fn revoke_current")
+    assert revocation_at >= 0
+    for name, old, new in [
+        (
+            "omit-revocation-active-pin-removal",
+            "ledger.active_pins.retain(|pin| pin.peer != peer);",
+            "ledger.active_pins.retain(|_| true);",
+        ),
+        (
+            "omit-revocation-tombstones",
+            "ledger.tombstones.extend(&removed);",
+            "let _ = &removed;",
+        ),
+    ]:
+        prefix = sources["pending"][:revocation_at]
+        suffix = sources["pending"][revocation_at:]
+        assert old in suffix, f"mutant {name} did not match revocation source"
+        candidate = dict(sources)
+        candidate["pending"] = prefix + suffix.replace(old, new, 1)
+        try:
+            validate(**candidate)
+        except AssertionError:
+            continue
+        raise AssertionError(f"mutant {name} survived")
+    print(f"PASS: base contract and {len(mutants) + 2} mutants rejected")
 
 
 if __name__ == "__main__":

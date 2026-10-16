@@ -235,7 +235,7 @@ impl SealedPromotionEvidence {
     ) -> Result<FrozenPromotionEvidence, HandshakeError> {
         let signal = self.watcher.freeze.take().ok_or(HandshakeError::Rejected)?;
         let revoker = store
-            .admission_revoker(self.pending.peer_fingerprint)
+            .admission_revoker(self.pending.peer_fingerprint, self.pending.attempt_id)
             .map_err(|_| HandshakeError::Rejected)?;
         signal.send(revoker).map_err(|_| HandshakeError::Rejected)?;
         let static_result = self.revalidate_static();

@@ -1,6 +1,11 @@
 //! Quarantined setup metadata. Nothing in this module grants trust or input.
 use serde::{Deserialize, Serialize};
 use std::path::Path;
+#[cfg(feature = "pairing-v2-experimental")]
+use std::{
+    collections::BTreeSet,
+    sync::{Mutex, OnceLock},
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum StoreError {
@@ -66,13 +71,60 @@ pub struct PendingStore {
 pub(crate) struct AdmissionRevoker {
     store: PendingStore,
     peer: [u8; 32],
+    attempt: [u8; 32],
+    token: [u8; 32],
+    armed: bool,
 }
 
 #[cfg(feature = "pairing-v2-experimental")]
 impl AdmissionRevoker {
-    pub(crate) fn revoke(self) -> Result<(), StoreError> {
-        self.store.revoke_current(self.peer)
+    pub(crate) fn arm(&mut self) -> Result<(), StoreError> {
+        active_revocation_guards()
+            .lock()
+            .map_err(|_| StoreError::Invalid)?
+            .insert(self.token);
+        self.armed = true;
+        Ok(())
     }
+
+    pub(crate) fn revoke(&mut self) -> Result<(), StoreError> {
+        active_revocation_guards()
+            .lock()
+            .map_err(|_| StoreError::Invalid)?
+            .remove(&self.token);
+        self.store.revoke_current(self.peer)?;
+        self.store.clear_admission_guard(self.attempt)?;
+        self.armed = false;
+        Ok(())
+    }
+}
+
+#[cfg(feature = "pairing-v2-experimental")]
+impl Drop for AdmissionRevoker {
+    fn drop(&mut self) {
+        if self.armed {
+            if let Ok(mut active) = active_revocation_guards().lock() {
+                active.remove(&self.token);
+            }
+        } else {
+            let _ = self.store.clear_admission_guard(self.attempt);
+        }
+    }
+}
+
+#[cfg(feature = "pairing-v2-experimental")]
+fn active_revocation_guards() -> &'static Mutex<BTreeSet<[u8; 32]>> {
+    static ACTIVE: OnceLock<Mutex<BTreeSet<[u8; 32]>>> = OnceLock::new();
+    ACTIVE.get_or_init(|| Mutex::new(BTreeSet::new()))
+}
+
+#[cfg(feature = "pairing-v2-experimental")]
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AdmissionRevocationGuard {
+    attempt: [u8; 32],
+    peer: [u8; 32],
+    token: [u8; 32],
 }
 
 impl PendingStore {
@@ -87,6 +139,7 @@ impl PendingStore {
 mod unix {
     use super::*;
     use crate::private_fs::PrivateDir;
+    use rand::RngCore;
     use sha2::{Digest, Sha256};
     use std::collections::BTreeSet;
 
@@ -362,24 +415,101 @@ mod unix {
         )
     }
 
+    #[cfg(feature = "pairing-v2-experimental")]
+    fn admission_guard_filename(attempt: [u8; 32]) -> String {
+        format!(
+            "admission-revocation-{}.json",
+            attempt
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+        )
+    }
+
     impl PendingStore {
         #[cfg(feature = "pairing-v2-experimental")]
         pub(crate) fn admission_revoker(
             &self,
             peer: [u8; 32],
+            attempt: [u8; 32],
         ) -> Result<AdmissionRevoker, StoreError> {
+            if peer == [0; 32] || attempt == [0; 32] {
+                return Err(StoreError::Invalid);
+            }
+            let mut token = [0u8; 32];
+            rand::rngs::OsRng.fill_bytes(&mut token);
+            if token == [0; 32] {
+                return Err(StoreError::Invalid);
+            }
+            let guard = AdmissionRevocationGuard {
+                attempt,
+                peer,
+                token,
+            };
+            let bytes = serde_json::to_vec(&guard).map_err(|_| StoreError::Invalid)?;
+            self.ledger_dir
+                .replace(&admission_guard_filename(attempt), &bytes)?;
             Ok(AdmissionRevoker {
                 store: PendingStore {
                     pending_dir: self.pending_dir.try_clone()?,
                     ledger_dir: self.ledger_dir.try_clone()?,
                 },
                 peer,
+                attempt,
+                token,
+                armed: false,
             })
         }
 
         #[cfg(feature = "pairing-v2-experimental")]
+        pub(crate) fn clear_admission_guard(&self, attempt: [u8; 32]) -> Result<(), StoreError> {
+            let file = admission_guard_filename(attempt);
+            #[cfg(all(test, feature = "pairing-v2-experimental"))]
+            crate::private_fs::faults::point(&file, "before_remove")?;
+            self.ledger_dir.remove(&file)?;
+            #[cfg(all(test, feature = "pairing-v2-experimental"))]
+            crate::private_fs::faults::point(&file, "after_remove")?;
+            Ok(())
+        }
+
+        #[cfg(feature = "pairing-v2-experimental")]
+        pub(crate) fn resolve_admission_guard(&self, attempt: [u8; 32]) -> Result<(), StoreError> {
+            let file = admission_guard_filename(attempt);
+            let Some(bytes) = self.ledger_dir.read(&file, RECORD_LIMIT)? else {
+                return Ok(());
+            };
+            let guard: AdmissionRevocationGuard =
+                serde_json::from_slice(&bytes).map_err(|_| StoreError::Invalid)?;
+            if guard.attempt != attempt || guard.peer == [0; 32] || guard.token == [0; 32] {
+                return Err(StoreError::Invalid);
+            }
+            if active_revocation_guards()
+                .lock()
+                .map_err(|_| StoreError::Invalid)?
+                .contains(&guard.token)
+            {
+                return Ok(());
+            }
+            let mut revoker = AdmissionRevoker {
+                store: PendingStore {
+                    pending_dir: self.pending_dir.try_clone()?,
+                    ledger_dir: self.ledger_dir.try_clone()?,
+                },
+                peer: guard.peer,
+                attempt,
+                token: guard.token,
+                armed: true,
+            };
+            revoker.revoke()
+        }
+
+        #[cfg(feature = "pairing-v2-experimental")]
         pub(super) fn revoke_current(&self, peer: [u8; 32]) -> Result<(), StoreError> {
+            #[cfg(all(test, feature = "pairing-v2-experimental"))]
+            crate::private_fs::faults::point("ledger.json", "before_revoke_lock")?;
             let _lock = self.ledger_dir.lock()?;
+            #[cfg(all(test, feature = "pairing-v2-experimental"))]
+            crate::private_fs::faults::point("ledger.json", "before_revoke_load")?;
             let mut ledger = self.load_validated_manifest()?;
             let expected = ledger.version;
             ledger.advance(expected)?;
@@ -419,9 +549,13 @@ mod unix {
             ledger.tombstones.extend(&removed);
             self.save(&ledger)?;
             for attempt in removed {
+                #[cfg(all(test, feature = "pairing-v2-experimental"))]
+                crate::private_fs::faults::point("ledger.json", "before_revoke_remove")?;
                 self.pending_dir.remove(&filename(attempt))?;
             }
             for file in old_journals {
+                #[cfg(all(test, feature = "pairing-v2-experimental"))]
+                crate::private_fs::faults::point("ledger.json", "before_revoke_cleanup")?;
                 self.pending_dir.remove(&file)?;
             }
             Ok(())

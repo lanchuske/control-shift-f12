@@ -44,6 +44,15 @@ I/O, a paused save cannot deadlock Drop, and any future runtime-authority phase
 must observe both the channel-free frozen type and the durable revocation. This
 phase still has no method that emits runtime authority.
 
+Freeze also writes a per-attempt revocation guard before the scope can become
+`Frozen`. The live process registers the guard only for that exact random token.
+Drop unregisters it before attempting storage revocation. If lock, load, save or
+cleanup fails, the guard remains durable; reconciliation in this or a fresh
+process retries revocation and returns an error rather than `Promoted` until the
+pin is durably inactive. Cleanup happens only after durable revocation, so a
+crash cannot turn a failed Drop into usable authority. No filesystem operation
+is performed while the consent-state mutex is held.
+
 ## Durability and failure
 
 After both signed approvals, `PendingStore::prepare` creates only physically separate pending evidence. The existing CAS/revision/identity-generation/tombstone checks govern each write. Before returning local Commit, CommitAck or Complete bytes to the I/O adapter, the role-specific `Finalizer` must persist and flush its journal and manifest. Storage failure latches failure and returns no bytes to emit. No retry refreshes a failed CAS behind the caller's back.

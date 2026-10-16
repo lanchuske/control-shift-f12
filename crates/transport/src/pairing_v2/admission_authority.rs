@@ -80,6 +80,7 @@ impl AdmissionAuthorityStore {
     }
 
     pub fn reconcile(&self, attempt: [u8; 32]) -> Result<ReconcileAdmission, StoreError> {
+        self.store.resolve_admission_guard(attempt)?;
         let (pending, receipt, active) = self.store.admission_state(attempt)?;
         match (pending, receipt, active) {
             (true, None, false) => Ok(ReconcileAdmission::Pending),

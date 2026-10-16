@@ -307,11 +307,12 @@ impl ConsentScope {
     fn is_active(&self) -> Result<bool, Invalid> {
         Ok(self.0.lock().map_err(|_| Invalid)?.phase == ConsentPhase::Active)
     }
-    fn freeze(&self, revoker: crate::pairing_pending::AdmissionRevoker) -> Result<(), Invalid> {
+    fn freeze(&self, mut revoker: crate::pairing_pending::AdmissionRevoker) -> Result<(), Invalid> {
         let mut state = self.0.lock().map_err(|_| Invalid)?;
         if state.phase != ConsentPhase::Active {
             return Err(Invalid);
         }
+        revoker.arm().map_err(|_| Invalid)?;
         state.phase = ConsentPhase::Frozen;
         state.revoker = Some(revoker);
         Ok(())
@@ -419,8 +420,8 @@ impl Drop for ProvisionalEndpoint {
             pause.reached.wait();
             pause.release.wait();
         }
-        if let Some(revoker) = revoker {
-            let _ = revoker.revoke();
+        if let Some(mut revoker) = revoker {
+            let _revocation_result = revoker.revoke();
         }
         self.endpoint.close(0u32.into(), b"consent scope closed");
     }

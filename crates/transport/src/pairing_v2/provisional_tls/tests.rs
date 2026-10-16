@@ -537,6 +537,146 @@ async fn freeze_before_endpoint_drop_is_durably_revoked_before_future_authority(
         crate::pairing_v2::admission_authority::ReconcileAdmission::Revoked
     );
 }
+
+#[tokio::test]
+async fn endpoint_drop_revocation_faults_remain_observable_and_retryable() {
+    for (setting, first_reconcile) in [
+        (
+            "ledger:before_revoke_lock:error",
+            Err(crate::pairing_pending::StoreError::Unavailable),
+        ),
+        (
+            "ledger:before_revoke_load:error",
+            Err(crate::pairing_pending::StoreError::Unavailable),
+        ),
+        (
+            "ledger:before_write:error",
+            Err(crate::pairing_pending::StoreError::Unavailable),
+        ),
+        (
+            "pending:before_remove:error",
+            Err(crate::pairing_pending::StoreError::Unavailable),
+        ),
+        (
+            "pending:after_remove:error",
+            Ok(crate::pairing_v2::admission_authority::ReconcileAdmission::Revoked),
+        ),
+    ] {
+        let (ea, _eb, a, b, _) = pair().await;
+        let ta = tempfile::tempdir().unwrap();
+        let tb = tempfile::tempdir().unwrap();
+        let sa = crate::pairing_pending::PendingStore::open(ta.path()).unwrap();
+        let sb = crate::pairing_pending::PendingStore::open(tb.path()).unwrap();
+        let (a, b) = tokio::join!(
+            a.handshake(
+                handshake_config(1, 2),
+                &sa,
+                |p| async move { p.decision(true) }
+            ),
+            b.handshake(
+                handshake_config(2, 1),
+                &sb,
+                |p| async move { p.decision(true) }
+            )
+        );
+        let a = a.unwrap();
+        let _b = b.unwrap();
+        let attempt = a.test_attempt();
+        let store =
+            crate::pairing_v2::admission_authority::AdmissionAuthorityStore::open(ta.path())
+                .unwrap();
+        store
+            .commit_sealed_foundation(store.version().unwrap(), a)
+            .await
+            .unwrap();
+
+        unsafe { std::env::set_var("PAIRING_TEST_FS_FAULT", setting) };
+        crate::private_fs::faults::arm();
+        drop(ea);
+        assert_eq!(store.reconcile(attempt), first_reconcile, "{setting}");
+        unsafe { std::env::remove_var("PAIRING_TEST_FS_FAULT") };
+        assert_eq!(
+            store.reconcile(attempt).unwrap(),
+            crate::pairing_v2::admission_authority::ReconcileAdmission::Revoked,
+            "retry after {setting}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn durable_guard_fails_closed_in_a_fresh_process() {
+    use std::process::Command;
+
+    let (ea, _eb, a, b, _) = pair().await;
+    let ta = tempfile::tempdir().unwrap();
+    let tb = tempfile::tempdir().unwrap();
+    let sa = crate::pairing_pending::PendingStore::open(ta.path()).unwrap();
+    let sb = crate::pairing_pending::PendingStore::open(tb.path()).unwrap();
+    let (a, b) = tokio::join!(
+        a.handshake(
+            handshake_config(1, 2),
+            &sa,
+            |p| async move { p.decision(true) }
+        ),
+        b.handshake(
+            handshake_config(2, 1),
+            &sb,
+            |p| async move { p.decision(true) }
+        )
+    );
+    let a = a.unwrap();
+    let _b = b.unwrap();
+    let attempt = a.test_attempt();
+    let store =
+        crate::pairing_v2::admission_authority::AdmissionAuthorityStore::open(ta.path()).unwrap();
+    store
+        .commit_sealed_foundation(store.version().unwrap(), a)
+        .await
+        .unwrap();
+
+    let status = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "pairing_v2::provisional_tls::tests::admission_guard_restart_worker",
+            "--ignored",
+        ])
+        .env("CSF12_ADMISSION_GUARD_ROOT", ta.path())
+        .env(
+            "CSF12_ADMISSION_GUARD_ATTEMPT",
+            attempt
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>(),
+        )
+        .status()
+        .unwrap();
+    assert!(status.success());
+    assert_eq!(
+        store.reconcile(attempt).unwrap(),
+        crate::pairing_v2::admission_authority::ReconcileAdmission::Revoked
+    );
+    drop(ea);
+}
+
+#[cfg(unix)]
+#[test]
+#[ignore]
+fn admission_guard_restart_worker() {
+    let root = std::env::var_os("CSF12_ADMISSION_GUARD_ROOT").unwrap();
+    let hex = std::env::var("CSF12_ADMISSION_GUARD_ATTEMPT").unwrap();
+    assert_eq!(hex.len(), 64);
+    let mut attempt = [0u8; 32];
+    for (index, byte) in attempt.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&hex[index * 2..index * 2 + 2], 16).unwrap();
+    }
+    let store =
+        crate::pairing_v2::admission_authority::AdmissionAuthorityStore::open(root).unwrap();
+    assert_eq!(
+        store.reconcile(attempt).unwrap(),
+        crate::pairing_v2::admission_authority::ReconcileAdmission::Revoked
+    );
+}
 #[tokio::test]
 async fn bilateral_rejection_issues_real_reset_and_stop_independently_of_connection_close() {
     let (_ea, _eb, a, b, _) = pair().await;

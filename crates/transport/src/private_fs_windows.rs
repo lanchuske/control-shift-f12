@@ -317,6 +317,23 @@ pub(crate) struct PrivateDir {
 }
 
 impl PrivateDir {
+    #[cfg(feature = "pairing-v2-experimental")]
+    pub(crate) fn try_clone(&self) -> Result<Self, StoreError> {
+        self.validate_self()?;
+        let file = self.file.try_clone().map_err(|_| StoreError::Unavailable)?;
+        let handle = file.as_raw_handle().cast();
+        validate(handle, true, &self.sid)?;
+        if identity(&file_info(handle)?) != self.id {
+            return Err(StoreError::Invalid);
+        }
+        Ok(Self {
+            path: self.path.clone(),
+            file,
+            id: self.id,
+            sid: self.sid.clone(),
+        })
+    }
+
     pub fn root(path: &Path) -> Result<Self, StoreError> {
         if !path.is_absolute() {
             return Err(StoreError::Invalid);
