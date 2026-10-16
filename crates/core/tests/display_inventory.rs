@@ -15,6 +15,14 @@ fn observed(index: u32, width: f64, scale: f64) -> LogicalDisplay {
 }
 
 #[test]
+fn unavailable_display_name_is_not_presented_as_a_measurement() {
+    let inventory = DisplayInventory::from_logical(1, vec![observed(7, 1920.0, 2.0)]).unwrap();
+    let json = serde_json::to_value(inventory).unwrap();
+    assert_eq!(json["displays"][0]["name"], serde_json::Value::Null);
+    assert_eq!(json["displays"][0]["name_provenance"], "unavailable");
+}
+
+#[test]
 fn inventory_preserves_logical_measurements_without_inventing_physical_metadata() {
     let inventory = DisplayInventory::from_logical(1, vec![observed(7, 1920.0, 2.0)]).unwrap();
     let display = &inventory.displays()[0];

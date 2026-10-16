@@ -175,7 +175,7 @@ mod unix {
             let _lock = store.ledger_dir.lock()?;
             match store.ledger_dir.read("ledger.json", LEDGER_LIMIT)? {
                 Some(_) => {
-                    store.load()?;
+                    store.load_validated_manifest()?;
                 }
                 None => {
                     // A missing ledger after initialization is data loss, never a fresh trust epoch.
@@ -189,13 +189,27 @@ mod unix {
             Ok(store)
         }
 
-        fn load(&self) -> Result<Ledger, StoreError> {
+        /// Caller holds the ledger lock. Validate the complete referenced state before
+        /// returning any observation or allowing a mutation, including unrelated peers.
+        fn load_validated_manifest(&self) -> Result<Ledger, StoreError> {
             let bytes = self
                 .ledger_dir
                 .read("ledger.json", LEDGER_LIMIT)?
                 .ok_or(StoreError::Invalid)?;
             let ledger: Ledger = serde_json::from_slice(&bytes).map_err(|_| StoreError::Invalid)?;
             ledger.validate()?;
+            for reference in &ledger.pending {
+                let bytes = self
+                    .pending_dir
+                    .read(&filename(reference.record.attempt_id), RECORD_LIMIT)?
+                    .ok_or(StoreError::Invalid)?;
+                let digest: [u8; 32] = Sha256::digest(&bytes).into();
+                let record: PendingRecord =
+                    serde_json::from_slice(&bytes).map_err(|_| StoreError::Invalid)?;
+                if digest != reference.digest || record != reference.record {
+                    return Err(StoreError::Invalid);
+                }
+            }
             Ok(ledger)
         }
 
@@ -210,7 +224,7 @@ mod unix {
 
         pub fn version(&self) -> Result<StoreVersion, StoreError> {
             let _lock = self.ledger_dir.lock()?;
-            Ok(self.load()?.version)
+            Ok(self.load_validated_manifest()?.version)
         }
 
         pub fn prepare(
@@ -220,7 +234,7 @@ mod unix {
             peer: [u8; 32],
         ) -> Result<PendingRecord, StoreError> {
             let _lock = self.ledger_dir.lock()?;
-            let mut ledger = self.load()?;
+            let mut ledger = self.load_validated_manifest()?;
             ledger.advance(expected)?;
             if attempt == [0; 32] || peer == [0; 32] {
                 return Err(StoreError::Invalid);
@@ -258,7 +272,7 @@ mod unix {
 
         pub fn pending(&self, attempt: [u8; 32]) -> Result<Option<PendingRecord>, StoreError> {
             let _lock = self.ledger_dir.lock()?;
-            let ledger = self.load()?;
+            let ledger = self.load_validated_manifest()?;
             let Some(reference) = ledger
                 .pending
                 .iter()
@@ -266,22 +280,12 @@ mod unix {
             else {
                 return Ok(None);
             };
-            let bytes = self
-                .pending_dir
-                .read(&filename(attempt), RECORD_LIMIT)?
-                .ok_or(StoreError::Invalid)?;
-            let digest: [u8; 32] = Sha256::digest(&bytes).into();
-            let record: PendingRecord =
-                serde_json::from_slice(&bytes).map_err(|_| StoreError::Invalid)?;
-            if digest != reference.digest || record != reference.record {
-                return Err(StoreError::Invalid);
-            }
-            Ok(Some(record))
+            Ok(Some(reference.record.clone()))
         }
 
         pub fn cancel(&self, expected: StoreVersion, attempt: [u8; 32]) -> Result<(), StoreError> {
             let _lock = self.ledger_dir.lock()?;
-            let mut ledger = self.load()?;
+            let mut ledger = self.load_validated_manifest()?;
             ledger.advance(expected)?;
             if !ledger
                 .pending
@@ -304,7 +308,7 @@ mod unix {
             peer: [u8; 32],
         ) -> Result<(), StoreError> {
             let _lock = self.ledger_dir.lock()?;
-            let mut ledger = self.load()?;
+            let mut ledger = self.load_validated_manifest()?;
             ledger.advance(expected)?;
             if peer == [0; 32] {
                 return Err(StoreError::Invalid);
@@ -334,13 +338,13 @@ mod unix {
 
         pub fn revocation_generation(&self, peer: [u8; 32]) -> Result<u64, StoreError> {
             let _lock = self.ledger_dir.lock()?;
-            Ok(self.load()?.revocation(peer))
+            Ok(self.load_validated_manifest()?.revocation(peer))
         }
 
         /// Advances the setup epoch. Does not regenerate, read, or write a device private key.
         pub fn rotate_identity(&self, expected: StoreVersion) -> Result<(), StoreError> {
             let _lock = self.ledger_dir.lock()?;
-            let mut ledger = self.load()?;
+            let mut ledger = self.load_validated_manifest()?;
             ledger.advance(expected)?;
             ledger.version.identity_generation = ledger
                 .version

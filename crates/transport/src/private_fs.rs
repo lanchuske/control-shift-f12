@@ -42,13 +42,13 @@ impl PrivateDir {
             return Err(StoreError::Invalid);
         }
         match std::fs::symlink_metadata(path) {
-            Ok(m) if m.file_type().is_symlink() => return Err(StoreError::Invalid),
             Ok(_) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 std::fs::create_dir_all(path).map_err(|_| StoreError::Unavailable)?;
             }
             Err(_) => return Err(StoreError::Unavailable),
         }
+        // Reject root links at the atomic open, not with a raceable path precheck.
         let file = OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)

@@ -4,6 +4,152 @@ use seamless_transport::{
     pairing_pending::{PendingStore, StoreError},
 };
 
+// Snapshot without following links: failed validation must not advance or clean up state.
+fn tree_snapshot(path: &std::path::Path) -> Vec<(std::path::PathBuf, u32, Vec<u8>)> {
+    use std::os::unix::fs::MetadataExt;
+    let mut result = vec![];
+    let mut entries: Vec<_> = std::fs::read_dir(path)
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    entries.sort_by_key(|e| e.file_name());
+    for entry in entries {
+        let p = entry.path();
+        let metadata = std::fs::symlink_metadata(&p).unwrap();
+        let bytes = if metadata.file_type().is_symlink() {
+            std::fs::read_link(&p)
+                .unwrap()
+                .as_os_str()
+                .as_encoded_bytes()
+                .to_vec()
+        } else if metadata.is_file() {
+            std::fs::read(&p).unwrap()
+        } else {
+            vec![]
+        };
+        result.push((p.clone(), metadata.mode(), bytes));
+        if metadata.is_dir() {
+            result.extend(tree_snapshot(&p));
+        }
+    }
+    result
+}
+
+#[test]
+fn every_operation_rejects_any_invalid_referenced_record_without_mutation() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    let mut failures = vec![];
+    for fault in [
+        "corrupt",
+        "record",
+        "digest",
+        "missing",
+        "symlink",
+        "hardlink",
+        "permissions",
+        "directory",
+    ] {
+        for operation in [
+            "open",
+            "version",
+            "generation",
+            "pending_b",
+            "prepare_c",
+            "cancel_b",
+            "revoke_b",
+            "rotate",
+        ] {
+            let home = tempfile::tempdir().unwrap();
+            let outside = tempfile::tempdir().unwrap();
+            let store = PendingStore::open(home.path()).unwrap();
+            store
+                .prepare(store.version().unwrap(), [1; 32], [11; 32])
+                .unwrap();
+            store
+                .prepare(store.version().unwrap(), [2; 32], [22; 32])
+                .unwrap();
+            let version = store.version().unwrap();
+            let a = home
+                .path()
+                .join("pairing-pending")
+                .join(format!("{}.json", "01".repeat(32)));
+            match fault {
+                "corrupt" => std::fs::write(&a, b"{}").unwrap(),
+                "record" => {
+                    let mut json: serde_json::Value =
+                        serde_json::from_slice(&std::fs::read(&a).unwrap()).unwrap();
+                    json["revocation_generation"] = serde_json::json!(1);
+                    std::fs::write(&a, serde_json::to_vec(&json).unwrap()).unwrap();
+                }
+                "digest" => {
+                    let mut bytes = std::fs::read(&a).unwrap();
+                    bytes.push(b' '); // Same record, different bytes: digest must still be checked.
+                    std::fs::write(&a, bytes).unwrap();
+                }
+                "missing" => std::fs::remove_file(&a).unwrap(),
+                "symlink" => {
+                    let target = outside.path().join("valid-private-record.json");
+                    std::fs::rename(&a, &target).unwrap();
+                    std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600))
+                        .unwrap();
+                    symlink(&target, &a).unwrap();
+                }
+                "hardlink" => std::fs::hard_link(&a, outside.path().join("hardlink")).unwrap(),
+                "permissions" => {
+                    std::fs::set_permissions(&a, std::fs::Permissions::from_mode(0o644)).unwrap()
+                }
+                "directory" => {
+                    std::fs::remove_file(&a).unwrap();
+                    std::fs::create_dir(&a).unwrap();
+                }
+                _ => unreachable!(),
+            }
+            let before = tree_snapshot(home.path());
+            let rejected = match operation {
+                "open" => PendingStore::open(home.path()).is_err(),
+                "version" => store.version().is_err(),
+                "generation" => store.revocation_generation([22; 32]).is_err(),
+                "pending_b" => store.pending([2; 32]).is_err(),
+                "prepare_c" => store.prepare(version, [3; 32], [33; 32]).is_err(),
+                "cancel_b" => store.cancel(version, [2; 32]).is_err(),
+                "revoke_b" => store.revoke_candidate(version, [22; 32]).is_err(),
+                "rotate" => store.rotate_identity(version).is_err(),
+                _ => unreachable!(),
+            };
+            if !rejected || tree_snapshot(home.path()) != before {
+                failures.push(format!(
+                    "{fault}/{operation}: rejected={rejected}, state_unchanged={}",
+                    tree_snapshot(home.path()) == before
+                ));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[test]
+fn owner_only_symlinked_root_is_rejected() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    let home = tempfile::tempdir().unwrap();
+    let target = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(target.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let link = home.path().join("linked-root");
+    symlink(target.path(), &link).unwrap();
+    assert!(PendingStore::open(&link).is_err());
+    assert!(tree_snapshot(target.path()).is_empty());
+}
+
+#[test]
+fn owner_only_symlinked_child_is_rejected() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    let home = tempfile::tempdir().unwrap();
+    let target = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(target.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    symlink(target.path(), home.path().join("pairing-pending")).unwrap();
+    assert!(PendingStore::open(home.path()).is_err());
+    assert!(tree_snapshot(target.path()).is_empty());
+}
+
 #[test]
 fn quarantined_candidate_never_appears_in_active_pins() {
     let home = tempfile::tempdir().unwrap();

@@ -31,7 +31,8 @@ pub struct PhysicalSize {
 pub struct DisplayDescriptor {
     pub runtime_index: u32,
     pub stable_display_id: Option<String>,
-    pub name: String,
+    pub name: Option<String>,
+    pub name_provenance: &'static str,
     pub logical_bounds: Bounds,
     pub backing_scale: Axes,
     pub framebuffer_pixels: Option<PixelSize>,
@@ -95,7 +96,8 @@ impl DisplayInventory {
             displays.push(DisplayDescriptor {
                 runtime_index: value.index,
                 stable_display_id: None,
-                name: format!("Display {}", value.index),
+                name: None,
+                name_provenance: "unavailable",
                 logical_bounds: Bounds {
                     x: normalized_zero(value.origin_x),
                     y: normalized_zero(value.origin_y),
