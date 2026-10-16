@@ -50,6 +50,35 @@ means the UI invents protocol facts or bypasses permissions/firewall policy.
 
 The detailed interaction contract is [the native setup UX specification](../native-setup-ux-specification.md).
 
+## Action-gate schema
+
+Presented state is a projection, never action authority. A disabled or visible
+control must not be treated as an engine command, and every future enabled
+control needs the typed gate below. “Future schema” names a review target; it
+does not add a current host-to-child command. The current host-to-child
+allowlist remains exactly `ui.refresh` and `ui.confirm_v01`.
+
+| User action | Future typed gate and engine owner | Required presented state / preconditions | Allowed effect | Fail-closed rejection and no fallback | Current status |
+| --- | --- | --- | --- | --- | --- |
+| `Find nearby` | `ui.discovery.begin`; discovery/admission owner | Explicit local gesture; app projection current; no selected attempt | Opens one bounded local discovery-consent window | Missing/stale runtime, duplicate window, or policy denial rejects; no manual address, legacy command, socket, or background retry | Fenced: G4, schema not implemented. |
+| `Stop looking` | `ui.discovery.stop`; discovery/admission owner | Own current discovery-window generation | Closes only that local window and clears untrusted catalogue projection | Generation mismatch or absent window rejects; cannot stop/alter another process or preserve a candidate | Fenced: G4, schema not implemented. |
+| `Select nearby computer` | `ui.discovery.select`; discovery/admission owner | Current compatible opaque handle in the selected catalogue generation; browsing stopped atomically | Binds one local candidate selection for the next reviewed bootstrap gate | Stale/missing/incompatible/replaced handle rejects; no identity inference or silent substitution | Fenced: G4, schema not implemented. |
+| `Begin bootstrap` | `ui.bootstrap.begin`; durable-pairing bootstrap owner | One current selected candidate, explicit local gesture, no active bootstrap/V01 attempt | Starts only the separately reviewed bootstrap state machine | Any unavailable receipt/identity/protocol fact rejects; no V01, layout, sharing, manual-address, or retained-connection fallback | Fenced: G4; frozen bootstrap contract absent. |
+| `Confirm bootstrap code` | `ui.bootstrap.confirm { matches: bool }`; bootstrap owner | Current bootstrap attempt, local SAS display, local unexpired deadline | Records one local match/mismatch decision for that bootstrap attempt | Missing/stale/expired code, duplicate, remote-only approval, or mismatch rejects/clears; no V01 confirmation reuse | Fenced: G4, schema not implemented. |
+| `Begin V01` | `ui.v01.begin`; operational-session owner | Explicit selection of locally verified active durable receipt/pin; no terminal fence; fresh local gesture | Creates one fresh V01 connection/attempt only | Prepared/revoked/missing receipt, candidate drift, or unavailable session rejects; no bootstrap, discovery, or legacy fallback | Fenced: G4/G5; V01 UI admission not wired. |
+| `Confirm V01 code` | Existing typed `ui.confirm_v01 { matches: bool }`; UI controller plus operational-session owner | One current engine-authored V01 SAS, exact live attempt, before authoritative deadline, one local gesture | Records only this local comparison choice; the remote peer must decide independently | Missing/stale/duplicate/late/malformed state rejects and clears; no remote confirmation, timeout extension, or authority grant | Adapter schema exists, but fenced until G1 plus operational integration. |
+| `Move display` | `ui.layout.move_cardinal { display, direction, alignment }`; future local layout-draft owner | Current measured inventory generation; local arrangement state; geometry valid before and after move | Changes only an in-memory local draft by a cardinal edge | Invalid/diagonal/overlap/stale-generation move rejects; no save, transport, input, or clipboard effect | Fenced: G5, schema not implemented. |
+| `Reset layout` | `ui.layout.reset_draft`; future local layout-draft owner | Current local draft tied to current inventory generation | Restores only the local default draft | Missing/stale inventory or absent draft rejects; no durable deletion or remote mutation | Fenced: G5, schema not implemented. |
+| `Review layout` | `ui.layout.propose`; future authenticated application-session owner | Valid canonical local draft; both inventories current; separately admitted post-V01 session | Produces a review-only proposal for the other local UI | No authenticated lifecycle, changed inventory, ambiguity, or failed canonical validation rejects; no map save or V01-payload reuse | Explicitly fenced: G6. |
+| `Start sharing` | `ui.runtime.start`; future runtime capability owner | Bilaterally durable saved layout, current runtime PASS, active permissions, separate sharing consent/capability gate | Starts only reviewed runtime capability after all gates | Any missing layout proof, permission, session, or capability rejects; no input/clipboard enablement from map/V01/UI state | Explicitly fenced: G7. |
+| `Stop sharing` | `ui.runtime.stop`; future runtime capability owner | Current locally owned runtime capability | Releases local sharing state and returns control locally | Missing/terminal state is idempotent local-safe; cannot revive a session, mutate trust, or act remotely | Fenced: G7; emergency/local recovery remains separately reviewed. |
+| `Retry` | `ui.session.retry`; owning failed-stage controller | The current projection contains a retryable, non-terminal, local failure class and no active child/session | Starts a fresh attempt for that same stage only | Terminal/revoked/ambiguous/stale failure rejects; no reuse of SAS, request ID, candidate, layout draft, or hidden fallback | Fenced until each owning stage is admitted. |
+
+The host may render these controls and their unavailable explanations, but it
+must not send any future schema before that schema, its owner, and the adapter
+allowlist are independently reviewed. Layout review/save/share are therefore
+not merely visually disabled: they have no admitted host-to-child authority.
+
 ## Two native design systems
 
 The common character is a calm equipment panel: one quiet vertical workflow

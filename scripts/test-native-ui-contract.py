@@ -369,6 +369,36 @@ class NativeHostBoundaryTests(unittest.TestCase):
         ):
             self.assertIn(invariant, plan)
 
+    def test_desktop_parity_plan_maps_every_user_action_to_a_fenced_gate(self):
+        """Presented desktop states do not themselves authorize user actions."""
+        plan = DESKTOP_PARITY_GATE.read_text()
+        self.assertIn("## Action-gate schema", plan)
+        for column in (
+            "Future typed gate and engine owner",
+            "Required presented state / preconditions",
+            "Allowed effect",
+            "Fail-closed rejection and no fallback",
+            "Current status",
+            "allowlist remains exactly `ui.refresh` and `ui.confirm_v01`",
+        ):
+            self.assertIn(column, plan)
+        for action in (
+            "Find nearby",
+            "Stop looking",
+            "Select nearby computer",
+            "Begin bootstrap",
+            "Confirm bootstrap code",
+            "Begin V01",
+            "Confirm V01 code",
+            "Move display",
+            "Reset layout",
+            "Review layout",
+            "Start sharing",
+            "Stop sharing",
+            "Retry",
+        ):
+            self.assertIn(f"`{action}`", plan)
+
     def test_every_sas_field_and_literal_is_rejected_recursively_from_host_args(self):
         """A partial display shape is still an impermissible host re-export."""
         for field in SAS_HOST_REQUEST_RESERVED_FIELDS:
