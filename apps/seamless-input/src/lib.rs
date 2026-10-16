@@ -12,3 +12,4 @@ pub mod runtime;
 pub mod runtime_status;
 pub mod supervisor;
 pub mod tui;
+pub mod ui_contract;
