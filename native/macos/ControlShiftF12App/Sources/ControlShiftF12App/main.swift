@@ -86,6 +86,61 @@ struct MacDesktopShellPresentation: Equatable {
     )
 }
 
+/// Presentation-only bilateral pairing state. The transport supplies an
+/// opaque candidate and a transient verification phrase; this state cannot
+/// expose addresses or make durable admission happen on its own.
+enum MacPairingBridgePhase: Equatable {
+    case browsing
+    case awaitingLocalConfirmation
+    case awaitingRemoteConfirmation
+    case readyForDurableAdmission
+}
+
+struct MacPairingBridgeState: Equatable {
+    private(set) var phase: MacPairingBridgePhase = .browsing
+    private(set) var selectedCandidate: String?
+    private(set) var verificationWords: [String] = []
+
+    mutating func beginVerification(candidate: String, words: [String]) {
+        guard phase == .browsing, Self.validHandle(candidate), Self.validWords(words) else { return }
+        selectedCandidate = candidate
+        verificationWords = words
+        phase = .awaitingLocalConfirmation
+    }
+
+    mutating func approveLocalDisplay(matches: Bool) {
+        guard phase == .awaitingLocalConfirmation else { return }
+        if matches {
+            phase = .awaitingRemoteConfirmation
+        } else {
+            cancel()
+        }
+    }
+
+    mutating func acceptRemoteDisplay() {
+        guard phase == .awaitingRemoteConfirmation else { return }
+        phase = .readyForDurableAdmission
+    }
+
+    mutating func cancel() {
+        phase = .browsing
+        selectedCandidate = nil
+        verificationWords = []
+    }
+
+    private static func validHandle(_ value: String) -> Bool {
+        !value.isEmpty && value.count <= 64 && value.allSatisfy {
+            $0.isASCII && ($0.isLetter || $0.isNumber || $0 == "-" || $0 == "_")
+        }
+    }
+
+    private static func validWords(_ words: [String]) -> Bool {
+        words.count == 4 && words.allSatisfy {
+            !$0.isEmpty && $0.count <= 24 && $0.allSatisfy { $0 >= "a" && $0 <= "z" }
+        }
+    }
+}
+
 struct DiagnosticSourceRow: Equatable {
     let id: String
     let label: String

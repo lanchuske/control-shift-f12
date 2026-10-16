@@ -15,6 +15,34 @@ final class ControlShiftF12AppTests: XCTestCase {
         XCTAssertFalse(shell.saveLayoutEnabled)
     }
 
+    func testPairingBridgeRequiresMatchingCodeAndBothConfirmationsBeforeAdmission() {
+        var state = MacPairingBridgeState()
+        state.beginVerification(
+            candidate: "windows-studio",
+            words: ["ember", "ocean", "violet", "copper"]
+        )
+        XCTAssertEqual(state.phase, .awaitingLocalConfirmation)
+        XCTAssertEqual(state.selectedCandidate, "windows-studio")
+
+        state.approveLocalDisplay(matches: true)
+        XCTAssertEqual(state.phase, .awaitingRemoteConfirmation)
+        state.acceptRemoteDisplay()
+        XCTAssertEqual(state.phase, .readyForDurableAdmission)
+    }
+
+    func testPairingBridgeRejectsInvalidOrRejectedVerificationWithoutAdmission() {
+        var rejected = MacPairingBridgeState()
+        rejected.beginVerification(candidate: "windows-studio", words: ["ember", "ocean", "violet", "copper"])
+        rejected.approveLocalDisplay(matches: false)
+        rejected.acceptRemoteDisplay()
+
+        var invalid = MacPairingBridgeState()
+        invalid.beginVerification(candidate: "windows studio", words: ["one", "two", "three", "four"])
+
+        XCTAssertEqual(rejected.phase, .browsing)
+        XCTAssertEqual(invalid.phase, .browsing)
+    }
+
     func testInitial_snapshot_enables_only_the_local_discovery_gesture() throws {
         let controller = DiagnosticsFrameController()
         let snapshot = """
