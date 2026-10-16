@@ -84,6 +84,51 @@ final class ControlShiftF12AppTests: XCTestCase {
         XCTAssertTrue(child.forceTerminated)
     }
 
+    func testStdoutEOFAfterPassInvalidatesProjectionAndClosesChildExactlyOnce() throws {
+        let child = RecordingChild()
+        let lifecycle = ChildLifecycle(child: child)
+        let session = DiagnosticsSession(lifecycle: lifecycle)
+
+        try session.receive(.data(frame(diagnosticsPayload(generation: 1))))
+        XCTAssertEqual(session.presentation.statusText, "Running")
+
+        try session.receive(.endOfFile)
+        try session.receive(.endOfFile)
+
+        XCTAssertEqual(session.presentation.statusText, "Not running")
+        XCTAssertTrue(session.isTerminal)
+        XCTAssertEqual(child.terminateCalls, 1)
+        XCTAssertEqual(child.reapCalls, 1)
+    }
+
+    func testTerminationAfterPassInvalidatesProjectionAndLateFrameIsInert() throws {
+        let child = RecordingChild()
+        let session = DiagnosticsSession(lifecycle: ChildLifecycle(child: child))
+
+        try session.receive(.data(frame(diagnosticsPayload(generation: 1))))
+        try session.receive(.termination)
+        try session.receive(.data(frame(diagnosticsPayload(generation: 2))))
+
+        XCTAssertEqual(session.presentation.statusText, "Not running")
+        XCTAssertTrue(session.presentation.rows.isEmpty)
+        XCTAssertEqual(child.terminateCalls, 1)
+    }
+
+    func testPartialOutputThenPipeFailureInvalidatesPriorPassAndRejectsLateCallback() throws {
+        let child = RecordingChild()
+        let session = DiagnosticsSession(lifecycle: ChildLifecycle(child: child))
+        let complete = frame(diagnosticsPayload(generation: 1))
+
+        try session.receive(.data(complete))
+        try session.receive(.data(Data(complete.prefix(3))))
+        try session.receive(.pipeFailure)
+        try session.receive(.data(frame(diagnosticsPayload(generation: 2))))
+
+        XCTAssertEqual(session.presentation.statusText, "Not running")
+        XCTAssertTrue(session.presentation.rows.isEmpty)
+        XCTAssertEqual(child.terminateCalls, 1)
+    }
+
     private func frame(_ payload: Data) -> Data {
         var length = UInt32(payload.count).bigEndian
         var data = Data(bytes: &length, count: MemoryLayout<UInt32>.size)
@@ -94,6 +139,7 @@ final class ControlShiftF12AppTests: XCTestCase {
     private func diagnosticsPayload(generation: Int) -> Data {
         """
         {"v":1,"kind":"ui_diagnostics_v1","generation":\(generation),"rows":[
+          {"id":"runtime","label":"runtime","state":"pass","detail":"ready","action":null,"failure_code":null},
           {"id":"displays","label":"displays","state":"pass","detail":"ready","action":null,"failure_code":null}
         ]}
         """.data(using: .utf8)!
@@ -106,15 +152,21 @@ private class RecordingChild: ChildLifecycleChild {
     var errorClosed = false
     var terminated = false
     var reaped = false
+    var terminateCalls = 0
+    var reapCalls = 0
 
     func sendRefresh() throws {}
     func closeInput() { inputClosed = true }
     func closeOutput() { outputClosed = true }
     func closeError() { errorClosed = true }
-    func terminate() { terminated = true }
+    func terminate() {
+        terminated = true
+        terminateCalls += 1
+    }
     func forceTerminate() {}
     func reap(timeout: TimeInterval) -> Bool {
         reaped = true
+        reapCalls += 1
         return true
     }
 }

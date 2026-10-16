@@ -135,6 +135,11 @@ final class DiagnosticsFrameController {
         isClosed = true
     }
 
+    func invalidate() {
+        isClosed = true
+        presentation = DiagnosticsPresentation(runtime: .unknown, rows: [])
+    }
+
     private func completePayload(from frame: Data) throws -> Data {
         guard frame.count >= MemoryLayout<UInt32>.size else { throw HostError.invalidFrame }
         let length = bigEndianLength(frame.prefix(MemoryLayout<UInt32>.size))
@@ -192,6 +197,13 @@ protocol ChildLifecycleChild: AnyObject {
     func reap(timeout: TimeInterval) -> Bool
 }
 
+enum ChildOutputEvent {
+    case data(Data)
+    case endOfFile
+    case pipeFailure
+    case termination
+}
+
 /// Generation makes queued output from a closed child inert before it reaches
 /// an AppKit view. The host has no commands other than a redacted refresh.
 final class ChildLifecycle {
@@ -220,6 +232,56 @@ final class ChildLifecycle {
             child.forceTerminate()
             _ = child.reap(timeout: 0.25)
         }
+    }
+}
+
+/// The sole terminal transition for one child generation. It is main-thread
+/// owned so EOF, pipe faults, and process exit cannot leave a previous PASS
+/// visible or race a queued output callback.
+final class DiagnosticsSession {
+    private let controller: DiagnosticsFrameController
+    private let lifecycle: ChildLifecycle
+    private let acceptedGeneration: UInt64
+    private let accumulator = FrameAccumulator()
+    private(set) var isTerminal = false
+
+    var presentation: DiagnosticsPresentation { controller.presentation }
+
+    init(
+        controller: DiagnosticsFrameController = DiagnosticsFrameController(),
+        lifecycle: ChildLifecycle
+    ) {
+        self.controller = controller
+        self.lifecycle = lifecycle
+        acceptedGeneration = lifecycle.generation
+    }
+
+    func receive(_ event: ChildOutputEvent) throws {
+        precondition(Thread.isMainThread)
+        guard !isTerminal, !lifecycle.isClosed, lifecycle.generation == acceptedGeneration else { return }
+        switch event {
+        case .data(let bytes):
+            guard !bytes.isEmpty else {
+                terminal()
+                return
+            }
+            do {
+                for frame in try accumulator.append(bytes) {
+                    try controller.consume(lengthPrefixed: frame)
+                }
+            } catch {
+                terminal()
+            }
+        case .endOfFile, .pipeFailure, .termination:
+            terminal()
+        }
+    }
+
+    private func terminal() {
+        guard !isTerminal else { return }
+        isTerminal = true
+        controller.invalidate()
+        lifecycle.close()
     }
 }
 
@@ -286,10 +348,15 @@ final class BundledChild: ChildLifecycleChild {
         return !process.isRunning
     }
 
-    func observeOutput(_ handler: @escaping (Data) -> Void) {
+    func observeOutput(_ handler: @escaping (ChildOutputEvent) -> Void) {
         outputPipe.fileHandleForReading.readabilityHandler = { handle in
-            handler(handle.availableData)
+            let data = handle.availableData
+            handler(data.isEmpty ? .endOfFile : .data(data))
         }
+    }
+
+    func observeTermination(_ handler: @escaping () -> Void) {
+        process.terminationHandler = { _ in handler() }
     }
 }
 
@@ -320,7 +387,7 @@ private final class FrameAccumulator {
 final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource, NSTableViewDelegate {
     private let diagnostics = DiagnosticsFrameController()
     private var lifecycle: ChildLifecycle?
-    private var accumulator = FrameAccumulator()
+    private var session: DiagnosticsSession?
     private let statusLabel = NSTextField(labelWithString: "Not running")
     private let table = NSTableView()
 
@@ -372,7 +439,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         if let child = BundledChild(), (try? child.start()) != nil {
             let lifecycle = ChildLifecycle(child: child)
             self.lifecycle = lifecycle
-            observe(child, lifecycle: lifecycle)
+            let session = DiagnosticsSession(controller: diagnostics, lifecycle: lifecycle)
+            self.session = session
+            observe(child, lifecycle: lifecycle, session: session)
             lifecycle.refresh()
         }
         window.makeKeyAndOrderFront(nil)
@@ -381,6 +450,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
 
     func applicationWillTerminate(_ notification: Notification) {
         diagnostics.close()
+        session = nil
         lifecycle?.close()
     }
 
@@ -388,21 +458,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         lifecycle?.refresh()
     }
 
-    private func observe(_ child: BundledChild, lifecycle: ChildLifecycle) {
+    private func observe(_ child: BundledChild, lifecycle: ChildLifecycle, session: DiagnosticsSession) {
         let generation = lifecycle.generation
-        child.observeOutput { [weak self] bytes in
-            guard !bytes.isEmpty else { return }
-            let frames = try? self?.accumulator.append(bytes)
+        let apply: (ChildOutputEvent) -> Void = { [weak self] event in
             DispatchQueue.main.async { [weak self] in
                 guard let self else { return }
                 guard !lifecycle.isClosed, lifecycle.generation == generation else { return }
-                for frame in frames ?? [] {
-                    try? self.diagnostics.consume(lengthPrefixed: frame)
-                }
+                try? session.receive(event)
                 self.statusLabel.stringValue = self.diagnostics.presentation.statusText
                 self.table.reloadData()
             }
         }
+        child.observeOutput(apply)
+        child.observeTermination { apply(.termination) }
     }
 
     func numberOfRows(in tableView: NSTableView) -> Int {
