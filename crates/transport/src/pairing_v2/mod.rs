@@ -1,4 +1,6 @@
-//! Isolated verification primitives. No network, trust store, signer or admission.
+//! Experimental offline pairing components: verification, phase ordering,
+//! injected-clock limits and quarantined durable evidence. No application
+//! adapter, network, trust-store signer, production emitter or admission.
 pub mod codec;
 mod evidence;
 pub use evidence::*;
@@ -6,8 +8,16 @@ mod primitives;
 pub use primitives::*;
 mod candidate;
 pub use candidate::*;
+mod coordinator_limits;
 mod identity;
+pub use coordinator_limits::*;
+mod recovery_authority;
+pub use recovery_authority::*;
+mod session;
 pub use identity::{Identity, validate_identity};
+pub use session::*;
+mod journal;
+pub use journal::*;
 use sha2::{Digest, Sha256};
 
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]

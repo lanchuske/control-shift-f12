@@ -14,7 +14,7 @@ pub const SUITE: &str = "x25519-hkdf-sha256-ed25519-v1";
 pub const PROTOCOL: &str = "control-shift-f12-pair/2";
 pub const ROLE_MAP: &str = "A=lower-fingerprint;B=higher-fingerprint";
 pub const SAS_FORMAT: &str = "words4-bip39-en-v1";
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Role {
     A,
     B,
@@ -33,7 +33,8 @@ impl Role {
         }
     }
 }
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SignedEvidence {
     pub body: Vec<u8>,
     pub signature: Vec<u8>,

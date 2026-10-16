@@ -33,6 +33,7 @@ fn canonical_headers(mut bytes: &[u8], depth: usize) -> Result<(), Invalid> {
 }
 
 /// Verified application certificate profile; not an active pin or admission token.
+#[derive(Clone)]
 pub struct Identity {
     fingerprint: [u8; 32],
     public_key: [u8; 32],

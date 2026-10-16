@@ -85,6 +85,33 @@ mod unix {
         pending: Vec<Reference>,
         tombstones: Vec<[u8; 32]>,
         revocations: Vec<Revocation>,
+        #[cfg(feature = "pairing-v2-experimental")]
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        recoveries: Vec<RecoveryConsumption>,
+        #[cfg(feature = "pairing-v2-experimental")]
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        journals: Vec<JournalReference>,
+    }
+
+    #[cfg(feature = "pairing-v2-experimental")]
+    #[derive(Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct RecoveryConsumption {
+        signer: [u8; 32],
+        body: Vec<u8>,
+        signature: Vec<u8>,
+    }
+    #[cfg(feature = "pairing-v2-experimental")]
+    #[derive(Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct JournalReference {
+        attempt: [u8; 32],
+        revision: u64,
+        digest: [u8; 32],
+    }
+    #[cfg(feature = "pairing-v2-experimental")]
+    fn journal_filename(r: &JournalReference) -> String {
+        format!("journal-{}-{}", r.revision, filename(r.attempt))
     }
 
     impl Ledger {
@@ -98,9 +125,46 @@ mod unix {
                 pending: vec![],
                 tombstones: vec![],
                 revocations: vec![],
+                #[cfg(feature = "pairing-v2-experimental")]
+                recoveries: vec![],
+                #[cfg(feature = "pairing-v2-experimental")]
+                journals: vec![],
             }
         }
         fn validate(&self) -> Result<(), StoreError> {
+            #[cfg(feature = "pairing-v2-experimental")]
+            {
+                if self.recoveries.len() > MAX_HISTORY {
+                    return Err(StoreError::Invalid);
+                }
+                let mut unique = BTreeSet::new();
+                for proof in &self.recoveries {
+                    crate::pairing_v2::validate_persisted_recovery(
+                        &proof.body,
+                        &proof.signer,
+                        &proof.signature,
+                    )
+                    .map_err(|_| StoreError::Invalid)?;
+                    if !unique.insert((proof.signer, &proof.body)) {
+                        return Err(StoreError::Invalid);
+                    }
+                }
+                if self.journals.len() > MAX_PENDING {
+                    return Err(StoreError::Invalid);
+                };
+                let mut attempts = BTreeSet::new();
+                for reference in &self.journals {
+                    if !attempts.insert(reference.attempt)
+                        || reference.revision > self.version.revision
+                        || !self
+                            .pending
+                            .iter()
+                            .any(|p| p.record.attempt_id == reference.attempt)
+                    {
+                        return Err(StoreError::Invalid);
+                    };
+                }
+            }
             if self.schema != 1
                 || self.pending.len() > MAX_PENDING
                 || self.tombstones.len() > MAX_HISTORY
@@ -164,6 +228,171 @@ mod unix {
     }
 
     impl PendingStore {
+        #[cfg(feature = "pairing-v2-experimental")]
+        pub fn reconcile_pairing(
+            &self,
+            attempt: [u8; 32],
+            clock: Option<crate::pairing_v2::JournalClock>,
+        ) -> Result<crate::pairing_v2::ReconcileOutcome, StoreError> {
+            use crate::pairing_v2::{ReconcileOutcome, RecoveryJournal};
+            let _lock = self.ledger_dir.lock()?;
+            let mut ledger = self.load_validated_manifest()?;
+            if !ledger
+                .pending
+                .iter()
+                .any(|r| r.record.attempt_id == attempt)
+            {
+                return Err(StoreError::Invalid);
+            };
+            let reference = ledger.journals.iter().find(|r| r.attempt == attempt);
+            let old_file = reference.map(journal_filename);
+            if let Some(reference) = reference {
+                let journal = self.read_journal(reference)?;
+                if let Some(now) = clock
+                    && journal.retained(now)
+                {
+                    return Ok(ReconcileOutcome::RecoveryOnly(Box::new(RecoveryJournal {
+                        journal,
+                    })));
+                }
+            }
+            let version = ledger.version;
+            ledger.advance(version)?;
+            ledger.pending.retain(|r| r.record.attempt_id != attempt);
+            ledger.journals.retain(|r| r.attempt != attempt);
+            ledger.tombstones.push(attempt);
+            self.save(&ledger)?;
+            self.pending_dir.remove(&filename(attempt))?;
+            if let Some(file) = old_file {
+                self.pending_dir.remove(&file)?;
+            }
+            Ok(ReconcileOutcome::Discarded)
+        }
+        #[cfg(feature = "pairing-v2-experimental")]
+        pub(crate) fn persist_pairing_journal(
+            &self,
+            expected: StoreVersion,
+            journal: &crate::pairing_v2::PublicJournal,
+        ) -> Result<(), StoreError> {
+            let _lock = self.ledger_dir.lock()?;
+            let mut ledger = self.load_validated_manifest()?;
+            ledger.advance(expected)?;
+            let record = &ledger
+                .pending
+                .iter()
+                .find(|r| r.record.attempt_id == journal.pending.attempt_id)
+                .ok_or(StoreError::Invalid)?
+                .record;
+            if *record != journal.pending {
+                return Err(StoreError::Conflict);
+            };
+            journal.validate().map_err(|_| StoreError::Invalid)?;
+            let previous = ledger
+                .journals
+                .iter()
+                .find(|r| r.attempt == record.attempt_id);
+            let old_file = previous.map(journal_filename);
+            if let Some(reference) = previous {
+                let old = self.read_journal(reference)?;
+                if !journal.follows(&old) {
+                    return Err(StoreError::Conflict);
+                };
+            } else if journal.messages.len()
+                != if journal.local == crate::pairing_v2::Role::A {
+                    3
+                } else {
+                    4
+                }
+            {
+                return Err(StoreError::Invalid);
+            }
+            let bytes = serde_json::to_vec(journal).map_err(|_| StoreError::Invalid)?;
+            if bytes.len() > 64 * 1024 {
+                return Err(StoreError::Limit);
+            };
+            let reference = JournalReference {
+                attempt: record.attempt_id,
+                revision: ledger.version.revision,
+                digest: Sha256::digest(&bytes).into(),
+            };
+            self.pending_dir
+                .replace(&journal_filename(&reference), &bytes)?;
+            ledger.journals.retain(|r| r.attempt != reference.attempt);
+            ledger.journals.push(reference);
+            self.save(&ledger)?;
+            if let Some(file) = old_file {
+                self.pending_dir.remove(&file)?;
+            }
+            Ok(())
+        }
+        #[cfg(feature = "pairing-v2-experimental")]
+        fn read_journal(
+            &self,
+            reference: &JournalReference,
+        ) -> Result<crate::pairing_v2::PublicJournal, StoreError> {
+            let bytes = self
+                .pending_dir
+                .read(&journal_filename(reference), 64 * 1024)?
+                .ok_or(StoreError::Invalid)?;
+            let digest: [u8; 32] = Sha256::digest(&bytes).into();
+            if digest != reference.digest {
+                return Err(StoreError::Invalid);
+            };
+            let journal: crate::pairing_v2::PublicJournal =
+                serde_json::from_slice(&bytes).map_err(|_| StoreError::Invalid)?;
+            if journal.pending.attempt_id != reference.attempt {
+                return Err(StoreError::Invalid);
+            };
+            journal.validate().map_err(|_| StoreError::Invalid)?;
+            Ok(journal)
+        }
+        /// Consumes only a signature-checked request from an authoritative context
+        /// provider. This does NOT populate that context or authorize admission.
+        #[cfg(feature = "pairing-v2-experimental")]
+        pub fn consume_verified_recovery(
+            &self,
+            proof: crate::pairing_v2::VerifiedRecoveryUse,
+        ) -> Result<(), StoreError> {
+            let _lock = self.ledger_dir.lock()?;
+            let mut ledger = self.load_validated_manifest()?;
+            ledger.advance(proof.local_version)?;
+            let reference = ledger
+                .pending
+                .iter()
+                .find(|r| r.record.attempt_id == proof.pending.attempt_id)
+                .ok_or(StoreError::Invalid)?;
+            if reference.record != proof.pending {
+                return Err(StoreError::Conflict);
+            }
+            let journal_reference = ledger
+                .journals
+                .iter()
+                .find(|r| r.attempt == proof.pending.attempt_id)
+                .ok_or(StoreError::Invalid)?;
+            let journal = self.read_journal(journal_reference)?;
+            if journal.local == proof.peer_role
+                || journal.validate().map_err(|_| StoreError::Invalid)? != Some(proof.fc_hash)
+            {
+                return Err(StoreError::Invalid);
+            }
+            if ledger
+                .recoveries
+                .iter()
+                .any(|r| r.signer == proof.signer && r.body == proof.body)
+            {
+                return Err(StoreError::ConsumedAttempt);
+            }
+            if ledger.recoveries.len() >= MAX_HISTORY {
+                return Err(StoreError::Limit);
+            }
+            ledger.recoveries.push(RecoveryConsumption {
+                signer: proof.signer,
+                body: proof.body,
+                signature: proof.signature,
+            });
+            self.save(&ledger)
+        }
+
         pub fn open(root: impl AsRef<Path>) -> Result<Self, StoreError> {
             let root = PrivateDir::root(root.as_ref())?;
             let pending_dir = root.child("pairing-pending")?;
@@ -209,6 +438,13 @@ mod unix {
                 if digest != reference.digest || record != reference.record {
                     return Err(StoreError::Invalid);
                 }
+            }
+            #[cfg(feature = "pairing-v2-experimental")]
+            for reference in &ledger.journals {
+                let journal = self.read_journal(reference)?;
+                if !ledger.pending.iter().any(|r| r.record == journal.pending) {
+                    return Err(StoreError::Invalid);
+                };
             }
             Ok(ledger)
         }
@@ -295,10 +531,24 @@ mod unix {
                 return Err(StoreError::Invalid);
             }
             ledger.pending.retain(|r| r.record.attempt_id != attempt);
+            #[cfg(feature = "pairing-v2-experimental")]
+            let old_journals: Vec<_> = ledger
+                .journals
+                .iter()
+                .filter(|r| r.attempt == attempt)
+                .map(journal_filename)
+                .collect();
+            #[cfg(feature = "pairing-v2-experimental")]
+            ledger.journals.retain(|r| r.attempt != attempt);
             ledger.tombstones.push(attempt);
             self.save(&ledger)?;
             // Durable tombstone is authoritative even if deletion fails: no resurrection on retry.
-            self.pending_dir.remove(&filename(attempt))
+            self.pending_dir.remove(&filename(attempt))?;
+            #[cfg(feature = "pairing-v2-experimental")]
+            for file in old_journals {
+                self.pending_dir.remove(&file)?;
+            }
+            Ok(())
         }
 
         /// Revokes quarantined setup candidates only. This is NOT legacy IdentityStore::unpair.
@@ -328,10 +578,23 @@ mod unix {
                 .map(|r| r.record.attempt_id)
                 .collect();
             ledger.pending.retain(|r| r.record.peer_fingerprint != peer);
+            #[cfg(feature = "pairing-v2-experimental")]
+            let old_journals: Vec<_> = ledger
+                .journals
+                .iter()
+                .filter(|r| removed.contains(&r.attempt))
+                .map(journal_filename)
+                .collect();
+            #[cfg(feature = "pairing-v2-experimental")]
+            ledger.journals.retain(|r| !removed.contains(&r.attempt));
             ledger.tombstones.extend(&removed);
             self.save(&ledger)?;
             for attempt in removed {
                 self.pending_dir.remove(&filename(attempt))?;
+            }
+            #[cfg(feature = "pairing-v2-experimental")]
+            for file in old_journals {
+                self.pending_dir.remove(&file)?;
             }
             Ok(())
         }
@@ -354,9 +617,17 @@ mod unix {
             let removed: Vec<_> = ledger.pending.iter().map(|r| r.record.attempt_id).collect();
             ledger.tombstones.extend(&removed);
             ledger.pending.clear();
+            #[cfg(feature = "pairing-v2-experimental")]
+            let old_journals: Vec<_> = ledger.journals.iter().map(journal_filename).collect();
+            #[cfg(feature = "pairing-v2-experimental")]
+            ledger.journals.clear();
             self.save(&ledger)?;
             for attempt in removed {
                 self.pending_dir.remove(&filename(attempt))?;
+            }
+            #[cfg(feature = "pairing-v2-experimental")]
+            for file in old_journals {
+                self.pending_dir.remove(&file)?;
             }
             Ok(())
         }
@@ -365,6 +636,29 @@ mod unix {
 
 #[cfg(not(unix))]
 impl PendingStore {
+    #[cfg(feature = "pairing-v2-experimental")]
+    pub fn reconcile_pairing(
+        &self,
+        _attempt: [u8; 32],
+        _clock: Option<crate::pairing_v2::JournalClock>,
+    ) -> Result<crate::pairing_v2::ReconcileOutcome, StoreError> {
+        Err(StoreError::UnsupportedPlatform)
+    }
+    #[cfg(feature = "pairing-v2-experimental")]
+    pub(crate) fn persist_pairing_journal(
+        &self,
+        _expected: StoreVersion,
+        _journal: &crate::pairing_v2::PublicJournal,
+    ) -> Result<(), StoreError> {
+        Err(StoreError::UnsupportedPlatform)
+    }
+    #[cfg(feature = "pairing-v2-experimental")]
+    pub fn consume_verified_recovery(
+        &self,
+        _proof: crate::pairing_v2::VerifiedRecoveryUse,
+    ) -> Result<(), StoreError> {
+        Err(StoreError::UnsupportedPlatform)
+    }
     /// Windows must acquire tested owner-only ACL/reparse-point storage before writes are enabled.
     pub fn open(_root: impl AsRef<Path>) -> Result<Self, StoreError> {
         Err(StoreError::UnsupportedPlatform)

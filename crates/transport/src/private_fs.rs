@@ -13,6 +13,45 @@ use std::{
 
 pub(crate) struct PrivateDir(File);
 
+// Fault controls exist only in the unit-test executable, never in library builds.
+#[cfg(all(test, feature = "pairing-v2-experimental"))]
+pub(crate) mod faults {
+    use super::StoreError;
+    std::thread_local! {static ARMED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };}
+    pub fn arm() {
+        ARMED.set(true);
+    }
+    pub fn point(file: &str, stage: &str) -> Result<(), StoreError> {
+        if !ARMED.get() {
+            return Ok(());
+        };
+        let target = if file == "ledger.json" {
+            "ledger"
+        } else if file.starts_with("journal-") {
+            "journal"
+        } else {
+            "pending"
+        };
+        let Ok(setting) = std::env::var("PAIRING_TEST_FS_FAULT") else {
+            return Ok(());
+        };
+        if setting == format!("{target}:{stage}:crash") {
+            std::process::exit(91)
+        }
+        if setting == format!("{target}:{stage}:error") {
+            return Err(StoreError::Unavailable);
+        }
+        Ok(())
+    }
+}
+
+macro_rules! fault_point {
+    ($file:expr, $stage:expr) => {
+        #[cfg(all(test, feature = "pairing-v2-experimental"))]
+        faults::point($file, $stage)?;
+    };
+}
+
 fn name(value: &str) -> Result<CString, StoreError> {
     if value.is_empty() || value.contains('/') || value == "." || value == ".." {
         return Err(StoreError::Invalid);
@@ -164,13 +203,18 @@ impl PrivateDir {
                 .collect::<String>()
         );
         let result = (|| {
+            fault_point!(value, "before_write");
             let mut file = self
                 .open(&tmp, libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL)?
                 .ok_or(StoreError::Unavailable)?;
             file.write_all(bytes).map_err(|_| StoreError::Unavailable)?;
+            fault_point!(value, "after_write");
+            fault_point!(value, "before_file_sync");
             file.sync_all().map_err(|_| StoreError::Unavailable)?;
+            fault_point!(value, "after_file_sync");
             let from = name(&tmp)?;
             let to = name(value)?;
+            fault_point!(value, "before_rename");
             let result = unsafe {
                 libc::renameat(
                     self.0.as_raw_fd(),
@@ -182,8 +226,12 @@ impl PrivateDir {
             if result != 0 {
                 return Err(StoreError::Unavailable);
             }
+            fault_point!(value, "after_rename");
             // Failure after rename is ambiguous; fail closed, then re-read on the next operation.
-            self.0.sync_all().map_err(|_| StoreError::Unavailable)
+            fault_point!(value, "before_dir_sync");
+            self.0.sync_all().map_err(|_| StoreError::Unavailable)?;
+            fault_point!(value, "after_dir_sync");
+            Ok(())
         })();
         if result.is_err() {
             let _ = self.remove(&tmp);

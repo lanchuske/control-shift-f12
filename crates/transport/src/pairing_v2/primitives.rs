@@ -111,6 +111,42 @@ pub fn derive_keys(
     })
 }
 impl DerivedKeys {
+    pub(super) fn verify_finalization(
+        &self,
+        context: &EvidenceContext,
+        phase: &str,
+        role: Role,
+        p: [u8; 32],
+        record: &super::SignedEvidence,
+        tag: &[u8],
+    ) -> Result<(), Invalid> {
+        if context.transcript != self.transcript {
+            return Err(Invalid);
+        }
+        context.verify_finalization(
+            phase,
+            role,
+            p,
+            record,
+            Some((self.confirm[role.index()].as_ref(), tag)),
+        )
+    }
+    pub(super) fn verify_approval(
+        &self,
+        context: &EvidenceContext,
+        role: Role,
+        record: &super::SignedEvidence,
+        tag: &[u8],
+    ) -> Result<(), Invalid> {
+        if context.transcript != self.transcript {
+            return Err(Invalid);
+        }
+        context.verify_approval(
+            role,
+            record,
+            Some((self.confirm[role.index()].as_ref(), tag)),
+        )
+    }
     pub fn sas_digest(&self, attempt: [u8; 32]) -> Result<[u8; 32], Invalid> {
         mac(
             self.sas.as_ref(),
