@@ -825,6 +825,7 @@ mod unix {
         }
 
         #[cfg(feature = "pairing-v2-experimental")]
+        #[allow(dead_code)] // Used only by the default-off admission foundation.
         pub(crate) fn admission_state(
             &self,
             attempt: [u8; 32],

@@ -3,6 +3,7 @@
 //! handshake emits only the reviewed control wire. No application I/O,
 //! RecoveryAuthority provider, active trust, promotion or admission.
 #[cfg(feature = "pairing-v2-experimental")]
+#[allow(dead_code)] // Internal foundation remains deliberately unwired and default-off.
 pub(crate) mod admission_authority;
 pub mod codec;
 mod evidence;
