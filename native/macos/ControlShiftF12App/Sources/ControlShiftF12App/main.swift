@@ -39,6 +39,31 @@ struct DiagnosticsPresentation: Equatable {
     }
 }
 
+/// Local presentation state for the desktop journey. It intentionally keeps
+/// pairing, sharing and persistence unavailable until the reviewed engine
+/// session can provide current authoritative projections.
+struct MacDesktopShellPresentation: Equatable {
+    let title: String
+    let connectionStatus: String
+    let findNearbyEnabled: Bool
+    let confirmCodeEnabled: Bool
+    let inputSharingEnabled: Bool
+    let clipboardSharingEnabled: Bool
+    let automaticUpdatesEnabled: Bool
+    let saveLayoutEnabled: Bool
+
+    static let initial = Self(
+        title: "Set up another computer",
+        connectionStatus: "Not connected",
+        findNearbyEnabled: false,
+        confirmCodeEnabled: false,
+        inputSharingEnabled: false,
+        clipboardSharingEnabled: false,
+        automaticUpdatesEnabled: false,
+        saveLayoutEnabled: false
+    )
+}
+
 struct DiagnosticSourceRow: Equatable {
     let id: String
     let label: String
@@ -456,7 +481,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 700, height: 430),
+            contentRect: NSRect(x: 0, y: 0, width: 900, height: 680),
             styleMask: [.titled, .closable, .miniaturizable],
             backing: .buffered,
             defer: false
@@ -466,9 +491,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         content.translatesAutoresizingMaskIntoConstraints = false
         window.contentView = content
 
-        let title = NSTextField(labelWithString: "Device readiness")
+        let title = NSTextField(labelWithString: "Control Shift F12")
         title.font = .systemFont(ofSize: 20, weight: .semibold)
-        let detail = NSTextField(wrappingLabelWithString: "Local checks are shown individually. Remote control stays off.")
+        let detail = NSTextField(wrappingLabelWithString: "Pair computers, organize displays, and choose what to share. Remote control stays off until a verified session is ready.")
         detail.textColor = .secondaryLabelColor
         statusLabel.font = .systemFont(ofSize: 13, weight: .medium)
         refreshButton.target = self
@@ -485,7 +510,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         scroll.documentView = table
         scroll.hasVerticalScroller = true
 
-        let stack = NSStackView(views: [title, detail, statusLabel, scroll, refreshButton])
+        let journey = desktopJourneyView()
+        let stack = NSStackView(views: [title, detail, journey, statusLabel, scroll, refreshButton])
         stack.orientation = .vertical
         stack.alignment = .leading
         stack.spacing = 12
@@ -521,6 +547,53 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     @objc private func refreshDiagnostics() {
         guard session?.presentation.refreshEnabled == true else { return }
         lifecycle?.refresh()
+    }
+
+    private func desktopJourneyView() -> NSView {
+        let presentation = MacDesktopShellPresentation.initial
+        let heading = NSTextField(labelWithString: presentation.title)
+        heading.font = .systemFont(ofSize: 15, weight: .semibold)
+
+        let status = NSTextField(labelWithString: presentation.connectionStatus)
+        status.textColor = .secondaryLabelColor
+
+        let pairing = NSButton(title: "Find nearby computers", target: nil, action: nil)
+        pairing.isEnabled = presentation.findNearbyEnabled
+        pairing.setAccessibilityLabel("Find nearby computers")
+
+        let confirm = NSButton(title: "Confirm code on both computers", target: nil, action: nil)
+        confirm.isEnabled = presentation.confirmCodeEnabled
+        confirm.setAccessibilityLabel("Confirm code on both computers")
+
+        let map = NSTextField(wrappingLabelWithString: "Display map — pair another computer to arrange screens by dragging them into their physical positions.")
+        map.textColor = .secondaryLabelColor
+
+        let input = checkBox(title: "Input sharing", enabled: presentation.inputSharingEnabled)
+        let clipboard = checkBox(title: "Clipboard sharing", enabled: presentation.clipboardSharingEnabled)
+        let updates = checkBox(title: "Automatic updates", enabled: presentation.automaticUpdatesEnabled)
+        let save = NSButton(title: "Save shared layout", target: nil, action: nil)
+        save.isEnabled = presentation.saveLayoutEnabled
+
+        let options = NSStackView(views: [input, clipboard, updates, save])
+        options.orientation = .horizontal
+        options.spacing = 14
+
+        let content = NSStackView(views: [heading, status, pairing, confirm, map, options])
+        content.orientation = .vertical
+        content.alignment = .leading
+        content.spacing = 8
+        content.edgeInsets = NSEdgeInsets(top: 14, left: 14, bottom: 14, right: 14)
+        content.wantsLayer = true
+        content.layer?.backgroundColor = NSColor.controlBackgroundColor.cgColor
+        content.layer?.cornerRadius = 10
+        return content
+    }
+
+    private func checkBox(title: String, enabled: Bool) -> NSButton {
+        let box = NSButton(checkboxWithTitle: title, target: nil, action: nil)
+        box.state = .on
+        box.isEnabled = enabled
+        return box
     }
 
     private func observe(_ child: BundledChild, lifecycle: ChildLifecycle, session: DiagnosticsSession) {

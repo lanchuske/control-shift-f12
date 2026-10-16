@@ -2,6 +2,19 @@ import XCTest
 @testable import ControlShiftF12App
 
 final class ControlShiftF12AppTests: XCTestCase {
+    func testDesktopShellStartsWithAllSharingAndLayoutActionsUnavailable() {
+        let shell = MacDesktopShellPresentation.initial
+
+        XCTAssertEqual(shell.title, "Set up another computer")
+        XCTAssertEqual(shell.connectionStatus, "Not connected")
+        XCTAssertFalse(shell.findNearbyEnabled)
+        XCTAssertFalse(shell.confirmCodeEnabled)
+        XCTAssertFalse(shell.inputSharingEnabled)
+        XCTAssertFalse(shell.clipboardSharingEnabled)
+        XCTAssertFalse(shell.automaticUpdatesEnabled)
+        XCTAssertFalse(shell.saveLayoutEnabled)
+    }
+
     func testStaleOrUnknownRuntimeProjectsNotRunningAndDisablesActions() {
         for runtime in [RuntimeStatus.stale, .unknown] {
             let presentation = DiagnosticsPresentation(
