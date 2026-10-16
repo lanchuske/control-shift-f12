@@ -260,6 +260,176 @@ async fn bilateral_sealed_evidence_commits_only_durable_metadata_not_runtime_aut
     );
     drop(b.unwrap());
 }
+
+#[tokio::test]
+async fn real_late_extra_between_validation_and_rename_cannot_publish_authority() {
+    let (_ea, _eb, a, b, _) = pair().await;
+    let ta = tempfile::tempdir().unwrap();
+    let tb = tempfile::tempdir().unwrap();
+    let sa = crate::pairing_pending::PendingStore::open(ta.path()).unwrap();
+    let sb = crate::pairing_pending::PendingStore::open(tb.path()).unwrap();
+    let (a, b) = tokio::join!(
+        a.handshake(
+            handshake_config(1, 2),
+            &sa,
+            |p| async move { p.decision(true) }
+        ),
+        b.handshake(
+            handshake_config(2, 1),
+            &sb,
+            |p| async move { p.decision(true) }
+        )
+    );
+    let a = a.unwrap();
+    let b = b.unwrap();
+    let attempt = a.test_attempt();
+    let root = ta.path().to_owned();
+    let pause = crate::private_fs::faults::pause_before_rename();
+    let commit_pause = pause.clone();
+    let commit = std::thread::spawn(move || {
+        commit_pause.arm_on_current_thread();
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async move {
+                let store =
+                    crate::pairing_v2::admission_authority::AdmissionAuthorityStore::open(&root)
+                        .unwrap();
+                let expected = store.version().unwrap();
+                store.commit_sealed_foundation(expected, a).await
+            })
+    });
+
+    let waiter = pause.clone();
+    tokio::task::spawn_blocking(move || waiter.wait_until_reached())
+        .await
+        .unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(1);
+    while b.is_protocol_valid() && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let accepted_after_freeze = b.test_try_late_extra().await;
+    pause.release();
+    let result = tokio::task::spawn_blocking(move || commit.join().unwrap())
+        .await
+        .unwrap();
+    assert!(
+        !accepted_after_freeze,
+        "freeze won but pairing ingress still accepted a real stream"
+    );
+    assert!(result.is_ok(), "metadata publication lost after freeze won");
+    let reopened =
+        crate::pairing_v2::admission_authority::AdmissionAuthorityStore::open(ta.path()).unwrap();
+    assert_eq!(
+        reopened.reconcile(attempt).unwrap(),
+        crate::pairing_v2::admission_authority::ReconcileAdmission::Promoted
+    );
+}
+
+#[tokio::test]
+async fn real_late_extra_that_wins_before_freeze_blocks_publication() {
+    let (_ea, _eb, a, b, _) = pair().await;
+    let ta = tempfile::tempdir().unwrap();
+    let tb = tempfile::tempdir().unwrap();
+    let sa = crate::pairing_pending::PendingStore::open(ta.path()).unwrap();
+    let sb = crate::pairing_pending::PendingStore::open(tb.path()).unwrap();
+    let (a, b) = tokio::join!(
+        a.handshake(
+            handshake_config(1, 2),
+            &sa,
+            |p| async move { p.decision(true) }
+        ),
+        b.handshake(
+            handshake_config(2, 1),
+            &sb,
+            |p| async move { p.decision(true) }
+        )
+    );
+    let a = a.unwrap();
+    let b = b.unwrap();
+    let attempt = a.test_attempt();
+    assert!(b.test_try_late_extra().await);
+    let deadline = std::time::Instant::now() + Duration::from_secs(1);
+    while a.is_protocol_valid() && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let store =
+        crate::pairing_v2::admission_authority::AdmissionAuthorityStore::open(ta.path()).unwrap();
+    assert_eq!(
+        store
+            .commit_sealed_foundation(store.version().unwrap(), a)
+            .await,
+        Err(crate::pairing_pending::StoreError::Invalid)
+    );
+    assert_ne!(
+        store.reconcile(attempt).unwrap(),
+        crate::pairing_v2::admission_authority::ReconcileAdmission::Promoted
+    );
+}
+
+#[tokio::test]
+async fn concurrent_real_late_extra_and_freeze_has_one_safe_winner() {
+    for iteration in 1..=4u8 {
+        let (_ea, _eb, a, b, _) = pair().await;
+        let ta = tempfile::tempdir().unwrap();
+        let tb = tempfile::tempdir().unwrap();
+        let sa = crate::pairing_pending::PendingStore::open(ta.path()).unwrap();
+        let sb = crate::pairing_pending::PendingStore::open(tb.path()).unwrap();
+        let (a, b) = tokio::join!(
+            a.handshake(
+                handshake_config(iteration, iteration + 10),
+                &sa,
+                |p| async move { p.decision(true) }
+            ),
+            b.handshake(
+                handshake_config(iteration + 10, iteration),
+                &sb,
+                |p| async move { p.decision(true) }
+            )
+        );
+        let a = a.unwrap();
+        let b = b.unwrap();
+        let attempt = a.test_attempt();
+        let root = ta.path().to_owned();
+        let commit = std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async move {
+                    let store =
+                        crate::pairing_v2::admission_authority::AdmissionAuthorityStore::open(
+                            &root,
+                        )
+                        .unwrap();
+                    store
+                        .commit_sealed_foundation(store.version().unwrap(), a)
+                        .await
+                })
+        });
+        let late_won = b.test_try_late_extra().await;
+        let result = tokio::task::spawn_blocking(move || commit.join().unwrap())
+            .await
+            .unwrap();
+        let reopened =
+            crate::pairing_v2::admission_authority::AdmissionAuthorityStore::open(ta.path())
+                .unwrap();
+        if late_won {
+            assert_eq!(result, Err(crate::pairing_pending::StoreError::Invalid));
+            assert_ne!(
+                reopened.reconcile(attempt).unwrap(),
+                crate::pairing_v2::admission_authority::ReconcileAdmission::Promoted
+            );
+        } else {
+            assert!(result.is_ok());
+            assert_eq!(
+                reopened.reconcile(attempt).unwrap(),
+                crate::pairing_v2::admission_authority::ReconcileAdmission::Promoted
+            );
+        }
+    }
+}
 #[tokio::test]
 async fn bilateral_rejection_issues_real_reset_and_stop_independently_of_connection_close() {
     let (_ea, _eb, a, b, _) = pair().await;

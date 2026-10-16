@@ -201,7 +201,7 @@ impl AdmissionAuthorityStore {
 }
 
 enum CommitWitness {
-    Live(Box<super::provisional_tls::SealedPromotionEvidence>),
+    Live(Box<super::provisional_tls::FrozenPromotionEvidence>),
     #[cfg(test)]
     Synthetic {
         validations: Cell<usize>,
@@ -228,7 +228,9 @@ impl SealedAdmissionCommit {
             .await
             .map_err(|_| StoreError::Invalid)?;
         evidence.revalidate().map_err(|_| StoreError::Invalid)?;
-        let fields = evidence.fields();
+        let frozen = evidence.freeze().await.map_err(|_| StoreError::Invalid)?;
+        frozen.revalidate().map_err(|_| StoreError::Invalid)?;
+        let fields = frozen.fields();
         let receipt = AdmissionReceiptRecord {
             attempt: fields.record.attempt_id,
             peer: fields.record.peer_fingerprint,
@@ -247,7 +249,7 @@ impl SealedAdmissionCommit {
         Ok(Self {
             record: fields.record,
             receipt,
-            witness: CommitWitness::Live(Box::new(evidence)),
+            witness: CommitWitness::Live(Box::new(frozen)),
         })
     }
 

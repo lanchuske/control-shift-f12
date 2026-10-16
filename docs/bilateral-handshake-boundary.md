@@ -22,6 +22,18 @@ An authenticated signed/MACed Cancel is distinct from a protocol error. Every ot
 
 `HandshakeCompletePendingAuthority` has a private constructor and retains the sealed connection/request half. A private task continues watching late candidate DATA and extra streams. `is_protocol_valid()` becomes false after violation or connection closure; `durable_fc_hash()` then returns None. This is **not** an authenticated application session. The durable journal may remain as historical quarantined evidence even when the live result becomes invalid. Dropping the result closes the channel. The two-process harness holds each endpoint alive until the other process finishes via an out-of-band test acknowledgement; this acknowledgement is not pairing wire.
 
+The default-off admission foundation consumes that pending authority through a
+single watcher-owned freeze transition before durable publication. The watcher
+gives queued request DATA and extra streams priority over the freeze request. If
+a violation wins, publication is rejected. If freeze wins, it closes pairing
+QUIC and returns move-only `FrozenPromotionEvidence` with no channel, stream or
+runtime capability; only then may the transactional manifest be written. This
+watcher decision is the protocol linearization point. It holds no synchronous
+or asynchronous lock across filesystem I/O, so a store stall cannot deadlock or
+starve violation detection. A post-freeze peer send is transport-rejected, not
+an unobserved protocol event. Durable `PromotionReceipt` remains metadata only
+and cannot authorize input, clipboard, topology or a session.
+
 ## Durability and failure
 
 After both signed approvals, `PendingStore::prepare` creates only physically separate pending evidence. The existing CAS/revision/identity-generation/tombstone checks govern each write. Before returning local Commit, CommitAck or Complete bytes to the I/O adapter, the role-specific `Finalizer` must persist and flush its journal and manifest. Storage failure latches failure and returns no bytes to emit. No retry refreshes a failed CAS behind the caller's back.

@@ -12,6 +12,7 @@ use super::*;
 use crate::pairing_pending::PendingStore;
 use rand::RngCore;
 use std::time::{Duration, Instant};
+use tokio::sync::oneshot;
 use zeroize::Zeroizing;
 #[cfg(test)]
 #[derive(Clone, Copy)]
@@ -106,6 +107,7 @@ pub struct HandshakeCompletePendingAuthority {
     _channel: ProvisionalChannel,
     _request: Stream,
     failed: Arc<AtomicBool>,
+    watcher: IngressWatcher,
 }
 /// Move-only, non-serializable protocol evidence. It deliberately has no public
 /// binding getter and cannot be reconstructed after restart.
@@ -120,6 +122,16 @@ pub(crate) struct SealedPromotionEvidence {
     channel: ProvisionalChannel,
     request: Stream,
     failed: Arc<AtomicBool>,
+    watcher: IngressWatcher,
+}
+struct IngressWatcher {
+    freeze: Option<oneshot::Sender<()>>,
+    task: tokio::task::JoinHandle<IngressDisposition>,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IngressDisposition {
+    Frozen,
+    Invalid,
 }
 #[allow(dead_code)]
 pub(in crate::pairing_v2) struct SealedPromotionFields {
@@ -139,6 +151,7 @@ struct Completed {
     certificate_fingerprints: [[u8; 32]; 2],
     request: Stream,
     failed: Arc<AtomicBool>,
+    watcher: IngressWatcher,
 }
 impl HandshakeCompletePendingAuthority {
     pub fn is_protocol_valid(&self) -> bool {
@@ -148,6 +161,21 @@ impl HandshakeCompletePendingAuthority {
     pub(super) async fn test_late_extra(&self) {
         let (mut send, _recv) = self._channel.connection.open_bi().await.unwrap();
         send.write_all(&[1]).await.unwrap();
+    }
+    #[cfg(test)]
+    pub(super) async fn test_try_late_extra(&self) -> bool {
+        let Ok(Ok((mut send, _recv))) = tokio::time::timeout(
+            Duration::from_millis(250),
+            self._channel.connection.open_bi(),
+        )
+        .await
+        else {
+            return false;
+        };
+        matches!(
+            tokio::time::timeout(Duration::from_millis(250), send.write_all(&[1])).await,
+            Ok(Ok(()))
+        )
     }
     #[cfg(test)]
     pub(super) async fn test_late_candidate(&mut self) {
@@ -162,6 +190,10 @@ impl HandshakeCompletePendingAuthority {
     #[cfg(test)]
     pub(super) fn test_local_binding(&self) -> Option<&[u8; 32]> {
         self.is_protocol_valid().then_some(&self.local_binding)
+    }
+    #[cfg(test)]
+    pub(super) fn test_attempt(&self) -> [u8; 32] {
+        self.pending.attempt_id
     }
 
     #[allow(dead_code)] // Foundation-only boundary; product wiring remains disabled.
@@ -187,16 +219,49 @@ impl HandshakeCompletePendingAuthority {
             channel: self._channel,
             request: self._request,
             failed: self.failed,
+            watcher: self.watcher,
         })
     }
 }
 
 impl SealedPromotionEvidence {
+    /// Atomically closes pairing ingress at the watcher that owns all possible
+    /// post-handshake inputs. The biased state transition is the protocol
+    /// linearization point: a queued violation wins; otherwise freeze wins,
+    /// closes QUIC, and removes every channel from the resulting evidence.
+    pub(crate) async fn freeze(mut self) -> Result<FrozenPromotionEvidence, HandshakeError> {
+        let signal = self.watcher.freeze.take().ok_or(HandshakeError::Rejected)?;
+        signal.send(()).map_err(|_| HandshakeError::Rejected)?;
+        let static_result = self.revalidate_static();
+        let task = self.watcher.task;
+        match task.await.map_err(|_| HandshakeError::Rejected)? {
+            IngressDisposition::Frozen => {}
+            IngressDisposition::Invalid => return Err(HandshakeError::Rejected),
+        }
+        static_result?;
+        Ok(FrozenPromotionEvidence {
+            role: self.role,
+            durable_fc_hash: self.durable_fc_hash,
+            local_binding: self.local_binding,
+            pending: self.pending,
+            transcript: self.transcript,
+            certificate_fingerprints: self.certificate_fingerprints,
+        })
+    }
+
     #[allow(dead_code)] // Called at each future promotion boundary, none of which is enabled yet.
     pub(crate) fn revalidate(&self) -> Result<(), HandshakeError> {
         if self.failed.load(Ordering::Acquire)
             || self.channel.connection.close_reason().is_some()
             || !self.request.clean
+        {
+            return Err(HandshakeError::Rejected);
+        }
+        self.revalidate_static()
+    }
+
+    fn revalidate_static(&self) -> Result<(), HandshakeError> {
+        if !self.request.clean
             || self.pending.attempt_id == [0; 32]
             || self.pending.peer_fingerprint != self.certificate_fingerprints[1 - self.role.index()]
             || self.durable_fc_hash == [0; 32]
@@ -209,6 +274,42 @@ impl SealedPromotionEvidence {
     }
 
     #[allow(dead_code)]
+    pub(in crate::pairing_v2) fn fields(&self) -> SealedPromotionFields {
+        SealedPromotionFields {
+            record: self.pending.clone(),
+            role: self.role,
+            durable_fc_hash: self.durable_fc_hash,
+            local_binding: *self.local_binding,
+            transcript: self.transcript,
+            certificate_fingerprints: self.certificate_fingerprints,
+        }
+    }
+}
+
+/// Frozen, move-only evidence contains no network channel and therefore cannot
+/// observe a post-publication pairing event or act as runtime authority.
+pub(crate) struct FrozenPromotionEvidence {
+    role: Role,
+    durable_fc_hash: [u8; 32],
+    local_binding: Zeroizing<[u8; 32]>,
+    pending: crate::pairing_pending::PendingRecord,
+    transcript: [u8; 32],
+    certificate_fingerprints: [[u8; 32]; 2],
+}
+
+impl FrozenPromotionEvidence {
+    pub(crate) fn revalidate(&self) -> Result<(), HandshakeError> {
+        if self.pending.attempt_id == [0; 32]
+            || self.pending.peer_fingerprint != self.certificate_fingerprints[1 - self.role.index()]
+            || self.durable_fc_hash == [0; 32]
+            || self.transcript == [0; 32]
+            || *self.local_binding == [0; 32]
+        {
+            return Err(HandshakeError::Rejected);
+        }
+        Ok(())
+    }
+
     pub(in crate::pairing_v2) fn fields(&self) -> SealedPromotionFields {
         SealedPromotionFields {
             record: self.pending.clone(),
@@ -520,6 +621,7 @@ impl ProvisionalChannel {
                 _channel: self,
                 _request: done.request,
                 failed: done.failed,
+                watcher: done.watcher,
             }),
             Ok(Err(HandshakeError::Cancelled)) => Err(HandshakeError::Cancelled),
             _ => {
@@ -803,16 +905,21 @@ impl ProvisionalChannel {
         let failed = Arc::new(AtomicBool::new(false));
         let signal = failed.clone();
         let connection = self.connection.clone();
+        let (freeze, mut freeze_request) = oneshot::channel();
         // Successful control FIN does not forgive DATA on the request half,
         // extra streams or a later protocol error. Keep this monitor sealed.
-        tokio::spawn(async move {
-            let violation = tokio::select! {biased;
-                _=connection.closed()=>false,
+        let task = tokio::spawn(async move {
+            let disposition = tokio::select! {biased;
                 _=watch_request(&mut incoming.recv)=>true,
                 extra=connection.accept_bi()=>{if let Ok(pair)=extra{drop(Stream::new(pair));}true},
                 extra=connection.accept_uni()=>{if let Ok(mut recv)=extra{let _=recv.stop(APPLICATION_ERROR.into());}true},
+                _=&mut freeze_request=>{
+                    connection.close(APPLICATION_ERROR.into(), b"pairing ingress frozen");
+                    false
+                },
+                _=connection.closed()=>true,
             };
-            if violation {
+            if disposition {
                 signal.store(true, Ordering::Release);
                 incoming.clean = false;
                 drop(incoming);
@@ -820,6 +927,9 @@ impl ProvisionalChannel {
                     APPLICATION_ERROR.into(),
                     b"post-completion pairing violation",
                 );
+                IngressDisposition::Invalid
+            } else {
+                IngressDisposition::Frozen
             }
         });
         Ok(Completed {
@@ -831,6 +941,10 @@ impl ProvisionalChannel {
             certificate_fingerprints,
             request,
             failed,
+            watcher: IngressWatcher {
+                freeze: Some(freeze),
+                task,
+            },
         })
     }
 }
