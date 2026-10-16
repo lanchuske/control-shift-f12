@@ -1,0 +1,11 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <EnableWindowsTargeting>true</EnableWindowsTargeting>
+    <AssemblyName>ControlShiftF12App</AssemblyName>
+    <RootNamespace>ControlShiftF12App</RootNamespace>
+    <ApplicationId>ai.lanchuske.control-shift-f12.windows-host</ApplicationId>
+  </PropertyGroup>
+</Project>
