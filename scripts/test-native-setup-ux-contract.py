@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Optional
 
 SPEC = Path(__file__).resolve().parents[1] / "docs" / "native-setup-ux-specification.md"
+MUTATION_CHECKS = 0
 
 
 @dataclass(frozen=True)
@@ -246,9 +247,11 @@ def certificate(digest: str = "d1", **changes: object) -> Certificate:
 
 
 def rejects(action) -> None:
+    global MUTATION_CHECKS
     try:
         action()
     except AssertionError:
+        MUTATION_CHECKS += 1
         return
     raise AssertionError("named mutation unexpectedly succeeded")
 
@@ -431,7 +434,7 @@ def main() -> None:
     final_delete_after_bilateral_abort_acks(a, b, evidence)
     rejects(lambda: a.commit(cert, b))
 
-    print("PASS: native UX bilateral-outcome state-machine and 28 guard mutations")
+    print("PASS: native UX bilateral-outcome state-machine and %d executed guard mutations" % MUTATION_CHECKS)
 
 
 if __name__ == "__main__":
