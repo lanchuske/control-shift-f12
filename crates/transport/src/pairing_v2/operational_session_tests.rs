@@ -207,6 +207,18 @@ async fn absolute_attempt_deadline_rejects_work_without_a_per_operation_extensio
 }
 
 #[tokio::test]
+async fn absolute_attempt_deadline_cancels_a_slow_consent_future() {
+    let guard = AttemptGuard::test_only_with_timeout(Duration::from_millis(1));
+    let result = guard
+        .within(async {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            Ok::<(), super::Invalid>(())
+        })
+        .await;
+    assert!(result.is_err());
+}
+
+#[tokio::test]
 async fn monitor_rejects_a_stream_opened_after_the_primary_window() {
     let (a_der, a_key) = identity();
     let (b_der, b_key) = identity();
@@ -233,6 +245,26 @@ async fn monitor_rejects_a_stream_opened_after_the_primary_window() {
     drop(late);
     drop(b_connection);
     drop(monitor);
+}
+
+#[tokio::test]
+async fn raw_peer_hook_is_test_only_and_does_not_escape_the_sealed_runtime() {
+    // The helper is compiled only by this crate's test build. Production code
+    // cannot name it, and it exposes no runtime/session authority.
+    let (a_der, a_key) = identity();
+    let (b_der, b_key) = identity();
+    let a =
+        OperationalEndpoint::bind("127.0.0.1:0".parse().unwrap(), a_der.clone(), a_key).unwrap();
+    let b =
+        OperationalEndpoint::bind("127.0.0.1:0".parse().unwrap(), b_der.clone(), b_key).unwrap();
+    let (a_channel, b_channel) = tokio::join!(
+        a.connect(b.local_addr().unwrap(), Sha256::digest(&b_der).into()),
+        b.accept(Sha256::digest(&a_der).into())
+    );
+    let peer =
+        super::operational_session::TestRawPeer::from_authenticated_channel(&b_channel.unwrap());
+    drop(a_channel);
+    assert_ne!(peer.exporter(b"test", b"context").unwrap(), [0; 32]);
 }
 
 #[tokio::test]
@@ -330,7 +362,7 @@ async fn v01_dynamic_attempt_uses_live_tls_exporter_and_durable_snapshots() {
     assert!(bb.is_ok(), "acceptor admission failed");
     let (ra, rb) = tokio::join!(
         aa.unwrap()
-            .complete_with_local_consent(|preconfirm, commitment| {
+            .complete_with_local_consent(|preconfirm, commitment| async move {
                 Ok(
                     super::operational_session::LocalOperationalConsent::test_only_approved(
                         preconfirm, commitment,
@@ -338,7 +370,7 @@ async fn v01_dynamic_attempt_uses_live_tls_exporter_and_durable_snapshots() {
                 )
             }),
         bb.unwrap()
-            .complete_with_local_consent(|preconfirm, commitment| {
+            .complete_with_local_consent(|preconfirm, commitment| async move {
                 Ok(
                     super::operational_session::LocalOperationalConsent::test_only_approved(
                         preconfirm, commitment,
@@ -383,6 +415,112 @@ async fn v01_dynamic_attempt_rejects_a_durable_tuple_with_the_wrong_tls_pin() {
 }
 
 #[tokio::test]
+async fn corrupted_confirm_a_gets_application_reset_and_never_receives_confirm_b() {
+    let (a_der, a_key, a_pin, b_der, b_key, b_pin) = loop {
+        let (a_der, a_key) = identity();
+        let (b_der, b_key) = identity();
+        let a_pin: [u8; 32] = Sha256::digest(&a_der).into();
+        let b_pin: [u8; 32] = Sha256::digest(&b_der).into();
+        if a_pin < b_pin {
+            break (a_der, a_key, a_pin, b_der, b_key, b_pin);
+        }
+    };
+    let a_root = tempfile::tempdir().unwrap();
+    let b_root = tempfile::tempdir().unwrap();
+    let a_store = AdmissionAuthorityStore::open(a_root.path()).unwrap();
+    let b_store = AdmissionAuthorityStore::open(b_root.path()).unwrap();
+    let ar = a_store
+        .prepare(a_store.version().unwrap(), [91; 32], [92; 32])
+        .unwrap();
+    let br = b_store
+        .prepare(b_store.version().unwrap(), [93; 32], [94; 32])
+        .unwrap();
+    a_store.commit_operational_test_receipt(&ar, b_pin).unwrap();
+    b_store.commit_operational_test_receipt(&br, a_pin).unwrap();
+    let a = OperationalEndpoint::bind("127.0.0.1:0".parse().unwrap(), a_der, a_key).unwrap();
+    let b = OperationalEndpoint::bind("127.0.0.1:0".parse().unwrap(), b_der, b_key).unwrap();
+    let (a_attempt, b_attempt) = tokio::join!(
+        a.connect_admitted(b.local_addr().unwrap(), &a_store, ar.attempt_id),
+        b.accept_admitted(&b_store, br.attempt_id)
+    );
+    let raw = super::operational_session::TestRawPeer::from_admitted_attempt(a_attempt.unwrap());
+    let (raw_result, victim) = tokio::join!(
+        raw.send_corrupt_confirm_a(),
+        b_attempt
+            .unwrap()
+            .complete_with_local_consent(|preconfirm, commitment| async move {
+                Ok(
+                    super::operational_session::LocalOperationalConsent::test_only_approved(
+                        preconfirm, commitment,
+                    ),
+                )
+            })
+    );
+    assert!(
+        raw_result.is_ok(),
+        "raw peer did not observe application reset: {raw_result:?}"
+    );
+    assert!(victim.is_err());
+}
+
+#[tokio::test]
+async fn bidi_open_after_confirm_fin_is_rejected_by_the_terminal_close_boundary() {
+    let (a_der, a_key, a_pin, b_der, b_key, b_pin) = loop {
+        let (a_der, a_key) = identity();
+        let (b_der, b_key) = identity();
+        let a_pin: [u8; 32] = Sha256::digest(&a_der).into();
+        let b_pin: [u8; 32] = Sha256::digest(&b_der).into();
+        if a_pin < b_pin {
+            break (a_der, a_key, a_pin, b_der, b_key, b_pin);
+        }
+    };
+    let a_root = tempfile::tempdir().unwrap();
+    let b_root = tempfile::tempdir().unwrap();
+    let a_store = AdmissionAuthorityStore::open(a_root.path()).unwrap();
+    let b_store = AdmissionAuthorityStore::open(b_root.path()).unwrap();
+    let ar = a_store
+        .prepare(a_store.version().unwrap(), [101; 32], [102; 32])
+        .unwrap();
+    let br = b_store
+        .prepare(b_store.version().unwrap(), [103; 32], [104; 32])
+        .unwrap();
+    a_store.commit_operational_test_receipt(&ar, b_pin).unwrap();
+    b_store.commit_operational_test_receipt(&br, a_pin).unwrap();
+    let a = OperationalEndpoint::bind("127.0.0.1:0".parse().unwrap(), a_der, a_key).unwrap();
+    let b = OperationalEndpoint::bind("127.0.0.1:0".parse().unwrap(), b_der, b_key).unwrap();
+    let (a_attempt, b_attempt) = tokio::join!(
+        a.connect_admitted(b.local_addr().unwrap(), &a_store, ar.attempt_id),
+        b.accept_admitted(&b_store, br.attempt_id)
+    );
+    let raw = super::operational_session::TestRawPeer::from_admitted_attempt(a_attempt.unwrap());
+    let (raw_result, victim) = tokio::join!(
+        raw.send_valid_confirm_a_then_open_late_stream(),
+        b_attempt
+            .unwrap()
+            .complete_with_local_consent(|preconfirm, commitment| async move {
+                Ok(
+                    super::operational_session::LocalOperationalConsent::test_only_approved(
+                        preconfirm, commitment,
+                    ),
+                )
+            })
+    );
+    assert!(
+        raw_result.is_ok(),
+        "late peer acquired a usable post-FIN stream: {raw_result:?}"
+    );
+    // Unlike `monitor_rejects_a_stream_opened_after_the_primary_window`, this
+    // peer opens after valid Confirm A plus FIN. The accepted attempt has
+    // already crossed the explicit close boundary, so its six-record result
+    // may be successful, but the attacker cannot create an operational
+    // session or obtain a stream after that point.
+    assert!(
+        victim.is_ok(),
+        "clean transcript failed before close boundary: {victim:?}"
+    );
+}
+
+#[tokio::test]
 async fn v01_dynamic_attempt_fails_closed_when_revocation_wins_before_promotion() {
     let (a_der, a_key) = identity();
     let (b_der, b_key) = identity();
@@ -420,16 +558,20 @@ async fn v01_dynamic_attempt_fails_closed_when_revocation_wins_before_promotion(
         .unwrap();
     let (ra, rb) = tokio::time::timeout(std::time::Duration::from_secs(2), async {
         tokio::join!(
-            aa.complete_with_local_consent(|preconfirm, commitment| Ok(
-                super::operational_session::LocalOperationalConsent::test_only_approved(
-                    preconfirm, commitment
+            aa.complete_with_local_consent(|preconfirm, commitment| async move {
+                Ok(
+                    super::operational_session::LocalOperationalConsent::test_only_approved(
+                        preconfirm, commitment,
+                    ),
                 )
-            )),
-            bb.complete_with_local_consent(|preconfirm, commitment| Ok(
-                super::operational_session::LocalOperationalConsent::test_only_approved(
-                    preconfirm, commitment
+            }),
+            bb.complete_with_local_consent(|preconfirm, commitment| async move {
+                Ok(
+                    super::operational_session::LocalOperationalConsent::test_only_approved(
+                        preconfirm, commitment,
+                    ),
                 )
-            ))
+            })
         )
     })
     .await
@@ -472,7 +614,7 @@ async fn v01_revocation_between_accept_and_confirm_emits_no_confirm() {
     let bb = bb.unwrap();
     let (first, second) = tokio::time::timeout(Duration::from_secs(2), async {
         tokio::join!(
-            aa.complete_with_local_consent(|preconfirm, commitment| {
+            aa.complete_with_local_consent(|preconfirm, commitment| async move {
                 a_store
                     .revoke_candidate(a_store.version().unwrap(), ar.peer_fingerprint)
                     .unwrap();
@@ -482,7 +624,7 @@ async fn v01_revocation_between_accept_and_confirm_emits_no_confirm() {
                     ),
                 )
             }),
-            bb.complete_with_local_consent(|preconfirm, commitment| {
+            bb.complete_with_local_consent(|preconfirm, commitment| async move {
                 Ok(
                     super::operational_session::LocalOperationalConsent::test_only_approved(
                         preconfirm, commitment,
@@ -558,7 +700,7 @@ async fn v01_dynamic_attempt_succeeds_between_two_os_processes() {
         parent
             .connect_admitted(address, &store, record.attempt_id)
             .await?
-            .complete_with_local_consent(|preconfirm, commitment| {
+            .complete_with_local_consent(|preconfirm, commitment| async move {
                 Ok(
                     super::operational_session::LocalOperationalConsent::test_only_approved(
                         preconfirm, commitment,
@@ -622,7 +764,7 @@ fn operational_dynamic_process_worker() {
                 .accept_admitted(&store, record.attempt_id)
                 .await
                 .unwrap()
-                .complete_with_local_consent(|preconfirm, commitment| {
+                .complete_with_local_consent(|preconfirm, commitment| async move {
                     Ok(
                         super::operational_session::LocalOperationalConsent::test_only_approved(
                             preconfirm, commitment,

@@ -697,6 +697,11 @@ fn bounded_bytes(value: &Value, limit: usize) -> Result<Vec<u8>, Invalid> {
 pub(crate) struct AttemptGuard {
     deadline: Instant,
     connection: Option<quinn::Connection>,
+    // Once a selected V01 stream exists, its abort owns the ordering: emit
+    // RESET_STREAM/STOP_SENDING first and only then close the connection.
+    // Closing directly here races those control frames and can hide the
+    // stream-level failure from the peer.
+    stream_selected: bool,
     complete: bool,
 }
 
@@ -705,6 +710,7 @@ impl AttemptGuard {
         Self {
             deadline: Instant::now() + ATTEMPT_TIMEOUT,
             connection: None,
+            stream_selected: false,
             complete: false,
         }
     }
@@ -726,6 +732,17 @@ impl AttemptGuard {
         Self {
             deadline: Instant::now() - Duration::from_millis(1),
             connection: None,
+            stream_selected: false,
+            complete: false,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_only_with_timeout(timeout: Duration) -> Self {
+        Self {
+            deadline: Instant::now() + timeout,
+            connection: None,
+            stream_selected: false,
             complete: false,
         }
     }
@@ -747,6 +764,10 @@ impl AttemptGuard {
         self.connection = Some(connection);
     }
 
+    fn mark_stream_selected(&mut self) {
+        self.stream_selected = true;
+    }
+
     fn succeed(&mut self) {
         self.complete = true;
     }
@@ -755,6 +776,7 @@ impl AttemptGuard {
 impl Drop for AttemptGuard {
     fn drop(&mut self) {
         if !self.complete
+            && !self.stream_selected
             && let Some(connection) = &self.connection
         {
             connection.close(APPLICATION_ERROR.into(), b"operational session aborted");
@@ -852,9 +874,11 @@ impl OperationalEndpoint {
         durable_attempt: [u8; 32],
     ) -> Result<OperationalAttempt, Invalid> {
         let guard = AttemptGuard::new();
+        guard.assert_lease(None)?;
         let snapshot = authority
             .operational_admission_snapshot(durable_attempt)
             .map_err(|_| Invalid)?;
+        guard.assert_lease(None)?;
         let view = AuthorityView::from_snapshot(self.local_leaf, &snapshot)?;
         if view.self_fingerprint >= view.peer_fingerprint {
             return Err(Invalid);
@@ -872,9 +896,11 @@ impl OperationalEndpoint {
         durable_attempt: [u8; 32],
     ) -> Result<OperationalAttempt, Invalid> {
         let guard = AttemptGuard::new();
+        guard.assert_lease(None)?;
         let snapshot = authority
             .operational_admission_snapshot(durable_attempt)
             .map_err(|_| Invalid)?;
+        guard.assert_lease(None)?;
         let view = AuthorityView::from_snapshot(self.local_leaf, &snapshot)?;
         if view.self_fingerprint <= view.peer_fingerprint {
             return Err(Invalid);
@@ -897,6 +923,309 @@ impl Drop for OperationalEndpoint {
 pub(crate) struct OperationalChannel {
     connection: quinn::Connection,
     observed_peer_fingerprint: [u8; 32],
+}
+
+/// Test-only raw transcript harness marker. It is deliberately absent from
+/// non-test builds and has no constructor or transport authority there.
+#[cfg(test)]
+pub(crate) struct TestRawPeer {
+    channel: OperationalChannel,
+    view: AuthorityView,
+}
+
+#[cfg(test)]
+impl TestRawPeer {
+    pub(crate) fn from_admitted_attempt(mut attempt: OperationalAttempt) -> Self {
+        // The test peer takes over this already-authenticated connection; do
+        // not let the attempt guard abort it during the ownership transfer.
+        attempt.guard.succeed();
+        Self {
+            channel: attempt.channel,
+            view: attempt.view,
+        }
+    }
+
+    pub(crate) fn from_authenticated_channel(channel: &OperationalChannel) -> Self {
+        Self {
+            channel: OperationalChannel {
+                connection: channel.connection.clone(),
+                observed_peer_fingerprint: channel.observed_peer_fingerprint,
+            },
+            // This constructor is used only by the narrow exporter test; a
+            // transcript peer must consume an admitted attempt below.
+            view: AuthorityView {
+                self_fingerprint: [1; 32],
+                peer_fingerprint: [2; 32],
+                suite: SUITE.to_owned(),
+                protocol_version: 2,
+                policy_revision: 0,
+                identity_generation: 0,
+                revocation_generation: 0,
+                receipt_revision: 1,
+                admission_attempt: [3; 32],
+            },
+        }
+    }
+
+    pub(crate) async fn accept_bi(
+        &self,
+    ) -> Result<(quinn::SendStream, quinn::RecvStream), Invalid> {
+        self.channel
+            .connection
+            .accept_bi()
+            .await
+            .map_err(|_| Invalid)
+    }
+
+    pub(crate) fn exporter(&self, label: &[u8], context: &[u8]) -> Result<[u8; 32], Invalid> {
+        let mut value = [0; 32];
+        self.channel
+            .connection
+            .export_keying_material(&mut value, label, context)
+            .map_err(|_| Invalid)?;
+        Ok(value)
+    }
+
+    /// Drives the A half only far enough to prove the B driver rejects a
+    /// syntactically correct but exporter-HMAC-corrupted Confirm A.  This is
+    /// deliberately test-only and owns no product authority.
+    pub(crate) async fn send_corrupt_confirm_a(self) -> Result<(), Invalid> {
+        let (mut send, mut recv) = self
+            .channel
+            .connection
+            .open_bi()
+            .await
+            .map_err(|_| Invalid)?;
+        let attempt = [41; 32];
+        let session = [42; 16];
+        let nonce_a = [43; 32];
+        let first = record(
+            0,
+            "operational-session-preflight-open-v1",
+            &[
+                Value::Bytes(attempt.to_vec()),
+                Value::Text("A".into()),
+                Value::Bytes(session.to_vec()),
+                Value::Bytes(nonce_a.to_vec()),
+                Value::Bytes(self.view.encode()?),
+                Value::Bytes(self.view.self_fingerprint.to_vec()),
+                Value::Bytes(self.view.peer_fingerprint.to_vec()),
+            ],
+        )?;
+        send.write_all(&first.encode()?)
+            .await
+            .map_err(|_| Invalid)?;
+        let second = read_one_record(&mut recv).await?;
+        let b = preflight_accept(&second)?;
+        if !self.view.inverse_of(&b.b_view)
+            || b.attempt != attempt
+            || b.session_id != session
+            || b.nonce_a != nonce_a
+        {
+            return Err(Invalid);
+        }
+        let commitment = authority_commitment(&self.view, &b.b_view)?;
+        let ch = hash(&commitment);
+        let context = exporter_context(
+            self.view.self_fingerprint,
+            self.view.peer_fingerprint,
+            ch,
+            nonce_a,
+            b.nonce_b,
+        )?;
+        let cx = hash(&context);
+        let exporter =
+            self.exporter(b"EXPORTER-ControlShiftF12-OperationalSession-v1", &context)?;
+        let key = confirm_key(exporter, cx)?;
+        let open = record(
+            2,
+            "operational-session-open-v1",
+            &[
+                Value::Bytes(attempt.to_vec()),
+                Value::Text("A".into()),
+                Value::Bytes(session.to_vec()),
+                Value::Bytes(ch.to_vec()),
+                Value::Bytes(cx.to_vec()),
+            ],
+        )?;
+        send.write_all(&open.encode()?).await.map_err(|_| Invalid)?;
+        let accept = read_one_record(&mut recv).await?;
+        let accepted = accept_record(&accept)?;
+        if accepted.attempt != attempt
+            || accepted.session_id != session
+            || accepted.open_hash != hash(open.payload())
+            || accepted.commitment_hash != ch
+            || accepted.context_hash != cx
+        {
+            return Err(Invalid);
+        }
+        let prior = hash(accept.payload());
+        let mut bad = confirmation(&key, Role::A, attempt, session, prior)?;
+        bad[0] ^= 1;
+        let confirm_a = record(
+            4,
+            "operational-session-confirm-v1",
+            &[
+                Value::Bytes(attempt.to_vec()),
+                Value::Text("A".into()),
+                Value::Bytes(session.to_vec()),
+                Value::Bytes(prior.to_vec()),
+                Value::Bytes(bad.to_vec()),
+            ],
+        )?;
+        send.write_all(&confirm_a.encode()?)
+            .await
+            .map_err(|_| Invalid)?;
+        send.finish().map_err(|_| Invalid)?;
+        let mut byte = [0; 1];
+        let terminal = recv.read(&mut byte).await;
+        if !matches!(terminal, Err(quinn::ReadError::Reset(code)) if code == APPLICATION_ERROR.into())
+        {
+            return Err(Invalid);
+        }
+        // The reset is the first peer-visible consequence. The connection is
+        // then closed with the same application code; accepting only the
+        // latter would mask a missing RESET_STREAM/STOP_SENDING.
+        matches!(
+            tokio::time::timeout(Duration::from_secs(1), self.channel.connection.closed()).await,
+            Ok(quinn::ConnectionError::ApplicationClosed(close)) if close.error_code == APPLICATION_ERROR.into()
+        )
+        .then_some(())
+        .ok_or(Invalid)
+    }
+
+    /// Sends a complete valid A transcript, FINs its selected stream, and
+    /// immediately opens one more bidi stream.  The extra stream is therefore
+    /// causally after Confirm A and its FIN, rather than a pre-transcript
+    /// race.  A correct B must reject it before reporting success.
+    pub(crate) async fn send_valid_confirm_a_then_open_late_stream(self) -> Result<(), Invalid> {
+        let (mut send, mut recv) = self
+            .channel
+            .connection
+            .open_bi()
+            .await
+            .map_err(|_| Invalid)?;
+        let attempt = [51; 32];
+        let session = [52; 16];
+        let nonce_a = [53; 32];
+        let first = record(
+            0,
+            "operational-session-preflight-open-v1",
+            &[
+                Value::Bytes(attempt.to_vec()),
+                Value::Text("A".into()),
+                Value::Bytes(session.to_vec()),
+                Value::Bytes(nonce_a.to_vec()),
+                Value::Bytes(self.view.encode()?),
+                Value::Bytes(self.view.self_fingerprint.to_vec()),
+                Value::Bytes(self.view.peer_fingerprint.to_vec()),
+            ],
+        )?;
+        send.write_all(&first.encode()?)
+            .await
+            .map_err(|_| Invalid)?;
+        let second = read_one_record(&mut recv).await?;
+        let b = preflight_accept(&second)?;
+        if !self.view.inverse_of(&b.b_view)
+            || b.attempt != attempt
+            || b.session_id != session
+            || b.nonce_a != nonce_a
+        {
+            return Err(Invalid);
+        }
+        let commitment = authority_commitment(&self.view, &b.b_view)?;
+        let ch = hash(&commitment);
+        let context = exporter_context(
+            self.view.self_fingerprint,
+            self.view.peer_fingerprint,
+            ch,
+            nonce_a,
+            b.nonce_b,
+        )?;
+        let cx = hash(&context);
+        let exporter =
+            self.exporter(b"EXPORTER-ControlShiftF12-OperationalSession-v1", &context)?;
+        let key = confirm_key(exporter, cx)?;
+        let open = record(
+            2,
+            "operational-session-open-v1",
+            &[
+                Value::Bytes(attempt.to_vec()),
+                Value::Text("A".into()),
+                Value::Bytes(session.to_vec()),
+                Value::Bytes(ch.to_vec()),
+                Value::Bytes(cx.to_vec()),
+            ],
+        )?;
+        send.write_all(&open.encode()?).await.map_err(|_| Invalid)?;
+        let accept = read_one_record(&mut recv).await?;
+        let accepted = accept_record(&accept)?;
+        if accepted.attempt != attempt
+            || accepted.session_id != session
+            || accepted.open_hash != hash(open.payload())
+            || accepted.commitment_hash != ch
+            || accepted.context_hash != cx
+        {
+            return Err(Invalid);
+        }
+        let prior = hash(accept.payload());
+        let confirm_a = record(
+            4,
+            "operational-session-confirm-v1",
+            &[
+                Value::Bytes(attempt.to_vec()),
+                Value::Text("A".into()),
+                Value::Bytes(session.to_vec()),
+                Value::Bytes(prior.to_vec()),
+                Value::Bytes(confirmation(&key, Role::A, attempt, session, prior)?.to_vec()),
+            ],
+        )?;
+        send.write_all(&confirm_a.encode()?)
+            .await
+            .map_err(|_| Invalid)?;
+        send.finish().map_err(|_| Invalid)?;
+
+        // This is the linear finalization adversary: it is opened only after
+        // the valid selected stream carries Confirm A and FIN.
+        let (mut late_send, mut late_recv) = match self.channel.connection.open_bi().await {
+            Ok(pair) => pair,
+            // The peer can close its V01 acceptance boundary before QUIC
+            // admits the late stream. That is the same fail-closed outcome,
+            // but still require the explicit application-close evidence.
+            Err(_) => return self.expect_any_application_close().await,
+        };
+        if late_send.write_all(b"late-v01-stream").await.is_err() {
+            return self.expect_any_application_close().await;
+        }
+
+        // B may have sent Confirm B before it notices the late stream. It is
+        // nevertheless forbidden to complete successfully after this point.
+        // Observe either selected stream: the peer may abort the selected
+        // stream first or the late stream first, but it must surface the
+        // application abort rather than let `complete` succeed.
+        let mut late_byte = [0; 1];
+        let mut selected_byte = [0; 1];
+        let terminal = tokio::select! {
+            result = late_recv.read(&mut late_byte) => result,
+            result = recv.read(&mut selected_byte) => result,
+        };
+        match terminal {
+            Err(quinn::ReadError::Reset(code)) if code == APPLICATION_ERROR.into() => Ok(()),
+            Err(quinn::ReadError::ConnectionLost(quinn::ConnectionError::ApplicationClosed(
+                close,
+            ))) if close.error_code == APPLICATION_ERROR.into() => Ok(()),
+            _ => Err(Invalid),
+        }
+    }
+
+    async fn expect_any_application_close(&self) -> Result<(), Invalid> {
+        matches!(
+            tokio::time::timeout(Duration::from_secs(1), self.channel.connection.closed()).await,
+            Ok(quinn::ConnectionError::ApplicationClosed(_))
+        )
+        .then_some(())
+        .ok_or(Invalid)
+    }
 }
 
 impl OperationalChannel {
@@ -1156,14 +1485,16 @@ impl Drop for ExtraStreamMonitor {
 struct AttemptStream {
     send: quinn::SendStream,
     recv: quinn::RecvStream,
+    connection: quinn::Connection,
     clean: bool,
 }
 
 impl AttemptStream {
-    fn new(pair: (quinn::SendStream, quinn::RecvStream)) -> Self {
+    fn new(pair: (quinn::SendStream, quinn::RecvStream), connection: quinn::Connection) -> Self {
         Self {
             send: pair.0,
             recv: pair.1,
+            connection,
             clean: false,
         }
     }
@@ -1178,11 +1509,28 @@ impl Drop for AttemptStream {
         if !self.clean {
             let _ = self.send.reset(APPLICATION_ERROR.into());
             let _ = self.recv.stop(APPLICATION_ERROR.into());
+            // Quinn queues RESET_STREAM/STOP_SENDING synchronously. Yield
+            // once before APPLICATION_ERROR so a malicious peer can observe
+            // the stream abort rather than only a connection-close race.
+            let connection = self.connection.clone();
+            tokio::spawn(async move {
+                tokio::task::yield_now().await;
+                connection.close(APPLICATION_ERROR.into(), b"operational session aborted");
+            });
         }
     }
 }
 
 impl OperationalAttempt {
+    fn assert_preflight_current(&self) -> Result<(), Invalid> {
+        self.guard.assert_lease(None)?;
+        self.preflight
+            .as_ref()
+            .ok_or(Invalid)?
+            .assert_current()
+            .map_err(|_| Invalid)
+    }
+
     async fn new(
         channel: OperationalChannel,
         role: Role,
@@ -1195,6 +1543,7 @@ impl OperationalAttempt {
         // close with the operational application error, even a lease-acquire
         // failure before the selected stream exists.
         guard.attach(channel.connection.clone());
+        guard.assert_lease(None)?;
         let encoded_view = view.encode()?;
         let view_hash = hash(&encoded_view);
         let (a, b) = match role {
@@ -1221,6 +1570,7 @@ impl OperationalAttempt {
             b"EXPORTER-ControlShiftF12-OperationalPreflightLease-v1",
             &context,
         )?;
+        guard.assert_lease(None)?;
         let binding = hash(&encode(
             "operational-session-preflight-lease-binding-v1",
             &[
@@ -1239,6 +1589,8 @@ impl OperationalAttempt {
         let preflight = authority
             .acquire_operational_preflight_lease(durable_attempt, view_hash, binding)
             .map_err(|_| Invalid)?;
+        guard.assert_lease(None)?;
+        preflight.assert_current().map_err(|_| Invalid)?;
         Ok(Self {
             channel,
             role,
@@ -1250,9 +1602,13 @@ impl OperationalAttempt {
 
     /// Runs the dynamic V01 transcript. The only values constructed here are
     /// fresh opaque attempt/session/nonces and the exact durable/TLS bindings.
-    pub(crate) async fn complete_with_local_consent<F>(mut self, confirm: F) -> Result<(), Invalid>
+    pub(crate) async fn complete_with_local_consent<F, Future>(
+        mut self,
+        confirm: F,
+    ) -> Result<(), Invalid>
     where
-        F: FnOnce([u8; 32], [u8; 32]) -> Result<LocalOperationalConsent, Invalid>,
+        F: FnOnce([u8; 32], [u8; 32]) -> Future,
+        Future: std::future::Future<Output = Result<LocalOperationalConsent, Invalid>>,
     {
         let result = self.complete_inner(confirm).await;
         if result.is_ok() {
@@ -1261,9 +1617,10 @@ impl OperationalAttempt {
         result
     }
 
-    async fn complete_inner<F>(&mut self, confirm: F) -> Result<(), Invalid>
+    async fn complete_inner<F, Future>(&mut self, confirm: F) -> Result<(), Invalid>
     where
-        F: FnOnce([u8; 32], [u8; 32]) -> Result<LocalOperationalConsent, Invalid>,
+        F: FnOnce([u8; 32], [u8; 32]) -> Future,
+        Future: std::future::Future<Output = Result<LocalOperationalConsent, Invalid>>,
     {
         let mut attempt = [0; 32];
         let mut session = [0; 16];
@@ -1285,7 +1642,9 @@ impl OperationalAttempt {
             }
             Role::B => extra_streams.take_primary(&self.guard).await?,
         };
-        let mut stream = AttemptStream::new(pair);
+        let mut stream = AttemptStream::new(pair, self.channel.connection.clone());
+        self.guard.mark_stream_selected();
+        self.assert_preflight_current()?;
         let first = if self.role == Role::A {
             record(
                 0,
@@ -1313,6 +1672,7 @@ impl OperationalAttempt {
             )
             .await?;
         }
+        self.assert_preflight_current()?;
         extra_streams.assert_clear()?;
         let a = preflight_open(&first)?;
         if self.role == Role::B {
@@ -1327,6 +1687,7 @@ impl OperationalAttempt {
         if self.role == Role::B {
             rand::rngs::OsRng.fill_bytes(&mut nonce_b);
         }
+        self.assert_preflight_current()?;
         let second = if self.role == Role::B {
             record(
                 1,
@@ -1355,6 +1716,7 @@ impl OperationalAttempt {
             )
             .await?;
         }
+        self.assert_preflight_current()?;
         extra_streams.assert_clear()?;
         let b = preflight_accept(&second)?;
         if self.role == Role::A {
@@ -1464,7 +1826,7 @@ impl OperationalAttempt {
             return Err(Invalid);
         }
         let preconfirm = preconfirm_transcript(&commitment, &[&first, &second, &open, &accept])?;
-        let consent = confirm(preconfirm, ch)?;
+        let consent = self.guard.within(confirm(preconfirm, ch)).await?;
         if !consent.matches(preconfirm, ch) {
             return Err(Invalid);
         }
@@ -1592,6 +1954,16 @@ impl OperationalAttempt {
             // trailing byte remains a hard failure below.
             Some(_) => return Err(Invalid),
         }
+        // This is the linear end-of-session boundary. The sealed driver never
+        // hands a live QUIC handle to its caller, so once both sides have
+        // exchanged Confirm and FIN there is no permitted follow-on stream.
+        // Start an explicit application close *before* releasing the monitor:
+        // an extra stream that won the race is observed by the monitor and
+        // fails this attempt; one that loses cannot be admitted after this
+        // boundary and receives the close instead.
+        self.channel
+            .connection
+            .close(0u32.into(), b"operational session finalized");
         extra_streams.finish_and_assert_clear(&self.guard).await?;
         self.guard.assert_lease(Some(&final_lease))?;
         stream.succeed();

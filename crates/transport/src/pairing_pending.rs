@@ -1372,6 +1372,34 @@ mod unix {
             &self.snapshot
         }
 
+        /// Re-reads the durable receipt/pin tuple while the attempt is still
+        /// preflight-only.  Open and Accept are transport-visible records, so
+        /// a revoke or rotation must win before either is accepted or emitted.
+        pub(crate) fn assert_current(&self) -> Result<(), StoreError> {
+            if !self.live
+                || !self
+                    .store
+                    .operational_snapshot_still_current(&self.snapshot)?
+            {
+                return Err(StoreError::Conflict);
+            }
+            let leases = operational_lease_states();
+            matches!(
+                leases.get(&self.token),
+                Some(OperationalLeaseState {
+                    snapshot,
+                    phase: OperationalLeasePhase::Preflight {
+                        view_hash,
+                        connection_binding,
+                    },
+                }) if snapshot == &self.snapshot
+                    && *view_hash == self.view_hash
+                    && *connection_binding == self.connection_binding
+            )
+            .then_some(())
+            .ok_or(StoreError::Conflict)
+        }
+
         /// Final promotion is the local operational linearization point.  It
         /// re-reads the durable state before changing the in-memory token; no
         /// connection, stream, or filesystem I/O occurs while the lease mutex
