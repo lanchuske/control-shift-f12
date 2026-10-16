@@ -34,6 +34,12 @@ pub struct CaptureOutcome {
     pub emergency: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaptureCallbackAction {
+    Continue,
+    RecoverLocal,
+}
+
 impl CaptureOutcome {
     pub fn pass_through() -> Self {
         Self {
@@ -303,7 +309,7 @@ mod native {
     impl MacEventTap {
         pub fn install(
             mode: CaptureMode,
-            callback: impl Fn(CaptureOutcome) + Send + Sync + 'static,
+            callback: impl Fn(CaptureOutcome) -> CaptureCallbackAction + Send + Sync + 'static,
         ) -> Result<Self, InputError> {
             let mode_value = Arc::new(AtomicU8::new(mode as u8));
             let callback = Arc::new(callback);
@@ -365,7 +371,7 @@ mod native {
                                     held.clear();
                                     emergency_mode
                                         .store(CaptureMode::Local as u8, Ordering::Relaxed);
-                                    callback(CaptureOutcome {
+                                    let _ = callback(CaptureOutcome {
                                         disposition: EventDisposition::PassThrough,
                                         event: None,
                                         emergency: true,
@@ -376,7 +382,7 @@ mod native {
                             let remote =
                                 callback_mode.load(Ordering::Relaxed) == CaptureMode::Remote as u8;
                             if let Some(input) = input {
-                                callback(CaptureOutcome {
+                                let action = callback(CaptureOutcome {
                                     disposition: if remote {
                                         EventDisposition::Suppress
                                     } else {
@@ -385,6 +391,11 @@ mod native {
                                     event: Some(input),
                                     emergency: false,
                                 });
+                                if action == CaptureCallbackAction::RecoverLocal {
+                                    callback_mode
+                                        .store(CaptureMode::Local as u8, Ordering::Release);
+                                    return CallbackResult::Keep;
+                                }
                             }
                             if remote {
                                 CallbackResult::Drop

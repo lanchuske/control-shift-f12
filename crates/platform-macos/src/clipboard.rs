@@ -14,6 +14,11 @@ pub trait ClipboardBackend {
     fn write(&mut self, content: &ClipboardContent) -> Result<(), ClipboardError>;
 }
 
+#[cfg(target_os = "macos")]
+pub trait PasteboardChangeToken {
+    fn current(&self) -> Result<u64, ClipboardError>;
+}
+
 #[derive(Debug, thiserror::Error, Clone, PartialEq, Eq)]
 pub enum ClipboardError {
     #[error("pasteboard access is unavailable")]
@@ -150,8 +155,16 @@ mod native {
     pub struct PasteboardBackend {
         clipboard: Mutex<Option<Clipboard>>,
         access: AccessState,
-        pasteboard: Option<objc2::rc::Retained<NSPasteboard>>,
+        change_token: Box<dyn PasteboardChangeToken>,
         snapshot_count: AtomicU64,
+    }
+
+    struct NativePasteboardChangeToken(objc2::rc::Retained<NSPasteboard>);
+
+    impl PasteboardChangeToken for NativePasteboardChangeToken {
+        fn current(&self) -> Result<u64, ClipboardError> {
+            Ok(self.0.changeCount().max(0) as u64)
+        }
     }
 
     impl PasteboardBackend {
@@ -160,15 +173,31 @@ mod native {
                 Ok(clipboard) => Self {
                     clipboard: Mutex::new(Some(clipboard)),
                     access: AccessState::Granted,
-                    pasteboard: Some(NSPasteboard::generalPasteboard()),
+                    change_token: Box::new(NativePasteboardChangeToken(
+                        NSPasteboard::generalPasteboard(),
+                    )),
                     snapshot_count: AtomicU64::new(0),
                 },
                 Err(_) => Self {
                     clipboard: Mutex::new(None),
                     access: AccessState::Denied,
-                    pasteboard: None,
+                    change_token: Box::new(NativePasteboardChangeToken(
+                        NSPasteboard::generalPasteboard(),
+                    )),
                     snapshot_count: AtomicU64::new(0),
                 },
+            }
+        }
+
+        #[cfg(test)]
+        pub(crate) fn with_change_token_for_test(
+            change_token: impl PasteboardChangeToken + 'static,
+        ) -> Self {
+            Self {
+                clipboard: Mutex::new(None),
+                access: AccessState::Granted,
+                change_token: Box::new(change_token),
+                snapshot_count: AtomicU64::new(0),
             }
         }
 
@@ -220,11 +249,7 @@ mod native {
             if self.access != AccessState::Granted {
                 return Err(ClipboardError::AccessUnavailable);
             }
-            let pasteboard = self
-                .pasteboard
-                .as_ref()
-                .ok_or(ClipboardError::AccessUnavailable)?;
-            Ok(pasteboard.changeCount().max(0) as u64)
+            self.change_token.current()
         }
         fn read(&mut self) -> Result<Option<ClipboardContent>, ClipboardError> {
             self.snapshot()
@@ -274,11 +299,37 @@ impl Default for MacClipboard {
 
 #[cfg(all(test, target_os = "macos"))]
 mod native_change_token_tests {
-    use super::{ClipboardBackend, PasteboardBackend};
+    use super::{ClipboardBackend, ClipboardError, PasteboardBackend, PasteboardChangeToken};
+    use std::{cell::RefCell, collections::VecDeque, rc::Rc};
+
+    type TokenExpectations = Rc<RefCell<VecDeque<Result<u64, ClipboardError>>>>;
+
+    struct ExpectedTokens {
+        expected: TokenExpectations,
+    }
+
+    impl PasteboardChangeToken for ExpectedTokens {
+        fn current(&self) -> Result<u64, ClipboardError> {
+            self.expected
+                .borrow_mut()
+                .pop_front()
+                .expect("unexpected change-token read")
+        }
+    }
+
+    fn backend_with_tokens(
+        values: impl IntoIterator<Item = Result<u64, ClipboardError>>,
+    ) -> (PasteboardBackend, TokenExpectations) {
+        let expected = Rc::new(RefCell::new(values.into_iter().collect()));
+        let backend = PasteboardBackend::with_change_token_for_test(ExpectedTokens {
+            expected: Rc::clone(&expected),
+        });
+        (backend, expected)
+    }
 
     #[test]
     fn unchanged_native_change_checks_do_not_read_or_encode_clipboard_contents() {
-        let backend = PasteboardBackend::new();
+        let (backend, expected) = backend_with_tokens((0..100).map(|_| Ok(41)));
         let before = backend.snapshot_count_for_test();
 
         for _ in 0..100 {
@@ -286,5 +337,16 @@ mod native_change_token_tests {
         }
 
         assert_eq!(backend.snapshot_count_for_test(), before);
+        assert!(expected.borrow().is_empty());
+    }
+
+    #[test]
+    fn native_change_count_propagates_real_increments_and_errors() {
+        let (backend, expected) = backend_with_tokens([Ok(7), Ok(8), Err(ClipboardError::Backend)]);
+
+        assert_eq!(backend.change_count(), Ok(7));
+        assert_eq!(backend.change_count(), Ok(8));
+        assert_eq!(backend.change_count(), Err(ClipboardError::Backend));
+        assert!(expected.borrow().is_empty());
     }
 }

@@ -8,7 +8,7 @@ use std::{
 use clap::{Args, Parser, Subcommand};
 use seamless_discovery::{Discovery, manual_address};
 use seamless_input::{
-    supervisor::{AppPaths, CapabilityReport, NativeSupervisor},
+    supervisor::{AppPaths, CapabilityReport, INPUT_SERVICE_INTERVAL, NativeSupervisor},
     tui,
 };
 use seamless_input_protocol::{NodeId, VERSION};
@@ -124,9 +124,13 @@ async fn start(paths: &AppPaths) -> Result<(), OperationalError> {
         .flush()
         .map_err(|error| OperationalError(error.to_string()))?;
     let mut interval = tokio::time::interval(Duration::from_millis(250));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut input_interval = tokio::time::interval(INPUT_SERVICE_INTERVAL);
+    input_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         tokio::select! {
             _ = interval.tick() => { supervisor.tick().await?; }
+            _ = input_interval.tick() => { supervisor.service_input().await?; }
             result = tokio::signal::ctrl_c() => {
                 result.map_err(|error| OperationalError(error.to_string()))?;
                 return Ok(());

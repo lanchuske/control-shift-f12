@@ -21,13 +21,16 @@ use seamless_transport::{
     EndpointOptions, IdentityStore, PairingError, PeerEndpoint, PeerSession, ReconnectPolicy,
 };
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 use tokio::{sync::mpsc, task::JoinHandle};
+
+pub const INPUT_SERVICE_INTERVAL: Duration = Duration::from_millis(5);
+const CAPTURE_DRAIN_BUDGET: usize = 64;
 
 #[derive(Clone, Debug)]
 pub struct AppPaths {
@@ -395,9 +398,6 @@ impl NativeSupervisor {
         }
 
         self.drain_inbound(now_ms).await?;
-        self.drain_capture(now_ms).await?;
-        self.capture
-            .set_remote(self.runtime.active_peer() != self.identity.node_id());
 
         Ok(SupervisorStatus {
             discovered,
@@ -409,6 +409,14 @@ impl NativeSupervisor {
 
     pub fn input_access(&self) -> AccessState {
         self.platform.input_access()
+    }
+
+    pub async fn service_input(&mut self) -> Result<(), SupervisorError> {
+        let now_ms = self.started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+        self.drain_capture(now_ms, CAPTURE_DRAIN_BUDGET).await?;
+        self.capture
+            .set_remote(self.runtime.active_peer() != self.identity.node_id());
+        Ok(())
     }
 
     async fn refresh_peer_membership(&mut self) -> Result<(), SupervisorError> {
@@ -586,8 +594,8 @@ impl NativeSupervisor {
         Ok(())
     }
 
-    async fn drain_capture(&mut self, now_ms: u64) -> Result<(), SupervisorError> {
-        let captured = self.capture.drain();
+    async fn drain_capture(&mut self, now_ms: u64, budget: usize) -> Result<(), SupervisorError> {
+        let captured = self.capture.drain(budget);
         for captured in captured {
             let effects = if captured.emergency {
                 self.runtime.emergency_return()
@@ -984,37 +992,265 @@ fn capture_point_to_logical(point: Point, displays: &[LogicalDisplay]) -> Option
     crate::cursor::physical_to_logical(point, displays)
 }
 
+#[derive(Clone, Debug, PartialEq)]
 struct CapturedInput {
     event: Option<seamless_input_protocol::InputEvent>,
     emergency: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CaptureEnqueueAction {
+    Continue,
+    RecoverLocal,
+}
+
+struct CaptureBufferState {
+    emergency: bool,
+    critical: VecDeque<CapturedInput>,
+    pointer: Option<CapturedInput>,
+}
+
+#[derive(Clone)]
+struct CaptureBuffer {
+    capacity: usize,
+    state: Arc<Mutex<CaptureBufferState>>,
+}
+
+impl CaptureBuffer {
+    fn new(capacity: usize) -> Self {
+        assert!(capacity > 0, "capture capacity must be non-zero");
+        Self {
+            capacity,
+            state: Arc::new(Mutex::new(CaptureBufferState {
+                emergency: false,
+                critical: VecDeque::with_capacity(capacity),
+                pointer: None,
+            })),
+        }
+    }
+
+    fn push(&self, captured: CapturedInput) -> CaptureEnqueueAction {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if captured.emergency {
+            state.critical.clear();
+            state.pointer = None;
+            state.emergency = true;
+            return CaptureEnqueueAction::RecoverLocal;
+        }
+        if matches!(
+            captured.event,
+            Some(seamless_input_protocol::InputEvent::Pointer { .. })
+        ) {
+            state.pointer = Some(captured);
+            return CaptureEnqueueAction::Continue;
+        }
+        if state.critical.len() == self.capacity {
+            state.critical.clear();
+            state.pointer = None;
+            state.emergency = true;
+            return CaptureEnqueueAction::RecoverLocal;
+        }
+        state.critical.push_back(captured);
+        CaptureEnqueueAction::Continue
+    }
+
+    fn drain(&self, budget: usize) -> Vec<CapturedInput> {
+        if budget == 0 {
+            return Vec::new();
+        }
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let mut drained = Vec::with_capacity(budget.min(state.critical.len() + 1));
+        if std::mem::take(&mut state.emergency) {
+            drained.push(CapturedInput {
+                event: None,
+                emergency: true,
+            });
+            return drained;
+        }
+        while drained.len() < budget {
+            let Some(captured) = state.critical.pop_front() else {
+                break;
+            };
+            drained.push(captured);
+        }
+        if drained.len() < budget
+            && let Some(pointer) = state.pointer.take()
+        {
+            drained.push(pointer);
+        }
+        drained
+    }
+}
+
+#[cfg(test)]
+mod capture_buffer_tests {
+    use super::{
+        CAPTURE_DRAIN_BUDGET, CaptureBuffer, CaptureEnqueueAction, CapturedInput,
+        INPUT_SERVICE_INTERVAL,
+    };
+    use seamless_input_protocol::{Button, InputEvent, Modifier};
+
+    fn captured(event: InputEvent) -> CapturedInput {
+        CapturedInput {
+            event: Some(event),
+            emergency: false,
+        }
+    }
+
+    #[test]
+    fn pointer_motion_is_latest_wins_and_drain_respects_budget() {
+        let queue = CaptureBuffer::new(4);
+        for value in 0..10_000 {
+            assert_eq!(
+                queue.push(captured(InputEvent::Pointer {
+                    x: value as f64,
+                    y: value as f64,
+                })),
+                CaptureEnqueueAction::Continue
+            );
+        }
+
+        let drained = queue.drain(1);
+        assert_eq!(drained.len(), 1);
+        assert_eq!(
+            drained[0].event,
+            Some(InputEvent::Pointer {
+                x: 9_999.0,
+                y: 9_999.0,
+            })
+        );
+        assert!(queue.drain(1).is_empty());
+    }
+
+    #[test]
+    fn key_modifier_and_button_transitions_remain_fifo_across_budgeted_drains() {
+        let queue = CaptureBuffer::new(4);
+        let events = [
+            InputEvent::Key {
+                code: 4,
+                pressed: true,
+            },
+            InputEvent::Modifier {
+                modifier: Modifier::Shift,
+                pressed: true,
+            },
+            InputEvent::Button {
+                button: Button::Left,
+                pressed: false,
+            },
+        ];
+        for event in events.clone() {
+            assert_eq!(queue.push(captured(event)), CaptureEnqueueAction::Continue);
+        }
+
+        assert_eq!(
+            queue
+                .drain(2)
+                .into_iter()
+                .map(|captured| captured.event.unwrap())
+                .collect::<Vec<_>>(),
+            events[..2]
+        );
+        assert_eq!(queue.drain(1)[0].event, Some(events[2].clone()));
+    }
+
+    #[test]
+    fn emergency_is_out_of_band_and_discards_stale_bulk_input() {
+        let queue = CaptureBuffer::new(4);
+        queue.push(captured(InputEvent::Key {
+            code: 4,
+            pressed: true,
+        }));
+        queue.push(captured(InputEvent::Pointer { x: 1.0, y: 2.0 }));
+
+        assert_eq!(
+            queue.push(CapturedInput {
+                event: None,
+                emergency: true,
+            }),
+            CaptureEnqueueAction::RecoverLocal
+        );
+        assert_eq!(
+            queue.drain(64),
+            vec![CapturedInput {
+                event: None,
+                emergency: true,
+            }]
+        );
+        assert!(queue.drain(64).is_empty());
+    }
+
+    #[test]
+    fn critical_overflow_forces_recovery_instead_of_silently_losing_an_up() {
+        let queue = CaptureBuffer::new(2);
+        queue.push(captured(InputEvent::Key {
+            code: 4,
+            pressed: true,
+        }));
+        queue.push(captured(InputEvent::Button {
+            button: Button::Left,
+            pressed: true,
+        }));
+
+        assert_eq!(
+            queue.push(captured(InputEvent::Button {
+                button: Button::Left,
+                pressed: false,
+            })),
+            CaptureEnqueueAction::RecoverLocal
+        );
+        assert_eq!(
+            queue.drain(64),
+            vec![CapturedInput {
+                event: None,
+                emergency: true,
+            }]
+        );
+    }
+
+    #[test]
+    fn input_service_has_a_small_fixed_time_and_work_budget() {
+        assert!(INPUT_SERVICE_INTERVAL < std::time::Duration::from_millis(250));
+        assert!((1..=64).contains(&CAPTURE_DRAIN_BUDGET));
+    }
+}
+
 #[cfg(all(target_os = "macos", not(test)))]
 struct NativeCapture {
     tap: seamless_input_platform_macos::input::MacEventTap,
-    receiver: std::sync::mpsc::Receiver<seamless_input_platform_macos::input::CaptureOutcome>,
+    buffer: CaptureBuffer,
 }
 
 #[cfg(all(target_os = "macos", not(test)))]
 impl NativeCapture {
     fn install() -> Result<Self, seamless_input_platform_macos::input::InputError> {
-        let (sender, receiver) = std::sync::mpsc::channel();
+        const CRITICAL_CAPTURE_CAPACITY: usize = 256;
+        let buffer = CaptureBuffer::new(CRITICAL_CAPTURE_CAPACITY);
+        let callback_buffer = buffer.clone();
         let tap = seamless_input_platform_macos::input::MacEventTap::install(
             seamless_input_core::platform::CaptureMode::Local,
-            move |event| {
-                let _ = sender.send(event);
+            move |event| match callback_buffer.push(CapturedInput {
+                event: event.event,
+                emergency: event.emergency,
+            }) {
+                CaptureEnqueueAction::Continue => {
+                    seamless_input_platform_macos::input::CaptureCallbackAction::Continue
+                }
+                CaptureEnqueueAction::RecoverLocal => {
+                    seamless_input_platform_macos::input::CaptureCallbackAction::RecoverLocal
+                }
             },
         )?;
-        Ok(Self { tap, receiver })
+        Ok(Self { tap, buffer })
     }
-    fn drain(&self) -> Vec<CapturedInput> {
-        self.receiver
-            .try_iter()
-            .map(|outcome| CapturedInput {
-                event: outcome.event,
-                emergency: outcome.emergency,
-            })
-            .collect()
+    fn drain(&self, budget: usize) -> Vec<CapturedInput> {
+        self.buffer.drain(budget)
     }
     fn set_remote(&self, remote: bool) {
         self.tap.set_mode(if remote {
@@ -1037,9 +1273,10 @@ impl NativeCapture {
         let (hooks, receiver) = seamless_input_platform_windows::input::WindowsHooks::install()?;
         Ok(Self { hooks, receiver })
     }
-    fn drain(&self) -> Vec<CapturedInput> {
+    fn drain(&self, budget: usize) -> Vec<CapturedInput> {
         self.receiver
             .try_iter()
+            .take(budget)
             .map(|outcome| CapturedInput {
                 event: outcome.event,
                 emergency: outcome.emergency,
@@ -1066,7 +1303,7 @@ impl NativeCapture {
         Ok(Self)
     }
 
-    fn drain(&self) -> Vec<CapturedInput> {
+    fn drain(&self, _budget: usize) -> Vec<CapturedInput> {
         Vec::new()
     }
 
