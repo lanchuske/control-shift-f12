@@ -12,6 +12,15 @@ use std::{
 };
 
 #[test]
+fn local_operational_consent_rejects_each_bound_value_mutation() {
+    let consent =
+        super::operational_session::LocalOperationalConsent::test_only_approved([71; 32], [72; 32]);
+    assert!(consent.matches([71; 32], [72; 32]));
+    assert!(!consent.matches([70; 32], [72; 32]));
+    assert!(!consent.matches([71; 32], [73; 32]));
+}
+
+#[test]
 fn frozen_v01_records_round_trip_exactly_and_enforce_the_six_record_schedule() {
     let fixture: serde_json::Value = serde_json::from_slice(include_bytes!(
         "../../tests/fixtures/pairing-v2/operational-session-v01.json"
@@ -267,7 +276,24 @@ async fn v01_dynamic_attempt_uses_live_tls_exporter_and_durable_snapshots() {
     };
     assert!(aa.is_ok(), "initiator admission failed");
     assert!(bb.is_ok(), "acceptor admission failed");
-    let (ra, rb) = tokio::join!(aa.unwrap().complete(), bb.unwrap().complete());
+    let (ra, rb) = tokio::join!(
+        aa.unwrap()
+            .complete_with_local_consent(|preconfirm, commitment| {
+                Ok(
+                    super::operational_session::LocalOperationalConsent::test_only_approved(
+                        preconfirm, commitment,
+                    ),
+                )
+            }),
+        bb.unwrap()
+            .complete_with_local_consent(|preconfirm, commitment| {
+                Ok(
+                    super::operational_session::LocalOperationalConsent::test_only_approved(
+                        preconfirm, commitment,
+                    ),
+                )
+            })
+    );
     assert!(ra.is_ok() && rb.is_ok(), "a={ra:?}; b={rb:?}");
 }
 
@@ -341,11 +367,81 @@ async fn v01_dynamic_attempt_fails_closed_when_revocation_wins_before_promotion(
         .revoke_candidate(a_store.version().unwrap(), ar.peer_fingerprint)
         .unwrap();
     let (ra, rb) = tokio::time::timeout(std::time::Duration::from_secs(2), async {
-        tokio::join!(aa.complete(), bb.complete())
+        tokio::join!(
+            aa.complete_with_local_consent(|preconfirm, commitment| Ok(
+                super::operational_session::LocalOperationalConsent::test_only_approved(
+                    preconfirm, commitment
+                )
+            )),
+            bb.complete_with_local_consent(|preconfirm, commitment| Ok(
+                super::operational_session::LocalOperationalConsent::test_only_approved(
+                    preconfirm, commitment
+                )
+            ))
+        )
     })
     .await
     .expect("revocation must close the live attempt without waiting for its deadline");
     assert!(ra.is_err() || rb.is_err());
+}
+
+#[tokio::test]
+async fn v01_revocation_between_accept_and_confirm_emits_no_confirm() {
+    let (a_der, a_key) = identity();
+    let (b_der, b_key) = identity();
+    let a_pin: [u8; 32] = Sha256::digest(&a_der).into();
+    let b_pin: [u8; 32] = Sha256::digest(&b_der).into();
+    let a_root = tempfile::tempdir().unwrap();
+    let b_root = tempfile::tempdir().unwrap();
+    let a_store = AdmissionAuthorityStore::open(a_root.path()).unwrap();
+    let b_store = AdmissionAuthorityStore::open(b_root.path()).unwrap();
+    let ar = a_store
+        .prepare(a_store.version().unwrap(), [81; 32], [82; 32])
+        .unwrap();
+    let br = b_store
+        .prepare(b_store.version().unwrap(), [83; 32], [84; 32])
+        .unwrap();
+    a_store.commit_operational_test_receipt(&ar, b_pin).unwrap();
+    b_store.commit_operational_test_receipt(&br, a_pin).unwrap();
+    let a = OperationalEndpoint::bind("127.0.0.1:0".parse().unwrap(), a_der, a_key).unwrap();
+    let b = OperationalEndpoint::bind("127.0.0.1:0".parse().unwrap(), b_der, b_key).unwrap();
+    let (aa, bb) = if a_pin < b_pin {
+        tokio::join!(
+            a.connect_admitted(b.local_addr().unwrap(), &a_store, ar.attempt_id),
+            b.accept_admitted(&b_store, br.attempt_id)
+        )
+    } else {
+        tokio::join!(
+            b.connect_admitted(a.local_addr().unwrap(), &b_store, br.attempt_id),
+            a.accept_admitted(&a_store, ar.attempt_id)
+        )
+    };
+    let aa = aa.unwrap();
+    let bb = bb.unwrap();
+    let (first, second) = tokio::time::timeout(Duration::from_secs(2), async {
+        tokio::join!(
+            aa.complete_with_local_consent(|preconfirm, commitment| {
+                a_store
+                    .revoke_candidate(a_store.version().unwrap(), ar.peer_fingerprint)
+                    .unwrap();
+                Ok(
+                    super::operational_session::LocalOperationalConsent::test_only_approved(
+                        preconfirm, commitment,
+                    ),
+                )
+            }),
+            bb.complete_with_local_consent(|preconfirm, commitment| {
+                Ok(
+                    super::operational_session::LocalOperationalConsent::test_only_approved(
+                        preconfirm, commitment,
+                    ),
+                )
+            })
+        )
+    })
+    .await
+    .unwrap();
+    assert!(first.is_err() || second.is_err());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -410,7 +506,13 @@ async fn v01_dynamic_attempt_succeeds_between_two_os_processes() {
         parent
             .connect_admitted(address, &store, record.attempt_id)
             .await?
-            .complete()
+            .complete_with_local_consent(|preconfirm, commitment| {
+                Ok(
+                    super::operational_session::LocalOperationalConsent::test_only_approved(
+                        preconfirm, commitment,
+                    ),
+                )
+            })
             .await
     })
     .await
@@ -468,7 +570,13 @@ fn operational_dynamic_process_worker() {
                 .accept_admitted(&store, record.attempt_id)
                 .await
                 .unwrap()
-                .complete()
+                .complete_with_local_consent(|preconfirm, commitment| {
+                    Ok(
+                        super::operational_session::LocalOperationalConsent::test_only_approved(
+                            preconfirm, commitment,
+                        ),
+                    )
+                })
                 .await
                 .unwrap();
             println!("OPERATIONAL_PASS");

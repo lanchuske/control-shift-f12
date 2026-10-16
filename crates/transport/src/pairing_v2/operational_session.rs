@@ -467,6 +467,35 @@ fn hash(bytes: &[u8]) -> [u8; 32] {
     Sha256::digest(bytes).into()
 }
 
+fn preconfirm_transcript(
+    commitment: &[u8],
+    records: &[&OperationalRecord],
+) -> Result<[u8; 32], Invalid> {
+    if records.len() != 4 {
+        return Err(Invalid);
+    }
+    let mut bytes = b"CSF12-operational-session-preconfirm-v1\0".to_vec();
+    bytes.extend(
+        u16::try_from(ALPN.len())
+            .map_err(|_| Invalid)?
+            .to_be_bytes(),
+    );
+    bytes.extend(ALPN);
+    bytes.extend(
+        u32::try_from(commitment.len())
+            .map_err(|_| Invalid)?
+            .to_be_bytes(),
+    );
+    bytes.extend(commitment);
+    bytes.extend(4u32.to_be_bytes());
+    for record in records {
+        let raw = record.encode()?;
+        bytes.extend(u32::try_from(raw.len()).map_err(|_| Invalid)?.to_be_bytes());
+        bytes.extend(raw);
+    }
+    Ok(hash(&bytes))
+}
+
 fn authority_commitment(a: &AuthorityView, b: &AuthorityView) -> Result<Vec<u8>, Invalid> {
     if !a.inverse_of(b) {
         return Err(Invalid);
@@ -901,6 +930,28 @@ pub(crate) struct OperationalAttempt {
     preflight: crate::pairing_pending::OperationalPreflightLease,
 }
 
+/// A one-use local approval bound to exactly one V01 preconfirm transcript and
+/// durable commitment. It is intentionally non-cloneable and has no public
+/// constructor: product UI must provide the reviewed local-gesture adapter.
+pub(crate) struct LocalOperationalConsent {
+    preconfirm: [u8; 32],
+    commitment: [u8; 32],
+}
+
+impl LocalOperationalConsent {
+    #[cfg(test)]
+    pub(crate) fn test_only_approved(preconfirm: [u8; 32], commitment: [u8; 32]) -> Self {
+        Self {
+            preconfirm,
+            commitment,
+        }
+    }
+
+    pub(crate) fn matches(&self, preconfirm: [u8; 32], commitment: [u8; 32]) -> bool {
+        self.preconfirm == preconfirm && self.commitment == commitment
+    }
+}
+
 /// Watches only for protocol-violating streams after the single V01 stream has
 /// been selected.  It never exposes either the connection or a stream handle.
 struct ExtraStreamMonitor {
@@ -1001,7 +1052,19 @@ impl OperationalAttempt {
 
     /// Runs the dynamic V01 transcript. The only values constructed here are
     /// fresh opaque attempt/session/nonces and the exact durable/TLS bindings.
-    pub(crate) async fn complete(self) -> Result<(), Invalid> {
+    pub(crate) async fn complete_with_local_consent<F>(self, confirm: F) -> Result<(), Invalid>
+    where
+        F: FnOnce([u8; 32], [u8; 32]) -> Result<LocalOperationalConsent, Invalid>,
+    {
+        tokio::time::timeout(Duration::from_secs(30), self.complete_inner(confirm))
+            .await
+            .map_err(|_| Invalid)?
+    }
+
+    async fn complete_inner<F>(self, confirm: F) -> Result<(), Invalid>
+    where
+        F: FnOnce([u8; 32], [u8; 32]) -> Result<LocalOperationalConsent, Invalid>,
+    {
         let mut attempt = [0; 32];
         let mut session = [0; 16];
         let mut nonce_a = [0; 32];
@@ -1102,6 +1165,7 @@ impl OperationalAttempt {
             .channel
             .exporter(b"EXPORTER-ControlShiftF12-OperationalSession-v1", &context)?;
         let key = confirm_key(exporter, cx)?;
+        final_lease.assert_current().map_err(|_| Invalid)?;
         let open = if self.role == Role::A {
             record(
                 2,
@@ -1121,6 +1185,15 @@ impl OperationalAttempt {
             send.write_all(&open.encode()?).await.map_err(|_| Invalid)?;
         }
         extra_streams.assert_clear()?;
+        final_lease.assert_current().map_err(|_| Invalid)?;
+        let checked_open = open_record(&open)?;
+        if checked_open.attempt != attempt
+            || checked_open.session_id != session
+            || checked_open.commitment_hash != ch
+            || checked_open.context_hash != cx
+        {
+            return Err(Invalid);
+        }
         let accept = if self.role == Role::B {
             record(
                 3,
@@ -1143,6 +1216,22 @@ impl OperationalAttempt {
                 .map_err(|_| Invalid)?;
         }
         extra_streams.assert_clear()?;
+        final_lease.assert_current().map_err(|_| Invalid)?;
+        let checked_accept = accept_record(&accept)?;
+        if checked_accept.attempt != attempt
+            || checked_accept.session_id != session
+            || checked_accept.open_hash != hash(open.payload())
+            || checked_accept.commitment_hash != ch
+            || checked_accept.context_hash != cx
+        {
+            return Err(Invalid);
+        }
+        let preconfirm = preconfirm_transcript(&commitment, &[&first, &second, &open, &accept])?;
+        let consent = confirm(preconfirm, ch)?;
+        if !consent.matches(preconfirm, ch) {
+            return Err(Invalid);
+        }
+        final_lease.assert_current().map_err(|_| Invalid)?;
         let prior = hash(accept.payload());
         let ca = confirmation(&key, Role::A, attempt, session, prior)?;
         let confirm_a = if self.role == Role::A {
@@ -1166,6 +1255,7 @@ impl OperationalAttempt {
                 .map_err(|_| Invalid)?;
         }
         extra_streams.assert_clear()?;
+        final_lease.assert_current().map_err(|_| Invalid)?;
         let prior_b = hash(confirm_a.payload());
         let cb = confirmation(&key, Role::B, attempt, session, prior_b)?;
         let confirm_b = if self.role == Role::B {
@@ -1189,6 +1279,7 @@ impl OperationalAttempt {
                 .map_err(|_| Invalid)?;
         }
         extra_streams.assert_clear()?;
+        final_lease.assert_current().map_err(|_| Invalid)?;
         let records = vec![first, second, open, accept, confirm_a, confirm_b];
         derive_and_verify_confirmation_key(&records, exporter)?;
         final_lease.assert_current().map_err(|_| Invalid)?;
