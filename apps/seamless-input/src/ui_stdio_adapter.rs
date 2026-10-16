@@ -8,7 +8,9 @@
 use std::{
     collections::BTreeMap,
     io::{self, Read, Write},
-    time::Instant,
+    sync::mpsc,
+    thread,
+    time::{Duration, Instant},
 };
 
 use serde::Serialize;
@@ -139,6 +141,7 @@ pub struct UiStdioAdapter {
     active_sas: Option<ActiveSas>,
     next_attempt_binding: u64,
     next_generation: u64,
+    now_ms: u64,
 }
 
 impl UiStdioAdapter {
@@ -150,6 +153,7 @@ impl UiStdioAdapter {
             active_sas: None,
             next_attempt_binding: 1,
             next_generation: 1,
+            now_ms,
         }
     }
 
@@ -166,7 +170,7 @@ impl UiStdioAdapter {
         now_ms: u64,
         event: AuthoritativeUiEvent,
     ) -> Vec<ChildFrame> {
-        self.expire_before(now_ms);
+        let now_ms = self.advance_clock(now_ms);
         match event {
             AuthoritativeUiEvent::RelationshipVerified => {
                 self.controller
@@ -175,10 +179,14 @@ impl UiStdioAdapter {
             AuthoritativeUiEvent::V01SasReady { view, remaining_ms }
                 if (1..=SAS_MAX_MS).contains(&remaining_ms) =>
             {
+                let was_pending = self.controller.snapshot().state == UiState::V01Pending;
                 self.controller
                     .on_runtime_at(now_ms, UiRuntimeEvent::V01SasReady(view.clone()));
-                if self.controller.snapshot().v01.is_some() {
-                    self.clear_sas();
+                let accepted = !was_pending
+                    && self.controller.snapshot().state == UiState::V01Pending
+                    && self.controller.snapshot().v01.as_ref() == Some(&view)
+                    && self.active_sas.is_none();
+                if accepted {
                     let binding = self.allocate_attempt_binding();
                     let generation = self.allocate_generation();
                     self.active_sas = Some(ActiveSas {
@@ -221,19 +229,23 @@ impl UiStdioAdapter {
     }
 
     pub fn handle_host_request_at(&mut self, now_ms: u64, request: &Request) -> Vec<ChildFrame> {
-        self.expire_before(now_ms);
+        let now_ms = self.advance_clock(now_ms);
+        let pending = self.drain_child_frames();
         if control_api::validate_request(request).is_err() {
-            return self.rejected(&request.id, UiError::InvalidRequest);
+            let rejected = self.rejected(&request.id, UiError::InvalidRequest);
+            return self.with_pending(pending, rejected);
         }
         if let Some((previous, response)) = self.replays.get(&request.id) {
             return if previous == request {
-                response.clone()
+                self.with_pending(pending, response.clone())
             } else {
-                self.rejected(&request.id, UiError::RequestIdConflict)
+                let rejected = self.rejected(&request.id, UiError::RequestIdConflict);
+                self.with_pending(pending, rejected)
             };
         }
         if self.replays.len() >= MAX_REPLAYED_REQUESTS {
-            return self.rejected(&request.id, UiError::RequestLimit);
+            let rejected = self.rejected(&request.id, UiError::RequestLimit);
+            return self.with_pending(pending, rejected);
         }
         let frames = match parse_host_command(request) {
             Ok(HostCommand::Refresh) => {
@@ -257,7 +269,23 @@ impl UiStdioAdapter {
         };
         self.replays
             .insert(request.id.clone(), (request.clone(), frames.clone()));
-        frames
+        self.with_pending(pending, frames)
+    }
+
+    /// Delivers an autonomous timer observation. Callers must use the same
+    /// monotonic source as every decisive event; no host request is required.
+    pub fn poll_at(&mut self, now_ms: u64) -> Vec<ChildFrame> {
+        self.advance_clock(now_ms);
+        self.drain_child_frames()
+    }
+
+    fn with_pending(
+        &mut self,
+        mut pending: Vec<ChildFrame>,
+        mut frames: Vec<ChildFrame>,
+    ) -> Vec<ChildFrame> {
+        pending.append(&mut frames);
+        pending
     }
 
     fn accepted(&mut self, id: &str) -> Vec<ChildFrame> {
@@ -272,16 +300,22 @@ impl UiStdioAdapter {
         frames
     }
 
+    fn advance_clock(&mut self, observed_now_ms: u64) -> u64 {
+        self.now_ms = self.now_ms.max(observed_now_ms);
+        self.expire_before(self.now_ms);
+        self.now_ms
+    }
+
     fn expire_before(&mut self, now_ms: u64) {
         if self
             .active_sas
             .as_ref()
             .is_some_and(|sas| now_ms >= sas.expires_at_ms)
         {
-            // Refresh is a no-op except that it advances the controller's injected monotonic time.
-            let _ = self
-                .controller
-                .apply_local_at(now_ms, UiCommand::RefreshDiagnostics);
+            // A shorter authoritative display window cannot leave the controller
+            // pending after the visible code has been invalidated.
+            self.controller
+                .on_runtime_at(now_ms, UiRuntimeEvent::V01Expired);
             self.clear_sas();
         }
     }
@@ -330,6 +364,13 @@ impl UiStdioAdapter {
         let generation = self.next_generation;
         self.next_generation = self.next_generation.saturating_add(1);
         generation
+    }
+
+    fn wait_until_next_deadline(&self) -> Duration {
+        self.active_sas
+            .as_ref()
+            .map(|sas| Duration::from_millis(sas.expires_at_ms.saturating_sub(self.now_ms)))
+            .unwrap_or(Duration::from_secs(60))
     }
 }
 
@@ -383,14 +424,54 @@ fn contains_sas_field(value: &Value) -> bool {
 
 /// Runs the bounded inherited-pipe adapter. It deliberately has no listener,
 /// shell, process spawning, or network path.
-pub fn run_stdio(reader: &mut impl Read, writer: &mut impl Write) -> io::Result<()> {
+pub fn run_stdio<R: Read + Send + 'static>(reader: R, writer: &mut impl Write) -> io::Result<()> {
     let started = Instant::now();
-    let mut adapter = UiStdioAdapter::new(0);
-    while let Some(request) = control_api::read_request(reader)? {
+    run_stdio_with_adapter_at(reader, writer, UiStdioAdapter::new(0), started)
+}
+
+/// Runs a previously admitted adapter over the inherited pipe. This is kept
+/// engine-side so a host cannot construct relationship or SAS state from it.
+pub fn run_stdio_with_adapter<R: Read + Send + 'static>(
+    reader: R,
+    writer: &mut impl Write,
+    adapter: UiStdioAdapter,
+) -> io::Result<()> {
+    run_stdio_with_adapter_at(reader, writer, adapter, Instant::now())
+}
+
+fn run_stdio_with_adapter_at<R: Read + Send + 'static>(
+    reader: R,
+    writer: &mut impl Write,
+    mut adapter: UiStdioAdapter,
+    started: Instant,
+) -> io::Result<()> {
+    let (sender, receiver) = mpsc::sync_channel(1);
+    thread::spawn(move || {
+        let mut reader = reader;
+        loop {
+            let result = control_api::read_request(&mut reader);
+            let eof = matches!(result, Ok(None));
+            if sender.send(result).is_err() || eof {
+                return;
+            }
+        }
+    });
+    loop {
         let now_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
-        for frame in adapter.handle_host_request_at(now_ms, &request) {
-            control_api::write_message(writer, &frame)?;
+        match receiver.recv_timeout(adapter.wait_until_next_deadline()) {
+            Ok(Ok(Some(request))) => {
+                for frame in adapter.handle_host_request_at(now_ms, &request) {
+                    control_api::write_message(writer, &frame)?;
+                }
+            }
+            Ok(Ok(None)) | Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
+            Ok(Err(error)) => return Err(error),
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                let now_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+                for frame in adapter.poll_at(now_ms) {
+                    control_api::write_message(writer, &frame)?;
+                }
+            }
         }
     }
-    Ok(())
 }

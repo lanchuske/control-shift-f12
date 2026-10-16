@@ -20,6 +20,7 @@ pub enum UiRuntimeEvent {
     BootstrapSasReady,
     BootstrapReceiptVerified,
     V01SasReady(V01View),
+    V01Expired,
     PeerConfirmed,
     Diagnostics(Vec<DiagnosticRow>),
     PermissionRevoked,
@@ -228,6 +229,9 @@ impl UiController {
                 self.snapshot.v01 = None;
                 self.v01_started_ms = None;
                 self.snapshot.state = UiState::InventoryCurrent;
+            }
+            UiRuntimeEvent::V01Expired if self.snapshot.state == UiState::V01Pending => {
+                self.clear_v01_to_confirmed();
             }
             UiRuntimeEvent::Diagnostics(rows) => self.snapshot.diagnostics = rows,
             UiRuntimeEvent::PermissionRevoked => {
