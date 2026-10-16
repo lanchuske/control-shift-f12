@@ -2,11 +2,12 @@
 
 ## Status
 
-This directory records **non-shipping manifests only**. It does not contain a
-native host implementation, build output, socket, pairing path, display map,
-or user-interface fallback. The Rust executable remains the only owner of
-runtime, pairing, operational-session, inventory, layout, input and clipboard
-state.
+This directory records non-shipping host admission material. It admits exactly
+one reviewable macOS AppKit **diagnostics projection** source and its XCTest
+target. It does not contain a product bundle or build output, a Windows host,
+a socket, pairing path, display map, or sharing controls. The Rust executable
+remains the only owner of runtime, pairing, operational-session, inventory,
+layout, input and clipboard state.
 
 The detailed parent/child boundary is
 [the architecture record](../docs/architecture/native-host-boundary.md).
@@ -31,17 +32,18 @@ The existing foundations channel remains:
 
 Written as a command for documentation only, that is
 `seamless-input control --stdio`. It is not a native-host fallback. The
-reserved native projection channel is:
+admitted macOS diagnostics projection channel is:
 
 ```text
 [absolute path to seamless-input, "control", "--ui-stdio"]
 ```
 
 Written as a command for documentation only, that is
-`seamless-input control --ui-stdio`; the host must still use this exact
-argument vector, not a shell command. Its Rust-only entrypoint is admitted;
-no native host source may launch it until platform-specific owner/tests are
-admitted.
+`seamless-input control --ui-stdio`; the admitted AppKit host uses this exact
+argument vector, not a shell command. It derives the absolute executable only
+from its installed bundle resource and owns only anonymous inherited standard
+streams. The static guard rejects every other native source, bundle, binary,
+or build artifact.
 
 The native host must use its platform's argument-array process API. It must not
 invoke a shell, interpolate a command string, or accept a user-supplied binary
@@ -76,8 +78,9 @@ licenses leaving a child process running.
 
 ## Deliberate non-goals in this change
 
-- No Swift or C# host source has been added.
-- No host has been compiled, launched, signed, installed, or shipped.
+- No Windows host source has been added.
+- No host product has been launched, signed, installed, or shipped.
 - No local or remote network endpoint has been added.
-- No pairing, SAS, inventory, topology, input, clipboard, diagnostic data, or
-  runtime capability is exposed to a host.
+- No pairing, SAS, inventory, topology, input, clipboard, runtime capability,
+  or layout action is exposed to the AppKit host. Its sole action is local
+  diagnostics refresh; it presents structured, redacted diagnostics rows.

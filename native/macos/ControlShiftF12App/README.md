@@ -1,11 +1,13 @@
 # Control Shift F12 AppKit host manifest
 
-`Package.swift` is a non-shipping AppKit host declaration. Its intended bundle
-identifier is `ai.lanchuske.control-shift-f12.macos-host`. It contains no Swift
-source and must not be built or launched until the parent/child boundary has a
-reviewed typed adapter and the host-specific tests exist.
+`Package.swift` and the admitted Swift source are a non-shipping AppKit
+diagnostics projection host. Its intended bundle identifier is
+`ai.lanchuske.control-shift-f12.macos-host`. The target has XCTest evidence for
+its projection and owned-child lifetime; it is not a product bundle, signed
+application, installer, or release artifact.
 
-When implementation is admitted, it uses AppKit and the argument-array,
-anonymous-inherited-pipe boundary described in [the native host
-record](../../README.md). It does not create a socket, a browser surface, a
-terminal fallback, or a shell command.
+It uses AppKit and the fixed argument-array, anonymous-inherited-pipe boundary
+described in [the native host record](../../README.md). It launches only the
+bundle resource `seamless-input` with `control --ui-stdio`, exposes only local
+diagnostic refresh, and does not create a socket, browser surface, terminal
+fallback, shell command, layout action, or sharing capability.

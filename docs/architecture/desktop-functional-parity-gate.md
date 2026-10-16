@@ -8,9 +8,10 @@ application. The TUI is a technical fallback for development and support; it
 is not the primary user flow or evidence that either desktop application is
 ready.
 
-This document is a docs-only admission plan. It adds no host source, GUI,
-child process, network, pairing endpoint, layout save, runtime capability, CI,
-or release. The non-shipping manifest guard remains active.
+This document remains the parity admission plan. One non-shipping macOS AppKit
+diagnostics projection source and XCTest target are now guarded/admitted; they
+do not add a product GUI, full desktop flow, pairing endpoint, layout save,
+runtime capability, CI, or release. The structural native guard remains active.
 
 ## Chosen control-channel separation
 
@@ -24,8 +25,9 @@ desktop app must never fall back from `--ui-stdio` to `--stdio`, TUI, a shell,
 or a network endpoint.
 
 `--ui-stdio` has a separately admitted Rust-only entrypoint. Native host source
-remains blocked until its platform-specific owner and tests are admitted. The
-pipe/cancellation rules remain those in [the host-process design](native-host-process-pipe-adapter.md).
+remains blocked except for the guarded macOS diagnostics projection owner and
+its XCTest target. The pipe/cancellation rules remain those in [the
+host-process design](native-host-process-pipe-adapter.md).
 
 ## Functional parity surface
 
@@ -167,7 +169,7 @@ else should look like an intentional native control surface.
 
 | Gate | Deliverable | Proof before advance | Failure result |
 | --- | --- | --- | --- |
-| G0 | This channel decision in boundary docs and guard | `control --stdio` remains covered; `--ui-stdio` is reserved; no native source tracked | Keep manifests non-shipping. |
+| G0 | This channel decision in boundary docs and guard | `control --stdio` remains covered; the one guarded AppKit diagnostics source is the only tracked native source; no product bundle/build artifact | Keep all unadmitted native surfaces non-shipping. |
 | G1 | Rust-only `control --ui-stdio` entrypoint | Bounded frames, strict direction, stdout closure with stdin held open exits boundedly, no listener/socket/process-spawn authority | Exit/clear; no fallback. |
 | G2 | AppKit and WinForms pipe owners | Per-OS cancellation/join/reap, timeout, stderr redaction, restart, main-thread handoff, no extra inherited/public handles | Failed platform remains disabled. |
 | G3 | Native projection, SAS, state, permissions, recovery, diagnostics | Visual/accessibility plus stale/malformed/terminal adversarial tests on each OS | Render blocked, never optimistic success. |

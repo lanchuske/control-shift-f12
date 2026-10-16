@@ -3,22 +3,23 @@
 ## Status, scope, and admission gate
 
 This is a reviewed boundary record for Tasks 6 and 7. The admitted Rust child
-entrypoint does not add AppKit, WinForms, native-host process code, native pipe
-code, network, or product UI source. In particular, it does not make either
-manifest under `native/` shippable.
+entrypoint and one guarded AppKit diagnostics projection source do not add a
+product bundle, WinForms source, network, or product sharing UI. In particular,
+they do not make either manifest under `native/` shippable.
 
 The candidate contains a bounded Rust `UiStdioAdapter`, a process-owned
 inherited-stdin reader for the Rust child, and a `TimedRequestReader`
-abstraction. It does **not** contain an AppKit host or a WinForms host. Moreover,
+abstraction. It contains the narrowly admitted AppKit diagnostics host, but no
+WinForms host. Moreover,
 `main.rs` routes `seamless-input control --stdio` to the foundations
 `control_engine::run_stdio`, not to `ui_stdio_adapter::run_stdio`. The separate
 `seamless-input control --ui-stdio` entrypoint is admitted for the Rust-only
 adapter while preserving foundations `--stdio` behavior. A native host remains
 blocked until its own target-platform owner/tests are admitted.
 
-The Rust-only UI entrypoint is admitted. In particular, no native host source may use this
-document as authority to launch a process; native source is admitted only after
-all pre-enable tests in
+The UI entrypoint is admitted. In particular, only the guarded AppKit
+diagnostics source may use this document as authority to launch its fixed child
+process; all other native source is admitted only after all pre-enable tests in
 [Required evidence before native source](#required-evidence-before-native-source)
 are present and passing on the actual target operating system.
 
@@ -225,8 +226,10 @@ simulated pipe never proves the target platform.
 | Accessibility | Platform UI tests verify keyboard-only operation, focus order, semantic status, focused SAS exposure, and terminal clearing. | No global SAS announcement/history; documented OS visibility limits remain visible to reviewers. |
 | Physical QA | Signed package tests on a real Mac and a real Windows target measure start/stop/restart, permission loss, process cleanup, memory/CPU, and no-network-endpoint behavior. | Record PASS/FAIL/NOT MEASURED separately; no stable release claim from a harness-only pass. |
 
-Until this evidence exists, manifests remain declarations only; no native host
-source, build, launch, signing, packaging, or release is permitted.
+Until this evidence exists, no additional native host source, product build,
+signing, packaging, or release is permitted. The guarded AppKit diagnostics
+source is non-shipping test material only; it does not satisfy full platform
+parity or release evidence.
 
 ## Non-goals
 
