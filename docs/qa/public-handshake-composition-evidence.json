@@ -20,6 +20,11 @@
     "no active trust, promotion, admission, input, clipboard, or downgrade path added",
     "no push, pull request, CI, signing, or publication"
   ],
+  "required_successor_prerequisites": [
+    "Before any admission or authority wiring, remove operational public access to local_binding.",
+    "A successor must move the pending authority into sealed evidence and revalidate late failure, connection closure, requester cleanliness, attempt, role, suite, protocol, certificates, transcript, FC and binding at every promotion boundary.",
+    "The composed candidate itself does not satisfy these successor prerequisites and remains pending-only."
+  ],
   "verification": {
     "cargo_metadata_locked": "PASS",
     "cargo_fmt_check": "PASS",

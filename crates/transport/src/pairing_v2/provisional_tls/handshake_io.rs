@@ -55,18 +55,83 @@ pub enum HandshakeError {
     Rejected,
     Cancelled,
 }
+/// Move-only protocol evidence that remains quarantined from product runtime.
+///
+/// ```compile_fail
+/// use seamless_transport::pairing_v2::provisional_tls::HandshakeCompletePendingAuthority;
+/// fn require_clone<T: Clone>() {}
+/// require_clone::<HandshakeCompletePendingAuthority>();
+/// ```
+///
+/// ```compile_fail
+/// use seamless_transport::pairing_v2::provisional_tls::HandshakeCompletePendingAuthority;
+/// fn require_serialize<T: serde::Serialize>() {}
+/// require_serialize::<HandshakeCompletePendingAuthority>();
+/// ```
+///
+/// ```compile_fail
+/// use seamless_transport::pairing_v2::provisional_tls::HandshakeCompletePendingAuthority;
+/// fn leak(value: &HandshakeCompletePendingAuthority) { let _ = value.local_binding(); }
+/// ```
+///
+/// ```compile_fail
+/// use seamless_transport::pairing_v2::provisional_tls::HandshakeCompletePendingAuthority;
+/// async fn bypass(value: HandshakeCompletePendingAuthority) { let _ = value.seal_for_promotion().await; }
+/// ```
+///
+/// ```compile_fail
+/// use seamless_transport::pairing_v2::provisional_tls::HandshakeCompletePendingAuthority;
+/// fn forge() -> HandshakeCompletePendingAuthority {
+///     HandshakeCompletePendingAuthority { role: unsafe { std::mem::zeroed() } }
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use seamless_transport::pairing_v2::provisional_tls::HandshakeCompletePendingAuthority;
+/// fn input_runtime_capability(_: [u8; 32]) {}
+/// fn bypass(value: HandshakeCompletePendingAuthority) { input_runtime_capability(value); }
+/// ```
 pub struct HandshakeCompletePendingAuthority {
     pub(super) role: Role,
     pub(super) durable_fc_hash: [u8; 32],
-    pub(super) local_binding: [u8; 32],
+    local_binding: [u8; 32],
+    pending: crate::pairing_pending::PendingRecord,
+    transcript: [u8; 32],
+    certificate_fingerprints: [[u8; 32]; 2],
     _channel: ProvisionalChannel,
     _request: Stream,
     failed: Arc<AtomicBool>,
+}
+/// Move-only, non-serializable protocol evidence. It deliberately has no public
+/// binding getter and cannot be reconstructed after restart.
+#[allow(dead_code)] // Intentionally unreachable from product until admission receives a separate GO.
+pub(crate) struct SealedPromotionEvidence {
+    role: Role,
+    durable_fc_hash: [u8; 32],
+    local_binding: Zeroizing<[u8; 32]>,
+    pending: crate::pairing_pending::PendingRecord,
+    transcript: [u8; 32],
+    certificate_fingerprints: [[u8; 32]; 2],
+    channel: ProvisionalChannel,
+    request: Stream,
+    failed: Arc<AtomicBool>,
+}
+#[allow(dead_code)]
+pub(in crate::pairing_v2) struct SealedPromotionFields {
+    pub record: crate::pairing_pending::PendingRecord,
+    pub role: Role,
+    pub durable_fc_hash: [u8; 32],
+    pub local_binding: [u8; 32],
+    pub transcript: [u8; 32],
+    pub certificate_fingerprints: [[u8; 32]; 2],
 }
 struct Completed {
     role: Role,
     durable_fc_hash: [u8; 32],
     local_binding: [u8; 32],
+    pending: crate::pairing_pending::PendingRecord,
+    transcript: [u8; 32],
+    certificate_fingerprints: [[u8; 32]; 2],
     request: Stream,
     failed: Arc<AtomicBool>,
 }
@@ -89,8 +154,65 @@ impl HandshakeCompletePendingAuthority {
     pub fn durable_fc_hash(&self) -> Option<&[u8; 32]> {
         self.is_protocol_valid().then_some(&self.durable_fc_hash)
     }
-    pub fn local_binding(&self) -> &[u8; 32] {
-        &self.local_binding
+    #[cfg(test)]
+    pub(super) fn test_local_binding(&self) -> Option<&[u8; 32]> {
+        self.is_protocol_valid().then_some(&self.local_binding)
+    }
+
+    #[allow(dead_code)] // Foundation-only boundary; product wiring remains disabled.
+    pub(crate) async fn seal_for_promotion(
+        self,
+    ) -> Result<SealedPromotionEvidence, HandshakeError> {
+        if !self.is_protocol_valid() {
+            return Err(HandshakeError::Rejected);
+        }
+        // Give the permanently armed ingress watcher a scheduling boundary before
+        // moving the authority across the promotion frontier.
+        tokio::task::yield_now().await;
+        if !self.is_protocol_valid() {
+            return Err(HandshakeError::Rejected);
+        }
+        Ok(SealedPromotionEvidence {
+            role: self.role,
+            durable_fc_hash: self.durable_fc_hash,
+            local_binding: Zeroizing::new(self.local_binding),
+            pending: self.pending,
+            transcript: self.transcript,
+            certificate_fingerprints: self.certificate_fingerprints,
+            channel: self._channel,
+            request: self._request,
+            failed: self.failed,
+        })
+    }
+}
+
+impl SealedPromotionEvidence {
+    #[allow(dead_code)] // Called at each future promotion boundary, none of which is enabled yet.
+    pub(crate) fn revalidate(&self) -> Result<(), HandshakeError> {
+        if self.failed.load(Ordering::Acquire)
+            || self.channel.connection.close_reason().is_some()
+            || !self.request.clean
+            || self.pending.attempt_id == [0; 32]
+            || self.pending.peer_fingerprint != self.certificate_fingerprints[1 - self.role.index()]
+            || self.durable_fc_hash == [0; 32]
+            || self.transcript == [0; 32]
+            || *self.local_binding == [0; 32]
+        {
+            return Err(HandshakeError::Rejected);
+        }
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    pub(in crate::pairing_v2) fn fields(&self) -> SealedPromotionFields {
+        SealedPromotionFields {
+            record: self.pending.clone(),
+            role: self.role,
+            durable_fc_hash: self.durable_fc_hash,
+            local_binding: *self.local_binding,
+            transcript: self.transcript,
+            certificate_fingerprints: self.certificate_fingerprints,
+        }
     }
 }
 fn fresh<const N: usize>() -> Result<[u8; N], Invalid> {
@@ -387,6 +509,9 @@ impl ProvisionalChannel {
                 role: done.role,
                 durable_fc_hash: done.durable_fc_hash,
                 local_binding: done.local_binding,
+                pending: done.pending,
+                transcript: done.transcript,
+                certificate_fingerprints: done.certificate_fingerprints,
                 _channel: self,
                 _request: done.request,
                 failed: done.failed,
@@ -662,6 +787,9 @@ impl ProvisionalChannel {
             second.clean = true;
         }
         let fc = result?;
+        let (pending, transcript, certificate_fingerprints) = machine
+            .promotion_context()
+            .ok_or(HandshakeError::Rejected)?;
         let (request, mut incoming) = if role == Role::A {
             (first, second)
         } else {
@@ -693,6 +821,9 @@ impl ProvisionalChannel {
             role,
             durable_fc_hash: fc,
             local_binding: binding,
+            pending,
+            transcript,
+            certificate_fingerprints,
             request,
             failed,
         })

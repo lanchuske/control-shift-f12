@@ -36,6 +36,25 @@ pub struct PendingRecord {
     pub revocation_generation: u64,
 }
 
+#[cfg(feature = "pairing-v2-experimental")]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct AdmissionReceiptRecord {
+    pub attempt: [u8; 32],
+    pub peer: [u8; 32],
+    pub peer_pin: [u8; 32],
+    pub durable_fc_hash: [u8; 32],
+    pub role: u8,
+    pub suite: String,
+    pub protocol_version: u16,
+    pub transcript: [u8; 32],
+    pub binding: [u8; 32],
+    pub revision: u64,
+    pub identity_generation: u64,
+    pub revocation_generation: u64,
+    pub policy_revision: u64,
+}
+
 pub struct PendingStore {
     #[cfg(any(unix, windows))]
     pending_dir: crate::private_fs::PrivateDir,
@@ -77,6 +96,16 @@ mod unix {
         generation: u64,
     }
 
+    #[cfg(feature = "pairing-v2-experimental")]
+    #[derive(Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct ActivePin {
+        peer: [u8; 32],
+        pin: [u8; 32],
+        identity_generation: u64,
+        revocation_generation: u64,
+    }
+
     #[derive(Serialize, Deserialize)]
     #[serde(deny_unknown_fields)]
     struct Ledger {
@@ -85,6 +114,18 @@ mod unix {
         pending: Vec<Reference>,
         tombstones: Vec<[u8; 32]>,
         revocations: Vec<Revocation>,
+        #[cfg(feature = "pairing-v2-experimental")]
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        active_pins: Vec<ActivePin>,
+        #[cfg(feature = "pairing-v2-experimental")]
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        consumed_attempts: Vec<[u8; 32]>,
+        #[cfg(feature = "pairing-v2-experimental")]
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        admission_receipts: Vec<AdmissionReceiptRecord>,
+        #[cfg(feature = "pairing-v2-experimental")]
+        #[serde(default)]
+        policy_revision: u64,
         #[cfg(feature = "pairing-v2-experimental")]
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         recoveries: Vec<RecoveryConsumption>,
@@ -126,6 +167,14 @@ mod unix {
                 tombstones: vec![],
                 revocations: vec![],
                 #[cfg(feature = "pairing-v2-experimental")]
+                active_pins: vec![],
+                #[cfg(feature = "pairing-v2-experimental")]
+                consumed_attempts: vec![],
+                #[cfg(feature = "pairing-v2-experimental")]
+                admission_receipts: vec![],
+                #[cfg(feature = "pairing-v2-experimental")]
+                policy_revision: 0,
+                #[cfg(feature = "pairing-v2-experimental")]
                 recoveries: vec![],
                 #[cfg(feature = "pairing-v2-experimental")]
                 journals: vec![],
@@ -134,6 +183,60 @@ mod unix {
         fn validate(&self) -> Result<(), StoreError> {
             #[cfg(feature = "pairing-v2-experimental")]
             {
+                if self.active_pins.len() > MAX_HISTORY
+                    || self.consumed_attempts.len() > MAX_HISTORY
+                    || self.admission_receipts.len() > MAX_HISTORY
+                {
+                    return Err(StoreError::Invalid);
+                }
+                let pins: BTreeSet<_> = self.active_pins.iter().map(|p| p.peer).collect();
+                if pins.len() != self.active_pins.len()
+                    || self.active_pins.iter().any(|p| {
+                        p.peer == [0; 32]
+                            || p.pin == [0; 32]
+                            || p.identity_generation != self.version.identity_generation
+                            || p.revocation_generation != self.revocation(p.peer)
+                    })
+                {
+                    return Err(StoreError::Invalid);
+                }
+                let consumed: BTreeSet<_> = self.consumed_attempts.iter().copied().collect();
+                if consumed.len() != self.consumed_attempts.len()
+                    || self.consumed_attempts.contains(&[0; 32])
+                {
+                    return Err(StoreError::Invalid);
+                }
+                let receipts: BTreeSet<_> = self
+                    .admission_receipts
+                    .iter()
+                    .map(|receipt| receipt.attempt)
+                    .collect();
+                if receipts.len() != self.admission_receipts.len()
+                    || receipts != consumed
+                    || self.admission_receipts.iter().any(|receipt| {
+                        receipt.peer == [0; 32]
+                            || receipt.peer_pin == [0; 32]
+                            || receipt.durable_fc_hash == [0; 32]
+                            || receipt.transcript == [0; 32]
+                            || receipt.binding == [0; 32]
+                            || receipt.role > 1
+                            || receipt.suite.is_empty()
+                            || receipt.protocol_version == 0
+                            || receipt.identity_generation > self.version.identity_generation
+                            || receipt.policy_revision != self.policy_revision
+                            || receipt.revocation_generation > self.revocation(receipt.peer)
+                    })
+                    || self
+                        .pending
+                        .iter()
+                        .any(|p| consumed.contains(&p.record.attempt_id))
+                    || self
+                        .tombstones
+                        .iter()
+                        .any(|attempt| consumed.contains(attempt))
+                {
+                    return Err(StoreError::Invalid);
+                }
                 if self.recoveries.len() > MAX_HISTORY {
                     return Err(StoreError::Invalid);
                 }
@@ -478,6 +581,10 @@ mod unix {
             if ledger.tombstones.contains(&attempt) {
                 return Err(StoreError::ConsumedAttempt);
             }
+            #[cfg(feature = "pairing-v2-experimental")]
+            if ledger.consumed_attempts.contains(&attempt) {
+                return Err(StoreError::ConsumedAttempt);
+            }
             if ledger
                 .pending
                 .iter()
@@ -571,6 +678,8 @@ mod unix {
                     generation: 1,
                 });
             }
+            #[cfg(feature = "pairing-v2-experimental")]
+            ledger.active_pins.retain(|pin| pin.peer != peer);
             let removed: Vec<_> = ledger
                 .pending
                 .iter()
@@ -604,6 +713,149 @@ mod unix {
             Ok(self.load_validated_manifest()?.revocation(peer))
         }
 
+        /// Internal foundation for a future reviewed admission authority. This is
+        /// deliberately crate-private and returns durable metadata, never a runtime
+        /// capability. Pending removal, pin, consumed marker and receipt share the
+        /// same manifest publication under the same multiprocess lock.
+        #[cfg(feature = "pairing-v2-experimental")]
+        #[allow(dead_code)] // Reachable only through the disabled admission foundation.
+        pub(crate) fn commit_admission_foundation<F>(
+            &self,
+            expected: StoreVersion,
+            expected_revocation_generation: u64,
+            expected_policy_revision: u64,
+            record: &PendingRecord,
+            receipt: AdmissionReceiptRecord,
+            mut revalidate: F,
+        ) -> Result<AdmissionReceiptRecord, StoreError>
+        where
+            F: FnMut() -> Result<(), StoreError>,
+        {
+            revalidate()?;
+            let _lock = self.ledger_dir.lock()?;
+            let mut ledger = self.load_validated_manifest()?;
+            revalidate()?;
+            if ledger.version != expected
+                || record.version.identity_generation != expected.identity_generation
+                || ledger.policy_revision != expected_policy_revision
+                || ledger.revocation(record.peer_fingerprint) != expected_revocation_generation
+                || record.revocation_generation != expected_revocation_generation
+            {
+                return Err(StoreError::Conflict);
+            }
+            let pending = ledger
+                .pending
+                .iter()
+                .find(|entry| entry.record.attempt_id == record.attempt_id)
+                .ok_or_else(|| {
+                    if ledger.consumed_attempts.contains(&record.attempt_id) {
+                        StoreError::ConsumedAttempt
+                    } else {
+                        StoreError::Invalid
+                    }
+                })?;
+            if pending.record != *record
+                || receipt.attempt != record.attempt_id
+                || receipt.peer != record.peer_fingerprint
+                || receipt.revision != expected.revision.checked_add(1).ok_or(StoreError::Limit)?
+                || receipt.identity_generation != expected.identity_generation
+                || receipt.revocation_generation != expected_revocation_generation
+                || receipt.policy_revision != expected_policy_revision
+            {
+                return Err(StoreError::Invalid);
+            }
+            if let Some(pin) = ledger
+                .active_pins
+                .iter()
+                .find(|pin| pin.peer == receipt.peer)
+                && pin.pin != receipt.peer_pin
+            {
+                return Err(StoreError::Conflict);
+            }
+            if ledger.consumed_attempts.contains(&receipt.attempt)
+                || ledger
+                    .admission_receipts
+                    .iter()
+                    .any(|stored| stored.attempt == receipt.attempt)
+                || ledger.tombstones.contains(&receipt.attempt)
+            {
+                return Err(StoreError::ConsumedAttempt);
+            }
+            if ledger.active_pins.len() >= MAX_HISTORY
+                || ledger.consumed_attempts.len() >= MAX_HISTORY
+                || ledger.admission_receipts.len() >= MAX_HISTORY
+            {
+                return Err(StoreError::Limit);
+            }
+            let old_journals: Vec<_> = ledger
+                .journals
+                .iter()
+                .filter(|entry| entry.attempt == receipt.attempt)
+                .map(journal_filename)
+                .collect();
+            ledger.advance(expected)?;
+            if !ledger
+                .active_pins
+                .iter()
+                .any(|pin| pin.peer == receipt.peer)
+            {
+                ledger.active_pins.push(ActivePin {
+                    peer: receipt.peer,
+                    pin: receipt.peer_pin,
+                    identity_generation: receipt.identity_generation,
+                    revocation_generation: receipt.revocation_generation,
+                });
+            }
+            ledger
+                .pending
+                .retain(|entry| entry.record.attempt_id != receipt.attempt);
+            ledger
+                .journals
+                .retain(|entry| entry.attempt != receipt.attempt);
+            ledger.consumed_attempts.push(receipt.attempt);
+            ledger.admission_receipts.push(receipt.clone());
+            revalidate()?;
+            self.save(&ledger)?;
+            self.pending_dir.remove(&filename(receipt.attempt))?;
+            for file in old_journals {
+                self.pending_dir.remove(&file)?;
+            }
+            revalidate()?;
+            Ok(receipt)
+        }
+
+        #[cfg(feature = "pairing-v2-experimental")]
+        pub(crate) fn admission_state(
+            &self,
+            attempt: [u8; 32],
+        ) -> Result<(bool, Option<AdmissionReceiptRecord>, bool), StoreError> {
+            let _lock = self.ledger_dir.lock()?;
+            let ledger = self.load_validated_manifest()?;
+            let receipt = ledger
+                .admission_receipts
+                .iter()
+                .find(|receipt| receipt.attempt == attempt)
+                .cloned();
+            let active = receipt.as_ref().is_some_and(|receipt| {
+                receipt.identity_generation == ledger.version.identity_generation
+                    && receipt.revocation_generation == ledger.revocation(receipt.peer)
+                    && ledger.active_pins.iter().any(|pin| {
+                        pin.peer == receipt.peer
+                            && pin.pin == receipt.peer_pin
+                            && pin.identity_generation == receipt.identity_generation
+                            && pin.revocation_generation == receipt.revocation_generation
+                    })
+            });
+            Ok((
+                ledger
+                    .pending
+                    .iter()
+                    .any(|entry| entry.record.attempt_id == attempt),
+                receipt,
+                active,
+            ))
+        }
+
         /// Advances the setup epoch. Does not regenerate, read, or write a device private key.
         pub fn rotate_identity(&self, expected: StoreVersion) -> Result<(), StoreError> {
             let _lock = self.ledger_dir.lock()?;
@@ -614,6 +866,8 @@ mod unix {
                 .identity_generation
                 .checked_add(1)
                 .ok_or(StoreError::Limit)?;
+            #[cfg(feature = "pairing-v2-experimental")]
+            ledger.active_pins.clear();
             let removed: Vec<_> = ledger.pending.iter().map(|r| r.record.attempt_id).collect();
             ledger.tombstones.extend(&removed);
             ledger.pending.clear();

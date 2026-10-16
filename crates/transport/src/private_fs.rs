@@ -231,6 +231,15 @@ impl PrivateDir {
             fault_point!(value, "before_dir_sync");
             self.0.sync_all().map_err(|_| StoreError::Unavailable)?;
             fault_point!(value, "after_dir_sync");
+            fault_point!(value, "before_readback");
+            if self.read(value, bytes.len())?.as_deref() != Some(bytes) {
+                return Err(StoreError::Invalid);
+            }
+            fault_point!(value, "after_readback");
+            fault_point!(value, "before_cleanup");
+            // The atomic rename consumed the temporary name. This boundary is
+            // explicit so crash schedules prove cleanup cannot alter publication.
+            fault_point!(value, "after_cleanup");
             Ok(())
         })();
         if result.is_err() {

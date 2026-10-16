@@ -269,6 +269,18 @@ impl Machine {
             self.core.finalizer.as_ref()?.durable_fc_hash()
         }
     }
+    pub fn promotion_context(
+        &self,
+    ) -> Option<(
+        crate::pairing_pending::PendingRecord,
+        [u8; 32],
+        [[u8; 32]; 2],
+    )> {
+        if self.status() != Status::CompletePendingAuthority {
+            return None;
+        }
+        self.core.finalizer.as_ref()?.promotion_context()
+    }
 }
 impl Core {
     fn clear(&mut self) {

@@ -2,6 +2,8 @@
 //! injected-clock limits and quarantined durable evidence. The sealed bilateral
 //! handshake emits only the reviewed control wire. No application I/O,
 //! RecoveryAuthority provider, active trust, promotion or admission.
+#[cfg(feature = "pairing-v2-experimental")]
+pub(crate) mod admission_authority;
 pub mod codec;
 mod evidence;
 mod handshake_binding;
