@@ -6,6 +6,7 @@ once both prepares exist, absence of a local CAS is not proof of a remote abort.
 """
 
 from dataclasses import dataclass, replace
+import hashlib
 from pathlib import Path
 from typing import Optional
 
@@ -101,6 +102,43 @@ class ZeroCasAbort:
             and self.signature_b == "zero:B:" + self.message()
         )
 
+    def digest(self) -> str:
+        return hashlib.sha256((self.unsigned() + self.signature_a + self.signature_b).encode()).hexdigest()
+
+
+@dataclass(frozen=True)
+class AbortAck:
+    version: int
+    zero_digest: str
+    commit_digest: str
+    sender_role: str
+    receipt_a: int
+    receipt_b: int
+    lock_a: int
+    lock_b: int
+    signature: str = ""
+
+    def unsigned(self) -> str:
+        return "|".join(map(str, (self.version, self.zero_digest, self.commit_digest,
+                                    self.sender_role, "leaf:A", "leaf:B", self.receipt_a,
+                                    self.receipt_b, self.lock_a, self.lock_b, "ed25519")))
+
+    def message(self) -> str:
+        return "CSF12 layout zero-cas abort ack v1\\0" + self.unsigned()
+
+    @classmethod
+    def for_abort(cls, abort: ZeroCasAbort, role: str) -> "AbortAck":
+        raw = cls(1, abort.digest(), abort.commit_digest, role, abort.receipt_a,
+                  abort.receipt_b, abort.lock_version_a, abort.lock_version_b)
+        return replace(raw, signature="ack:" + role + ":" + raw.message())
+
+    def valid(self, abort: ZeroCasAbort, expected_role: str) -> bool:
+        return (self.version == 1 and self.zero_digest == abort.digest()
+                and self.commit_digest == abort.commit_digest and self.sender_role == expected_role
+                and self.receipt_a == abort.receipt_a and self.receipt_b == abort.receipt_b
+                and self.lock_a == abort.lock_version_a and self.lock_b == abort.lock_version_b
+                and self.signature == "ack:" + expected_role + ":" + self.message())
+
 
 class Store:
     def __init__(self) -> None:
@@ -112,7 +150,7 @@ class Store:
         self.committed: Optional[tuple[str, int]] = None
         self.transaction_state: Optional[str] = None
         self.transaction_state_version = 0
-        self.abort_ack = False
+        self.abort_ack: Optional[AbortAck] = None
         self.fenced = self.remote_outcome_unknown = self.finalized = False
         self.inventory_cache = self.diagnostics = True
 
@@ -175,7 +213,7 @@ class Store:
         assert self.committed is None and other.committed is None
         assert self.transaction_state == other.transaction_state == "ABORT_LOCKED"
         self.transaction_state, self.transaction_state_version = "ABORTED", 3
-        self.abort_ack = True
+        self.abort_ack = None
         self.prepared = self.certificate = None
         self.fenced = self.remote_outcome_unknown = False
 
@@ -215,15 +253,15 @@ def rejects(action) -> None:
     raise AssertionError("named mutation unexpectedly succeeded")
 
 
-def record_abort_ack(local: Store, remote: Store, evidence: ZeroCasAbort) -> None:
+def record_abort_ack(local: Store, remote: Store, evidence: ZeroCasAbort, role: str) -> None:
     """Persist one ack; this deliberately cannot delete any local record."""
     cert = local.certificate
     assert cert is not None and cert == remote.certificate and evidence.valid(cert)
     assert local.committed is None and remote.committed is None
     assert local.transaction_state == remote.transaction_state == "ABORT_LOCKED"
     assert local.transaction_state_version == remote.transaction_state_version == 2
-    assert not local.abort_ack
-    local.abort_ack = True
+    assert role in ("A", "B") and local.abort_ack is None
+    local.abort_ack = AbortAck.for_abort(evidence, role)
 
 
 def final_delete_after_bilateral_abort_acks(a: Store, b: Store, evidence: ZeroCasAbort) -> None:
@@ -233,7 +271,8 @@ def final_delete_after_bilateral_abort_acks(a: Store, b: Store, evidence: ZeroCa
     assert a.committed is None and b.committed is None
     assert a.transaction_state == b.transaction_state == "ABORT_LOCKED"
     assert a.transaction_state_version == b.transaction_state_version == 2
-    assert a.abort_ack and b.abort_ack
+    assert a.abort_ack is not None and b.abort_ack is not None
+    assert a.abort_ack.valid(evidence, "A") and b.abort_ack.valid(evidence, "B")
     a.transaction_state, a.transaction_state_version = "ABORTED", 3
     b.transaction_state, b.transaction_state_version = "ABORTED", 3
     a.prepared = a.certificate = None
@@ -263,6 +302,8 @@ def main() -> None:
         "asymmetric\nfinalization", "not_committed",
         "AbortPrepare", "ABORT_LOCKED", "LAYOUT_ABORT_LOCKED", "transaction_state_version",
         "PROPOSAL_LOCAL / PROPOSAL_REMOTE_REVIEW",
+        "zero-cas-abort-ack-v1", "zero_cas_certificate_digest",
+        "Both persisted acknowledgements are required",
     ):
         assert phrase in text, "missing contract phrase: " + phrase
 
@@ -288,9 +329,9 @@ def main() -> None:
     a.abort_prepare(cert); b.abort_prepare(cert)
     a.terminal_after_bilateral_prepare(); b.terminal_after_bilateral_prepare()
     evidence = ZeroCasAbort.for_certificate(cert)
-    record_abort_ack(a, b, evidence)
+    record_abort_ack(a, b, evidence, "A")
     rejects(lambda: final_delete_after_bilateral_abort_acks(a, b, evidence))
-    record_abort_ack(b, a, evidence)
+    record_abort_ack(b, a, evidence, "B")
     final_delete_after_bilateral_abort_acks(a, b, evidence)
     assert a.certificate is b.certificate is None and a.can_start_v01() and b.can_start_v01()
     assert a.transaction_state == b.transaction_state == "ABORTED"
@@ -335,6 +376,15 @@ def main() -> None:
     rejects(lambda: replace(evidence, version=2).valid(cert) or (_ for _ in ()).throw(AssertionError()))
     rejects(lambda: replace(evidence, algorithm="rsa").valid(cert) or (_ for _ in ()).throw(AssertionError()))
 
+    # Ack bytes bind the full zero-CAS object, role, locks and signature.
+    ack = AbortAck.for_abort(evidence, "A")
+    assert ack.valid(evidence, "A")
+    rejects(lambda: replace(ack, zero_digest="replay").valid(evidence, "A") or (_ for _ in ()).throw(AssertionError()))
+    rejects(lambda: replace(ack, sender_role="B").valid(evidence, "A") or (_ for _ in ()).throw(AssertionError()))
+    rejects(lambda: replace(ack, lock_b=3).valid(evidence, "A") or (_ for _ in ()).throw(AssertionError()))
+    rejects(lambda: replace(ack, receipt_a=2).valid(evidence, "A") or (_ for _ in ()).throw(AssertionError()))
+    rejects(lambda: replace(ack, signature="bad").valid(evidence, "A") or (_ for _ in ()).throw(AssertionError()))
+
     # Independent-store interleavings: whichever versioned transition wins blocks the other.
     a, b, cert = Store(), Store(), certificate("race-a")
     a.prepare(cert, b); b.prepare(cert, a); a.abort_prepare(cert)
@@ -344,19 +394,19 @@ def main() -> None:
     a.prepare(cert, b); b.prepare(cert, a); b.commit(cert, a)
     rejects(lambda: b.abort_prepare(cert))
     a.abort_prepare(cert)
-    rejects(lambda: record_abort_ack(a, b, ZeroCasAbort.for_certificate(cert)))
+    rejects(lambda: record_abort_ack(a, b, ZeroCasAbort.for_certificate(cert), "A"))
     assert a.transaction_state == "ABORT_LOCKED" and b.transaction_state == "COMMITTED"
 
     # Zero-CAS cannot be started from prepared/committed/unknown records lacking exact locks.
     a, b, cert = Store(), Store(), certificate("no-lock-prepared")
     a.prepare(cert, b); b.prepare(cert, a)
-    rejects(lambda: record_abort_ack(a, b, ZeroCasAbort.for_certificate(cert)))
+    rejects(lambda: record_abort_ack(a, b, ZeroCasAbort.for_certificate(cert), "A"))
     a, b, cert = Store(), Store(), certificate("no-lock-committed")
     a.prepare(cert, b); b.prepare(cert, a); a.commit(cert, b)
-    rejects(lambda: record_abort_ack(a, b, ZeroCasAbort.for_certificate(cert)))
+    rejects(lambda: record_abort_ack(a, b, ZeroCasAbort.for_certificate(cert), "A"))
     a, b, cert = Store(), Store(), certificate("no-lock-unknown")
     a.prepare(cert, b); b.prepare(cert, a); a.terminal_after_bilateral_prepare(); b.terminal_after_bilateral_prepare()
-    rejects(lambda: record_abort_ack(a, b, ZeroCasAbort.for_certificate(cert)))
+    rejects(lambda: record_abort_ack(a, b, ZeroCasAbort.for_certificate(cert), "A"))
 
     # Revoke/inventory/V01 terminal after prepare fence rather than silently abort.
     a, b, cert = Store(), Store(), certificate("d4")
@@ -377,7 +427,7 @@ def main() -> None:
     a, b, cert = Store(), Store(), certificate("delayed")
     a.prepare(cert, b); b.prepare(cert, a); a.abort_prepare(cert); b.abort_prepare(cert)
     evidence = ZeroCasAbort.for_certificate(cert)
-    record_abort_ack(a, b, evidence); record_abort_ack(b, a, evidence)
+    record_abort_ack(a, b, evidence, "A"); record_abort_ack(b, a, evidence, "B")
     final_delete_after_bilateral_abort_acks(a, b, evidence)
     rejects(lambda: a.commit(cert, b))
 

@@ -517,6 +517,28 @@ state/version, either signature, an invalid signature length, unknown/duplicate
 tag, or an assertion when either peer already has a local CAS. These are
 evidence mutations, not display-only checks.
 
+#### Zero-CAS abort acknowledgement V1
+
+`zero-cas-abort-ack-v1` is a separate canonical TLV object using the same
+`tag:u8 || length:u16be || value` encoding. Its unsigned tags are: `1`
+`ack_version:u64=1`; `2` `zero_cas_certificate_digest:bytes32` (SHA-256 of the
+full canonical zero-CAS certificate, including both signatures); `3`
+`commit_certificate_digest:bytes32`; `4` `sender_role` ASCII `A` or `B`; `5–6`
+role-A/B leaf hashes; `7–8` role-A/B receipt epochs; `9–10` role-A/B abort-lock
+versions; and `11` `signature_algorithm` ASCII `ed25519`. Tag `12` is the
+64-byte sender signature. The signed bytes are exactly
+`CSF12 layout zero-cas abort ack v1\0 || unsigned-tags-1-through-11`.
+
+The sender persists its own verified acknowledgement before sending it. The
+receiver accepts a remote acknowledgement only when every field exactly matches
+its persisted zero-CAS certificate, the sender role is the opposite role, the
+receipt-pinned leaf verifies the signature, and that peer's durable lock has the
+signed version. Replay under another certificate, role, epoch, leaf or lock
+version rejects. Both persisted acknowledgements are required before terminal
+delete. The durable `ABORTED` tombstone retains at minimum commit digest,
+base/proposed revisions, state `ABORTED`, state version and zero-CAS digest
+until terminal scoped purge; it is not a log/export/backup record.
+
 ## Screen 5: bilateral preview and durable resolution
 
 The other computer sees the same proportional geometry and canonical revision,
