@@ -84,8 +84,11 @@ For `current: true`, the only additional fields are `remaining_ms`,
 `1..=30000`. `code_groups` has `1..=8` printable-ASCII strings, each
 `1..=32` bytes; the reviewed SAS presentation contract, not the host, defines
 their exact alphabet and grouping. `details_suffix`, if present, is a
-printable-ASCII string of `1..=16` bytes and contains neither code nor locator.
-When no suffix is needed, the field is omitted; JSON `null` is not accepted.
+semantic token exactly `attempt-current` or `expires-soon`; the token carries
+no raw attempt substring, code group, locator, IP address, hostname or port.
+No other ASCII text, including a code-group substring, `192.168.1.4`,
+`host:443`, or an illustrative “attempt ending …” phrase, is accepted. When no
+suffix is needed, the field is omitted; JSON `null` is not accepted.
 For `current: false`, there are no additional fields: it is a terminal
 invalidation, not a new status frame.
 
@@ -99,6 +102,17 @@ or an out-of-bounds field is rejected and clears the visible view. This local
 framing serialization is permitted only as transient inherited-pipe bytes; it
 does not make the view serializable for persistence, logs, copying, caching,
 telemetry, host-to-child requests or any re-export.
+
+On the host-to-child side, the JSON request envelope's own top-level `v` and
+`id` retain their existing meaning, but its `args` tree is recursively closed
+over every `sas_display_v1` shape. The adapter rejects a request command named
+`sas_display_v1`, the literal kind value `sas_display_v1`, or any nested args
+key named `v`, `kind`, `attempt_binding`, `generation`, `current`,
+`remaining_ms`, `code_groups`, or `details_suffix`. This deliberately prevents
+a host from sending a complete frame, a partial frame, timing metadata, or a
+re-exported SAS value back to the engine. A future host command needing one of
+those generic names must receive a separately reviewed schema rather than
+weakening this exclusion.
 
 ## Lifecycle and capability boundary
 
@@ -115,7 +129,8 @@ must clear/drop it on every terminal state or timeout. It must reject any cache,
 history, clipboard, drag payload, share sheet, notification, title, tooltip,
 help, crash report, diagnostic/support export or analytics use. An optional
 details suffix exists only if needed by reviewed UX, has the same lifetime, and
-contains neither the code nor a locator.
+is one of the restricted semantic tokens defined above; it contains neither the
+code nor a locator.
 
 The focused confirmation control may expose its grouped code to the current
 local assistive technology, but code and suffix must not enter a global

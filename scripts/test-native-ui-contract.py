@@ -45,6 +45,19 @@ BUILD_OUTPUT_SUFFIXES = (
 )
 BUILD_OUTPUT_SEGMENTS = frozenset({".build", "bin", "obj", "DerivedData"})
 HOST_BUNDLE_SUFFIXES = (".app", ".bundle", ".framework", ".xcarchive")
+SAS_DETAILS_SUFFIX_TOKENS = frozenset({"attempt-current", "expires-soon"})
+SAS_HOST_REQUEST_RESERVED_FIELDS = frozenset(
+    {
+        "v",
+        "kind",
+        "attempt_binding",
+        "generation",
+        "current",
+        "remaining_ms",
+        "code_groups",
+        "details_suffix",
+    }
+)
 
 
 def is_nonshipping_native_path(path):
@@ -115,12 +128,7 @@ def validate_sas_display_frame(frame):
         if "details_suffix" not in frame:
             return True
         suffix = frame["details_suffix"]
-        return (
-            isinstance(suffix, str)
-            and 1 <= len(suffix) <= 16
-            and suffix.isascii()
-            and suffix.isprintable()
-        )
+        return isinstance(suffix, str) and suffix in SAS_DETAILS_SUFFIX_TOKENS
     return set(frame) == common
 
 
@@ -149,14 +157,17 @@ def host_request_contains_sas(request):
         return True
     if request.get("command") == "sas_display_v1":
         return True
-    protected = {"kind", "attempt_binding", "generation", "current", "code_groups", "details_suffix"}
-
     def contains(value):
         if isinstance(value, dict):
-            return any(key in protected or contains(child) for key, child in value.items())
+            return any(
+                key in SAS_HOST_REQUEST_RESERVED_FIELDS
+                or child == "sas_display_v1"
+                or contains(child)
+                for key, child in value.items()
+            )
         if isinstance(value, list):
             return any(contains(child) for child in value)
-        return False
+        return value == "sas_display_v1"
 
     return contains(request.get("args"))
 
@@ -303,6 +314,27 @@ class NativeHostBoundaryTests(unittest.TestCase):
             self.assertFalse(host_request_contains_sas(request), request)
         for request in fixture["invalid_host_requests"]:
             self.assertTrue(host_request_contains_sas(request), request)
+
+    def test_every_sas_field_and_literal_is_rejected_recursively_from_host_args(self):
+        """A partial display shape is still an impermissible host re-export."""
+        for field in SAS_HOST_REQUEST_RESERVED_FIELDS:
+            request = {
+                "v": 1,
+                "id": "host-field",
+                "command": "confirm",
+                "args": {"nested": [{field: "untrusted"}]},
+            }
+            self.assertTrue(host_request_contains_sas(request), field)
+        self.assertTrue(
+            host_request_contains_sas(
+                {
+                    "v": 1,
+                    "id": "host-literal",
+                    "command": "confirm",
+                    "args": {"nested": ["sas_display_v1"]},
+                }
+            )
+        )
 
 
 if __name__ == "__main__":

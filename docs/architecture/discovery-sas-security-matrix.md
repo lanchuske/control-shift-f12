@@ -74,9 +74,12 @@ network read cannot extend its 30-second deadline.
 value produced by the reviewed engine adapter for an active bootstrap or V01
 attempt. It is not a wire object, a durable receipt field, or a host capability.
 It may carry only the grouped human-comparison code, the current remaining-time
-view, and an optional details suffix **only if needed** by the reviewed UX. It
-does not carry a locator, identity, certificate, raw transcript, exporter,
-receipt, approval, layout data, or any authority.
+view, and an optional details suffix **only if needed** by the reviewed UX. The
+suffix is a restricted semantic token (`attempt-current` or `expires-soon`),
+not free text: it rejects code groups/substrings, raw attempt material, IP
+addresses, hostnames and host:port values. It does not carry a locator,
+identity, certificate, raw transcript, exporter, receipt, approval, layout
+data, or any authority.
 
 `SasDisplayView` is non-serializable, not persistible, not loggable and not
 copyable. A host may hold it only while that exact confirmation screen is
@@ -107,8 +110,9 @@ Its adapter-local `attempt_binding`, strictly increasing `generation`, and
 `current` invalidation bind a rendered code to one active screen without
 exposing the raw V01 attempt/session/transcript. This is transient pipe
 serialization, not a persistible/loggable/copyable value: the host cannot send
-the frame or any SAS-bearing argument back to the child, and cannot re-export
-it anywhere else.
+the frame, any partial shape or timing metadata (`v`, `remaining_ms`,
+`generation`, and related fields) or any SAS-bearing argument back to the
+child, and cannot re-export it anywhere else.
 
 ## Design and adversarial test matrix
 

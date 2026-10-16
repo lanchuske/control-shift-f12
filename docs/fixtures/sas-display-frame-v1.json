@@ -8,7 +8,7 @@
       "current": true,
       "remaining_ms": 30000,
       "code_groups": ["42", "71", "68"],
-      "details_suffix": "3F7A"
+      "details_suffix": "attempt-current"
     },
     {
       "v": 1,
@@ -55,6 +55,46 @@
       "remaining_ms": 10,
       "code_groups": ["42"],
       "details_suffix": null
+    },
+    {
+      "v": 1,
+      "kind": "sas_display_v1",
+      "attempt_binding": 41,
+      "generation": 7,
+      "current": true,
+      "remaining_ms": 10,
+      "code_groups": ["42", "71", "68"],
+      "details_suffix": "42"
+    },
+    {
+      "v": 1,
+      "kind": "sas_display_v1",
+      "attempt_binding": 41,
+      "generation": 7,
+      "current": true,
+      "remaining_ms": 10,
+      "code_groups": ["42", "71", "68"],
+      "details_suffix": "attempt ending 3F7A"
+    },
+    {
+      "v": 1,
+      "kind": "sas_display_v1",
+      "attempt_binding": 41,
+      "generation": 7,
+      "current": true,
+      "remaining_ms": 10,
+      "code_groups": ["42"],
+      "details_suffix": "192.168.1.4"
+    },
+    {
+      "v": 1,
+      "kind": "sas_display_v1",
+      "attempt_binding": 41,
+      "generation": 7,
+      "current": true,
+      "remaining_ms": 10,
+      "code_groups": ["42"],
+      "details_suffix": "host.local:443"
     },
     {
       "v": 1,
@@ -132,6 +172,34 @@
     }
   ],
   "invalid_host_requests": [
+    {
+      "v": 1,
+      "id": "host-v",
+      "command": "confirm",
+      "args": {
+        "v": 1
+      }
+    },
+    {
+      "v": 1,
+      "id": "host-timing",
+      "command": "confirm",
+      "args": {
+        "remaining_ms": 10
+      }
+    },
+    {
+      "v": 1,
+      "id": "host-nested",
+      "command": "confirm",
+      "args": {
+        "nested": [
+          {
+            "attempt_binding": 41
+          }
+        ]
+      }
+    },
     {
       "v": 1,
       "id": "host-1",
