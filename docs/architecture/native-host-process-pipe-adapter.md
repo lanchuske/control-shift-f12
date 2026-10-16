@@ -23,8 +23,8 @@ process. A Windows diagnostics parser/test pair and platform-neutral lifecycle,
 journey-state, fixed child-launch specification, or closed initial-snapshot
 projection may validate redacted frames, terminal projection clearing,
 unavailable product actions, the immutable package-child command/environment
-allowlist, and the inert baseline snapshot, but cannot launch a process, open
-a pipe, or render a host. All other native source
+allowlist, the inert baseline snapshot, and bounded frame parsing, but cannot
+launch a process, open a pipe, or render a host. All other native source
 is admitted only after all pre-enable tests in
 [Required evidence before native source](#required-evidence-before-native-source)
 are present and passing on the actual target operating system.
