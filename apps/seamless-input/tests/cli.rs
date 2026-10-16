@@ -326,6 +326,17 @@ fn doctor_report_is_opt_in_redacted_and_stable_identifier_free() {
 }
 
 #[test]
+fn status_fails_closed_when_no_live_runtime_heartbeat_exists() {
+    let output = run(&["status"]);
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap().trim(),
+        "Control Shift F12 stopped: 0 authenticated session(s)"
+    );
+    assert_eq!(output.stderr, b"");
+}
+
+#[test]
 fn config_show_loads_the_real_default_configuration() {
     let output = run(&["config", "show"]);
     assert!(output.status.success());

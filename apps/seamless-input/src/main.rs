@@ -2,12 +2,13 @@ use std::{
     fmt,
     io::{self, Write},
     process::ExitCode,
-    time::{Duration, SystemTime},
+    time::{Duration, Instant, SystemTime},
 };
 
 use clap::{Args, Parser, Subcommand};
 use seamless_discovery::{Discovery, manual_address};
 use seamless_input::{
+    runtime_status::{RuntimeStatus, RuntimeStatusStore},
     supervisor::{AppPaths, CapabilityReport, INPUT_SERVICE_INTERVAL, NativeSupervisor},
     tui,
 };
@@ -32,6 +33,8 @@ struct Cli {
 enum Commands {
     /// Start this machine as a Control Shift F12 peer.
     Start,
+    /// Report the currently running peer and authenticated session count.
+    Status,
     /// Pair this machine with another peer.
     Pair(PairArgs),
     /// List paired and discovered peers.
@@ -101,6 +104,7 @@ async fn run(cli: Cli) -> Result<(), OperationalError> {
     let paths = AppPaths::discover()?;
     match cli.command {
         Commands::Start => start(&paths).await,
+        Commands::Status => status(&paths),
         Commands::Pair(args) => pair(&paths, &args.code, args.address.as_deref()).await,
         Commands::Peers => peers(&paths),
         Commands::Unpair { peer } => unpair(&paths, &peer),
@@ -114,12 +118,18 @@ async fn run(cli: Cli) -> Result<(), OperationalError> {
 }
 
 async fn start(paths: &AppPaths) -> Result<(), OperationalError> {
+    let status_store = RuntimeStatusStore::within(&paths.root);
+    status_store.clear()?;
+    let _status_lease = RuntimeStatusLease(status_store.clone());
     let mut supervisor = NativeSupervisor::bootstrap(paths)?;
-    let state = supervisor.tick().await?;
-    println!(
-        "Control Shift F12 running: {} display(s), {} authenticated session(s)",
-        state.displays, state.authenticated_sessions
-    );
+    let mut state = supervisor.tick().await?;
+    let mut status = RuntimeStatus::live(
+        std::process::id(),
+        state.displays,
+        state.authenticated_sessions,
+    )?;
+    status_store.publish(&status)?;
+    println!("{}", status.display_line());
     io::stdout()
         .flush()
         .map_err(|error| OperationalError(error.to_string()))?;
@@ -127,9 +137,24 @@ async fn start(paths: &AppPaths) -> Result<(), OperationalError> {
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut input_interval = tokio::time::interval(INPUT_SERVICE_INTERVAL);
     input_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut last_heartbeat = Instant::now();
     loop {
         tokio::select! {
-            _ = interval.tick() => { supervisor.tick().await?; }
+            _ = interval.tick() => {
+                let next = supervisor.tick().await?;
+                let changed = next.displays != state.displays
+                    || next.authenticated_sessions != state.authenticated_sessions;
+                if changed || last_heartbeat.elapsed() >= Duration::from_secs(2) {
+                    status = RuntimeStatus::live(
+                        std::process::id(),
+                        next.displays,
+                        next.authenticated_sessions,
+                    )?;
+                    status_store.publish(&status)?;
+                    last_heartbeat = Instant::now();
+                }
+                state = next;
+            }
             _ = input_interval.tick() => { supervisor.service_input().await?; }
             result = tokio::signal::ctrl_c() => {
                 result.map_err(|error| OperationalError(error.to_string()))?;
@@ -137,6 +162,24 @@ async fn start(paths: &AppPaths) -> Result<(), OperationalError> {
             }
         }
     }
+}
+
+struct RuntimeStatusLease(RuntimeStatusStore);
+
+impl Drop for RuntimeStatusLease {
+    fn drop(&mut self) {
+        let _ = self.0.clear();
+    }
+}
+
+fn status(paths: &AppPaths) -> Result<(), OperationalError> {
+    let store = RuntimeStatusStore::within(&paths.root);
+    if let Some(status) = store.read_current(SystemTime::now())? {
+        println!("{}", status.display_line());
+    } else {
+        println!("Control Shift F12 stopped: 0 authenticated session(s)");
+    }
+    Ok(())
 }
 
 async fn pair(
