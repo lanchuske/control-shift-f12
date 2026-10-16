@@ -51,6 +51,7 @@ ADMITTED_WINDOWS_CONTRACT_PATHS = frozenset(
         "native/windows/ControlShiftF12App.Tests/DesktopJourneyStateTests.cs",
         "native/windows/ControlShiftF12App.Tests/DesktopSnapshotProjectionTests.cs",
         "native/windows/ControlShiftF12App.Tests/FramedPayloadReaderTests.cs",
+        "native/windows/ControlShiftF12App.Tests/UiStdioChildProbeTests.cs",
         "native/windows/ControlShiftF12App.Tests/WindowsDiagnosticsProjectionTests.cs",
     }
 )
@@ -324,12 +325,13 @@ class NativeHostBoundaryTests(unittest.TestCase):
         self.assertTrue(MACOS_MANIFEST.is_file())
         self.assertTrue(WINDOWS_MANIFEST.is_file())
 
-        native_sources = [
+        native_production_sources = [
             ROOT / path
             for path in tracked_native_paths()
             if path.endswith((".swift", ".cs", ".csproj")) or path.endswith("Package.swift")
+            if "/Tests/" not in path and ".Tests/" not in path
         ]
-        native_text = "\n".join(path.read_text() for path in native_sources)
+        native_text = "\n".join(path.read_text() for path in native_production_sources)
         forbidden = (
             "http://",
             "https://",
@@ -377,6 +379,22 @@ class NativeHostBoundaryTests(unittest.TestCase):
         )
         for token in forbidden:
             self.assertNotIn(token, native_text, token)
+
+    def test_windows_engine_probe_is_test_only_and_uses_the_reviewed_child_mode(self):
+        probe = (
+            ROOT / "native/windows/ControlShiftF12App.Tests/UiStdioChildProbeTests.cs"
+        ).read_text()
+        for expected in (
+            'ArgumentList.Add("control")',
+            'ArgumentList.Add("--ui-stdio")',
+            "RedirectStandardInput = true",
+            "RedirectStandardOutput = true",
+            "StandardInput.Close()",
+            "target", "debug", "seamless-input.exe",
+        ):
+            self.assertIn(expected, probe)
+        for forbidden in ("cmd.exe", "powershell", "pwsh", "http://", "https://", "Socket"):
+            self.assertNotIn(forbidden, probe, forbidden)
 
     def test_hosts_are_declared_as_nonshipping_pipe_clients_of_the_existing_engine(self):
         macos_manifest = MACOS_MANIFEST.read_text()
