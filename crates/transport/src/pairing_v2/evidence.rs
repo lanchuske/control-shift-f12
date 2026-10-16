@@ -5,6 +5,10 @@ use super::{
 };
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
+use std::{
+    collections::HashSet,
+    sync::{Arc, Mutex},
+};
 pub const DOMAIN: &str = "control-shift-f12 pairing v2";
 pub const SUITE: &str = "x25519-hkdf-sha256-ed25519-v1";
 pub const PROTOCOL: &str = "control-shift-f12-pair/2";
@@ -271,18 +275,56 @@ impl RecoveryFields {
         )
     }
 }
-/// One-use signature check, not a restart/promotion capability.
+/// Shared process-local one-use registry. All verifiers in a verification scope
+/// must receive the same Arc. Never evicts consumed entries; capacity/poison fail
+/// closed. NOT durable, cross-process, or a source of revocation tombstones.
+#[derive(Default)]
+pub struct RecoveryReplayRegistry {
+    consumed: Mutex<HashSet<RecoveryReplayKey>>,
+}
+
+// Retain the complete canonical proof body, not a partial ID or signature.
+// The signer is part of the expected context; deadline is deliberately not, so
+// recreating a verifier with a later deadline cannot reopen a used challenge.
+#[derive(Hash, PartialEq, Eq)]
+struct RecoveryReplayKey {
+    signer: [u8; 32],
+    canonical_proof: Vec<u8>,
+}
+
+impl RecoveryReplayRegistry {
+    const CAPACITY: usize = 1024;
+
+    fn consume_verified(&self, signer: [u8; 32], canonical_proof: Vec<u8>) -> Result<(), Invalid> {
+        let mut consumed = self.consumed.lock().map_err(|_| Invalid)?;
+        if consumed.len() >= Self::CAPACITY
+            || !consumed.insert(RecoveryReplayKey {
+                signer,
+                canonical_proof,
+            })
+        {
+            return Err(Invalid);
+        }
+        Ok(())
+    }
+}
+
+/// Shared-registry one-use signature check, not a restart/promotion capability.
 pub struct RecoverySignatureVerifier {
     fields: RecoveryFields,
     deadline: u64,
-    consumed: bool,
+    registry: Arc<RecoveryReplayRegistry>,
 }
 impl RecoverySignatureVerifier {
-    pub fn new(fields: RecoveryFields, deadline: u64) -> Self {
+    pub fn new(
+        fields: RecoveryFields,
+        deadline: u64,
+        registry: Arc<RecoveryReplayRegistry>,
+    ) -> Self {
         Self {
             fields,
             deadline,
-            consumed: false,
+            registry,
         }
     }
     pub fn verify(
@@ -292,11 +334,53 @@ impl RecoverySignatureVerifier {
         now: u64,
         tombstoned: bool,
     ) -> Result<(), Invalid> {
-        if self.consumed || now >= self.deadline || tombstoned {
+        if now >= self.deadline || tombstoned {
             return Err(Invalid);
         }
-        super::identity::verify_ed25519(key, &self.fields.encode()?, sig)?;
-        self.consumed = true;
-        Ok(())
+        let body = self.fields.encode()?;
+        super::identity::verify_ed25519(key, &body, sig)?;
+        // Signature verification is side-effect free. Only authenticated proofs
+        // reach the mutex-protected check-and-insert (one winner across callers).
+        self.registry.consume_verified(*key, body)
+    }
+}
+
+#[cfg(test)]
+mod recovery_registry_tests {
+    use super::*;
+
+    #[test]
+    fn capacity_fails_closed_without_eviction_or_cleanup() {
+        let registry = RecoveryReplayRegistry::default();
+        for n in 0..RecoveryReplayRegistry::CAPACITY {
+            registry
+                .consume_verified([1; 32], n.to_be_bytes().to_vec())
+                .unwrap();
+        }
+        assert!(registry.consume_verified([2; 32], vec![0]).is_err());
+        assert!(
+            registry
+                .consume_verified([1; 32], 0_usize.to_be_bytes().to_vec())
+                .is_err()
+        );
+        assert_eq!(
+            registry.consumed.lock().unwrap().len(),
+            RecoveryReplayRegistry::CAPACITY
+        );
+    }
+
+    #[test]
+    fn poisoned_registry_fails_closed() {
+        let registry = Arc::new(RecoveryReplayRegistry::default());
+        let other = registry.clone();
+        assert!(
+            std::thread::spawn(move || {
+                let _guard = other.consumed.lock().unwrap();
+                panic!("synthetic poison");
+            })
+            .join()
+            .is_err()
+        );
+        assert!(registry.consume_verified([1; 32], vec![0]).is_err());
     }
 }

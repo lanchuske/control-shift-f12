@@ -28,8 +28,12 @@ eligibility, peer liveness, an active pin, or permission to share input.
   libraries: bounded complete DER, canonical header roundtrip, v3 self-issued
   leaf, matching Ed25519 inner/outer/SPKI algorithms with absent parameters,
   exact key/signature sizes, self-signature, validity, duplicate/malformed and
-  unsupported critical extension rejection, non-CA/basic-constraints,
-  digital-signature key usage when present, product URI SAN. Keys and signature
+  unsupported critical extension rejection, unknown-extension rejection even
+  when noncritical, mandatory non-CA/basic-constraints, mandatory KeyUsage with
+  digitalSignature set and keyCertSign/crlSign clear, mandatory product URI SAN.
+  Other parser-recognized noncritical extensions remain permitted; this is not
+  a three-OID allowlist. Presence requires `basic && usage && san` independently.
+  Keys and signature
   points must be canonical, non-small-order and torsion-free. Certificate DER
   fingerprint and its 16-byte NodeId prefix are checked separately.
 - The parser initially accepted a nonminimal DER length. A real failing test
@@ -56,9 +60,37 @@ eligibility, peer liveness, an active pin, or permission to share input.
   JSON conversion accepts only exactly 64 lowercase hex characters. Signature
   checks bind role, both nonces, exporter, generations and durable-state marker;
   the expected-challenge verifier expires at `now >= deadline`, rejects a
-  tombstone and consumes itself after one success. This one-use state belongs
-  to that verifier instance; a global/durable challenge registry is **not**
-  implemented and a fresh verifier must never be used to resume old challenges.
+  tombstone and consumes the context through an injected shared registry after
+  successful signature verification. See the registry contract below; it is
+  process-local, not a durable/global operational registry.
+
+### Recovery replay registry contract (round 2)
+
+`RecoverySignatureVerifier::new(fields, deadline, Arc<RecoveryReplayRegistry>)`
+requires registry injection: constructing a verifier never implicitly constructs
+or resets a registry. All verifiers in one verification scope must share the
+same Arc. The registry uses a mutex-protected set; signature verification occurs
+before the atomic check-and-insert. Invalid signatures, malformed evidence,
+expiration and a caller-supplied tombstone do not consume entries. Concurrent
+valid proofs for the same context have exactly one successful caller.
+
+The key is an exact pair `(Ed25519 signer public key, canonical RecoveryProof
+body bytes)`, not a partial attempt ID, an ambiguous concatenation, or signature
+bytes. The canonical body includes domain, attempt ID, FC hash, role, both
+nonces, TLS exporter, identity generation, revocation generation and the durable
+state marker. Deadline is intentionally not part of the key: recreating a
+verifier with a later deadline cannot reopen the consumed context. All original
+reference wire bytes and signature encodings are unchanged.
+
+The registry retains up to 1024 consumed entries without eviction, cleanup or
+reset APIs. Capacity exhaustion and mutex poisoning fail closed. This is only
+an internal shared-memory verification facility. Separate registries/processes
+and process restart do **not** share consumption. A scope owner must not create
+a new registry to reopen a challenge or bypass capacity. Durable, globally
+consistent consumption plus authoritative generation/revocation tombstones and
+crash/restart reconciliation are mandatory **before operational use or release**.
+The supplied clock, key, challenge and tombstone boolean remain expected inputs,
+not proof of actual transport provenance or authoritative persisted state.
 
 ## Fixture migration and provenance
 
@@ -80,11 +112,11 @@ and TLS exporter acquisition belong to the future operational coordinator.
 
 Implemented fixture coverage: V01 cryptographic messages/evidence, V02 codec,
 V03/V04 SAS/asset, V05 legal certificate plus independent negative mutations,
-V10 phase/role checks through V01 messages, V11 proof and replay within one
-verifier, INTEROP-V01 CandidateHello/binding/strict hex. V13 is retained as
+V10 phase/role checks through V01 messages, V11 proof and replay across verifiers
+sharing one registry, INTEROP-V01 CandidateHello/binding/strict hex. V13 is retained as
 reference input but a new legacy negotiation engine is not implemented.
 
-## Evidence (2026-10-16, aarch64 macOS, offline)
+## Baseline evidence (ca0343e, 2026-10-16, aarch64 macOS, offline)
 
 Final runs: default workspace **219 passed, 2 preexisting ignored**; experimental
 workspace **232 passed, the same 2 ignored**. Experimental all-target clippy with
@@ -121,6 +153,39 @@ cargo test --workspace --features seamless-transport/pairing-v2-experimental --o
 cargo clippy --workspace --all-targets --features seamless-transport/pairing-v2-experimental --offline -- -D warnings
 cargo fmt --all -- --check
 ```
+
+## Round-2 correction evidence (2026-10-16, aarch64 macOS, offline)
+
+The initial negative certificate test failed against the old validator for a
+properly re-signed Ed25519 certificate missing KeyUsage. After requiring usage,
+the same test independently failed for a properly re-signed unknown noncritical
+extension. Both retain a positive legal certificate using the same synthetic
+key. Recovery tests first failed because reconstruction accepted a consumed
+proof and 16 concurrent independent verifier instances all succeeded. They now
+share an injected registry and require exactly one winner.
+
+Additional tests cover every distinct context component (including signer),
+replay with a renewed deadline, invalid-signature/expired/tombstoned attempts
+not consuming a valid proof, full registry with no eviction and poisoned-lock
+fail-closed behavior. No frozen JSON fixture was modified.
+
+Twelve isolated production mutants were run and restored. Each failed an
+assertion for its expected defect (not a compile failure):
+
+| Mutant | Killing assertion |
+| --- | --- |
+| Remove mandatory `usage` presence | Correctly signed certificate without KeyUsage rejected |
+| Accept unknown noncritical extension | Correctly signed unknown extension rejected |
+| Omit each of eight variable RecoveryProof context fields from replay key, separately | Distinct correctly signed context must not collide (indexes 0–7) |
+| Omit signer from replay key | Distinct signer context must not collide (index 8) |
+| Skip shared registry consumption | Original proof rejected after first success across instances |
+
+Final restored-tree verification: default workspace **219 passed, 2 preexisting
+ignored**; experimental workspace **237 passed, the same 2 ignored** (16 fixture
+integration tests plus two registry guard unit tests). All-target clippy with
+warnings denied passed both default and experimental configurations. Formatting
+and `git diff --check` passed. The experimental module is still disabled by
+default and no admission/promotion behavior was changed.
 
 ## Required next work before any connection to product behavior
 

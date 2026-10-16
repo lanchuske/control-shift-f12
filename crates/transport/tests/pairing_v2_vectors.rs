@@ -1,8 +1,14 @@
 #![cfg(feature = "pairing-v2-experimental")]
 use seamless_transport::pairing_v2::{
+    RecoveryReplayRegistry,
     codec::{Value, decode, encode},
     sas_words, validate_identity, validate_wordlist,
 };
+use std::sync::Arc;
+
+fn fresh_replay_registry() -> Arc<RecoveryReplayRegistry> {
+    Arc::new(RecoveryReplayRegistry::default())
+}
 
 fn fixture(name: &str) -> serde_json::Value {
     serde_json::from_slice(
@@ -133,6 +139,35 @@ fn resign_v05(mut der: Vec<u8>) -> Vec<u8> {
     let offset = der.len() - 64;
     der[offset..].copy_from_slice(signature.as_ref());
     der
+}
+
+#[test]
+fn certificate_requires_key_usage_and_rejects_unknown_noncritical_extension() {
+    use rcgen::{CertificateParams, CustomExtension, IsCa, KeyPair, KeyUsagePurpose, SanType};
+    let key = KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap();
+    let mut params = CertificateParams::default();
+    params.is_ca = IsCa::ExplicitNoCa;
+    params.subject_alt_names = vec![SanType::URI(
+        "urn:control-shift-f12:identity".try_into().unwrap(),
+    )];
+    params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+    let legal = params.self_signed(&key).unwrap();
+    validate_identity(legal.der(), computed_node(legal.der()), 1_893_456_000).unwrap();
+    params.key_usages.clear();
+    let missing = params.self_signed(&key).unwrap();
+    assert!(
+        validate_identity(missing.der(), computed_node(missing.der()), 1_893_456_000).is_err(),
+        "correctly signed certificate without KeyUsage must be rejected"
+    );
+    params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+    let mut unknown = CustomExtension::from_oid_content(&[1, 3, 6, 1, 4, 1, 55555, 1], vec![5, 0]);
+    unknown.set_criticality(false);
+    params.custom_extensions.push(unknown);
+    let unknown = params.self_signed(&key).unwrap();
+    assert!(
+        validate_identity(unknown.der(), computed_node(unknown.der()), 1_893_456_000).is_err(),
+        "correctly signed certificate with unknown noncritical extension must be rejected"
+    );
 }
 
 #[test]
@@ -311,7 +346,8 @@ fn every_recovery_binding_and_wrong_signer_rejects_without_consuming_valid_chall
         let mut changed = fields.clone();
         altered(&mut changed[index]);
         let sig = signing.sign(&encode("recovery-proof", &changed).unwrap());
-        let mut verifier = RecoverySignatureVerifier::new(original.clone(), 30_000);
+        let mut verifier =
+            RecoverySignatureVerifier::new(original.clone(), 30_000, fresh_replay_registry());
         assert!(
             verifier.verify(public, sig.as_ref(), 1, false).is_err(),
             "recovery/{index}"
@@ -320,7 +356,7 @@ fn every_recovery_binding_and_wrong_signer_rejects_without_consuming_valid_chall
     }
     let other = ring::signature::Ed25519KeyPair::from_seed_unchecked(&[b'x'; 32]).unwrap();
     assert!(
-        RecoverySignatureVerifier::new(original, 30_000)
+        RecoverySignatureVerifier::new(original, 30_000, fresh_replay_registry())
             .verify(
                 other.public_key().as_ref().try_into().unwrap(),
                 &signature,
@@ -621,21 +657,124 @@ fn recovery_signature_matches_external_v11_and_is_one_use() {
         identity_generation: 3,
         revocation_generation: 4,
     };
-    let mut verifier = RecoverySignatureVerifier::new(fields.clone(), 30_000);
+    let registry = fresh_replay_registry();
+    let mut verifier = RecoverySignatureVerifier::new(fields.clone(), 30_000, registry.clone());
     let public = key.public_key().as_ref().try_into().unwrap();
     let sig = bytes(&v, "signature_hex");
     assert_eq!(key.sign(&fields.encode().unwrap()).as_ref(), sig);
     verifier.verify(public, &sig, 29_999, false).unwrap();
     assert!(verifier.verify(public, &sig, 29_999, false).is_err());
     assert!(
-        RecoverySignatureVerifier::new(fields.clone(), 30_000)
+        RecoverySignatureVerifier::new(fields.clone(), 30_000, registry)
+            .verify(public, &sig, 29_999, false)
+            .is_err(),
+        "reconstructing a verifier must not reopen a consumed challenge"
+    );
+    assert!(
+        RecoverySignatureVerifier::new(fields.clone(), 30_000, fresh_replay_registry())
             .verify(public, &sig, 30_000, false)
             .is_err()
     );
     assert!(
-        RecoverySignatureVerifier::new(fields, 30_000)
+        RecoverySignatureVerifier::new(fields, 30_000, fresh_replay_registry())
             .verify(public, &sig, 1, true)
             .is_err()
+    );
+}
+
+fn recovery_fields() -> seamless_transport::pairing_v2::RecoveryFields {
+    use seamless_transport::pairing_v2::{RecoveryFields, Role};
+    RecoveryFields {
+        attempt_id: [0xaa; 32],
+        fc_hash: [0xbb; 32],
+        role: Role::A,
+        challenger_nonce: b"nonce-1".to_vec(),
+        responder_nonce: b"nonce-2".to_vec(),
+        tls_exporter: b"exporter".to_vec(),
+        identity_generation: 3,
+        revocation_generation: 4,
+    }
+}
+
+#[test]
+fn recovery_shared_registry_has_exact_context_and_consumes_only_verified_proofs() {
+    use ring::signature::KeyPair;
+    use seamless_transport::pairing_v2::{RecoverySignatureVerifier, Role};
+    let signing = ring::signature::Ed25519KeyPair::from_seed_unchecked(&[b'k'; 32]).unwrap();
+    let other = ring::signature::Ed25519KeyPair::from_seed_unchecked(&[b'x'; 32]).unwrap();
+    let public: &[u8; 32] = signing.public_key().as_ref().try_into().unwrap();
+    let original = recovery_fields();
+    let sig = signing.sign(&original.encode().unwrap());
+    for index in 0..9 {
+        let registry = fresh_replay_registry();
+        let mut first = RecoverySignatureVerifier::new(original.clone(), 30_000, registry.clone());
+        assert!(first.verify(public, &[0; 64], 1, false).is_err());
+        assert!(first.verify(public, sig.as_ref(), 30_000, false).is_err());
+        assert!(first.verify(public, sig.as_ref(), 1, true).is_err());
+        RecoverySignatureVerifier::new(original.clone(), 30_000, registry.clone())
+            .verify(public, sig.as_ref(), 1, false)
+            .unwrap();
+        let mut changed = original.clone();
+        match index {
+            0 => changed.attempt_id[0] ^= 1,
+            1 => changed.fc_hash[0] ^= 1,
+            2 => changed.role = Role::B,
+            3 => changed.challenger_nonce.push(0),
+            4 => changed.responder_nonce.push(0),
+            5 => changed.tls_exporter.push(0),
+            6 => changed.identity_generation += 1,
+            7 => changed.revocation_generation += 1,
+            8 => {}
+            _ => unreachable!(),
+        }
+        let signer = if index == 8 { &other } else { &signing };
+        let changed_public = signer.public_key().as_ref().try_into().unwrap();
+        let changed_sig = signer.sign(&changed.encode().unwrap());
+        RecoverySignatureVerifier::new(changed.clone(), 30_000, registry.clone())
+            .verify(changed_public, changed_sig.as_ref(), 1, false)
+            .unwrap_or_else(|_| panic!("distinct verified context {index} must not collide"));
+        assert!(
+            RecoverySignatureVerifier::new(original.clone(), 90_000, registry.clone())
+                .verify(public, sig.as_ref(), 2, false)
+                .is_err(),
+            "original replay/{index}"
+        );
+        assert!(
+            RecoverySignatureVerifier::new(changed, 90_000, registry)
+                .verify(changed_public, changed_sig.as_ref(), 2, false)
+                .is_err(),
+            "changed replay/{index}"
+        );
+    }
+}
+
+#[test]
+fn recovery_shared_registry_concurrent_verifiers_have_exactly_one_winner() {
+    use ring::signature::KeyPair;
+    use seamless_transport::pairing_v2::RecoverySignatureVerifier;
+    let signing = ring::signature::Ed25519KeyPair::from_seed_unchecked(&[b'k'; 32]).unwrap();
+    let public: [u8; 32] = signing.public_key().as_ref().try_into().unwrap();
+    let fields = recovery_fields();
+    let signature = signing.sign(&fields.encode().unwrap()).as_ref().to_vec();
+    let registry = fresh_replay_registry();
+    let barrier = Arc::new(std::sync::Barrier::new(16));
+    let threads: Vec<_> = (0..16)
+        .map(|_| {
+            let registry = registry.clone();
+            let fields = fields.clone();
+            let signature = signature.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                let mut verifier = RecoverySignatureVerifier::new(fields, 30_000, registry);
+                barrier.wait();
+                usize::from(verifier.verify(&public, &signature, 1, false).is_ok())
+            })
+        })
+        .collect();
+    let winners: usize = threads.into_iter().map(|t| t.join().unwrap()).sum();
+    assert_eq!(
+        winners, 1,
+        "one shared challenge must have exactly one atomic winner"
     );
 }
 

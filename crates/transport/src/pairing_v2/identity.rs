@@ -96,6 +96,7 @@ pub fn validate_identity(der: &[u8], node: [u8; 16], now: i64) -> Result<Identit
         return Err(Invalid);
     }
     let mut basic = false;
+    let mut usage = false;
     let mut san = false;
     for ext in cert.extensions() {
         // Parse the complete extension payload as DER too; no ignored trailing data.
@@ -115,6 +116,7 @@ pub fn validate_identity(der: &[u8], node: [u8; 16], now: i64) -> Result<Identit
                 if !v.digital_signature() || v.key_cert_sign() || v.crl_sign() {
                     return Err(Invalid);
                 }
+                usage = true;
             }
             ParsedExtension::SubjectAlternativeName(v) => {
                 if v.general_names != [GeneralName::URI("urn:control-shift-f12:identity")] {
@@ -122,12 +124,14 @@ pub fn validate_identity(der: &[u8], node: [u8; 16], now: i64) -> Result<Identit
                 }
                 san = true;
             }
-            ParsedExtension::ParseError { .. } | ParsedExtension::Unparsed => return Err(Invalid),
+            ParsedExtension::ParseError { .. }
+            | ParsedExtension::Unparsed
+            | ParsedExtension::UnsupportedExtension { .. } => return Err(Invalid),
             _ if ext.critical => return Err(Invalid),
             _ => {}
         }
     }
-    if !basic || !san {
+    if !basic || !usage || !san {
         return Err(Invalid);
     }
     let public_key: [u8; 32] = cert
