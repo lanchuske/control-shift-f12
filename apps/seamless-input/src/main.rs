@@ -8,6 +8,7 @@ use std::{
 use clap::{Args, Parser, Subcommand};
 use seamless_discovery::{Discovery, manual_address};
 use seamless_input::{
+    diagnostics::compatibility_lines,
     runtime_status::{RuntimeStatus, RuntimeStatusStore},
     supervisor::{AppPaths, CapabilityReport, INPUT_SERVICE_INTERVAL, NativeSupervisor},
     tui,
@@ -441,6 +442,7 @@ fn config(paths: &AppPaths, command: ConfigCommands) -> Result<(), OperationalEr
 
 fn doctor(paths: &AppPaths, report: bool) {
     let measured = CapabilityReport::measure(paths);
+    let diagnostics = measured.diagnostics();
     if report {
         println!("Control Shift F12 diagnostic report");
         println!("privacy: redacted");
@@ -451,11 +453,10 @@ fn doctor(paths: &AppPaths, report: bool) {
         println!("administrator elevation: not required");
         println!("user consent: checked separately from administrator elevation");
     }
+    for (label, value) in compatibility_lines(&diagnostics.rows) {
+        println!("{label}: {value}");
+    }
     println!("config: {}", measured.config);
-    println!("input access: {}", measured.input);
-    println!("clipboard access: {}", measured.clipboard);
-    println!("displays: {}", measured.displays);
-    println!("discovery: {}", measured.discovery);
     println!("UDP transport: {}", measured.udp_transport);
     println!("paired identity pins: {}", measured.identity);
     println!("enterprise restrictions: not bypassed");

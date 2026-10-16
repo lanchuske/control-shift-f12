@@ -207,6 +207,22 @@ pub enum DiagnosticDetail {
     Fault,
 }
 
+/// A stable, non-sensitive category for a local diagnostic failure.
+///
+/// It deliberately excludes platform messages, paths, peer identifiers,
+/// addresses and values received from another machine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiagnosticFailureCode {
+    RuntimeStatusUnavailable,
+    InputPermissionDenied,
+    ClipboardUnavailable,
+    ClipboardFault,
+    DisplaysUnavailable,
+    DiscoveryUnavailable,
+    SessionUnavailable,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DiagnosticAction {
@@ -224,6 +240,7 @@ pub struct DiagnosticRow {
     pub state: DiagnosticState,
     pub detail: DiagnosticDetail,
     pub action: Option<DiagnosticAction>,
+    pub failure_code: Option<DiagnosticFailureCode>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

@@ -26,6 +26,7 @@ fn snapshot() -> UiSnapshot {
             state: DiagnosticState::Unknown,
             detail: DiagnosticDetail::NotMeasured,
             action: Some(DiagnosticAction::Refresh),
+            failure_code: None,
         }],
         candidates: vec![CandidateView {
             handle: handle::<CandidateHandle>("nearby_1"),
@@ -121,6 +122,7 @@ fn snapshot_rejects_more_than_32_diagnostics_before_writing_a_frame() {
             state: DiagnosticState::Unknown,
             detail: DiagnosticDetail::NotMeasured,
             action: None,
+            failure_code: None,
         })
         .collect();
 

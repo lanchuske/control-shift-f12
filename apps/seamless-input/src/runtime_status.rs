@@ -18,6 +18,15 @@ pub struct RuntimeStatus {
     pub authenticated_sessions: usize,
 }
 
+/// Freshness of the local runtime heartbeat. Consumers must distinguish a
+/// missing heartbeat from a stale one so that an old success is never reused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeStatusRead {
+    Current(RuntimeStatus),
+    Missing,
+    Stale,
+}
+
 impl RuntimeStatus {
     pub fn live(
         process_id: u32,
@@ -113,9 +122,18 @@ impl RuntimeStatusStore {
         &self,
         now: SystemTime,
     ) -> Result<Option<RuntimeStatus>, RuntimeStatusError> {
+        match self.read_state(now)? {
+            RuntimeStatusRead::Current(status) => Ok(Some(status)),
+            RuntimeStatusRead::Missing | RuntimeStatusRead::Stale => Ok(None),
+        }
+    }
+
+    pub fn read_state(&self, now: SystemTime) -> Result<RuntimeStatusRead, RuntimeStatusError> {
         let text = match fs::read_to_string(&self.path) {
             Ok(text) => text,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok(RuntimeStatusRead::Missing);
+            }
             Err(error) => return Err(error.into()),
         };
         let status = decode(&text)?;
@@ -124,9 +142,9 @@ impl RuntimeStatusStore {
             return Err(RuntimeStatusError::Invalid);
         }
         if now_ms.saturating_sub(status.updated_unix_ms) > MAX_AGE.as_millis() as u64 {
-            return Ok(None);
+            return Ok(RuntimeStatusRead::Stale);
         }
-        Ok(Some(status))
+        Ok(RuntimeStatusRead::Current(status))
     }
 
     pub fn clear_owned(&self, owner_pid: u32) -> Result<(), RuntimeStatusError> {

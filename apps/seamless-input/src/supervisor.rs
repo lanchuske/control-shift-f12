@@ -1,6 +1,10 @@
 use crate::{
     config::{ConfigError, ConfigStore, ConfigV1, LiveConfig, PeerConfig},
     cursor::CursorContinuity,
+    diagnostics::{
+        ClipboardObservation, DiagnosticFacts, DiagnosticSnapshot, DiscoveryObservation,
+        DisplayObservation, PairedSessionObservation, RelationshipObservation, RuntimeObservation,
+    },
     peer::{Capabilities, RemoteDisplay, decode_peer_message, encode_peer_message},
     runtime::{Runtime, RuntimeEffect, RuntimeError, apply_receive},
 };
@@ -201,6 +205,10 @@ pub struct CapabilityReport {
     pub discovery: &'static str,
     pub udp_transport: &'static str,
     pub identity: &'static str,
+    diagnostic_input: AccessState,
+    diagnostic_clipboard: ClipboardObservation,
+    diagnostic_displays: DisplayObservation,
+    diagnostic_discovery: DiscoveryObservation,
 }
 
 fn clipboard_diagnostic_label(
@@ -243,10 +251,10 @@ impl CapabilityReport {
         } else {
             "PASS (not configured)"
         };
-        let discovery = Discovery::new(VERSION)
+        let discovery_ok = Discovery::new(VERSION)
             .and_then(|mut value| value.browse(Duration::ZERO))
-            .map(|_| "PASS")
-            .unwrap_or("FAIL");
+            .is_ok();
+        let discovery = if discovery_ok { "PASS" } else { "FAIL" };
         let udp_transport = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
             .map(|_| "PASS")
             .unwrap_or("FAIL");
@@ -267,10 +275,25 @@ impl CapabilityReport {
                 platform.clipboard_access(),
             )
         };
-        let displays = match platform.displays() {
-            Ok(displays) if !displays.is_empty() => format!("PASS ({})", displays.len()),
-            Ok(_) => "FAIL (none found)".into(),
-            Err(_) => "FAIL".into(),
+        let measured_displays = platform.displays();
+        let (displays, diagnostic_displays) = match measured_displays {
+            Ok(displays) if !displays.is_empty() => (
+                format!("PASS ({})", displays.len()),
+                DisplayObservation::Measured(displays.len()),
+            ),
+            Ok(_) => ("FAIL (none found)".into(), DisplayObservation::Unavailable),
+            Err(_) => ("FAIL".into(), DisplayObservation::Unavailable),
+        };
+        let diagnostic_clipboard = if clipboard_initial == AccessState::NotDetermined {
+            ClipboardObservation::PermissionNotDetermined
+        } else if clipboard_initial == AccessState::Denied {
+            ClipboardObservation::PermissionDenied
+        } else if probe_disabled {
+            ClipboardObservation::Unavailable
+        } else if !probe_succeeded || platform.clipboard_access() != AccessState::Granted {
+            ClipboardObservation::Fault
+        } else {
+            ClipboardObservation::Ready
         };
         Self {
             config,
@@ -280,7 +303,30 @@ impl CapabilityReport {
             discovery,
             udp_transport,
             identity,
+            diagnostic_input: platform.input_access(),
+            diagnostic_clipboard,
+            diagnostic_displays,
+            diagnostic_discovery: if discovery_ok {
+                DiscoveryObservation::Ready
+            } else {
+                DiscoveryObservation::Unavailable
+            },
         }
+    }
+
+    /// Project only local, current capability measurements. This standalone
+    /// doctor invocation has no owner PID, so it must not claim a runtime or
+    /// authenticated session is currently live.
+    pub fn diagnostics(&self) -> DiagnosticSnapshot {
+        DiagnosticSnapshot::from_live(DiagnosticFacts {
+            runtime: RuntimeObservation::Missing,
+            input_access: self.diagnostic_input,
+            clipboard: self.diagnostic_clipboard,
+            displays: self.diagnostic_displays,
+            discovery: self.diagnostic_discovery,
+            relationship: RelationshipObservation::Unavailable,
+            paired_session: PairedSessionObservation::Unavailable,
+        })
     }
 }
 
