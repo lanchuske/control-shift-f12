@@ -17,6 +17,7 @@ WINDOWS_MANIFEST = ROOT / "native/windows/ControlShiftF12App/ControlShiftF12App.
 NATIVE_README = ROOT / "native/README.md"
 BOUNDARY_RECORD = ROOT / "docs/architecture/native-host-boundary.md"
 SAS_MATRIX = ROOT / "docs/architecture/discovery-sas-security-matrix.md"
+HOST_PIPE_DESIGN = ROOT / "docs/architecture/native-host-process-pipe-adapter.md"
 SAS_FRAME_FIXTURE = ROOT / "docs/fixtures/sas-display-frame-v1.json"
 NONSHIPPING_NATIVE_PATHS = frozenset(
     {
@@ -314,6 +315,24 @@ class NativeHostBoundaryTests(unittest.TestCase):
             self.assertFalse(host_request_contains_sas(request), request)
         for request in fixture["invalid_host_requests"]:
             self.assertTrue(host_request_contains_sas(request), request)
+
+    def test_native_host_pipe_design_keeps_native_source_admission_closed(self):
+        """The host plan must retain its adapter and OS-specific safety gates."""
+        design = HOST_PIPE_DESIGN.read_text()
+        required = (
+            "control_engine::run_stdio",
+            "ui_stdio_adapter::run_stdio",
+            "[absolute path to seamless-input, \"control\", \"--stdio\"]",
+            "MAX_FRAME_BYTES = 256 KiB",
+            "ui.refresh",
+            "ui.confirm_v01",
+            "terminal `sas_display_v1 current:false`",
+            "Platform-specific reader cancellation is intentionally not unified",
+            "No implementation may use this document as authority to launch a process.",
+            "no native host\nsource, build, launch, signing, packaging, or release is permitted",
+        )
+        for invariant in required:
+            self.assertIn(invariant, design)
 
     def test_every_sas_field_and_literal_is_rejected_recursively_from_host_args(self):
         """A partial display shape is still an impermissible host re-export."""

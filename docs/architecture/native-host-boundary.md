@@ -7,6 +7,11 @@ hosts. The Rust `seamless-input` executable remains the sole owner of all
 runtime, pairing, operational-session, inventory, layout, input and clipboard
 state. This document adds no runtime behavior.
 
+The planned native owner, inherited-pipe lifetime, platform-specific reader
+cancellation, main-thread handoff, and pre-enable test matrix are recorded in
+[the process-pipe adapter design](native-host-process-pipe-adapter.md). That
+record is design-only and does not admit native source or a process launch.
+
 The current internal control engine is reached only through:
 
 ```text
