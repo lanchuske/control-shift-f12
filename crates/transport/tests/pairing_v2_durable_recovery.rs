@@ -1,4 +1,4 @@
-#![cfg(all(unix, feature = "pairing-v2-experimental"))]
+#![cfg(all(any(unix, windows), feature = "pairing-v2-experimental"))]
 use seamless_transport::{
     pairing_pending::PendingStore,
     pairing_v2::{

@@ -105,7 +105,7 @@ pub fn approval(v: &serde_json::Value, role: Role) -> SessionMessage {
     )
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub fn stored_until(
     local: Role,
     last_index: usize,
@@ -118,7 +118,7 @@ pub fn stored_until(
     let (store, attempt) = populate(temp.path(), local, last_index);
     (temp, store, attempt)
 }
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub fn populate(
     root: &std::path::Path,
     local: Role,

@@ -9,7 +9,10 @@ Reference addendum: `f991802…`; independently reviewed E2E reference:
 `pairing-v2-experimental` remains default-off; no application enables it.
 No network adapter, native UI, signer/emitter, active-pin promotion, input,
 clipboard, packaging or legacy auto-pin path was added. PendingStore promotion
-still unconditionally denies. Windows persistence remains UnsupportedPlatform.
+still unconditionally denies. Windows now implements the same quarantined
+pending/journal/recovery contract behind this default-off feature, with native
+owner-only ACL, no-reparse, cross-process locking and durable-replace tests; it
+does not make the feature operational or release-eligible.
 
 ## Delivered components and interfaces
 
@@ -19,7 +22,7 @@ still unconditionally denies. Windows persistence remains UnsupportedPlatform.
 | `session.rs / BoundHello` | Exact CandidateBinding hash, connection ID/generation, TLS fingerprint, certificate/NodeId and CandidateHello→Hello field binding. Only the approved singleton [SUITE], with exact Hello equality; no multisuite negotiation or legacy fallback. |
 | `SasSession` | Full-fingerprint role ordering; only the connection initiated by A. Both commitments before any reveal; reveal/commitment and local ephemeral-key equality; both identity proofs before SAS. Local approval requires current explicit confirm(attempt,T,ui-generation,true,time). Signed/MACed approvals from both roles produce P. |
 | `journal.rs / Finalizer` | Ready A/B → Commit A → CommitAck B → Complete A. Local A Commit, local B Ack and each full FC are NeedsDurability barriers. Further frames reject while a barrier is outstanding. persist(store,CAS,clock) must succeed before advancement. Failure/ambiguity/stale CAS freezes the instance and drops keys. |
-| `PendingStore` extension | Owner-only directory-FD anchored Unix storage under the existing cross-process lock. Pending and public signed journals remain physically separate from active pins. Every operation validates ALL references, including unrelated attempts. |
+| `PendingStore` extension | Owner-only directory-FD anchored Unix storage and protected current-user Windows storage under a cross-process lock. Pending and public signed journals remain physically separate from active pins. Every operation validates ALL references, including unrelated attempts. |
 | `reconcile_pairing / RecoveryJournal` | Precommit/no journal is tombstoned. Valid own-role evidence returns RecoveryOnly, never Paired. complete_signed appends only exact remaining Ack/Complete evidence to the immutable prefix; no new human approval or signing. |
 | `recovery_authority.rs` | Typed authoritative-context port; absence/mismatch/error fail closed. Exact expected role, FC, remote accepted generations, both challenges/exporter before consumption. PendingStore supplies only LOCAL CAS/generations and durable exact-proof consumption. |
 
@@ -99,7 +102,9 @@ both nonces/exporter/deadline/revision. Compare and consume that context atomica
 with exact-proof consumption; persist consumed challenge IDs/tombstones and never
 reissue old challenges. NEVER derive remote generations from local counters.
 The test adapter supplies remote generations 91/73, different from local
-generations; it is NOT the production/global authority.
+generations; it is NOT the production/global authority. The Windows storage
+backend does not add, infer or install that provider: without an injected
+authoritative context, recovery remains unavailable and fails closed.
 
 The operational-context validator requires 32-byte random challenge nonces
 (as the design specifies) and currently 32-byte exporter output. The reviewed
@@ -143,9 +148,10 @@ exact visible revision, recovery-only/discard outcome and promotion denial.
   × process cut/error.
 
 These are real subprocess terminations and injected I/O errors around actual
-filesystem calls. NOT power loss, disk/controller cache durability, native
-Windows ACL/reparse-point behavior, actual clocks or TLS network evidence.
-Unlink/initialization-specific process cuts are not claimed by these 192 cases.
+filesystem calls. On Windows, the same schedules ran natively together with
+ACL, junction, hardlink, concurrent-CAS and reopen tests. They are NOT proof of
+hardware power-loss or disk/controller-cache durability, actual clocks or TLS
+network evidence. Unlink/initialization-specific process cuts are not claimed.
 
 ### Mutation sensitivity: 18 individually restored
 
@@ -225,5 +231,6 @@ Fresh final round-2 runs on the isolated macOS/aarch64 worktree:
 Next: independent security/code review of this isolated commit, including
 non-operational composition boundaries and the authoritative-context port.
 External crypto audit, reviewed persistent context provider, independent
-real-channel vectors, native Windows secure storage and real macOS/Windows
-interop remain mandatory before any release decision.
+real-channel vectors and real macOS/Windows interop remain mandatory before any
+release decision. This commit supplies native Windows storage evidence only; it
+does not satisfy the separate production-provider gate.

@@ -37,9 +37,9 @@ pub struct PendingRecord {
 }
 
 pub struct PendingStore {
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pending_dir: crate::private_fs::PrivateDir,
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     ledger_dir: crate::private_fs::PrivateDir,
 }
 
@@ -51,7 +51,7 @@ impl PendingStore {
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 mod unix {
     use super::*;
     use crate::private_fs::PrivateDir;
@@ -634,7 +634,7 @@ mod unix {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 impl PendingStore {
     #[cfg(feature = "pairing-v2-experimental")]
     pub fn reconcile_pairing(

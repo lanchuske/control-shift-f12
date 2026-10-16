@@ -6,6 +6,9 @@ pub mod pairing_pending;
 pub mod pairing_v2;
 #[cfg(unix)]
 mod private_fs;
+#[cfg(windows)]
+#[path = "private_fs_windows.rs"]
+mod private_fs;
 pub mod quic;
 pub mod setup_lock;
 pub use identity::{IdentityStore, PinnedIdentityVerifier, PinnedPeer};

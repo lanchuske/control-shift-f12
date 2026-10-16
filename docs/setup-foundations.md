@@ -89,10 +89,18 @@ accidental mismatch between file and ledger; it does not defend against maliciou
 same-user modification of both or full-directory rollback. The trusted local
 root and its ancestor path are caller-controlled; no peer chooses those paths.
 
-Windows pending persistence returns `UnsupportedPlatform` before creating files.
-It must not be enabled until owner-only ACL, reparse-point, atomic replacement,
-locking and durability behavior has target tests. Windows control uses a local
-session mutex; this is process coordination, not a persistent security boundary.
+On Windows, the same ledger and record contract uses a physically separate
+owner-only store with a protected current-user DACL. Handles are opened without
+following the final reparse point and validate owner, exact one-ACE ACL, type,
+link count and retained directory identity. Existing insecure children are
+rejected rather than silently repaired. Writers use a cross-process byte-range
+lock, bounded reads, temporary owner-only files, `FlushFileBuffers`,
+`ReplaceFileW`/write-through move, and directory flush; any unsupported or
+ambiguous durability result fails closed. Native Windows subprocess tests cover
+CAS, one-use recovery after reopen, junctions, hardlinks, ACL widening, digest
+mismatch and each journal/ledger crash or I/O-error boundary. Windows control's
+separate local session mutex remains process coordination, not this persistence
+security boundary.
 
 ## Verification recorded on 2026-10-16
 
@@ -152,17 +160,16 @@ writers, restart after revocation and denied ledger writes. They do **not** clai
 process-kill-at-every-fsync, hardware power-loss, complete mutation coverage,
 cryptographic replay resistance, or end-to-end layout consent.
 
-The core and existing Windows adapter cross-check passed. A standalone ignored
-compile probe of the exact Windows mutex source also passed. Full Windows
-workspace cross-check stopped in the existing `ring` C build because this Mac
-lacks MSVC SDK headers (`assert.h`). Windows runtime, ACL storage and actual
-Windows display measurements are **not measured**. No CI, remote execution,
-signing, deployment or publication was performed.
+The core and existing Windows adapter cross-check passed. Pending persistence,
+durable recovery and fault injection ran natively on Windows, including real
+subprocess contention, ACL widening, junction and hardlink rejection. Display
+measurements and end-to-end pairing remain **not measured**. No CI, signing,
+deployment or publication was performed.
 
 ## Next gate
 
-Keep this branch isolated. Review the foundations and close native storage and
-inventory gaps separately. Phase 2 may be recommended against corrected reference
+Keep this branch isolated. Review the foundations and close remaining inventory
+gaps separately. Phase 2 may be recommended against corrected reference
 `03d6148fc68969099ada11c3d7c3bd6e99514ce2` after phase-1 review; it is not started
 in this delivery. Do not wire pending records into admission, invent new crypto,
 enable legacy auto-pin, or consume the rejected fixture revision. Release remains

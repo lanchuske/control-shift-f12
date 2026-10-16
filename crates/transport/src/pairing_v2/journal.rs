@@ -1,5 +1,5 @@
 //! Role-specific quarantined finalization. No promotion or runtime admission.
-#[cfg(all(test, unix))]
+#[cfg(all(test, any(unix, windows)))]
 #[path = "journal_fault_tests.rs"]
 mod fault_tests;
 use super::{
