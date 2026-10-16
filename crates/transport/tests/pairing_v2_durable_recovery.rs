@@ -286,3 +286,106 @@ fn authoritative_claim_cannot_replace_missing_local_durable_fc() {
     );
     assert_eq!(std::fs::read(path).unwrap(), before);
 }
+
+fn durable_snapshot(
+    root: &std::path::Path,
+) -> std::collections::BTreeMap<std::path::PathBuf, Vec<u8>> {
+    ["pairing-pending", "pairing-tombstones"]
+        .into_iter()
+        .flat_map(|directory| std::fs::read_dir(root.join(directory)).unwrap())
+        .map(|entry| {
+            let path = entry.unwrap().path();
+            (
+                path.strip_prefix(root).unwrap().to_owned(),
+                std::fs::read(path).unwrap(),
+            )
+        })
+        .collect()
+}
+
+// Killing the field's 32-byte guard must admit a correctly signed length-1
+// proof and make this matrix RED. Context and signed body change together, so
+// an unrelated expected-body or signature mismatch cannot mask a missing guard.
+fn rejects_operational_recovery_length_matrix(field: &str, index: usize) {
+    use seamless_transport::pairing_v2::codec::{Value, decode, encode};
+    for length in [0, 1, 31, 33, 256] {
+        let temp = tempfile::tempdir().unwrap();
+        let (authority, original_body, _) = setup(temp.path());
+        let value = vec![0x5a; length];
+        {
+            let mut guard = authority.context.lock().unwrap();
+            let context = guard.as_mut().unwrap();
+            match field {
+                "challenger_nonce" => context.expected.challenger_nonce = value.clone(),
+                "responder_nonce" => context.expected.responder_nonce = value.clone(),
+                "tls_exporter" => context.expected.tls_exporter = value.clone(),
+                _ => panic!("unknown matrix field"),
+            }
+        }
+        let mut fields = decode(
+            "recovery-proof",
+            &original_body,
+            &[3, 2, 2, 3, 2, 2, 2, 1, 1, 3],
+        )
+        .unwrap();
+        fields[index] = Value::Bytes(value);
+        // Encode the zero-length case at the canonical codec boundary too:
+        // RecoveryFields::encode itself rejects empty generic fields.
+        let body = encode("recovery-proof", &fields).unwrap();
+        let signer = ring::signature::Ed25519KeyPair::from_seed_unchecked(&[4; 32]).unwrap();
+        let signature = signer.sign(&body);
+        let version = authority.store.version().unwrap();
+        let pending = authority.store.pending(attempt()).unwrap();
+        let before = durable_snapshot(temp.path());
+        let ledger: serde_json::Value =
+            serde_json::from_slice(&before[std::path::Path::new("pairing-tombstones/ledger.json")])
+                .unwrap();
+        assert!(
+            ledger.get("recoveries").is_none(),
+            "fresh fixture has no consumed proof"
+        );
+
+        assert_eq!(
+            verify_authoritative_recovery(
+                &authority,
+                [1; 32],
+                &body,
+                signature.as_ref(),
+                1,
+                1_893_456_000
+            ),
+            Err(Invalid),
+            "operational {field} length {length} must reject"
+        );
+        assert_eq!(
+            authority.store.version().unwrap(),
+            version,
+            "{field}/{length}: CAS advanced"
+        );
+        assert_eq!(
+            authority.store.pending(attempt()).unwrap(),
+            pending,
+            "{field}/{length}: pending changed"
+        );
+        assert_eq!(
+            durable_snapshot(temp.path()),
+            before,
+            "{field}/{length}: journal/tombstone/consumption changed"
+        );
+    }
+}
+
+#[test]
+fn operational_challenger_nonce_length_matrix_rejects_without_durable_mutation() {
+    rejects_operational_recovery_length_matrix("challenger_nonce", 4);
+}
+
+#[test]
+fn operational_responder_nonce_length_matrix_rejects_without_durable_mutation() {
+    rejects_operational_recovery_length_matrix("responder_nonce", 5);
+}
+
+#[test]
+fn operational_tls_exporter_length_matrix_rejects_without_durable_mutation() {
+    rejects_operational_recovery_length_matrix("tls_exporter", 6);
+}

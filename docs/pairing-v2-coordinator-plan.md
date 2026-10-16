@@ -174,6 +174,29 @@ All produced the expected assertion failure, not merely compile failure:
 
 ## Verification / handoff
 
+### Round 2 coverage repair over 39bf613
+
+No production behavior or cryptography changed. Three independently named
+integration tests exercise `verify_authoritative_recovery` with lengths
+**0, 1, 31, 33 and 256** for each of challenger_nonce, responder_nonce and
+tls_exporter (15 cases). Each case changes the authoritative expected context
+and canonical signed body together, then signs with the correct synthetic peer
+key. An unrelated signature/context mismatch cannot hide a missing size guard.
+The empty case is constructed through the canonical codec because the generic
+RecoveryFields builder already rejects empty fields.
+
+Every case requires exactly `Err(Invalid)`, unchanged StoreVersion/pending
+record, and byte-identical snapshots of ALL files in both pending and tombstone
+directories, including the full FC journal and consumption ledger. The fixture
+starts with no consumed proof. Existing 32-byte valid-path tests remain green.
+Short reference fixtures remain exclusive to the generic verifier; no exception
+or fixture rewrite was added to the operational port.
+
+Three separate mutants remove index 4, 5 or 6 from the persisted-proof size
+checks. Each corresponding matrix becomes assertion RED at length 1 with actual
+`Ok(())` versus expected `Err(Invalid)`; production was restored byte-for-byte
+before final verification. [Round 2 captured outputs](qa/pairing-v2-phase3-r2-mutants.json).
+
 Commands (aarch64 Cargo; offline):
 
 ```text
@@ -185,16 +208,18 @@ cargo fmt --all -- --check
 git diff --check
 ```
 
-Fresh final runs on the isolated macOS/aarch64 worktree:
+Fresh final round-2 runs on the isolated macOS/aarch64 worktree:
 
 - Default workspace: **219 passed, 0 failed, 2 existing ignored subprocess helpers**.
-- Experimental workspace: **269 passed, 0 failed, the same 2 ignored helpers**.
+- Experimental workspace: **272 passed, 0 failed, the same 2 ignored helpers**.
 - Both full-workspace/all-target clippy modes: exit 0 with warnings denied.
 - Formatting and diff whitespace checks: exit 0.
-- 18/18 individual mutants: expected assertion RED, restored before final runs.
+- Original slice: 18/18 individual mutants, expected assertion RED and restored.
   Raw captured outputs: [mutation evidence](qa/pairing-v2-phase3-mutants.json).
+- Round 2: 3/3 field-size mutants, expected assertion RED and restored before
+  these final runs; 15 invalid-length cases pass with no durable mutation.
 - 192 real subprocess-cut/injected-error schedules pass as nested test cases;
-  they are not added to the 269 top-level test count.
+  they are not added to the 272 top-level test count.
 - Reference git-object and copied E2E fixture SHA256 match exactly.
 
 Next: independent security/code review of this isolated commit, including
