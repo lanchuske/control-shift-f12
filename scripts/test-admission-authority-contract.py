@@ -25,10 +25,16 @@ def validate(handshake: str, authority: str, pending: str) -> None:
     assert "use crate::identity_store::IdentityStore" not in authority
     assert ": IdentityStore" not in authority
     assert "pub(crate) async fn commit_sealed_foundation" in authority
+    assert "commit_admission_foundation<F>" not in pending
+    assert "FnMut() -> Result<(), StoreError>" not in pending
+    metadata_at = authority.find("fn commit_metadata(")
+    assert metadata_at < 0 or "#[cfg(test)]" in authority[max(0, metadata_at - 200) : metadata_at]
+    assert "pub(crate) struct SealedAdmissionCommit" in authority
+    assert "commit: crate::pairing_v2::admission_authority::SealedAdmissionCommit" in pending
     assert "active_pins: Vec<ActivePin>" in pending
     assert "consumed_attempts: Vec<[u8; 32]>" in pending
     assert "admission_receipts: Vec<AdmissionReceiptRecord>" in pending
-    commit = pending.split("fn commit_admission_foundation", 1)[1]
+    commit = pending.split("fn commit_sealed_admission", 1)[1]
     before_save = commit.split("self.save(&ledger)?", 1)[0]
     assert "ledger.active_pins.push" in before_save
     assert "ledger.consumed_attempts.push" in before_save
@@ -37,6 +43,12 @@ def validate(handshake: str, authority: str, pending: str) -> None:
     assert "record.version.identity_generation != expected.identity_generation" in commit
     assert "ledger.revocation(record.peer_fingerprint) != expected_revocation_generation" in commit
     assert "ledger.policy_revision != expected_policy_revision" in commit
+    assert "receipt.suite != crate::pairing_v2::SUITE" in pending
+    assert re.search(
+        r"receipt\.protocol_version\s*!=\s*crate::pairing_v2::admission_authority::PROTOCOL_VERSION",
+        pending,
+    )
+    assert "receipt.revision > self.version.revision" in pending
     assert "StoreError::ConsumedAttempt" in pending
 
 
@@ -60,6 +72,10 @@ def main() -> None:
         "drop-identity-cas": ("pending", "record.version.identity_generation != expected.identity_generation", "false"),
         "drop-revocation-cas": ("pending", "ledger.revocation(record.peer_fingerprint) != expected_revocation_generation", "false"),
         "drop-policy-cas": ("pending", "ledger.policy_revision != expected_policy_revision", "false"),
+        "unsealed-commit-input": ("pending", "commit: crate::pairing_v2::admission_authority::SealedAdmissionCommit", "commit: AdmissionReceiptRecord"),
+        "drop-exact-suite": ("pending", "receipt.suite != crate::pairing_v2::SUITE", "receipt.suite.is_empty()"),
+        "drop-protocol-bound": ("pending", "!= crate::pairing_v2::admission_authority::PROTOCOL_VERSION", "== 0"),
+        "drop-revision-bound": ("pending", "receipt.revision > self.version.revision", "false"),
     }
     for name, (key, old, new) in mutants.items():
         assert old in sources[key], f"mutant {name} did not match source"

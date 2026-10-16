@@ -91,6 +91,11 @@ pub enum HandshakeError {
 /// fn input_runtime_capability(_: [u8; 32]) {}
 /// fn bypass(value: HandshakeCompletePendingAuthority) { input_runtime_capability(value); }
 /// ```
+///
+/// ```compile_fail
+/// use seamless_transport::pairing_v2::admission_authority::SealedAdmissionCommit;
+/// fn inject(_: SealedAdmissionCommit) {}
+/// ```
 pub struct HandshakeCompletePendingAuthority {
     pub(super) role: Role,
     pub(super) durable_fc_hash: [u8; 32],

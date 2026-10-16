@@ -22,6 +22,7 @@ use std::sync::{
 mod handshake_io;
 #[cfg(test)]
 mod tests;
+pub(crate) use handshake_io::SealedPromotionEvidence;
 pub use handshake_io::{
     HandshakeCompletePendingAuthority, HandshakeConfig, HandshakeError, VerificationDecision,
     VerificationPrompt,

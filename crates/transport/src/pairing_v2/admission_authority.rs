@@ -3,12 +3,14 @@
 use crate::pairing_pending::{
     AdmissionReceiptRecord, PendingRecord, PendingStore, StoreError, StoreVersion,
 };
+#[cfg(test)]
+use std::cell::Cell;
 use std::path::Path;
 
 #[allow(dead_code)]
-const PROTOCOL_VERSION: u16 = 2;
+pub(crate) const PROTOCOL_VERSION: u16 = 2;
 #[allow(dead_code)]
-const POLICY_REVISION: u64 = 0;
+pub(crate) const POLICY_REVISION: u64 = 0;
 
 /// Durable metadata only. It is not an input, clipboard, topology or session capability.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -88,7 +90,9 @@ impl AdmissionAuthorityStore {
         }
     }
 
-    #[allow(dead_code)] // No product admission path is wired in this foundation phase.
+    /// Test-only synthetic entry point. Production can commit only a live sealed
+    /// handshake witness through `commit_sealed_foundation`.
+    #[cfg(test)]
     fn commit_metadata(
         &self,
         expected: StoreVersion,
@@ -107,29 +111,26 @@ impl AdmissionAuthorityStore {
         {
             return Err(StoreError::Invalid);
         }
-        let durable = AdmissionReceiptRecord {
-            attempt: evidence.attempt,
-            peer: evidence.peer,
-            peer_pin: evidence.peer_pin,
-            durable_fc_hash: evidence.fc,
-            role: evidence.role,
-            suite: evidence.suite.to_owned(),
-            protocol_version: PROTOCOL_VERSION,
-            transcript: evidence.transcript,
-            binding: evidence.binding,
-            revision: expected.revision.checked_add(1).ok_or(StoreError::Limit)?,
-            identity_generation: expected.identity_generation,
-            revocation_generation: expected_revocation_generation,
-            policy_revision: POLICY_REVISION,
-        };
-        let stored = self.store.commit_admission_foundation(
-            expected,
-            expected_revocation_generation,
-            POLICY_REVISION,
-            record,
-            durable,
-            || Ok(()),
-        )?;
+        let commit = SealedAdmissionCommit::synthetic(
+            record.clone(),
+            AdmissionReceiptRecord {
+                attempt: evidence.attempt,
+                peer: evidence.peer,
+                peer_pin: evidence.peer_pin,
+                durable_fc_hash: evidence.fc,
+                role: evidence.role,
+                suite: evidence.suite.to_owned(),
+                protocol_version: PROTOCOL_VERSION,
+                transcript: evidence.transcript,
+                binding: evidence.binding,
+                revision: expected.revision.checked_add(1).ok_or(StoreError::Limit)?,
+                identity_generation: expected.identity_generation,
+                revocation_generation: expected_revocation_generation,
+                policy_revision: POLICY_REVISION,
+            },
+            None,
+        );
+        let stored = self.store.commit_sealed_admission(expected, commit)?;
         Ok(PromotionReceipt {
             attempt: stored.attempt,
             peer: stored.peer,
@@ -148,13 +149,87 @@ impl AdmissionAuthorityStore {
         expected: StoreVersion,
         authority: super::provisional_tls::HandshakeCompletePendingAuthority,
     ) -> Result<PromotionReceipt, StoreError> {
+        let commit = SealedAdmissionCommit::from_authority(expected, authority).await?;
+        let stored = self.store.commit_sealed_admission(expected, commit)?;
+        Ok(PromotionReceipt {
+            attempt: stored.attempt,
+            peer: stored.peer,
+            peer_pin: stored.peer_pin,
+            trust_revision: stored.revision,
+            identity_generation: stored.identity_generation,
+            revocation_generation: stored.revocation_generation,
+        })
+    }
+
+    #[cfg(test)]
+    fn commit_metadata_failing_on_validation(
+        &self,
+        expected: StoreVersion,
+        record: &PendingRecord,
+        evidence: EvidenceFields,
+        fail_on: usize,
+    ) -> Result<PromotionReceipt, StoreError> {
+        let commit = SealedAdmissionCommit::synthetic(
+            record.clone(),
+            AdmissionReceiptRecord {
+                attempt: evidence.attempt,
+                peer: evidence.peer,
+                peer_pin: evidence.peer_pin,
+                durable_fc_hash: evidence.fc,
+                role: evidence.role,
+                suite: evidence.suite.to_owned(),
+                protocol_version: PROTOCOL_VERSION,
+                transcript: evidence.transcript,
+                binding: evidence.binding,
+                revision: expected.revision.checked_add(1).ok_or(StoreError::Limit)?,
+                identity_generation: expected.identity_generation,
+                revocation_generation: record.revocation_generation,
+                policy_revision: POLICY_REVISION,
+            },
+            Some(fail_on),
+        );
+        let stored = self.store.commit_sealed_admission(expected, commit)?;
+        Ok(PromotionReceipt {
+            attempt: stored.attempt,
+            peer: stored.peer,
+            peer_pin: stored.peer_pin,
+            trust_revision: stored.revision,
+            identity_generation: stored.identity_generation,
+            revocation_generation: stored.revocation_generation,
+        })
+    }
+}
+
+enum CommitWitness {
+    Live(Box<super::provisional_tls::SealedPromotionEvidence>),
+    #[cfg(test)]
+    Synthetic {
+        validations: Cell<usize>,
+        fail_on: Option<usize>,
+    },
+}
+
+/// Unforgeable move-only input to durable admission publication. Fields and
+/// constructors are private; production can obtain one only by consuming a
+/// completed bilateral handshake authority.
+pub(crate) struct SealedAdmissionCommit {
+    record: PendingRecord,
+    receipt: AdmissionReceiptRecord,
+    witness: CommitWitness,
+}
+
+impl SealedAdmissionCommit {
+    async fn from_authority(
+        expected: StoreVersion,
+        authority: super::provisional_tls::HandshakeCompletePendingAuthority,
+    ) -> Result<Self, StoreError> {
         let evidence = authority
             .seal_for_promotion()
             .await
             .map_err(|_| StoreError::Invalid)?;
         evidence.revalidate().map_err(|_| StoreError::Invalid)?;
         let fields = evidence.fields();
-        let durable = AdmissionReceiptRecord {
+        let receipt = AdmissionReceiptRecord {
             attempt: fields.record.attempt_id,
             peer: fields.record.peer_fingerprint,
             peer_pin: fields.certificate_fingerprints[1 - fields.role.index()],
@@ -169,26 +244,58 @@ impl AdmissionAuthorityStore {
             revocation_generation: fields.record.revocation_generation,
             policy_revision: POLICY_REVISION,
         };
-        let stored = self.store.commit_admission_foundation(
-            expected,
-            fields.record.revocation_generation,
-            POLICY_REVISION,
-            &fields.record,
-            durable,
-            || evidence.revalidate().map_err(|_| StoreError::Invalid),
-        )?;
-        Ok(PromotionReceipt {
-            attempt: stored.attempt,
-            peer: stored.peer,
-            peer_pin: stored.peer_pin,
-            trust_revision: stored.revision,
-            identity_generation: stored.identity_generation,
-            revocation_generation: stored.revocation_generation,
+        Ok(Self {
+            record: fields.record,
+            receipt,
+            witness: CommitWitness::Live(Box::new(evidence)),
         })
+    }
+
+    pub(crate) fn revalidate(&self) -> Result<(), StoreError> {
+        match &self.witness {
+            CommitWitness::Live(evidence) => evidence.revalidate().map_err(|_| StoreError::Invalid),
+            #[cfg(test)]
+            CommitWitness::Synthetic {
+                validations,
+                fail_on,
+            } => {
+                let next = validations.get() + 1;
+                validations.set(next);
+                if *fail_on == Some(next) {
+                    Err(StoreError::Invalid)
+                } else {
+                    Ok(())
+                }
+            }
+        }
+    }
+
+    pub(crate) fn record(&self) -> &PendingRecord {
+        &self.record
+    }
+
+    pub(crate) fn receipt(&self) -> &AdmissionReceiptRecord {
+        &self.receipt
+    }
+
+    #[cfg(test)]
+    fn synthetic(
+        record: PendingRecord,
+        receipt: AdmissionReceiptRecord,
+        fail_on: Option<usize>,
+    ) -> Self {
+        Self {
+            record,
+            receipt,
+            witness: CommitWitness::Synthetic {
+                validations: Cell::new(0),
+                fail_on,
+            },
+        }
     }
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 struct EvidenceFields {
     attempt: [u8; 32],
     peer: [u8; 32],
@@ -377,6 +484,53 @@ mod tests {
     }
 
     #[test]
+    fn downgraded_or_impossible_receipt_fails_closed_on_reopen() {
+        for (field, replacement) in [
+            ("suite", serde_json::json!("legacy-suite")),
+            ("protocol_version", serde_json::json!(99)),
+            ("revision", serde_json::json!(u64::MAX)),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let store = AdmissionAuthorityStore::open(root.path()).unwrap();
+            let record = store
+                .prepare(store.version().unwrap(), [71; 32], [72; 32])
+                .unwrap();
+            store
+                .commit_metadata(store.version().unwrap(), 0, &record, evidence(&record))
+                .unwrap();
+            let ledger_path = root.path().join("pairing-tombstones/ledger.json");
+            let mut ledger: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&ledger_path).unwrap()).unwrap();
+            ledger["admission_receipts"][0][field] = replacement;
+            std::fs::write(&ledger_path, serde_json::to_vec(&ledger).unwrap()).unwrap();
+            assert!(
+                AdmissionAuthorityStore::open(root.path()).is_err(),
+                "{field}"
+            );
+        }
+    }
+
+    #[test]
+    fn fourth_late_invalidation_never_reconciles_as_promoted() {
+        let root = tempfile::tempdir().unwrap();
+        let store = AdmissionAuthorityStore::open(root.path()).unwrap();
+        let record = store
+            .prepare(store.version().unwrap(), [73; 32], [74; 32])
+            .unwrap();
+        let result = store.commit_metadata_failing_on_validation(
+            store.version().unwrap(),
+            &record,
+            evidence(&record),
+            4,
+        );
+        assert_eq!(result, Err(StoreError::Invalid));
+        assert_ne!(
+            store.reconcile(record.attempt_id).unwrap(),
+            ReconcileAdmission::Promoted
+        );
+    }
+
+    #[test]
     fn two_processes_have_exactly_one_admission_winner() {
         let root = tempfile::tempdir().unwrap();
         let store = AdmissionAuthorityStore::open(root.path()).unwrap();
@@ -424,22 +578,22 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn every_manifest_durability_boundary_fails_closed_and_reconciles() {
-        for (stage, mode) in [
-            "before_write",
-            "after_write",
-            "before_file_sync",
-            "after_file_sync",
-            "before_rename",
-            "after_rename",
-            "before_dir_sync",
-            "after_dir_sync",
-            "before_readback",
-            "after_readback",
-            "before_cleanup",
-            "after_cleanup",
+        for (stage, expected, mode) in [
+            ("before_write", ReconcileAdmission::Pending),
+            ("after_write", ReconcileAdmission::Pending),
+            ("before_file_sync", ReconcileAdmission::Pending),
+            ("after_file_sync", ReconcileAdmission::Pending),
+            ("before_rename", ReconcileAdmission::Pending),
+            ("after_rename", ReconcileAdmission::Promoted),
+            ("before_dir_sync", ReconcileAdmission::Promoted),
+            ("after_dir_sync", ReconcileAdmission::Promoted),
+            ("before_readback", ReconcileAdmission::Promoted),
+            ("after_readback", ReconcileAdmission::Promoted),
+            ("before_cleanup", ReconcileAdmission::Promoted),
+            ("after_cleanup", ReconcileAdmission::Promoted),
         ]
         .into_iter()
-        .flat_map(|stage| [(stage, "error"), (stage, "crash")])
+        .flat_map(|(stage, expected)| [(stage, expected, "error"), (stage, expected, "crash")])
         {
             let root = tempfile::tempdir().unwrap();
             let store = AdmissionAuthorityStore::open(root.path()).unwrap();
@@ -461,10 +615,11 @@ mod tests {
                 "fault stage {stage}:{mode} did not fail closed"
             );
             let reopened = AdmissionAuthorityStore::open(root.path()).unwrap();
-            assert!(matches!(
+            assert_eq!(
                 reopened.reconcile([51; 32]).unwrap(),
-                ReconcileAdmission::Pending | ReconcileAdmission::Promoted
-            ));
+                expected,
+                "{stage}:{mode}"
+            );
         }
     }
 

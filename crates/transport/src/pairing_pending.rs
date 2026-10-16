@@ -211,7 +211,13 @@ mod unix {
                     .iter()
                     .map(|receipt| receipt.attempt)
                     .collect();
+                let receipt_revisions: BTreeSet<_> = self
+                    .admission_receipts
+                    .iter()
+                    .map(|receipt| receipt.revision)
+                    .collect();
                 if receipts.len() != self.admission_receipts.len()
+                    || receipt_revisions.len() != self.admission_receipts.len()
                     || receipts != consumed
                     || self.admission_receipts.iter().any(|receipt| {
                         receipt.peer == [0; 32]
@@ -220,11 +226,24 @@ mod unix {
                             || receipt.transcript == [0; 32]
                             || receipt.binding == [0; 32]
                             || receipt.role > 1
-                            || receipt.suite.is_empty()
-                            || receipt.protocol_version == 0
+                            || receipt.suite != crate::pairing_v2::SUITE
+                            || receipt.protocol_version
+                                != crate::pairing_v2::admission_authority::PROTOCOL_VERSION
+                            || receipt.revision == 0
+                            || receipt.revision > self.version.revision
                             || receipt.identity_generation > self.version.identity_generation
+                            || receipt.policy_revision
+                                != crate::pairing_v2::admission_authority::POLICY_REVISION
                             || receipt.policy_revision != self.policy_revision
                             || receipt.revocation_generation > self.revocation(receipt.peer)
+                    })
+                    || self.active_pins.iter().any(|pin| {
+                        !self.admission_receipts.iter().any(|receipt| {
+                            receipt.peer == pin.peer
+                                && receipt.peer_pin == pin.pin
+                                && receipt.identity_generation == pin.identity_generation
+                                && receipt.revocation_generation == pin.revocation_generation
+                        })
                     })
                     || self
                         .pending
@@ -719,22 +738,19 @@ mod unix {
         /// same manifest publication under the same multiprocess lock.
         #[cfg(feature = "pairing-v2-experimental")]
         #[allow(dead_code)] // Reachable only through the disabled admission foundation.
-        pub(crate) fn commit_admission_foundation<F>(
+        pub(crate) fn commit_sealed_admission(
             &self,
             expected: StoreVersion,
-            expected_revocation_generation: u64,
-            expected_policy_revision: u64,
-            record: &PendingRecord,
-            receipt: AdmissionReceiptRecord,
-            mut revalidate: F,
-        ) -> Result<AdmissionReceiptRecord, StoreError>
-        where
-            F: FnMut() -> Result<(), StoreError>,
-        {
-            revalidate()?;
+            commit: crate::pairing_v2::admission_authority::SealedAdmissionCommit,
+        ) -> Result<AdmissionReceiptRecord, StoreError> {
+            commit.revalidate()?;
             let _lock = self.ledger_dir.lock()?;
             let mut ledger = self.load_validated_manifest()?;
-            revalidate()?;
+            commit.revalidate()?;
+            let record = commit.record();
+            let receipt = commit.receipt();
+            let expected_revocation_generation = receipt.revocation_generation;
+            let expected_policy_revision = receipt.policy_revision;
             if ledger.version != expected
                 || record.version.identity_generation != expected.identity_generation
                 || ledger.policy_revision != expected_policy_revision
@@ -787,6 +803,7 @@ mod unix {
             {
                 return Err(StoreError::Limit);
             }
+            commit.revalidate()?;
             let old_journals: Vec<_> = ledger
                 .journals
                 .iter()
@@ -814,14 +831,15 @@ mod unix {
                 .retain(|entry| entry.attempt != receipt.attempt);
             ledger.consumed_attempts.push(receipt.attempt);
             ledger.admission_receipts.push(receipt.clone());
-            revalidate()?;
+            // Final protocol check immediately precedes the single publication
+            // linearization point. No fallible protocol validation follows save.
+            commit.revalidate()?;
             self.save(&ledger)?;
             self.pending_dir.remove(&filename(receipt.attempt))?;
             for file in old_journals {
                 self.pending_dir.remove(&file)?;
             }
-            revalidate()?;
-            Ok(receipt)
+            Ok(receipt.clone())
         }
 
         #[cfg(feature = "pairing-v2-experimental")]
