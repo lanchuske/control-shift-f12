@@ -80,8 +80,19 @@ impl AdmissionAuthorityStore {
     }
 
     pub fn reconcile(&self, attempt: [u8; 32]) -> Result<ReconcileAdmission, StoreError> {
-        self.store.resolve_admission_guard(attempt)?;
-        let (pending, receipt, active) = self.store.admission_state(attempt)?;
+        let observation = self.store.resolve_admission_guard(attempt)?;
+        let mut state = self.store.admission_state(attempt)?;
+        if observation
+            .as_ref()
+            .is_some_and(|guard| !self.store.admission_guard_still_active(guard))
+        {
+            // Drop crossed the in-memory linearization point while storage was
+            // being read. Complete/retry durable revocation before interpreting
+            // the ledger; never return a stale Promoted result.
+            self.store.resolve_admission_guard(attempt)?;
+            state = self.store.admission_state(attempt)?;
+        }
+        let (pending, receipt, active) = state;
         match (pending, receipt, active) {
             (true, None, false) => Ok(ReconcileAdmission::Pending),
             (false, Some(_), true) => Ok(ReconcileAdmission::Promoted),

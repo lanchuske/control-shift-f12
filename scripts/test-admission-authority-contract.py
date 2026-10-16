@@ -39,6 +39,10 @@ def validate(handshake: str, provisional: str, authority: str, pending: str) -> 
     assert "if state.phase != ConsentPhase::Active" in provisional
     freeze_scope = provisional.split("fn freeze(&self", 1)[1].split("fn revoke(&self)", 1)[0]
     assert freeze_scope.find("revoker.arm()") < freeze_scope.find("ConsentPhase::Frozen")
+    revoke_scope = provisional.split("fn revoke(&self)", 1)[1].split("}\n}", 1)[0]
+    mark_revoking_at = revoke_scope.find("revoker.mark_revoking()")
+    revoked_at = revoke_scope.find("ConsentPhase::Revoked")
+    assert 0 <= mark_revoking_at < revoked_at
     drop_body = provisional.split("impl Drop for ProvisionalEndpoint", 1)[1].split("impl Drop for ProvisionalChannel", 1)[0]
     revoke_scope_at = drop_body.find("let revoker = self.scope.revoke()")
     revoke_store_at = drop_body.find("revoker.revoke()")
@@ -51,9 +55,23 @@ def validate(handshake: str, provisional: str, authority: str, pending: str) -> 
         pending,
     )
     resolver = pending.split("fn resolve_admission_guard", 1)[1].split("fn revoke_current", 1)[0]
-    assert "contains(&guard.token)" in resolver
+    assert "Some(AdmissionGuardPhase::Active)" in resolver
+    assert "Some(AdmissionGuardPhase::RevokingOwned)" in resolver
+    assert "return Err(StoreError::Unavailable)" in resolver
+    assert "Some(AdmissionGuardPhase::RevokingRetryable)" in resolver
     assert "armed: true" in resolver
+    assert "owns_revocation: false" in resolver
     assert "revoker.revoke()" in resolver
+    transition = pending.split("pub(crate) fn mark_revoking", 1)[1].split("pub(crate) fn revoke", 1)[0]
+    assert "revocation_guard_phases()" in transition
+    assert "AdmissionGuardPhase::RevokingOwned" in transition
+    assert "self.store" not in transition
+    retry = pending.split("fn release_for_retry", 1)[1].split("impl Drop", 1)[0]
+    assert "AdmissionGuardPhase::RevokingRetryable" in retry
+    reconciliation = authority.split("pub fn reconcile(&self", 1)[1].split("/// Test-only", 1)[0]
+    recheck_at = reconciliation.find("admission_guard_still_active")
+    interpret_at = reconciliation.find("match (pending, receipt, active)")
+    assert 0 <= recheck_at < interpret_at
     revocation = pending.split("fn revoke_current", 1)[1].split("fn reconcile_pairing", 1)[0]
     revocation_before_save = revocation.split("self.save(&ledger)?", 1)[0]
     assert "ledger.active_pins.retain(|pin| pin.peer != peer)" in revocation_before_save
@@ -116,6 +134,10 @@ def main() -> None:
         "omit-durable-drop-revocation": ("provisional", "let _revocation_result = revoker.revoke();", "let _revocation_result = Ok::<(), crate::pairing_pending::StoreError>(());"),
         "omit-revocation-guard": ("pending", "self.ledger_dir\n                .replace(&admission_guard_filename(attempt), &bytes)?;", "let _ = bytes;"),
         "consume-revocation-retry": ("pending", "armed: true", "armed: false"),
+        "drop-synchronous-revoking-transition": ("provisional", "revoker.mark_revoking();", "let _ = revoker;"),
+        "permit-concurrent-revocation-owner": ("pending", "Some(AdmissionGuardPhase::RevokingOwned) => {", "Some(AdmissionGuardPhase::Active) => {"),
+        "drop-retryable-revocation": ("pending", "revocation_guard_phases().insert(self.token, AdmissionGuardPhase::RevokingRetryable);", "revocation_guard_phases().insert(self.token, AdmissionGuardPhase::Active);"),
+        "drop-post-io-revocation-observation": ("authority", "!self.store.admission_guard_still_active(guard)", "false"),
         "frozen-retains-runtime-channel": ("handshake", "pub(crate) struct FrozenPromotionEvidence {", "pub(crate) struct FrozenPromotionEvidence {\n    channel: ProvisionalChannel,"),
         "return-before-durability": ("pending", "self.save(&ledger)?;\n            self.pending_dir.remove(&filename(receipt.attempt))?;", "return Ok(receipt.clone());\n            self.save(&ledger)?;\n            self.pending_dir.remove(&filename(receipt.attempt))?;"),
         "legacy-identity-owner": ("authority", "use std::path::Path;", "use std::path::Path;\nuse crate::identity_store::IdentityStore;"),

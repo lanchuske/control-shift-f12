@@ -321,6 +321,9 @@ impl ConsentScope {
         let Ok(mut state) = self.0.lock() else {
             return None;
         };
+        if let Some(revoker) = state.revoker.as_mut() {
+            revoker.mark_revoking();
+        }
         state.phase = ConsentPhase::Revoked;
         state.revoker.take()
     }

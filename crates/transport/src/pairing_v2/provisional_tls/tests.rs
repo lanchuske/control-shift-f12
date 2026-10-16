@@ -527,6 +527,15 @@ async fn freeze_before_endpoint_drop_is_durably_revoked_before_future_authority(
     let result = tokio::task::spawn_blocking(move || commit.join().unwrap())
         .await
         .unwrap();
+    let during_drop =
+        crate::pairing_v2::admission_authority::AdmissionAuthorityStore::open(ta.path())
+            .unwrap()
+            .reconcile(attempt);
+    assert_eq!(
+        during_drop,
+        Err(crate::pairing_pending::StoreError::Unavailable),
+        "a live endpoint owns durable revocation; concurrent reconciliation must fail closed"
+    );
     drop_pause.release();
     drop_thread.join().unwrap();
     assert!(result.is_ok());

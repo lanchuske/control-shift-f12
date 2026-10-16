@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 #[cfg(feature = "pairing-v2-experimental")]
 use std::{
-    collections::BTreeSet,
+    collections::BTreeMap,
     sync::{Mutex, OnceLock},
 };
 
@@ -74,21 +74,68 @@ pub(crate) struct AdmissionRevoker {
     attempt: [u8; 32],
     token: [u8; 32],
     armed: bool,
+    owns_revocation: bool,
 }
+
+#[cfg(feature = "pairing-v2-experimental")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AdmissionGuardPhase {
+    Active,
+    RevokingOwned,
+    RevokingRetryable,
+}
+
+#[cfg(feature = "pairing-v2-experimental")]
+pub(crate) struct AdmissionGuardObservation([u8; 32]);
 
 #[cfg(feature = "pairing-v2-experimental")]
 impl AdmissionRevoker {
     pub(crate) fn arm(&mut self) {
-        active_revocation_guard_tokens().insert(self.token);
+        revocation_guard_phases().insert(self.token, AdmissionGuardPhase::Active);
         self.armed = true;
+        self.owns_revocation = false;
+    }
+
+    pub(crate) fn mark_revoking(&mut self) -> bool {
+        if !self.armed {
+            return false;
+        }
+        if self.owns_revocation {
+            return true;
+        }
+        // This registry transition is the revocation linearization point. The
+        // mutex is never held across filesystem I/O: it only elects one durable
+        // revocation owner, so reconciliation can fail closed without deadlock.
+        let mut guards = revocation_guard_phases();
+        match guards.get(&self.token) {
+            Some(AdmissionGuardPhase::RevokingOwned) => false,
+            Some(AdmissionGuardPhase::Active | AdmissionGuardPhase::RevokingRetryable) | None => {
+                guards.insert(self.token, AdmissionGuardPhase::RevokingOwned);
+                self.owns_revocation = true;
+                true
+            }
+        }
     }
 
     pub(crate) fn revoke(&mut self) -> Result<(), StoreError> {
-        active_revocation_guard_tokens().remove(&self.token);
+        if !self.mark_revoking() {
+            return Err(StoreError::Unavailable);
+        }
+        // Ownership survives after the registry mutex is released. Durable I/O
+        // therefore runs lock-free with respect to the in-memory phase machine.
         self.store.revoke_current(self.peer)?;
         self.store.clear_admission_guard(self.attempt)?;
+        revocation_guard_phases().remove(&self.token);
         self.armed = false;
+        self.owns_revocation = false;
         Ok(())
+    }
+
+    fn release_for_retry(&mut self) {
+        if self.armed && self.owns_revocation {
+            revocation_guard_phases().insert(self.token, AdmissionGuardPhase::RevokingRetryable);
+            self.owns_revocation = false;
+        }
     }
 }
 
@@ -96,7 +143,10 @@ impl AdmissionRevoker {
 impl Drop for AdmissionRevoker {
     fn drop(&mut self) {
         if self.armed {
-            active_revocation_guard_tokens().remove(&self.token);
+            if !self.owns_revocation {
+                let _ = self.mark_revoking();
+            }
+            self.release_for_retry();
         } else {
             let _ = self.store.clear_admission_guard(self.attempt);
         }
@@ -104,14 +154,15 @@ impl Drop for AdmissionRevoker {
 }
 
 #[cfg(feature = "pairing-v2-experimental")]
-fn active_revocation_guards() -> &'static Mutex<BTreeSet<[u8; 32]>> {
-    static ACTIVE: OnceLock<Mutex<BTreeSet<[u8; 32]>>> = OnceLock::new();
-    ACTIVE.get_or_init(|| Mutex::new(BTreeSet::new()))
+fn revocation_guards() -> &'static Mutex<BTreeMap<[u8; 32], AdmissionGuardPhase>> {
+    static GUARDS: OnceLock<Mutex<BTreeMap<[u8; 32], AdmissionGuardPhase>>> = OnceLock::new();
+    GUARDS.get_or_init(|| Mutex::new(BTreeMap::new()))
 }
 
 #[cfg(feature = "pairing-v2-experimental")]
-fn active_revocation_guard_tokens() -> std::sync::MutexGuard<'static, BTreeSet<[u8; 32]>> {
-    active_revocation_guards()
+fn revocation_guard_phases()
+-> std::sync::MutexGuard<'static, BTreeMap<[u8; 32], AdmissionGuardPhase>> {
+    revocation_guards()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
@@ -457,6 +508,7 @@ mod unix {
                 attempt,
                 token,
                 armed: false,
+                owns_revocation: false,
             })
         }
 
@@ -472,18 +524,35 @@ mod unix {
         }
 
         #[cfg(feature = "pairing-v2-experimental")]
-        pub(crate) fn resolve_admission_guard(&self, attempt: [u8; 32]) -> Result<(), StoreError> {
+        pub(crate) fn resolve_admission_guard(
+            &self,
+            attempt: [u8; 32],
+        ) -> Result<Option<AdmissionGuardObservation>, StoreError> {
             let file = admission_guard_filename(attempt);
             let Some(bytes) = self.ledger_dir.read(&file, RECORD_LIMIT)? else {
-                return Ok(());
+                return Ok(None);
             };
             let guard: AdmissionRevocationGuard =
                 serde_json::from_slice(&bytes).map_err(|_| StoreError::Invalid)?;
             if guard.attempt != attempt || guard.peer == [0; 32] || guard.token == [0; 32] {
                 return Err(StoreError::Invalid);
             }
-            if active_revocation_guard_tokens().contains(&guard.token) {
-                return Ok(());
+            match revocation_guard_phases().get(&guard.token).copied() {
+                Some(AdmissionGuardPhase::Active) => {
+                    return Ok(Some(AdmissionGuardObservation(guard.token)));
+                }
+                Some(AdmissionGuardPhase::RevokingOwned) => {
+                    return Err(StoreError::Unavailable);
+                }
+                Some(AdmissionGuardPhase::RevokingRetryable) => {}
+                None => {
+                    // The guard could have been removed after the first read by
+                    // a revocation that just completed in this process. Re-read
+                    // before treating an unknown token as crash recovery.
+                    if self.ledger_dir.read(&file, RECORD_LIMIT)?.is_none() {
+                        return Ok(None);
+                    }
+                }
             }
             let mut revoker = AdmissionRevoker {
                 store: PendingStore {
@@ -494,8 +563,18 @@ mod unix {
                 attempt,
                 token: guard.token,
                 armed: true,
+                owns_revocation: false,
             };
-            revoker.revoke()
+            revoker.revoke()?;
+            Ok(None)
+        }
+
+        #[cfg(feature = "pairing-v2-experimental")]
+        pub(crate) fn admission_guard_still_active(
+            &self,
+            observation: &AdmissionGuardObservation,
+        ) -> bool {
+            revocation_guard_phases().get(&observation.0) == Some(&AdmissionGuardPhase::Active)
         }
 
         #[cfg(feature = "pairing-v2-experimental")]
