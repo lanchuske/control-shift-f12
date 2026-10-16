@@ -102,17 +102,30 @@ class Store:
         self.prepared: Optional[Certificate] = None
         self.certificate: Optional[Certificate] = None
         self.committed: Optional[tuple[str, int]] = None
+        self.transaction_state: Optional[str] = None
+        self.transaction_state_version = 0
+        self.abort_ack = False
         self.fenced = self.remote_outcome_unknown = self.finalized = False
         self.inventory_cache = self.diagnostics = True
 
     def prepare(self, cert: Certificate, other: "Store") -> None:
         assert not self.fenced and cert.valid_live(self, other)
+        assert self.transaction_state is None
         self.prepared = self.certificate = cert
+        self.transaction_state, self.transaction_state_version = "PREPARED", 1
 
     def commit(self, cert: Certificate, other: "Store") -> None:
         assert not self.fenced and self.prepared == cert and self.certificate == cert
+        assert self.transaction_state == "PREPARED" and self.transaction_state_version == 1
         assert cert.valid_live(self, other)
         self.committed, self.prepared = (cert.digest, cert.proposed), None
+        self.transaction_state, self.transaction_state_version = "COMMITTED", 2
+
+    def abort_prepare(self, cert: Certificate) -> None:
+        assert self.prepared == cert and self.certificate == cert
+        assert self.committed is None and self.transaction_state == "PREPARED"
+        assert self.transaction_state_version == 1
+        self.transaction_state, self.transaction_state_version = "ABORT_LOCKED", 2
 
     def terminal_after_bilateral_prepare(self) -> None:
         self.v01_active = False
@@ -140,10 +153,21 @@ class Store:
         self.inventory += 1
         return "confirmed_relationship"
 
+    @staticmethod
+    def proposal_event(state: str, event: str) -> str:
+        assert state in ("PROPOSAL_LOCAL", "PROPOSAL_REMOTE_REVIEW")
+        assert event in ("permission_revoke", "receipt_revoke", "timeout", "reset", "disappear")
+        if event == "receipt_revoke":
+            return "untrusted_catalogue"
+        return "confirmed_relationship"
+
     def abort_zero_cas(self, evidence: ZeroCasAbort, other: "Store") -> None:
         cert = self.certificate
         assert cert is not None and cert == other.certificate and evidence.valid(cert)
         assert self.committed is None and other.committed is None
+        assert self.transaction_state == other.transaction_state == "ABORT_LOCKED"
+        self.transaction_state, self.transaction_state_version = "ABORTED", 3
+        self.abort_ack = True
         self.prepared = self.certificate = None
         self.fenced = self.remote_outcome_unknown = False
 
@@ -188,8 +212,12 @@ def abort_bilateral(a: Store, b: Store, evidence: ZeroCasAbort) -> None:
     cert = a.certificate
     assert cert is not None and cert == b.certificate and evidence.valid(cert)
     assert a.committed is None and b.committed is None
+    assert a.transaction_state == b.transaction_state == "ABORT_LOCKED"
+    assert a.transaction_state_version == b.transaction_state_version == 2
     # Model both durable persists/verification before either delete.
     assert evidence.valid(a.certificate) and evidence.valid(b.certificate)
+    a.transaction_state, a.transaction_state_version, a.abort_ack = "ABORTED", 3, True
+    b.transaction_state, b.transaction_state_version, b.abort_ack = "ABORTED", 3, True
     a.prepared = a.certificate = None
     b.prepared = b.certificate = None
     a.fenced = a.remote_outcome_unknown = False
@@ -215,6 +243,8 @@ def main() -> None:
         "permission revocation only turns off", "Receipt/identity",
         "CSF12 layout zero-cas abort v1\\0", "abort_certificate_version",
         "asymmetric\nfinalization", "not_committed",
+        "AbortPrepare", "ABORT_LOCKED", "LAYOUT_ABORT_LOCKED", "transaction_state_version",
+        "PROPOSAL_LOCAL / PROPOSAL_REMOTE_REVIEW",
     ):
         assert phrase in text, "missing contract phrase: " + phrase
 
@@ -237,10 +267,12 @@ def main() -> None:
     # Bilateral zero-CAS evidence can clear only two prepared/no-CAS stores.
     a, b, cert = Store(), Store(), certificate("d3")
     a.prepare(cert, b); b.prepare(cert, a)
+    a.abort_prepare(cert); b.abort_prepare(cert)
     a.terminal_after_bilateral_prepare(); b.terminal_after_bilateral_prepare()
     evidence = ZeroCasAbort.for_certificate(cert)
     abort_bilateral(a, b, evidence)
     assert a.certificate is b.certificate is None and a.can_start_v01() and b.can_start_v01()
+    assert a.transaction_state == b.transaction_state == "ABORTED"
 
     # Early events are typed: permission vs receipt/identity revoke vs V01 terminal.
     for event in ("timeout", "reset", "disappear"):
@@ -249,6 +281,11 @@ def main() -> None:
     a = Store(); assert a.permission_revoke_preprepare() == "confirmed_relationship" and a.receipt == 1
     a = Store(); assert a.inventory_change_before_prepare() == "confirmed_relationship"
     a = Store(); assert a.receipt_revoke() == "untrusted_catalogue" and a.certificate is None
+    for proposal in ("PROPOSAL_LOCAL", "PROPOSAL_REMOTE_REVIEW"):
+        assert Store.proposal_event(proposal, "permission_revoke") == "confirmed_relationship"
+        assert Store.proposal_event(proposal, "receipt_revoke") == "untrusted_catalogue"
+        for event in ("timeout", "reset", "disappear"):
+            assert Store.proposal_event(proposal, event) == "confirmed_relationship"
 
     # Signature/role/epoch/binding mutations reject before prepare.
     a, b = Store(), Store()
@@ -274,6 +311,18 @@ def main() -> None:
     rejects(lambda: replace(evidence, signature_b="bad").valid(cert) or (_ for _ in ()).throw(AssertionError()))
     rejects(lambda: replace(evidence, version=2).valid(cert) or (_ for _ in ()).throw(AssertionError()))
     rejects(lambda: replace(evidence, algorithm="rsa").valid(cert) or (_ for _ in ()).throw(AssertionError()))
+
+    # Independent-store interleavings: whichever versioned transition wins blocks the other.
+    a, b, cert = Store(), Store(), certificate("race-a")
+    a.prepare(cert, b); b.prepare(cert, a); a.abort_prepare(cert)
+    rejects(lambda: a.commit(cert, b))
+    assert a.transaction_state == "ABORT_LOCKED" and a.transaction_state_version == 2
+    a, b, cert = Store(), Store(), certificate("race-b")
+    a.prepare(cert, b); b.prepare(cert, a); b.commit(cert, a)
+    rejects(lambda: b.abort_prepare(cert))
+    a.abort_prepare(cert)
+    rejects(lambda: abort_bilateral(a, b, ZeroCasAbort.for_certificate(cert)))
+    assert a.transaction_state == "ABORT_LOCKED" and b.transaction_state == "COMMITTED"
 
     # Revoke/inventory/V01 terminal after prepare fence rather than silently abort.
     a, b, cert = Store(), Store(), certificate("d4")

@@ -402,27 +402,42 @@ purges its prepared record, and makes commit impossible.
 
 1. `PrepareLayout` validates the proposal and all certificate preconditions,
    writes an immutable local **prepared** record containing the certificate
-   digest, and persists the verified certificate. Repeating the same valid
+   digest, `transaction_state=PREPARED` and `transaction_state_version=1`, and
+   persists the verified certificate. Repeating the same valid
    prepare returns that record; a different proposal/certificate for the same
    base revision rejects.
 2. `CommitLayout` re-runs every certificate guard in the same local durable
-   transaction as its CAS from base to proposed revision. It accepts only the
-   exact persisted valid certificate and marks the matching prepared record
-   committed. Repetition is idempotent only for the exact digest/revision.
-3. `AbortLayout` is legal only while neither local store has committed that
-   certificate. It marks the exact uncommitted prepared record aborted and
-   removes its placement payload. It cannot roll back a committed layout.
+   transaction as its CAS from base to proposed revision. Its atomic condition
+   includes exact certificate digest, `transaction_state=PREPARED` and the
+   expected `transaction_state_version`; its transition is
+   `PREPARED -> COMMITTED`. It accepts only the exact persisted valid
+   certificate. Repetition is idempotent only for the exact digest/revision;
+   no later acknowledgement or deletion may make an `ABORT_LOCKED` or
+   `ABORTED` record committable.
+3. `AbortPrepare` is a durable local operation scoped by that same certificate.
+   It atomically checks exact digest, `PREPARED`, expected state version and no
+   local CAS, then transitions `PREPARED -> ABORT_LOCKED` and increments the
+   version. It preserves the prepared record and placement payload while locked.
+   `AbortPrepare` and `CommitLayout` are mutually exclusive local CAS
+   transitions: if commit wins first, abort lock/signing rejects; if abort lock
+   wins first, commit rejects even if an old commit acknowledgement arrives.
+   `AbortLayout` may proceed only after both peers durably report that lock for
+   the same certificate; it never rolls back a committed layout.
 4. `ResolvePreparedOutcome` never infers a remote outcome from the absence of a
    local CAS. Once both prepares exist, any timeout, V01 reset/terminal,
    crash/restart, endpoint disappearance or lost acknowledgement marks the
    transaction `remote_outcome_unknown` and fences its base revision. Both peers
    retain the certificate/prepared evidence and disable a new V01 selection or
    new proposal at that base revision. A local CAS also fences immediately.
-5. `AbortLayout` after bilateral prepare is legal only on a durable bilateral
+5. `AbortLayout` after bilateral `AbortPrepare` is legal only on a durable bilateral
    **zero-CAS abort certificate V1** for the same commit-certificate digest.
-   It is persisted and verified on both peers before either deletes a prepared
-   record. A timeout, failed read or missing remote record is not zero-CAS
-   evidence.
+   It is persisted and verified on both peers before either executes its local
+   `ABORT_LOCKED -> ABORTED` transition or deletes ephemeral evidence. Each
+   peer emits and persists a durable abort acknowledgement. Only after both
+   acknowledgements are verified may it delete the prepared payload and
+   certificate/signatures; the `ABORTED` versioned tombstone remains to reject a
+   delayed commit. A timeout, failed read or missing remote record is not
+   zero-CAS evidence.
 6. `FinalizeLayout` runs only after both peers durably recognize the same
    committed digest/revision. It deletes the commit certificate, prepared
    record, signatures, V01 attempt, approvals and all ephemeral bindings. It
@@ -573,15 +588,24 @@ INVENTORY_CURRENT
 
 PROPOSAL_LOCAL / PROPOSAL_REMOTE_REVIEW
   -- both valid approvals --> LAYOUT_PREPARE_PENDING
-  -- cancel/reject/timeout/reset/disappear/revoke --> INVENTORY_CURRENT
+  -- cancel/reject --> INVENTORY_CURRENT
+  -- permission revoke --> CONFIRMED_RELATIONSHIP (capability off)
+  -- receipt/identity revoke --> PURGE_TO_UNTRUSTED
+  -- timeout/reset/disappear --> CONFIRMED_RELATIONSHIP
 
 LAYOUT_PREPARE_PENDING
   -- exact immutable prepares on both peers --> LAYOUT_COMMIT_PENDING
-  -- bilateral durable zero-CAS abort certificate --> purge prepared, then INVENTORY_CURRENT
+  -- each peer durable AbortPrepare lock --> LAYOUT_ABORT_LOCKED
   -- cancel/reject/timeout/reset/crash/ack-loss --> REMOTE_OUTCOME_UNKNOWN
   -- permission revoke / lease expiry / inventory change --> REMOTE_OUTCOME_UNKNOWN
   -- receipt/identity revoke --> purge peer scope, then UNTRUSTED_CATALOGUE
   -- remote revoke/identity/inventory race at CAS --> fence, capability off, REMOTE_OUTCOME_UNKNOWN
+
+LAYOUT_ABORT_LOCKED
+  -- bilateral zero-CAS certificate + both abort acknowledgements --> ABORTED tombstones, then INVENTORY_CURRENT
+  -- CommitLayout / delayed commit acknowledgement --> reject; remain locked/fenced
+  -- crash/acknowledgement loss / any remote committed evidence --> REMOTE_OUTCOME_UNKNOWN
+  -- receipt/identity revoke --> purge peer scope, then UNTRUSTED_CATALOGUE
 
 LAYOUT_COMMIT_PENDING
   -- both durable commits recognized --> FINALIZE_PENDING
@@ -643,8 +667,11 @@ close-window event is Cancel. A remote Cancel/Reject is terminal for that
 proposal but preserves the last committed layout. If a peer disappears before
 prepare, the visible result is “The other computer is unavailable; this layout
 was not saved,” and the local editable draft is discarded rather than queued.
-Before bilateral prepare, timeout, lease expiry, inventory change or local
-cancellation clears only volatile draft state. After bilateral prepare, those
+From either proposal state, permission revoke returns to the confirmed
+relationship with capability off; receipt/identity revoke purges to the
+untrusted catalogue; timeout, reset or disappearance clears the draft and
+returns to the confirmed relationship. Only explicit cancel/reject returns to
+the current inventory. After bilateral prepare, those
 same events mark the remote outcome unknown; they do **not** purge the evidence
 or permit a new proposal based on a locally absent CAS. A remote revocation is
 inherently TOCTOU: it can race the final local CAS even after the last guard
@@ -766,9 +793,13 @@ a required design test matrix, not a claim that runtime tests exist today.
 | Permission revoke before bilateral prepare | capability off; retain valid receipt and return `CONFIRMED_RELATIONSHIP` |
 | Receipt/identity revoke before bilateral prepare | purge peer scope and return `UNTRUSTED_CATALOGUE` |
 | V01 timeout/reset/disappear before bilateral prepare | clear volatile attempt and return `CONFIRMED_RELATIONSHIP` |
+| Permission revoke from either proposal state | clear draft, capability off, return `CONFIRMED_RELATIONSHIP` |
+| Receipt/identity revoke from either proposal state | purge peer scope and return `UNTRUSTED_CATALOGUE` |
+| Timeout/reset/disappear from either proposal state | discard draft and return `CONFIRMED_RELATIONSHIP` |
 | Timeout/reset/crash/ack-loss after bilateral prepare, even with local no-CAS | `REMOTE_OUTCOME_UNKNOWN`; no new V01/proposal/base reuse without bilateral zero-CAS evidence |
 | Crash/restart after prepare A/B or between commit write 1 and write 2 | old V01 is terminal; no completion from certificate; local/remote outcome is fenced/capability-off |
 | Zero-CAS digest/role/epoch/base/proposed/assertion/signature mutation | reject certificate before either prepared record is deleted |
+| AbortPrepare races CommitLayout on either peer | one versioned local transition wins; loser rejects, and no ack/delete can revive its opposite transition |
 | Crash/ack-loss after finalization on one peer | both remain fenced; neither reports ready or reuses the base until durable bilateral resolution |
 | One-sided acceptance, remote cancellation or acknowledgement loss | neither UI reports saved; no partial success |
 | Revocation, endpoint drop or inventory generation change during commit | pre-CAS purge or post-CAS fence; capability off, no replay on reconnect |
