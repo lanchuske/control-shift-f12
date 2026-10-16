@@ -43,9 +43,16 @@ enum OutboundEnqueueError {
     Closed,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct OutboundFailure {
+    peer: NodeId,
+    generation: u64,
+}
+
 struct OutboundWriter {
     sender: mpsc::Sender<Vec<u8>>,
     task: JoinHandle<()>,
+    generation: u64,
 }
 
 impl OutboundWriter {
@@ -56,7 +63,8 @@ impl OutboundWriter {
     fn spawn<F, Fut>(
         capacity: usize,
         peer: NodeId,
-        failure_tx: mpsc::UnboundedSender<NodeId>,
+        generation: u64,
+        failure_tx: mpsc::UnboundedSender<OutboundFailure>,
         mut deliver: F,
     ) -> Self
     where
@@ -67,12 +75,16 @@ impl OutboundWriter {
         let task = tokio::spawn(async move {
             while let Some(packet) = receiver.recv().await {
                 if deliver(packet).await.is_err() {
-                    let _ = failure_tx.send(peer);
+                    let _ = failure_tx.send(OutboundFailure { peer, generation });
                     break;
                 }
             }
         });
-        Self { sender, task }
+        Self {
+            sender,
+            task,
+            generation,
+        }
     }
 
     fn try_send(&self, packet: Vec<u8>) -> Result<(), OutboundEnqueueError> {
@@ -318,8 +330,9 @@ pub struct NativeSupervisor {
     sessions: BTreeMap<NodeId, PeerSession>,
     readers: BTreeMap<NodeId, JoinHandle<()>>,
     writers: BTreeMap<NodeId, OutboundWriter>,
-    outbound_failure_tx: mpsc::UnboundedSender<NodeId>,
-    outbound_failure_rx: mpsc::UnboundedReceiver<NodeId>,
+    outbound_failure_tx: mpsc::UnboundedSender<OutboundFailure>,
+    outbound_failure_rx: mpsc::UnboundedReceiver<OutboundFailure>,
+    next_writer_generation: u64,
     inbound_tx: mpsc::UnboundedSender<InboundPacket>,
     inbound_rx: mpsc::UnboundedReceiver<InboundPacket>,
     runtime: Runtime,
@@ -336,6 +349,8 @@ pub struct NativeSupervisor {
     suppress_native_apply: bool,
     #[cfg(test)]
     observed_received: Vec<crate::runtime::RuntimeReceive>,
+    #[cfg(test)]
+    observed_recovery: Vec<RuntimeEffect>,
 }
 
 impl NativeSupervisor {
@@ -392,6 +407,7 @@ impl NativeSupervisor {
             writers: BTreeMap::new(),
             outbound_failure_tx,
             outbound_failure_rx,
+            next_writer_generation: 1,
             inbound_tx,
             inbound_rx,
             runtime,
@@ -408,6 +424,8 @@ impl NativeSupervisor {
             suppress_native_apply: false,
             #[cfg(test)]
             observed_received: Vec::new(),
+            #[cfg(test)]
+            observed_recovery: Vec::new(),
         })
     }
 
@@ -571,12 +589,7 @@ impl NativeSupervisor {
             for link in &self.links {
                 link.endpoint.revoke(peer);
             }
-            self.sessions.remove(&peer);
-            self.writers.remove(&peer);
-            self.admitted.remove(&peer);
-            if let Some(task) = self.readers.remove(&peer) {
-                task.abort();
-            }
+            self.drop_peer_resources(peer, b"peer unpaired");
             let effects = self.runtime.disconnect(peer);
             self.execute_effects(effects).await?;
         }
@@ -658,9 +671,15 @@ impl NativeSupervisor {
 
     fn spawn_writer(&mut self, session: PeerSession) {
         let peer = session.peer();
+        let generation = self.next_writer_generation;
+        self.next_writer_generation = self.next_writer_generation.wrapping_add(1).max(1);
         let failure_tx = self.outbound_failure_tx.clone();
-        let writer =
-            OutboundWriter::spawn(OUTBOUND_QUEUE_CAPACITY, peer, failure_tx, move |packet| {
+        let writer = OutboundWriter::spawn(
+            OUTBOUND_QUEUE_CAPACITY,
+            peer,
+            generation,
+            failure_tx,
+            move |packet| {
                 let session = session.clone();
                 async move {
                     tokio::time::timeout(OUTBOUND_SEND_DEADLINE, session.send_packet(&packet))
@@ -668,29 +687,46 @@ impl NativeSupervisor {
                         .map_err(|_| "peer send timed out".to_owned())?
                         .map_err(|error| error.to_string())
                 }
-            });
+            },
+        );
         self.writers.insert(peer, writer);
     }
 
     fn drain_outbound_failures(&mut self) -> Result<(), SupervisorError> {
-        let mut failed = BTreeSet::new();
-        while let Ok(peer) = self.outbound_failure_rx.try_recv() {
-            failed.insert(peer);
-        }
-        for peer in failed {
-            self.isolate_peer(peer)?;
+        while let Ok(failure) = self.outbound_failure_rx.try_recv() {
+            if self
+                .writers
+                .get(&failure.peer)
+                .is_some_and(|writer| writer.generation == failure.generation)
+            {
+                self.isolate_peer(failure.peer)?;
+            }
         }
         Ok(())
     }
 
     fn isolate_peer(&mut self, peer: NodeId) -> Result<(), SupervisorError> {
+        self.drop_peer_resources(peer, b"peer isolated");
+        let recovery = self.runtime.disconnect(peer);
+        self.apply_recovery(recovery)
+    }
+
+    fn drop_peer_resources(&mut self, peer: NodeId, reason: &'static [u8]) {
+        if let Some(session) = self.sessions.get(&peer) {
+            session.close(reason);
+        }
         self.sessions.remove(&peer);
         self.writers.remove(&peer);
         self.admitted.remove(&peer);
         if let Some(task) = self.readers.remove(&peer) {
             task.abort();
         }
-        for recovery in self.runtime.disconnect(peer) {
+    }
+
+    fn apply_recovery(&mut self, recovery: Vec<RuntimeEffect>) -> Result<(), SupervisorError> {
+        #[cfg(test)]
+        self.observed_recovery.extend(recovery.iter().cloned());
+        for recovery in recovery {
             match recovery {
                 RuntimeEffect::ReleaseLocal => self
                     .platform
@@ -790,14 +826,8 @@ impl NativeSupervisor {
                     }
                 }
                 PeerPacketOutcome::Isolated { recovery } => {
-                    if let Some(session) = self.sessions.remove(&inbound.peer) {
-                        session.close(b"peer packet rejected");
-                    }
-                    self.admitted.remove(&inbound.peer);
-                    if let Some(task) = self.readers.remove(&inbound.peer) {
-                        task.abort();
-                    }
-                    self.execute_effects(recovery).await?;
+                    self.drop_peer_resources(inbound.peer, b"peer packet rejected");
+                    self.apply_recovery(recovery)?;
                 }
             }
         }
@@ -1516,6 +1546,7 @@ mod capture_buffer_tests {
         let writer = OutboundWriter::spawn(
             2,
             seamless_input_core::NodeId([7; 16]),
+            1,
             failure_tx,
             |_| async { std::future::pending::<Result<(), String>>().await },
         );
@@ -1550,6 +1581,7 @@ mod capture_buffer_tests {
         let writer = OutboundWriter::spawn(
             4,
             seamless_input_core::NodeId([8; 16]),
+            1,
             failure_tx,
             move |packet| {
                 let observed = Arc::clone(&observed);
@@ -1574,6 +1606,7 @@ mod capture_buffer_tests {
         let blocked = OutboundWriter::spawn(
             1,
             seamless_input_core::NodeId([9; 16]),
+            1,
             failure_tx,
             |_| async { std::future::pending::<Result<(), String>>().await },
         );
@@ -2533,5 +2566,169 @@ mod tests {
         connect_supervisors(&mut a, &mut b).await;
         assert_eq!(a.admitted, BTreeSet::from([b_id]));
         assert_eq!(b.admitted, BTreeSet::from([a_id]));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn current_writer_failure_closes_session_cleans_tasks_and_recovers_before_readmission() {
+        let root = tempfile::tempdir().unwrap();
+        let a_paths = test_paths(root.path(), "a");
+        let b_paths = test_paths(root.path(), "b");
+        let (a_id, b_id) = pin_each_other(&a_paths, &b_paths);
+        let mut a = NativeSupervisor::bootstrap(&a_paths).unwrap();
+        let mut b = NativeSupervisor::bootstrap(&b_paths).unwrap();
+        a.suppress_native_apply = true;
+        b.suppress_native_apply = true;
+        let a_display = a.platform.displays().unwrap()[0].index;
+        let b_display = b.platform.displays().unwrap()[0].index;
+        place_remote(&a_paths, b_id, b_display, 1);
+        place_remote(&b_paths, a_id, a_display, -1);
+        a.tick().await.unwrap();
+        b.tick().await.unwrap();
+        connect_supervisors(&mut a, &mut b).await;
+
+        let session = a.sessions.get(&b_id).unwrap().clone();
+        let local_display = a.runtime.active_display();
+        let mut topology = Topology::new(Display {
+            id: local_display,
+            origin: Point { x: 0.0, y: 0.0 },
+            width: 100.0,
+            height: 100.0,
+            scale: 1.0,
+        })
+        .unwrap();
+        topology
+            .place(
+                local_display,
+                seamless_input_core::Edge::Right,
+                Display {
+                    id: DisplayId {
+                        node: b_id,
+                        index: 0,
+                    },
+                    origin: Point { x: 0.0, y: 0.0 },
+                    width: 100.0,
+                    height: 100.0,
+                    scale: 1.0,
+                },
+            )
+            .unwrap();
+        let effects = a
+            .runtime
+            .reconfigure(local_display, topology, 8_000)
+            .unwrap();
+        a.execute_effects(effects).await.unwrap();
+        let now_ms = a.started.elapsed().as_millis() as u64 + 1;
+        let effects = a
+            .runtime
+            .cross(
+                seamless_input_core::Edge::Right,
+                Point { x: 100.0, y: 50.0 },
+                now_ms,
+            )
+            .unwrap();
+        a.execute_effects(effects).await.unwrap();
+        assert_eq!(a.runtime.active_peer(), b_id);
+
+        let generation = a.next_writer_generation;
+        a.next_writer_generation += 1;
+        let timeout_writer = OutboundWriter::spawn(
+            1,
+            b_id,
+            generation,
+            a.outbound_failure_tx.clone(),
+            |_| async { Err("simulated send timeout".to_owned()) },
+        );
+        timeout_writer.try_send(vec![1]).unwrap();
+        a.writers.insert(b_id, timeout_writer);
+
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+            a.drain_outbound_failures().unwrap();
+            if !a.admitted.contains(&b_id) {
+                break;
+            }
+        }
+
+        assert!(session.is_closed(), "isolated session was not closed");
+        assert!(!a.sessions.contains_key(&b_id));
+        assert!(!a.writers.contains_key(&b_id));
+        assert!(!a.readers.contains_key(&b_id));
+        assert!(!a.admitted.contains(&b_id));
+        assert_eq!(a.runtime.active_peer(), a_id);
+        assert!(
+            a.observed_recovery
+                .iter()
+                .any(|effect| matches!(effect, RuntimeEffect::ReleaseLocal))
+        );
+        assert!(
+            a.observed_recovery
+                .iter()
+                .any(|effect| matches!(effect, RuntimeEffect::WarpLocal { .. }))
+        );
+        assert!(
+            a.links[0]
+                .endpoint
+                .sessions()
+                .iter()
+                .all(|candidate| candidate.peer() != b_id),
+            "closed endpoint session was readmitted without a new connection"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stale_writer_failure_cannot_isolate_replacement_generation() {
+        let root = tempfile::tempdir().unwrap();
+        let a_paths = test_paths(root.path(), "a");
+        let b_paths = test_paths(root.path(), "b");
+        let (_, b_id) = pin_each_other(&a_paths, &b_paths);
+        let mut a = NativeSupervisor::bootstrap(&a_paths).unwrap();
+        let mut b = NativeSupervisor::bootstrap(&b_paths).unwrap();
+        connect_supervisors(&mut a, &mut b).await;
+
+        let stale_generation = a.writers.get(&b_id).unwrap().generation;
+        let replacement = a.sessions.get(&b_id).unwrap().clone();
+        a.spawn_writer(replacement);
+        let current_generation = a.writers.get(&b_id).unwrap().generation;
+        assert_ne!(stale_generation, current_generation);
+
+        a.outbound_failure_tx
+            .send(OutboundFailure {
+                peer: b_id,
+                generation: stale_generation,
+            })
+            .unwrap();
+        a.drain_outbound_failures().unwrap();
+
+        assert!(a.admitted.contains(&b_id));
+        assert!(a.sessions.contains_key(&b_id));
+        assert_eq!(a.writers.get(&b_id).unwrap().generation, current_generation);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn rejected_peer_packet_closes_session_reader_and_writer_together() {
+        let root = tempfile::tempdir().unwrap();
+        let a_paths = test_paths(root.path(), "a");
+        let b_paths = test_paths(root.path(), "b");
+        let (_, b_id) = pin_each_other(&a_paths, &b_paths);
+        let mut a = NativeSupervisor::bootstrap(&a_paths).unwrap();
+        let mut b = NativeSupervisor::bootstrap(&b_paths).unwrap();
+        connect_supervisors(&mut a, &mut b).await;
+        let session = a.sessions.get(&b_id).unwrap().clone();
+
+        a.inbound_tx
+            .send(InboundPacket {
+                peer: b_id,
+                packet: Ok(vec![0xc1]),
+            })
+            .unwrap();
+        a.drain_inbound(a.started.elapsed().as_millis() as u64 + 1)
+            .await
+            .unwrap();
+
+        assert!(session.is_closed());
+        assert!(!a.sessions.contains_key(&b_id));
+        assert!(!a.readers.contains_key(&b_id));
+        assert!(!a.writers.contains_key(&b_id));
+        assert!(!a.admitted.contains(&b_id));
     }
 }
