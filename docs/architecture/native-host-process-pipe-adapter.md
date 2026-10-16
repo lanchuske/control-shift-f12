@@ -19,8 +19,9 @@ blocked until its own target-platform owner/tests are admitted.
 
 The UI entrypoint is admitted. In particular, only the guarded AppKit
 diagnostics source may use this document as authority to launch its fixed child
-process. A Windows diagnostics parser/test pair may validate redacted frames but
-cannot launch a process, open a pipe, or render a host. All other native source
+process. A Windows diagnostics parser/test pair and platform-neutral lifecycle
+state contract may validate redacted frames and terminal projection clearing,
+but cannot launch a process, open a pipe, or render a host. All other native source
 is admitted only after all pre-enable tests in
 [Required evidence before native source](#required-evidence-before-native-source)
 are present and passing on the actual target operating system.
