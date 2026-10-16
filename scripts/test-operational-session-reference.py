@@ -20,6 +20,7 @@ SPEC = ROOT / "docs" / "operational-session-interoperability.md"
 FIXTURE = ROOT / "crates/transport/tests/fixtures/pairing-v2/operational-session-v01.json"
 MAGIC = b"CSF12S1\x00"
 VERSION = 1
+PAIRING_RECEIPT_VERSION = 2
 ALPN = "csf12-operational/1"
 EXPORTER_LABEL = "EXPORTER-ControlShiftF12-OperationalSession-v1"
 LIMIT = 4096
@@ -102,7 +103,7 @@ def authority_view(fields: dict[str, str | int]) -> bytes:
             (1, 2, hx(str(fields["self_fingerprint_sha256_hex"]))),
             (2, 2, hx(str(fields["peer_fingerprint_sha256_hex"]))),
             (3, 3, str(fields["suite"]).encode("ascii")),
-            (4, 1, struct.pack(">Q", int(fields["protocol_version"]))),
+            (4, 1, struct.pack(">Q", int(fields["pairing_receipt_protocol_version"]))),
             (5, 1, struct.pack(">Q", int(fields["policy_revision"]))),
             (6, 1, struct.pack(">Q", int(fields["identity_generation"]))),
             (7, 1, struct.pack(">Q", int(fields["revocation_generation"]))),
@@ -220,6 +221,9 @@ def validate(vector: dict[str, object], spec: str) -> None:
     assert vector["wire_attempt_source"] == "A-csprng-32-bytes-one-use-not-durable"
     assert vector["quic_client_role"] == "A-lower-fingerprint"
     assert vector["stream_count"] == 1
+    assert vector["operational_wire_version"] == VERSION
+    assert vector["authority_view_a"]["pairing_receipt_protocol_version"] == PAIRING_RECEIPT_VERSION
+    assert vector["authority_view_b"]["pairing_receipt_protocol_version"] == PAIRING_RECEIPT_VERSION
     lease = vector["preflight_lease"]
     assert lease["stage"] == "local-view-plus-selected-tls-before-stream"
     assert lease["promotion"] == "atomic-revalidate-after-bilateral-preflight"
@@ -289,6 +293,8 @@ def validate(vector: dict[str, object], spec: str) -> None:
         "PromoteSessionLease",
         "A hash alone is never treated as evidence",
         "canonical A authority view(5 bytes≤512)",
+        "pairing_receipt_protocol_version",
+        "They are never compared for equality",
         "linearization",
     ):
         assert phrase in spec
@@ -329,6 +335,7 @@ def mutate_framed_payload_field(index: int, tag: int):
 MUTATIONS = {
     "alpn-downgrade": lambda v: v.__setitem__("alpn", "csf12-pair/2"),
     "wire-version-downgrade": lambda v: v.__setitem__("wire_version", 0),
+    "operational-wire-version-two": lambda v: v.__setitem__("wire_version", 2),
     "magic-substitution": lambda v: v.__setitem__("wire_magic_hex", "00" * 8),
     "type-substitution": record_byte(0, 10, 5),
     "direction-substitution": record_byte(0, 11, 2),
@@ -337,6 +344,8 @@ MUTATIONS = {
     "payload-oversize": lambda v: v["records_hex"].__setitem__(0, v["records_hex"][0][:32] + "00001001" + v["records_hex"][0][40:]),
     "tuple-revision-substitution": lambda v: v["authority_view_a"].__setitem__("receipt_revision", 13),
     "tuple-revocation-substitution": lambda v: v["authority_view_b"].__setitem__("revocation_generation", 4),
+    "pairing-receipt-version-one": lambda v: v["authority_view_a"].__setitem__("pairing_receipt_protocol_version", 1),
+    "pairing-receipt-version-three": lambda v: v["authority_view_b"].__setitem__("pairing_receipt_protocol_version", 3),
     "observed-leaf-substitution": lambda v: v.__setitem__("role_b_fingerprint_sha256_hex", "99" * 32),
     "exporter-label-substitution": lambda v: v.__setitem__("exporter_label", "wrong"),
     "exporter-context-substitution": lambda v: v.__setitem__("exporter_context_hex", "00"),
