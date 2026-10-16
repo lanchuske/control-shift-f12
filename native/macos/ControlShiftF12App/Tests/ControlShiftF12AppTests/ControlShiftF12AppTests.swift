@@ -45,6 +45,32 @@ final class ControlShiftF12AppTests: XCTestCase {
         XCTAssertFalse(controller.presentation.statusText.localizedCaseInsensitiveContains("session"))
     }
 
+    func testAllowedSnapshotDiagnosticsAndResponseDoNotTerminateTheChildSession() throws {
+        let child = RecordingChild()
+        let session = DiagnosticsSession(lifecycle: ChildLifecycle(child: child))
+        let snapshot = """
+        {"v":1,"kind":"ui_snapshot_v1","snapshot":{
+          "schema_version":1,"generation":1,"state":"not_started",
+          "candidates":[],"confirmed":[],"inventory":null,
+          "layout":{"state":"not_configured"},
+          "capabilities":{"input_enabled":false,"clipboard_enabled":false},
+          "diagnostics":[]
+        }}
+        """.data(using: .utf8)!
+
+        try session.receive(.data(frame(snapshot)))
+        try session.receive(.data(frame(diagnosticsPayload(generation: 2))))
+        let response = """
+        {"v":1,"kind":"ui_response_v1","id":"mac-refresh","ok":true}
+        """.data(using: .utf8)!
+        try session.receive(.data(frame(response)))
+
+        XCTAssertFalse(session.isTerminal)
+        XCTAssertFalse(session.presentation.rows.isEmpty)
+        XCTAssertEqual(session.presentation.statusText, "Running")
+        XCTAssertEqual(child.terminateCalls, 0)
+    }
+
     func testStaleGenerationAndClosedSessionNeverUpdateTheMainThreadPresentation() throws {
         let controller = DiagnosticsFrameController()
         try controller.consume(lengthPrefixed: frame(diagnosticsPayload(generation: 4)))

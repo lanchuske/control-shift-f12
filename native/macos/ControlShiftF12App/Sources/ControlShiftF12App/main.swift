@@ -113,22 +113,28 @@ final class DiagnosticsFrameController {
         guard Thread.isMainThread else { throw HostError.notOnMainThread }
         guard !isClosed else { return }
         let payload = try completePayload(from: frame)
-        let object = try strictObject(payload)
-        guard Set(object.keys) == ["v", "kind", "generation", "rows"] else {
+        let object = try JSONSerialization.jsonObject(with: payload) as? [String: Any]
+        guard let object, let kind = object["kind"] as? String else {
             throw HostError.invalidFrame
         }
-        let decoded = try JSONDecoder().decode(WireDiagnosticsFrame.self, from: payload)
-        guard decoded.v == 1, decoded.kind == "ui_diagnostics_v1" else {
-            throw HostError.invalidFrame
-        }
-        guard decoded.rows.allSatisfy(isValid) else { throw HostError.invalidFrame }
-        guard decoded.generation > highestGeneration else { return }
 
-        highestGeneration = decoded.generation
-        let rows = decoded.rows.map {
-            DiagnosticSourceRow(id: $0.id, label: $0.label, state: $0.state, detail: $0.detail)
+        switch kind {
+        case "ui_snapshot_v1":
+            // The adapter always publishes a snapshot before its separately
+            // typed diagnostics frame. This host does not render snapshots,
+            // but accepts their bounded, typed envelope so the following
+            // diagnostics frame can remain current.
+            try validateIgnoredSnapshot(object)
+        case "ui_response_v1":
+            // A successful response acknowledges the preceding bounded local
+            // request. It carries no presentation state for this diagnostics
+            // host, so it is validated and deliberately not rendered.
+            try validateIgnoredSuccessResponse(object)
+        case "ui_diagnostics_v1":
+            try consumeDiagnostics(payload: payload, object: object)
+        default:
+            throw HostError.invalidFrame
         }
-        presentation = DiagnosticsPresentation(runtime: runtimeStatus(for: rows), rows: rows)
     }
 
     func close() {
@@ -150,15 +156,43 @@ final class DiagnosticsFrameController {
         return Data(payload)
     }
 
-    private func strictObject(_ payload: Data) throws -> [String: Any] {
-        guard let object = try JSONSerialization.jsonObject(with: payload) as? [String: Any] else {
+    private func consumeDiagnostics(payload: Data, object: [String: Any]) throws {
+        let rowKeys: Set<String> = ["id", "label", "state", "detail", "action", "failure_code"]
+        guard let rawRows = object["rows"] as? [[String: Any]],
+              Set(object.keys) == ["v", "kind", "generation", "rows"],
+              rawRows.allSatisfy({ Set($0.keys) == rowKeys })
+        else { throw HostError.invalidFrame }
+        let decoded = try JSONDecoder().decode(WireDiagnosticsFrame.self, from: payload)
+        guard decoded.v == 1, decoded.kind == "ui_diagnostics_v1" else {
             throw HostError.invalidFrame
         }
-        let rowKeys: Set<String> = ["id", "label", "state", "detail", "action", "failure_code"]
-        guard let rows = object["rows"] as? [[String: Any]],
-              rows.allSatisfy({ Set($0.keys) == rowKeys })
+        guard decoded.rows.allSatisfy(isValid) else { throw HostError.invalidFrame }
+        guard decoded.generation > highestGeneration else { return }
+
+        highestGeneration = decoded.generation
+        let rows = decoded.rows.map {
+            DiagnosticSourceRow(id: $0.id, label: $0.label, state: $0.state, detail: $0.detail)
+        }
+        presentation = DiagnosticsPresentation(runtime: runtimeStatus(for: rows), rows: rows)
+    }
+
+    private func validateIgnoredSnapshot(_ object: [String: Any]) throws {
+        guard Set(object.keys) == ["v", "kind", "snapshot"],
+              let version = object["v"] as? Int,
+              version == 1,
+              object["snapshot"] is [String: Any]
         else { throw HostError.invalidFrame }
-        return object
+    }
+
+    private func validateIgnoredSuccessResponse(_ object: [String: Any]) throws {
+        guard Set(object.keys) == ["v", "kind", "id", "ok"],
+              let version = object["v"] as? Int,
+              version == 1,
+              let id = object["id"] as? String,
+              !id.isEmpty,
+              let ok = object["ok"] as? Bool,
+              ok
+        else { throw HostError.invalidFrame }
     }
 
     private func isValid(_ row: WireDiagnosticRow) -> Bool {
