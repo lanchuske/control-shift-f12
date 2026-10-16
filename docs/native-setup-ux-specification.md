@@ -412,14 +412,23 @@ purges its prepared record, and makes commit impossible.
 3. `AbortLayout` is legal only while neither local store has committed that
    certificate. It marks the exact uncommitted prepared record aborted and
    removes its placement payload. It cannot roll back a committed layout.
-4. `RecoverLayout` loads local records and a certificate digest only. It never
-   infers approval from a prepared record. V01 is terminal after a crash or
-   restart, so recovery cannot use the old certificate to complete a remote
-   commit. If no local commit occurred, it may purge/abort the local prepared
-   record. If a local CAS occurred, it remains fenced and reports
-   `LAYOUT_RECOVERY_PENDING`; a new explicitly specified protocol with fresh
-   authentication, fresh bilateral approvals and per-peer local deadlines is
-   required before any later resolution.
+4. `ResolvePreparedOutcome` never infers a remote outcome from the absence of a
+   local CAS. Once both prepares exist, any timeout, V01 reset/terminal,
+   crash/restart, endpoint disappearance or lost acknowledgement marks the
+   transaction `remote_outcome_unknown` and fences its base revision. Both peers
+   retain the certificate/prepared evidence and disable a new V01 selection or
+   new proposal at that base revision. A local CAS also fences immediately.
+5. `AbortLayout` after bilateral prepare is legal only on a durable bilateral
+   **zero-CAS abort certificate** for the same commit-certificate digest. It
+   contains both leaf identities, base/proposed revisions and two verified
+   Ed25519 statements, each asserting its local durable CAS state is exactly
+   `not_committed` for that certificate. It is persisted and verified on both
+   peers before either deletes a prepared record. A timeout, failed read or
+   missing remote record is not zero-CAS evidence.
+6. `FinalizeLayout` runs only after both peers durably recognize the same
+   committed digest/revision. It deletes the commit certificate, prepared
+   record, signatures, V01 attempt, approvals and all ephemeral bindings. It
+   retains only the minimal committed layout record described above.
 
 The sender and receiver each prepare locally first. Only then may the reviewed
 post-V01 application contract exchange prepared acknowledgements and create the
@@ -429,16 +438,17 @@ but before the other responds, the user-facing state is **“Layout saving was
 interrupted”**, never `LAYOUT_COMMITTED`. The local UI is read-only for that
 proposal and does not enable sharing.
 
-After any unilateral CAS, recovery is conservatively fenced. It cannot finish
-the old certificate because that V01 attempt is terminal; it cannot create a
-newer proposal revision, reuse the revision, reinterpret prepared as approval,
-or abort a side that has already committed. A reconnect always loads the latest
-receipts, layout revisions and fence state, creates a new V01 attempt and never
-carries SAS/approval/certificate authority into it. A future resolution protocol
-must define fresh authentication, two new local approvals, per-peer local
-deadlines and how it proves/repairs the old revision without weakening the
-fence. A prepared record and certificate are internal recovery artifacts, not
-layout data a user can edit, export or restore from a shared backup.
+After any unilateral CAS, or any unknown remote outcome after bilateral
+prepare, recovery is conservatively fenced. It cannot finish the old
+certificate because that V01 attempt is terminal; it cannot create a newer
+proposal revision, reuse the revision, reinterpret prepared as approval, or
+abort without the durable bilateral zero-CAS certificate. A reconnect cannot
+start a fresh V01 session while that transaction fence exists. A future
+resolution protocol must define fresh authentication, two new local approvals,
+per-peer local deadlines and how it proves/repairs the old revision without
+weakening the fence. A prepared record and certificate are internal recovery
+artifacts, retained only while fenced; they are not layout data a user can edit,
+export or restore from a shared backup.
 
 ## Screen 5: bilateral preview and durable resolution
 
@@ -522,19 +532,30 @@ PROPOSAL_LOCAL / PROPOSAL_REMOTE_REVIEW
 
 LAYOUT_PREPARE_PENDING
   -- exact immutable prepares on both peers --> LAYOUT_COMMIT_PENDING
-  -- cancel/reject before CAS --> purge prepared, then INVENTORY_CURRENT
-  -- permission revoke / lease expiry / inventory change before CAS --> purge prepared, then CONFIRMED_RELATIONSHIP
-  -- receipt/identity revoke before CAS --> purge prepared and peer scope, then UNTRUSTED_CATALOGUE
-  -- remote revoke/identity/inventory race at CAS --> fence, capability off, LAYOUT_RECOVERY_PENDING
+  -- bilateral durable zero-CAS abort certificate --> purge prepared, then INVENTORY_CURRENT
+  -- cancel/reject/timeout/reset/crash/ack-loss --> REMOTE_OUTCOME_UNKNOWN
+  -- permission revoke / lease expiry / inventory change --> REMOTE_OUTCOME_UNKNOWN
+  -- receipt/identity revoke --> purge peer scope, then UNTRUSTED_CATALOGUE
+  -- remote revoke/identity/inventory race at CAS --> fence, capability off, REMOTE_OUTCOME_UNKNOWN
 
 LAYOUT_COMMIT_PENDING
-  -- exact durable resolution on both peers --> LAYOUT_COMMITTED
-  -- crash/acknowledgement loss / remote TOCTOU revoke --> fence, capability off, LAYOUT_RECOVERY_PENDING
-  -- abort only before any commit --> INVENTORY_CURRENT
+  -- both durable commits recognized --> FINALIZE_PENDING
+  -- crash/acknowledgement loss / remote TOCTOU revoke --> fence, capability off, REMOTE_OUTCOME_UNKNOWN
+  -- abort only with bilateral durable zero-CAS certificate --> INVENTORY_CURRENT
+
+FINALIZE_PENDING
+  -- both finalizations acknowledge deletion of ephemeral material --> LAYOUT_COMMITTED
+  -- crash/acknowledgement loss --> REMOTE_OUTCOME_UNKNOWN
+
+REMOTE_OUTCOME_UNKNOWN
+  -- bilateral durable zero-CAS abort certificate --> purge prepared, then CONFIRMED_RELATIONSHIP
+  -- local/remote CAS evidence or missing evidence --> LAYOUT_RECOVERY_PENDING
+  -- no new V01, proposal or base-revision reuse --> REMOTE_OUTCOME_UNKNOWN
 
 LAYOUT_RECOVERY_PENDING
-  -- no local CAS --> purge local prepared/certificate, then CONFIRMED_RELATIONSHIP
+  -- bilateral durable zero-CAS abort certificate --> purge prepared, then CONFIRMED_RELATIONSHIP
   -- local CAS / missing or fenced certificate --> remain fenced, capability off
+  -- no new V01, proposal or base-revision reuse --> LAYOUT_RECOVERY_PENDING
   -- new recovery protocol with fresh authentication + both approvals --> outside this specification
 
 LAYOUT_COMMITTED
@@ -561,19 +582,29 @@ identity failure, which first purges that relationship and returns to
 `UNTRUSTED_CATALOGUE`. The UI never chooses a different candidate, legacy
 address, alternative ALPN or bootstrap shortcut as a preflight retry.
 
+This preflight rule applies only before bilateral layout prepare. Once both
+prepares exist, V01 timeout/reset is not a harmless return to
+`CONFIRMED_RELATIONSHIP`: it creates `REMOTE_OUTCOME_UNKNOWN`, blocks fresh V01
+and new proposals for the fenced base revision, and waits for durable bilateral
+zero-CAS evidence or a future reviewed recovery protocol. Receipt/identity
+revocation is always stronger than an unknown transaction: it purges the peer
+scope and returns to `UNTRUSTED_CATALOGUE`; permission revocation only turns off
+capability and retains a valid receipt.
+
 `PROPOSAL_LOCAL` and `PROPOSAL_REMOTE_REVIEW` hold no durable approval. A
 close-window event is Cancel. A remote Cancel/Reject is terminal for that
 proposal but preserves the last committed layout. If a peer disappears before
 prepare, the visible result is “The other computer is unavailable; this layout
 was not saved,” and the local editable draft is discarded rather than queued.
-Before CAS, timeout, lease expiry, inventory change or local cancellation purges
-the prepared certificate and returns to the safe state shown above. A remote
-revocation is inherently TOCTOU: it can race the final local CAS even after the
-last guard check. Therefore any post-prepare uncertainty, including a remote
-revocation report, is `LAYOUT_RECOVERY_PENDING`, remote control stays off, and
-the prior layout cannot be presented as newly ready. A reconnect starts a fresh
-V01 attempt from `CONFIRMED_RELATIONSHIP`, but a fenced prior certificate stays
-fenced; the fresh attempt cannot reuse its revision or approvals.
+Before bilateral prepare, timeout, lease expiry, inventory change or local
+cancellation clears only volatile draft state. After bilateral prepare, those
+same events mark the remote outcome unknown; they do **not** purge the evidence
+or permit a new proposal based on a locally absent CAS. A remote revocation is
+inherently TOCTOU: it can race the final local CAS even after the last guard
+check. Therefore any post-prepare uncertainty, including a remote revocation
+report, is fenced/capability-off and the prior layout cannot be presented as
+newly ready. A reconnect cannot start a fresh V01 attempt while the fence
+exists, and cannot reuse the revision or approvals.
 
 ## Error and recovery matrix
 
@@ -631,6 +662,18 @@ privacy state: discovery may remain visible, but the prior relationship and
 layout cannot be used or resurrected. A future backup/restore feature requires
 its own encrypted, per-user, consented design; it is not implied here.
 
+On a successful bilateral commit recognition, `FinalizeLayout` verifies that
+both peers durably report the same committed digest/revision, then verifiably
+deletes the commit certificate, prepared record, both signature values, V01
+attempt, preconfirm binding, approvals and all volatile session material. It
+retains only the minimal committed record. A local finalization without the
+remote recognition acknowledgement is not success: it keeps the certificate
+bundle in the fenced outcome state. Certificate/prepared/signature/approval
+material is therefore retained only to support a fence, and is purged on
+receipt revoke, unpair or identity change. The deletion verifier must fail if
+any of those values remains in the local transaction record, UI cache,
+diagnostics or export after a recognized finalization/purge.
+
 ## Accessibility and platform behavior
 
 - AppKit: use VoiceOver labels for each monitor with owner, display number,
@@ -666,11 +709,13 @@ a required design test matrix, not a claim that runtime tests exist today.
 | Placement overlaps, omits a display, duplicates one, or loses cardinal touch | geometry validation rejects before approval |
 | Base revision stale or proposed revision not `base + 1` | CAS/revision validation rejects before durable write |
 | Missing/mismatched certificate, wrong signature/role, one approval, receipt epoch or V01 binding | rejected before persistence and again atomically before each CAS |
-| Certificate inventory generation/revocation/V01 lease terminal after prepare | certificate fenced, prepared payload purged, CAS rejected |
-| Crash/restart after prepare A/B or between commit write 1 and write 2 | old V01 is terminal; no completion from certificate; post-CAS state remains fenced/capability-off |
+| Certificate inventory generation/revocation/V01 lease terminal before bilateral prepare | typed event: receipt/identity purge to catalogue; otherwise return confirmed relationship |
+| Timeout/reset/crash/ack-loss after bilateral prepare, even with local no-CAS | `REMOTE_OUTCOME_UNKNOWN`; no new V01/proposal/base reuse without bilateral zero-CAS evidence |
+| Crash/restart after prepare A/B or between commit write 1 and write 2 | old V01 is terminal; no completion from certificate; local/remote outcome is fenced/capability-off |
 | One-sided acceptance, remote cancellation or acknowledgement loss | neither UI reports saved; no partial success |
 | Revocation, endpoint drop or inventory generation change during commit | pre-CAS purge or post-CAS fence; capability off, no replay on reconnect |
 | Revoke/unpair/identity change leaves layout/inventory cache or diagnostic copy | deletion check fails closed; relationship remains unusable |
+| Successful bilateral recognition leaves certificate/signature/attempt/approval | finalization deletion check fails; layout not reported ready |
 
 The static verifier must mutate the actual canonical proposal bytes and framed
 state fixture, recompute framing where necessary, and assert the named stage.
