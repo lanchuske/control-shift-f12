@@ -1,6 +1,6 @@
 //! Pure, deterministic presentation projection for a local native host.
 
-use crate::ui_contract::{DiagnosticId, DiagnosticState, UiSnapshot, UiState};
+use crate::ui_contract::{DiagnosticDetail, DiagnosticId, DiagnosticState, UiSnapshot, UiState};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UiView {
@@ -11,10 +11,18 @@ pub struct UiView {
 }
 
 pub fn project(snapshot: &UiSnapshot) -> UiView {
-    let runtime_not_running = snapshot
+    let current_runtime_passes = snapshot
         .diagnostics
         .iter()
-        .any(|row| row.id == DiagnosticId::Runtime && row.state != DiagnosticState::Pass);
+        .filter(|row| {
+            row.id == DiagnosticId::Runtime
+                && row.state == DiagnosticState::Pass
+                && row.detail == DiagnosticDetail::Ready
+        })
+        .count();
+    // Missing, duplicate, stale or non-PASS runtime rows are all ambiguous.
+    // A host must render ambiguity as not running, never as a usable action.
+    let runtime_not_running = current_runtime_passes != 1;
     let fenced = matches!(
         snapshot.state,
         UiState::RemoteOutcomeUnknown | UiState::LayoutRecoveryPending | UiState::Blocked
@@ -27,6 +35,7 @@ pub fn project(snapshot: &UiSnapshot) -> UiView {
         can_edit_layout: matches!(
             snapshot.state,
             UiState::InventoryCurrent | UiState::ProposalLocal
-        ) && !fenced,
+        ) && !fenced
+            && !runtime_not_running,
     }
 }

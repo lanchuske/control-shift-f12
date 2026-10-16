@@ -45,6 +45,28 @@ fn enter_v01(controller: &mut UiController) {
     }));
 }
 
+fn runtime_pass() -> DiagnosticRow {
+    DiagnosticRow {
+        id: DiagnosticId::Runtime,
+        label: DiagnosticLabel::Runtime,
+        state: DiagnosticState::Pass,
+        detail: DiagnosticDetail::Ready,
+        action: None,
+        failure_code: None,
+    }
+}
+
+fn inventory_controller() -> UiController {
+    let mut controller = confirmed_controller();
+    enter_v01(&mut controller);
+    controller
+        .apply_local_at(29_999, UiCommand::ConfirmV01 { matches: true })
+        .unwrap();
+    controller.on_runtime_at(29_999, UiRuntimeEvent::PeerConfirmed);
+    assert_eq!(controller.snapshot().state, UiState::InventoryCurrent);
+    controller
+}
+
 #[test]
 fn legal_local_route_keeps_capabilities_off() {
     let mut controller = controller();
@@ -118,6 +140,72 @@ fn v01_deadline_and_cancel_clear_volatile_state_without_extending_it() {
     controller.apply_local(UiCommand::Cancel).unwrap();
     assert_eq!(controller.snapshot().state, UiState::ConfirmedRelationship);
     assert!(controller.snapshot().v01.is_none());
+}
+
+#[test]
+fn decisive_commands_and_runtime_events_expire_v01_at_exact_deadline_without_a_tick() {
+    let mut confirm_controller = confirmed_controller();
+    enter_v01(&mut confirm_controller);
+    assert_eq!(
+        confirm_controller.apply_local_at(30_000, UiCommand::ConfirmV01 { matches: true }),
+        Err(UiError::InvalidState)
+    );
+    assert_eq!(
+        confirm_controller.snapshot().state,
+        UiState::ConfirmedRelationship
+    );
+    assert!(confirm_controller.snapshot().v01.is_none());
+
+    let mut peer_controller = confirmed_controller();
+    enter_v01(&mut peer_controller);
+    peer_controller
+        .apply_local_at(29_999, UiCommand::ConfirmV01 { matches: true })
+        .unwrap();
+    peer_controller.on_runtime_at(30_000, UiRuntimeEvent::PeerConfirmed);
+    assert_eq!(
+        peer_controller.snapshot().state,
+        UiState::ConfirmedRelationship
+    );
+    assert!(peer_controller.snapshot().v01.is_none());
+}
+
+#[test]
+fn invalid_v01_runtime_fact_is_rejected_before_snapshot_storage() {
+    let mut controller = confirmed_controller();
+    controller.apply_local(UiCommand::BeginV01).unwrap();
+    controller.on_runtime(UiRuntimeEvent::V01SasReady(V01View {
+        code: SasCode::try_from(vec!["42".to_owned(), "71".to_owned()]).unwrap(),
+        remaining: RemainingDuration::Seconds(0),
+    }));
+
+    assert_eq!(controller.snapshot().state, UiState::ConfirmedRelationship);
+    assert!(controller.snapshot().v01.is_none());
+    assert!(controller.snapshot().validate().is_ok());
+}
+
+#[test]
+fn projection_requires_one_current_runtime_pass_before_any_actions() {
+    let cases = [
+        vec![],
+        vec![runtime_pass(), runtime_pass()],
+        vec![DiagnosticRow {
+            id: DiagnosticId::Runtime,
+            label: DiagnosticLabel::Runtime,
+            state: DiagnosticState::Unknown,
+            detail: DiagnosticDetail::Stale,
+            action: None,
+            failure_code: None,
+        }],
+    ];
+
+    for rows in cases {
+        let mut controller = inventory_controller();
+        controller.on_runtime(UiRuntimeEvent::Diagnostics(rows));
+        let view = controller.view();
+        assert!(view.runtime_not_running);
+        assert!(!view.can_start_sharing);
+        assert!(!view.can_edit_layout);
+    }
 }
 
 #[test]

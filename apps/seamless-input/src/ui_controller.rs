@@ -65,17 +65,27 @@ impl UiController {
     }
 
     pub fn advance_to(&mut self, now_ms: u64) {
-        self.now_ms = now_ms;
+        // The injected clock is monotonic: a delayed event may not rewind a
+        // deadline that was already observed by a later command.
+        self.now_ms = self.now_ms.max(now_ms);
         if self
             .v01_started_ms
-            .is_some_and(|started| now_ms.saturating_sub(started) > V01_MAX_MS)
+            .is_some_and(|started| self.now_ms.saturating_sub(started) >= V01_MAX_MS)
         {
             self.clear_v01_to_confirmed();
         }
     }
 
     pub fn apply_local(&mut self, command: UiCommand) -> Result<(), UiError> {
-        self.advance_to(self.now_ms);
+        self.apply_local_at(self.now_ms, command)
+    }
+
+    /// Applies a local command at an injected monotonic clock reading.
+    ///
+    /// A presentation host must provide its current monotonic time for every
+    /// decisive action, so a paused dialog or delayed repaint cannot extend V01.
+    pub fn apply_local_at(&mut self, now_ms: u64, command: UiCommand) -> Result<(), UiError> {
+        self.advance_to(now_ms);
         match command {
             UiCommand::RefreshDiagnostics => Ok(()),
             UiCommand::StartDiscovery if self.snapshot.state == UiState::NotStarted => {
@@ -180,6 +190,12 @@ impl UiController {
     }
 
     pub fn on_runtime(&mut self, event: UiRuntimeEvent) {
+        self.on_runtime_at(self.now_ms, event);
+    }
+
+    /// Records adapter-owned facts at an injected monotonic clock reading.
+    pub fn on_runtime_at(&mut self, now_ms: u64, event: UiRuntimeEvent) {
+        self.advance_to(now_ms);
         match event {
             UiRuntimeEvent::Candidates(candidates) if self.snapshot.state == UiState::Browsing => {
                 self.snapshot.candidates = candidates;
@@ -197,9 +213,16 @@ impl UiController {
             UiRuntimeEvent::V01SasReady(v01)
                 if self.snapshot.state == UiState::ConfirmedRelationship =>
             {
-                self.snapshot.v01 = Some(v01);
-                self.v01_started_ms = Some(self.now_ms);
-                self.snapshot.state = UiState::V01Pending;
+                // Never store a runtime-supplied presentation fact until both
+                // the fact and its resulting snapshot validate fail-closed.
+                let mut candidate = self.snapshot.clone();
+                candidate.state = UiState::V01Pending;
+                candidate.v01 = Some(v01);
+                if candidate.validate().is_ok() {
+                    self.snapshot = candidate;
+                    self.v01_started_ms = Some(self.now_ms);
+                    self.local_v01_confirmed = false;
+                }
             }
             UiRuntimeEvent::PeerConfirmed
                 if self.snapshot.state == UiState::V01Pending && self.local_v01_confirmed =>
