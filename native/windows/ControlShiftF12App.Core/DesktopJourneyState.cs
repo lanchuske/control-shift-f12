@@ -7,6 +7,7 @@ public sealed record DesktopJourneyState(
     bool CanArrangeDisplays,
     bool CanSaveLayout,
     bool CanShareInput,
+    IReadOnlyList<string> Nearby,
     string ConnectionHealth
 )
 {
@@ -17,6 +18,22 @@ public sealed record DesktopJourneyState(
         CanArrangeDisplays: false,
         CanSaveLayout: false,
         CanShareInput: false,
+        Nearby: [],
         ConnectionHealth: "Not measured"
     );
+
+    public DesktopJourneyState ReceiveCurrentNearby(IReadOnlyList<string> candidates)
+    {
+        if (!CanFindNearby || candidates.Count is 0 or > 32 || candidates.Any(candidate =>
+            string.IsNullOrWhiteSpace(candidate) || candidate.Length > 64))
+        {
+            return this;
+        }
+
+        return this with {
+            Header = "Nearby computers",
+            Nearby = candidates.ToArray(),
+            ConnectionHealth = "Not connected",
+        };
+    }
 }
