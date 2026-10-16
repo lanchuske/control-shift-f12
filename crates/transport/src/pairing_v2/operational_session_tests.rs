@@ -5,6 +5,11 @@ use super::operational_session::{
 };
 use rustls::pki_types::PrivatePkcs8KeyDer;
 use sha2::{Digest, Sha256};
+use std::{
+    io::{BufRead, BufReader, Read, Write},
+    process::{Command, Stdio},
+    time::Duration,
+};
 
 #[test]
 fn frozen_v01_records_round_trip_exactly_and_enforce_the_six_record_schedule() {
@@ -343,6 +348,133 @@ async fn v01_dynamic_attempt_fails_closed_when_revocation_wins_before_promotion(
     assert!(ra.is_err() || rb.is_err());
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn v01_dynamic_attempt_succeeds_between_two_os_processes() {
+    let (a_der, a_key) = identity_raw();
+    let a_pin: [u8; 32] = Sha256::digest(&a_der).into();
+    let (b_der, b_key, b_pin) = loop {
+        let (der, key) = identity_raw();
+        let pin: [u8; 32] = Sha256::digest(&der).into();
+        if a_pin < pin {
+            break (der, key, pin);
+        }
+    };
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--ignored",
+            "--exact",
+            "pairing_v2::operational_session_tests::operational_dynamic_process_worker",
+            "--nocapture",
+        ])
+        .env("CSF12_OPERATIONAL_WORKER", "1")
+        .env("CSF12_OPERATIONAL_CERT", hex_encode(&b_der))
+        .env("CSF12_OPERATIONAL_KEY", hex_encode(&b_key))
+        .env("CSF12_OPERATIONAL_PEER_PIN", hex_encode(&a_pin))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let mut reader = BufReader::new(stdout);
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let address = loop {
+        let mut line = String::new();
+        assert!(
+            reader.read_line(&mut line).unwrap() != 0,
+            "worker exited before ready"
+        );
+        if let Some(address) = line.trim().strip_prefix("OPERATIONAL_ADDR=") {
+            break address.parse().unwrap();
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "worker did not report an endpoint"
+        );
+    };
+
+    let root = tempfile::tempdir().unwrap();
+    let store = AdmissionAuthorityStore::open(root.path()).unwrap();
+    let record = store
+        .prepare(store.version().unwrap(), [61; 32], [62; 32])
+        .unwrap();
+    store
+        .commit_operational_test_receipt(&record, b_pin)
+        .unwrap();
+    let parent = OperationalEndpoint::bind(
+        "127.0.0.1:0".parse().unwrap(),
+        a_der,
+        PrivatePkcs8KeyDer::from(a_key).into(),
+    )
+    .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        parent
+            .connect_admitted(address, &store, record.attempt_id)
+            .await?
+            .complete()
+            .await
+    })
+    .await
+    .expect("two-process operational attempt timed out")
+    .unwrap();
+
+    let status = tokio::task::spawn_blocking(move || child.wait_with_output())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        status.status.success(),
+        "{}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    let mut remaining = String::new();
+    reader.read_to_string(&mut remaining).unwrap();
+    assert!(remaining.contains("OPERATIONAL_PASS"), "{remaining}");
+}
+
+#[test]
+#[ignore = "subprocess helper"]
+fn operational_dynamic_process_worker() {
+    if std::env::var_os("CSF12_OPERATIONAL_WORKER").is_none() {
+        return;
+    }
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let der = hex_decode(&std::env::var("CSF12_OPERATIONAL_CERT").unwrap());
+            let key = hex_decode(&std::env::var("CSF12_OPERATIONAL_KEY").unwrap());
+            let peer_pin: [u8; 32] =
+                hex_decode(&std::env::var("CSF12_OPERATIONAL_PEER_PIN").unwrap())
+                    .try_into()
+                    .unwrap();
+            let root = tempfile::tempdir().unwrap();
+            let store = AdmissionAuthorityStore::open(root.path()).unwrap();
+            let record = store
+                .prepare(store.version().unwrap(), [63; 32], [64; 32])
+                .unwrap();
+            store
+                .commit_operational_test_receipt(&record, peer_pin)
+                .unwrap();
+            let endpoint = OperationalEndpoint::bind(
+                "127.0.0.1:0".parse().unwrap(),
+                der,
+                PrivatePkcs8KeyDer::from(key).into(),
+            )
+            .unwrap();
+            println!("OPERATIONAL_ADDR={}", endpoint.local_addr().unwrap());
+            std::io::stdout().flush().unwrap();
+            endpoint
+                .accept_admitted(&store, record.attempt_id)
+                .await
+                .unwrap()
+                .complete()
+                .await
+                .unwrap();
+            println!("OPERATIONAL_PASS");
+        });
+}
+
 #[tokio::test]
 async fn v01_rejects_a_live_tls_peer_that_does_not_match_the_admitted_pin() {
     let (a_der, a_key) = identity();
@@ -359,6 +491,11 @@ async fn v01_rejects_a_live_tls_peer_that_does_not_match_the_admitted_pin() {
 }
 
 fn identity() -> (Vec<u8>, rustls::pki_types::PrivateKeyDer<'static>) {
+    let (certificate, key) = identity_raw();
+    (certificate, PrivatePkcs8KeyDer::from(key).into())
+}
+
+fn identity_raw() -> (Vec<u8>, Vec<u8>) {
     let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap();
     let mut params = rcgen::CertificateParams::default();
     params.is_ca = rcgen::IsCa::ExplicitNoCa;
@@ -368,8 +505,20 @@ fn identity() -> (Vec<u8>, rustls::pki_types::PrivateKeyDer<'static>) {
     params.key_usages = vec![rcgen::KeyUsagePurpose::DigitalSignature];
     (
         params.self_signed(&key).unwrap().der().to_vec(),
-        PrivatePkcs8KeyDer::from(key.serialize_der()).into(),
+        key.serialize_der(),
     )
+}
+
+fn hex_encode(value: &[u8]) -> String {
+    value.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn hex_decode(value: &str) -> Vec<u8> {
+    assert_eq!(value.len() % 2, 0);
+    (0..value.len())
+        .step_by(2)
+        .map(|index| u8::from_str_radix(&value[index..index + 2], 16).unwrap())
+        .collect()
 }
 
 fn raw_a(fixture: &serde_json::Value) -> Vec<u8> {

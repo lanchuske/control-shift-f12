@@ -13,6 +13,7 @@ use rand::RngCore;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use sha2::{Digest, Sha256};
 use std::{net::SocketAddr, time::Duration};
+use tokio::sync::oneshot;
 
 pub(crate) const ALPN: &[u8] = b"csf12-operational/1";
 pub(crate) const APPLICATION_ERROR: u32 = 0x4353_4612;
@@ -900,6 +901,44 @@ pub(crate) struct OperationalAttempt {
     preflight: crate::pairing_pending::OperationalPreflightLease,
 }
 
+/// Watches only for protocol-violating streams after the single V01 stream has
+/// been selected.  It never exposes either the connection or a stream handle.
+struct ExtraStreamMonitor {
+    notified: oneshot::Receiver<()>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl ExtraStreamMonitor {
+    fn new(connection: quinn::Connection) -> Self {
+        let (send, notified) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            tokio::select! {
+                result = connection.accept_bi() => {
+                    if let Ok((send, recv)) = result { drop(send); drop(recv); }
+                }
+                result = connection.accept_uni() => {
+                    if let Ok(mut recv) = result { let _ = recv.stop(APPLICATION_ERROR.into()); }
+                }
+            }
+            let _ = send.send(());
+        });
+        Self { notified, task }
+    }
+
+    fn assert_clear(&mut self) -> Result<(), Invalid> {
+        match self.notified.try_recv() {
+            Err(oneshot::error::TryRecvError::Empty) => Ok(()),
+            Ok(()) | Err(oneshot::error::TryRecvError::Closed) => Err(Invalid),
+        }
+    }
+}
+
+impl Drop for ExtraStreamMonitor {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
 impl OperationalAttempt {
     async fn new(
         channel: OperationalChannel,
@@ -985,6 +1024,7 @@ impl OperationalAttempt {
                 .await
                 .map_err(|_| Invalid)?,
         };
+        let mut extra_streams = ExtraStreamMonitor::new(self.channel.connection.clone());
         let first = if self.role == Role::A {
             record(
                 0,
@@ -1007,6 +1047,7 @@ impl OperationalAttempt {
                 .await
                 .map_err(|_| Invalid)?;
         }
+        extra_streams.assert_clear()?;
         let a = preflight_open(&first)?;
         if self.role == Role::B {
             attempt = a.attempt;
@@ -1043,6 +1084,7 @@ impl OperationalAttempt {
                 .await
                 .map_err(|_| Invalid)?;
         }
+        extra_streams.assert_clear()?;
         let b = preflight_accept(&second)?;
         if self.role == Role::A {
             nonce_b = b.nonce_b;
@@ -1078,6 +1120,7 @@ impl OperationalAttempt {
         if self.role == Role::A {
             send.write_all(&open.encode()?).await.map_err(|_| Invalid)?;
         }
+        extra_streams.assert_clear()?;
         let accept = if self.role == Role::B {
             record(
                 3,
@@ -1099,6 +1142,7 @@ impl OperationalAttempt {
                 .await
                 .map_err(|_| Invalid)?;
         }
+        extra_streams.assert_clear()?;
         let prior = hash(accept.payload());
         let ca = confirmation(&key, Role::A, attempt, session, prior)?;
         let confirm_a = if self.role == Role::A {
@@ -1121,6 +1165,7 @@ impl OperationalAttempt {
                 .await
                 .map_err(|_| Invalid)?;
         }
+        extra_streams.assert_clear()?;
         let prior_b = hash(confirm_a.payload());
         let cb = confirmation(&key, Role::B, attempt, session, prior_b)?;
         let confirm_b = if self.role == Role::B {
@@ -1143,6 +1188,7 @@ impl OperationalAttempt {
                 .await
                 .map_err(|_| Invalid)?;
         }
+        extra_streams.assert_clear()?;
         let records = vec![first, second, open, accept, confirm_a, confirm_b];
         derive_and_verify_confirmation_key(&records, exporter)?;
         final_lease.assert_current().map_err(|_| Invalid)?;
