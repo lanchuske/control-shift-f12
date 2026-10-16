@@ -151,6 +151,36 @@ def confirmation_key(vector: dict[str, object]) -> tuple[bytes, bytes]:
     return context_hash, key
 
 
+def preflight_lease_context(vector: dict[str, object], role: bytes) -> bytes:
+    assert role in (b"A", b"B")
+    view = authority_view(vector["authority_view_a" if role == b"A" else "authority_view_b"])
+    return canonical(
+        "operational-session-preflight-lease-context-v1",
+        [
+            (1, 3, ALPN.encode("ascii")),
+            (2, 3, role),
+            (3, 2, hx(vector["role_a_fingerprint_sha256_hex"])),
+            (4, 2, hx(vector["role_b_fingerprint_sha256_hex"])),
+            (5, 2, hashlib.sha256(view).digest()),
+        ],
+    )
+
+
+def preflight_lease_binding(vector: dict[str, object], role: bytes) -> bytes:
+    lease = vector["preflight_lease"]
+    output = hx(lease["a_exporter_output_hex" if role == b"A" else "b_exporter_output_hex"])
+    view = authority_view(vector["authority_view_a" if role == b"A" else "authority_view_b"])
+    return canonical(
+        "operational-session-preflight-lease-binding-v1",
+        [
+            (1, 3, role),
+            (2, 2, hashlib.sha256(view).digest()),
+            (3, 2, hashlib.sha256(preflight_lease_context(vector, role)).digest()),
+            (4, 2, hashlib.sha256(output).digest()),
+        ],
+    )
+
+
 def mac(key: bytes, role: bytes, attempt: bytes, session: bytes, prior: bytes) -> bytes:
     return hmac.new(key, b"CSF12 operational session confirm v1\x00" + role + attempt + session + prior, hashlib.sha256).digest()
 
@@ -190,12 +220,17 @@ def validate(vector: dict[str, object], spec: str) -> None:
     assert vector["wire_attempt_source"] == "A-csprng-32-bytes-one-use-not-durable"
     assert vector["quic_client_role"] == "A-lower-fingerprint"
     assert vector["stream_count"] == 1
+    lease = vector["preflight_lease"]
+    assert lease["stage"] == "local-view-plus-selected-tls-before-stream"
+    assert lease["promotion"] == "atomic-revalidate-after-bilateral-preflight"
+    assert lease["exporter_label"] == "EXPORTER-ControlShiftF12-OperationalPreflightLease-v1"
     assert hx(vector["role_a_fingerprint_sha256_hex"]) < hx(vector["role_b_fingerprint_sha256_hex"])
     a_view, b_view = authority_view(vector["authority_view_a"]), authority_view(vector["authority_view_b"])
     assert a_view.hex() == vector["authority_commitment_a_view_hex"]
     assert b_view.hex() == vector["authority_commitment_b_view_hex"]
     assert hashlib.sha256(a_view).hexdigest() == vector["authority_view_a_sha256_hex"]
     assert hashlib.sha256(b_view).hexdigest() == vector["authority_view_b_sha256_hex"]
+    assert len(a_view) <= 512 and len(b_view) <= 512
     assert vector["authority_view_a"]["self_fingerprint_sha256_hex"] == vector["role_a_fingerprint_sha256_hex"]
     assert vector["authority_view_a"]["peer_fingerprint_sha256_hex"] == vector["role_b_fingerprint_sha256_hex"]
     assert vector["authority_view_b"]["self_fingerprint_sha256_hex"] == vector["role_b_fingerprint_sha256_hex"]
@@ -207,6 +242,11 @@ def validate(vector: dict[str, object], spec: str) -> None:
     assert exporter_context.hex() == vector["exporter_context_hex"]
     assert hashlib.sha256(exporter_context).hexdigest() == vector["exporter_context_sha256_hex"]
     assert len(hx(vector["expected_exporter_output_hex"])) == 32
+    assert len(hx(lease["a_exporter_output_hex"])) == len(hx(lease["b_exporter_output_hex"])) == 32
+    assert preflight_lease_context(vector, b"A").hex() == lease["a_context_hex"]
+    assert preflight_lease_context(vector, b"B").hex() == lease["b_context_hex"]
+    assert preflight_lease_binding(vector, b"A").hex() == lease["a_binding_hex"]
+    assert preflight_lease_binding(vector, b"B").hex() == lease["b_binding_hex"]
     payloads = [hx(item) for item in vector["canonical_payloads_hex"]]
     records = [hx(item) for item in vector["records_hex"]]
     assert len(payloads) == len(records) == len(SCHEDULE)
@@ -229,8 +269,10 @@ def validate(vector: dict[str, object], spec: str) -> None:
         "b_confirmation_key_sha256_hex": hashlib.sha256(key).hexdigest(),
     }
     role_a, role_b = hx(vector["role_a_fingerprint_sha256_hex"]), hx(vector["role_b_fingerprint_sha256_hex"])
-    assert decoded[0] == {1:(2,attempt),2:(3,b"A"),3:(2,session),4:(2,nonce_a),5:(2,hashlib.sha256(a_view).digest()),6:(2,role_a),7:(2,role_b)}
-    assert decoded[1] == {1:(2,attempt),2:(3,b"B"),3:(2,session),4:(2,nonce_a),5:(2,nonce_b),6:(2,hashlib.sha256(b_view).digest()),7:(2,role_a),8:(2,role_b)}
+    assert decoded[0] == {1:(2,attempt),2:(3,b"A"),3:(2,session),4:(2,nonce_a),5:(2,a_view),6:(2,role_a),7:(2,role_b)}
+    assert decoded[1] == {1:(2,attempt),2:(3,b"B"),3:(2,session),4:(2,nonce_a),5:(2,nonce_b),6:(2,b_view),7:(2,role_a),8:(2,role_b)}
+    assert decode_canonical("operational-authority-view-v1", decoded[0][5][1]) == decode_canonical("operational-authority-view-v1", a_view)
+    assert decode_canonical("operational-authority-view-v1", decoded[1][6][1]) == decode_canonical("operational-authority-view-v1", b_view)
     assert decoded[2] == {1:(2,attempt),2:(3,b"A"),3:(2,session),4:(2,commitment_hash),5:(2,context_hash)}
     assert decoded[3] == {1:(2,attempt),2:(3,b"B"),3:(2,session),4:(2,hashlib.sha256(payloads[2]).digest()),5:(2,commitment_hash),6:(2,context_hash)}
     assert decoded[4] == {1:(2,attempt),2:(3,b"A"),3:(2,session),4:(2,hashlib.sha256(payloads[3]).digest()),5:(2,mac(key,b"A",attempt,session,hashlib.sha256(payloads[3]).digest()))}
@@ -238,7 +280,17 @@ def validate(vector: dict[str, object], spec: str) -> None:
     assert preconfirm_transcript(vector, records).hex() == vector["preconfirm_transcript_sha256_hex"]
     assert transcript(vector, records).hex() == vector["transcript_sha256_hex"]
     assert set(vector["negative_mutations"]) == set(MUTATIONS)
-    for phrase in ("not `csf12-pair/2`", "No downgrade", "input, clipboard, topology", "independent security/protocol review", "linearization"):
+    for phrase in (
+        "not `csf12-pair/2`",
+        "No downgrade",
+        "input, clipboard, topology",
+        "independent security/protocol review",
+        "AcquirePreflightLease",
+        "PromoteSessionLease",
+        "A hash alone is never treated as evidence",
+        "canonical A authority view(5 bytes≤512)",
+        "linearization",
+    ):
         assert phrase in spec
 
 
@@ -247,6 +299,30 @@ def record_byte(index: int, byte_index: int, replacement: int):
         raw = bytearray(hx(vector["records_hex"][index]))
         raw[byte_index] = replacement
         vector["records_hex"][index] = raw.hex()
+    return apply
+
+
+def mutate_framed_payload_field(index: int, tag: int):
+    """Mutate one canonical field inside a real frame and rebuild its header."""
+    def apply(vector: dict[str, object]) -> None:
+        message_type, direction, sequence, payload = decode_frame(hx(vector["records_hex"][index]))
+        offset = 8
+        kind_length = payload[offset]
+        offset += 1 + kind_length
+        count = struct.unpack_from(">H", payload, offset)[0]
+        offset += 2
+        mutated = bytearray(payload)
+        for _ in range(count):
+            current_tag, _value_type, length = struct.unpack_from(">HBI", payload, offset)
+            offset += 7
+            if current_tag == tag:
+                mutated[offset + length - 1] ^= 1
+                rebuilt = bytes(mutated)
+                vector["canonical_payloads_hex"][index] = rebuilt.hex()
+                vector["records_hex"][index] = frame(message_type, direction, sequence, rebuilt).hex()
+                return
+            offset += length
+        raise AssertionError(f"tag {tag} missing")
     return apply
 
 
@@ -266,8 +342,8 @@ MUTATIONS = {
     "exporter-context-substitution": lambda v: v.__setitem__("exporter_context_hex", "00"),
     "exporter-cross-connection-substitution": lambda v: v.__setitem__("expected_exporter_output_hex", "99" * 32),
     "nonce-substitution": lambda v: v.__setitem__("nonce_b_hex", "99" * 32),
-    "open-hash-substitution": lambda v: v["canonical_payloads_hex"].__setitem__(3, v["canonical_payloads_hex"][3][:-2] + "00"),
-    "confirm-mac-substitution": lambda v: v["canonical_payloads_hex"].__setitem__(4, v["canonical_payloads_hex"][4][:-2] + "00"),
+    "open-hash-substitution": mutate_framed_payload_field(3, 4),
+    "confirm-mac-substitution": mutate_framed_payload_field(4, 5),
     "one-sided-confirm": lambda v: v["records_hex"].pop(),
     "early-fin": lambda v: v["canonical_payloads_hex"].pop(),
     "extra-stream": lambda v: v.__setitem__("stream_count", 2),

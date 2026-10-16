@@ -66,8 +66,29 @@ length. At most six records and 24,576 payload bytes are accepted per attempt.
 
 ### Fresh wire values and privacy
 
+Before a stream exists, each peer acquires an opaque local preflight lease with
+`AcquirePreflightLease(local_view_hash, selected_authenticated_tls)`. The local
+view must be current and unrevoked, and `selected_authenticated_tls` is the
+already authenticated, nonserializable live connection object whose leaf hashes
+match the view. The lease binding additionally uses 32 bytes from the selected
+TLS exporter with label `EXPORTER-ControlShiftF12-OperationalPreflightLease-v1`
+and canonical context `(ALPN, role, A leaf, B leaf, local_view_hash)`. It is
+local-only, cannot be sent or treated as the final commitment, and creates no
+capability. A preflight lease is revoked/reset if either its stored view or its
+selected TLS connection changes before promotion.
+
+The exact local lease binding is canonical
+`operational-session-preflight-lease-binding-v1`: role, SHA-256(local view),
+SHA-256(preflight exporter context), SHA-256(the 32-byte preflight exporter
+output), in that tag order. It is bound to the selected live TLS object by the
+exporter call and is never put on the wire. Role A first acquires this lease,
+then mints attempt/session ID/nonce A, then opens the stream. Role B acquires
+its preflight lease for that selected authenticated connection before accepting
+the stream; only after validating PreflightOpen does B mint nonce B and send
+PreflightAccept. Both then promote their own preflight lease before Open.
+
 The wire `attempt` is a new 32-byte CSPRNG value minted by role A only after
-`AcquireSessionLease` succeeds and before opening its one stream. It is one-use
+its preflight lease succeeds and before opening its one stream. It is one-use
 inside the selected connection/lease, kept only in memory, rejected if repeated
 on that connection, zeroized on terminal state, and never written to the
 durable store, logs, discovery record or UI. It is deliberately distinct from
@@ -81,7 +102,7 @@ PreflightOpen. None may be all-zero or reused by a live lease; all three are
 discarded after a terminal result. V01 sends no device name, OS, IP address,
 port, display description, clipboard data, user identifier or raw durable
 admission material. It sends only the two pinned public fingerprints, opaque
-fresh values and hashes of canonical durable views.
+fresh values and the bounded canonical authority view permitted below.
 
 ## Bilateral durable authority commitment
 
@@ -109,6 +130,17 @@ identity rotation, policy change, or storage failure is terminal. The local
 connection ID and local connection generation are never sent, never compared
 across peers and never substitute for a durable field.
 
+The first preflight record carries A's exact canonical view (tag 5); the second
+carries B's exact canonical view (tag 6). This is an explicit and bounded
+privacy exception: each view is at most 512 bytes and includes only public leaf
+fingerprints, fixed suite/version, revision/generation counters, and an
+already-hashed admission attempt. It excludes all device, network, display,
+user and raw admission data. The receiver decodes the remote bytes strictly and
+verifies its `self_fingerprint` is the remote `peer_fingerprint`, its
+`peer_fingerprint` is the remote `self_fingerprint`, and that both role leaves
+match the selected TLS connection. A hash alone is never treated as evidence of
+an unseen view.
+
 After the two preflight records, both peers build identical
 `operational-admission-commitment-v1` bytes in the fixed order: role-A leaf,
 role-B leaf, SHA-256(A's exact view), SHA-256(B's exact view), suite, protocol
@@ -123,14 +155,17 @@ derivations.  It proves that inverse local store views yield the same
 commitment, exporter context and confirmation-key hash; a parser MUST reject
 either view when that bilateral equality does not hold.
 
-Acquiring a V01 attempt requires one shared admission/revocation linearization
-transition. `AcquireSessionLease(commitment_hash)` atomically compares the full
-local view, verifies its active guard, and installs a lease token. Revocation,
-identity rotation, policy change and endpoint drop use that same transition:
-they either win before acquisition (no stream starts), or mark the acquired
-lease revoked and terminate its stream before any later record is accepted. No
-lock is held across network or filesystem I/O. A lease is not runtime authority
-and cannot enable input, clipboard or topology.
+Only after both remote-view checks does
+`PromoteSessionLease(preflight_token, commitment_hash)` atomically re-read and
+compare the local view, re-check the selected TLS object and exporter binding,
+verify its active guard, and replace the preflight token with a final
+commitment-bound lease. Open, Accept and Confirm are forbidden before this
+promotion. Revocation, identity rotation, policy change and endpoint drop use
+the same linearization point: they either win before preflight (no stream),
+between preflight and promotion (reset before Open), or after promotion (mark
+the final lease revoked and reset before another record is accepted). No lock
+is held across network or filesystem I/O. Neither lease is runtime authority
+and neither can enable input, clipboard or topology.
 
 ## Canonical record and exporter encoding
 
@@ -194,14 +229,15 @@ over 4,096 bytes is terminal before state changes.
 V01 first establishes both nonces and both durable views. Its exact schedule is
 `PreflightOpen A→B`, `PreflightAccept B→A`, `Open A→B`, `Accept B→A`,
 `Confirm A→B`, `Confirm B→A`, with sequences 0 through 5. This ordering is
-constructible: exporter context is not derived until PreflightAccept supplies
-nonce B. A sender half-closes only after its Confirm; success requires both
+constructible: after PreflightAccept supplies nonce B, both sides validate the
+remote canonical view and atomically promote the local preflight lease before
+deriving exporter context. A sender half-closes only after its Confirm; success requires both
 verifies and both FINs. The payload schemas are:
 
 | Type | Kind | Exact fields in tag order |
 |---:|---|---|
-| 1 | `operational-session-preflight-open-v1` | attempt(1 bytes32), role(2 ASCII `A`), session_id(3 bytes16), nonce_a(4 bytes32), SHA-256(A authority view)(5 bytes32), role-A leaf(6 bytes32), role-B leaf(7 bytes32) |
-| 2 | `operational-session-preflight-accept-v1` | attempt(1 bytes32), role(2 ASCII `B`), session_id(3 bytes16), echoed nonce_a(4 bytes32), nonce_b(5 bytes32), SHA-256(B authority view)(6 bytes32), role-A leaf(7 bytes32), role-B leaf(8 bytes32) |
+| 1 | `operational-session-preflight-open-v1` | attempt(1 bytes32), role(2 ASCII `A`), session_id(3 bytes16), nonce_a(4 bytes32), canonical A authority view(5 bytes≤512), role-A leaf(6 bytes32), role-B leaf(7 bytes32) |
+| 2 | `operational-session-preflight-accept-v1` | attempt(1 bytes32), role(2 ASCII `B`), session_id(3 bytes16), echoed nonce_a(4 bytes32), nonce_b(5 bytes32), canonical B authority view(6 bytes≤512), role-A leaf(7 bytes32), role-B leaf(8 bytes32) |
 | 3 | `operational-session-open-v1` | attempt(1 bytes32), role(2 ASCII `A`), session_id(3 bytes16), commitment_hash(4 bytes32), context_hash(5 bytes32) |
 | 4 | `operational-session-accept-v1` | attempt(1 bytes32), role(2 ASCII `B`), session_id(3 bytes16), open_hash(4 bytes32), commitment_hash(5 bytes32), context_hash(6 bytes32) |
 | 5 | `operational-session-confirm-v1` | attempt(1 bytes32), role(2 ASCII `A`/`B`), session_id(3 bytes16), prior_record_hash(4 bytes32), confirmation(5 bytes32) |
