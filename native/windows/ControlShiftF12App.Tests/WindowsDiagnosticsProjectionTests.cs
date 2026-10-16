@@ -36,4 +36,29 @@ public sealed class WindowsDiagnosticsProjectionTests
 
         Assert.False(DiagnosticsProjection.TryParse(negativeGeneration, out _));
     }
+
+    [Fact]
+    public void Extra_or_sensitive_frame_field_is_rejected_without_a_projection()
+    {
+        const string injectedV01 = "{\"v\":1,\"kind\":\"ui_diagnostics_v1\",\"generation\":1,\"rows\":[],\"v01\":{}}";
+
+        Assert.False(DiagnosticsProjection.TryParse(injectedV01, out _));
+    }
+
+    [Fact]
+    public void Invalid_row_enum_is_rejected_without_a_projection()
+    {
+        const string invalidState = "{\"v\":1,\"kind\":\"ui_diagnostics_v1\",\"generation\":1,\"rows\":[{\"id\":\"runtime\",\"label\":\"runtime\",\"state\":\"running\",\"detail\":\"ready\",\"action\":null,\"failure_code\":null}]}";
+
+        Assert.False(DiagnosticsProjection.TryParse(invalidState, out _));
+    }
+
+    [Fact]
+    public void More_than_32_rows_is_rejected_without_a_projection()
+    {
+        var row = "{\"id\":\"runtime\",\"label\":\"runtime\",\"state\":\"pass\",\"detail\":\"ready\",\"action\":null,\"failure_code\":null}";
+        var tooManyRows = "{\"v\":1,\"kind\":\"ui_diagnostics_v1\",\"generation\":1,\"rows\":[" + string.Join(',', Enumerable.Repeat(row, 33)) + "]}";
+
+        Assert.False(DiagnosticsProjection.TryParse(tooManyRows, out _));
+    }
 }

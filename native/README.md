@@ -17,7 +17,7 @@ The detailed parent/child boundary is
 | Host | Required build environment | Current evidence | Decision when unavailable |
 | --- | --- | --- | --- |
 | macOS AppKit | macOS 27.0.1 with Xcode 27.0 (build 27A266a), capable of evaluating the Swift 5.9 package manifest | Verified on the local planning Mac on 2026-10-16; no host was built or launched | Block the native-host build. Do not substitute a terminal, web, or CLI surface. |
-| Windows WinForms | .NET 8 WindowsDesktop SDK (`net8.0-windows`), MSVC Build Tools, and a matching Windows SDK for the Rust engine | Rust engine contracts and the Windows diagnostics parser were built and tested on the target Windows machine on 2026-10-16; no WinForms host has been built or launched. | Block the native-host build until its pipe owner and target tests are admitted. Do not substitute a terminal, web, or CLI surface. |
+| Windows WinForms | .NET 8 WindowsDesktop SDK (`net8.0-windows`), MSVC Build Tools, and a matching Windows SDK for the Rust engine | Toolchain and Rust engine contracts were verified on the target Windows machine on 2026-10-16. The declared Windows diagnostics parser project discovered and passed seven adversarial tests there; no WinForms host has been built or launched. | Block the native-host build until its pipe owner and target tests are admitted. Do not substitute a terminal, web, or CLI surface. |
 
 The macOS observation is a development-host fact, not a released compatibility
 promise. A shipping support matrix requires host builds and platform QA.

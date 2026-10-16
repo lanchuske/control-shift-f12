@@ -241,7 +241,8 @@ class NativeHostBoundaryTests(unittest.TestCase):
             self.assertNotIn(forbidden, parser, forbidden)
         for expected in (
             "Duplicate_frame_field_is_rejected", "Frame_larger_than_the_engine_limit",
-            "Negative_generation_is_rejected",
+            "Negative_generation_is_rejected", "Extra_or_sensitive_frame_field_is_rejected",
+            "Invalid_row_enum_is_rejected", "More_than_32_rows_is_rejected",
         ):
             self.assertIn(expected, tests)
 
