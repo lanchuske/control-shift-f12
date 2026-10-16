@@ -74,6 +74,16 @@ fn unsafe_commands_never_fall_through_to_legacy_pairing_or_runtime() {
     }
 }
 
+#[cfg(not(feature = "pairing-v2-experimental"))]
+#[test]
+fn guided_pairing_is_not_exposed_in_default_build() {
+    let output = exchange(&frame(
+        r#"{"v":1,"id":"closed","command":"pairing.v2","args":{"action":"open_discovery"}}"#,
+    ));
+    assert!(output.status.success());
+    assert!(bodies(&output.stdout)[0].contains(r#""code":"not_available_in_foundations""#));
+}
+
 #[test]
 fn same_request_id_with_changed_payload_is_rejected() {
     let mut input = frame(r#"{"v":1,"id":"same","command":"snapshot","args":{}}"#);

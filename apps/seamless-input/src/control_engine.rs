@@ -1,5 +1,6 @@
 //! Setup-only process. Deliberately owns no NativeSupervisor, input adapter,
-//! clipboard adapter, identity writer, discovery, or network listener.
+//! clipboard adapter, identity writer or network listener. Experimental pairing
+//! may browse LAN locators only after a typed, explicit local consent command.
 use crate::control_api::{Request, read_request, write_message};
 use serde_json::{Value, json};
 use std::{
@@ -17,6 +18,8 @@ pub struct ControlEngine {
     event_sequence: u64,
     events: Vec<Value>,
     stopped: bool,
+    #[cfg(feature = "pairing-v2-experimental")]
+    guided: crate::guided_setup::SetupController<crate::guided_setup::OsSetupClock>,
 }
 
 impl Default for ControlEngine {
@@ -32,6 +35,8 @@ impl Default for ControlEngine {
             inventory: json!({"status":"not_measured","layout_ready":false}),
             event_sequence: 0,
             events: Vec::new(),
+            #[cfg(feature = "pairing-v2-experimental")]
+            guided: Default::default(),
         }
     }
 }
@@ -71,6 +76,8 @@ impl ControlEngine {
                 }
                 "shutdown" if request.args.as_object().is_some_and(|a| a.is_empty()) => {
                     self.stopped = true;
+                    #[cfg(feature = "pairing-v2-experimental")]
+                    self.guided.shutdown();
                     self.emit(
                         "EngineStopping",
                         json!({"input_enabled":false,"clipboard_enabled":false}),
@@ -95,6 +102,8 @@ impl ControlEngine {
                 "snapshot" | "diagnostics.snapshot" | "shutdown" | "inventory.refresh" => {
                     error(&request.id, "invalid_arguments")
                 }
+                #[cfg(feature = "pairing-v2-experimental")]
+                "pairing.v2" => self.guided_request(&request),
                 _ => error(&request.id, "not_available_in_foundations"),
             }
         };
@@ -107,6 +116,44 @@ impl ControlEngine {
         // At most one event per accepted request; the request bound prevents overflow.
         self.event_sequence += 1;
         self.events.push(json!({"v":1,"engine":self.engine_id,"seq":self.event_sequence,"event":event,"data":data}));
+    }
+
+    #[cfg(feature = "pairing-v2-experimental")]
+    fn guided_request(&mut self, request: &Request) -> Value {
+        use crate::guided_setup::{SetupCommand, SetupError};
+        let command: SetupCommand = match serde_json::from_value(request.args.clone()) {
+            Ok(command) => command,
+            Err(_) => return error(&request.id, "invalid_arguments"),
+        };
+        let changes = !matches!(
+            command,
+            SetupCommand::Snapshot {} | SetupCommand::CompareMatch {}
+        );
+        match self.guided.execute(command) {
+            Ok(snapshot) => {
+                let value = serde_json::to_value(snapshot).expect("typed snapshot serialization");
+                if changes {
+                    self.emit("PairingV2Changed", value.clone());
+                }
+                json!({"v":1,"id":request.id,"ok":true,"result":value})
+            }
+            Err(reason) => {
+                if matches!(
+                    reason,
+                    SetupError::OperationalContractPending
+                        | SetupError::Expired
+                        | SetupError::Unavailable
+                ) && let Ok(snapshot) = self.guided.execute(SetupCommand::Snapshot {})
+                {
+                    self.emit(
+                        "PairingV2Changed",
+                        serde_json::to_value(snapshot).expect("typed snapshot serialization"),
+                    );
+                }
+                let code = serde_json::to_value(reason).expect("typed error serialization");
+                error(&request.id, code.as_str().expect("enum is a string"))
+            }
+        }
     }
 }
 
