@@ -36,7 +36,7 @@ fn utc() -> Result<i64, Invalid> {
     )
     .map_err(|_| Invalid)
 }
-fn profile(leaf: &[u8], now: i64) -> Result<(), Invalid> {
+pub(crate) fn profile(leaf: &[u8], now: i64) -> Result<(), Invalid> {
     let node = hash(leaf)[..16].try_into().map_err(|_| Invalid)?;
     validate_identity(leaf, node, now).map(|_| ())
 }
@@ -149,6 +149,23 @@ fn configs(
     certificate: Vec<u8>,
     key: PrivateKeyDer<'static>,
 ) -> Result<(quinn::ServerConfig, StrictClient), Invalid> {
+    strict_configs(certificate, key, ALPN, 2, 1)
+}
+
+/// Shared strict TLS profile for separately-versioned, sealed control channels.
+/// The caller selects only the exact frozen ALPN and QUIC stream cardinality;
+/// TLS identity validation, TLS1.3-only, no early data, no resumption and no
+/// tickets remain owned here.
+pub(crate) fn strict_configs(
+    certificate: Vec<u8>,
+    key: PrivateKeyDer<'static>,
+    alpn: &[u8],
+    max_bidi_streams: u32,
+    max_uni_streams: u32,
+) -> Result<(quinn::ServerConfig, StrictClient), Invalid> {
+    if alpn.is_empty() || !alpn.is_ascii() || max_bidi_streams == 0 {
+        return Err(Invalid);
+    }
     profile(&certificate, utc()?)?;
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let verifier = Arc::new(ProfileVerifier(provider.clone()));
@@ -159,7 +176,7 @@ fn configs(
         .with_client_cert_verifier(verifier.clone())
         .with_single_cert(vec![cert.clone()], key.clone_key())
         .map_err(|_| Invalid)?;
-    server.alpn_protocols = vec![ALPN.to_vec()];
+    server.alpn_protocols = vec![alpn.to_vec()];
     server.max_early_data_size = 0;
     server.send_tls13_tickets = 0;
     let mut client = rustls::ClientConfig::builder_with_provider(provider)
@@ -169,15 +186,15 @@ fn configs(
         .with_custom_certificate_verifier(verifier)
         .with_client_auth_cert(vec![cert], key)
         .map_err(|_| Invalid)?;
-    client.alpn_protocols = vec![ALPN.to_vec()];
+    client.alpn_protocols = vec![alpn.to_vec()];
     client.enable_early_data = false;
     client.resumption = rustls::client::Resumption::disabled();
     let mut limits = quinn::TransportConfig::default();
     limits
         // A retains its candidate request half while opening the control stream.
         // The application rejects every extra stream beyond this exact schedule.
-        .max_concurrent_bidi_streams(2u32.into())
-        .max_concurrent_uni_streams(1u32.into())
+        .max_concurrent_bidi_streams(max_bidi_streams.into())
+        .max_concurrent_uni_streams(max_uni_streams.into())
         .stream_receive_window(16_399u32.into())
         .receive_window(65_536u32.into())
         .keep_alive_interval(Some(std::time::Duration::from_secs(10)))
@@ -199,12 +216,12 @@ fn configs(
         },
     ))
 }
-struct StrictClient {
+pub(crate) struct StrictClient {
     config: rustls::ClientConfig,
     limits: Arc<quinn::TransportConfig>,
 }
 #[derive(Debug)]
-struct ClientAuthEvidence {
+pub(crate) struct ClientAuthEvidence {
     resolver: Arc<dyn rustls::client::ResolvesClientCert>,
     requested: AtomicBool,
 }
@@ -224,14 +241,19 @@ impl rustls::client::ResolvesClientCert for ClientAuthEvidence {
         self.resolver.has_certs()
     }
 }
+impl ClientAuthEvidence {
+    pub(crate) fn was_requested(&self) -> bool {
+        self.requested.load(Ordering::Acquire)
+    }
+}
 impl StrictClient {
-    fn identity(&self) -> Result<Arc<rustls::sign::CertifiedKey>, Invalid> {
+    pub(crate) fn identity(&self) -> Result<Arc<rustls::sign::CertifiedKey>, Invalid> {
         self.config
             .client_auth_cert_resolver
             .resolve(&[], &[rustls::SignatureScheme::ED25519])
             .ok_or(Invalid)
     }
-    fn fresh(&self) -> Result<(quinn::ClientConfig, Arc<ClientAuthEvidence>), Invalid> {
+    pub(crate) fn fresh(&self) -> Result<(quinn::ClientConfig, Arc<ClientAuthEvidence>), Invalid> {
         let mut config = self.config.clone();
         let evidence = Arc::new(ClientAuthEvidence {
             resolver: config.client_auth_cert_resolver.clone(),

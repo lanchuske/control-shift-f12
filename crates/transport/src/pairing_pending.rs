@@ -60,6 +60,79 @@ pub(crate) struct AdmissionReceiptRecord {
     pub policy_revision: u64,
 }
 
+/// Immutable read of a currently active durable admission.  This is a
+/// crate-private input to the sealed operational-session boundary, never a
+/// runtime-control capability.  In particular, it contains no connection or
+/// stream handle and cannot enable input, clipboard, or topology.
+#[cfg(feature = "pairing-v2-experimental")]
+#[allow(dead_code)] // Sealed default-off operational foundation; no product caller in this phase.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct OperationalAdmissionSnapshot {
+    pub(crate) receipt: AdmissionReceiptRecord,
+    pub(crate) store_revision: u64,
+}
+
+/// A local-only preflight lease.  Its token is deliberately process-local and
+/// never serialized; dropping it only releases this attempt, never a durable
+/// pin or receipt.
+#[cfg(feature = "pairing-v2-experimental")]
+#[allow(dead_code)] // Sealed default-off operational foundation; no product caller in this phase.
+pub(crate) struct OperationalPreflightLease {
+    store: PendingStore,
+    token: [u8; 32],
+    snapshot: OperationalAdmissionSnapshot,
+    view_hash: [u8; 32],
+    connection_binding: [u8; 32],
+    live: bool,
+}
+
+/// A local-only final lease.  It must be checked before every operational
+/// record; a durable revoke/rotation wins by making that check fail closed.
+#[cfg(feature = "pairing-v2-experimental")]
+#[allow(dead_code)] // Sealed default-off operational foundation; no product caller in this phase.
+pub(crate) struct OperationalFinalLease {
+    store: PendingStore,
+    token: [u8; 32],
+    snapshot: OperationalAdmissionSnapshot,
+    commitment_hash: [u8; 32],
+    live: bool,
+}
+
+#[cfg(feature = "pairing-v2-experimental")]
+#[allow(dead_code)] // Sealed default-off operational foundation; no product caller in this phase.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OperationalLeasePhase {
+    Preflight {
+        view_hash: [u8; 32],
+        connection_binding: [u8; 32],
+    },
+    Final {
+        commitment_hash: [u8; 32],
+    },
+}
+
+#[cfg(feature = "pairing-v2-experimental")]
+#[allow(dead_code)] // Sealed default-off operational foundation; no product caller in this phase.
+#[derive(Clone, Debug)]
+struct OperationalLeaseState {
+    snapshot: OperationalAdmissionSnapshot,
+    phase: OperationalLeasePhase,
+}
+
+#[cfg(feature = "pairing-v2-experimental")]
+fn operational_leases() -> &'static Mutex<BTreeMap<[u8; 32], OperationalLeaseState>> {
+    static LEASES: OnceLock<Mutex<BTreeMap<[u8; 32], OperationalLeaseState>>> = OnceLock::new();
+    LEASES.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+#[cfg(feature = "pairing-v2-experimental")]
+fn operational_lease_states()
+-> std::sync::MutexGuard<'static, BTreeMap<[u8; 32], OperationalLeaseState>> {
+    operational_leases()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 pub struct PendingStore {
     #[cfg(any(unix, windows))]
     pending_dir: crate::private_fs::PrivateDir,
@@ -477,6 +550,100 @@ mod unix {
     }
 
     impl PendingStore {
+        #[cfg(feature = "pairing-v2-experimental")]
+        fn clone_for_operational_lease(&self) -> Result<Self, StoreError> {
+            Ok(Self {
+                pending_dir: self.pending_dir.try_clone()?,
+                ledger_dir: self.ledger_dir.try_clone()?,
+            })
+        }
+
+        #[cfg(feature = "pairing-v2-experimental")]
+        fn current_operational_snapshot(
+            &self,
+            attempt: [u8; 32],
+        ) -> Result<OperationalAdmissionSnapshot, StoreError> {
+            if attempt == [0; 32] {
+                return Err(StoreError::Invalid);
+            }
+            let _lock = self.ledger_dir.lock()?;
+            let ledger = self.load_validated_manifest()?;
+            let receipt = ledger
+                .admission_receipts
+                .iter()
+                .find(|receipt| receipt.attempt == attempt)
+                .cloned()
+                .ok_or(StoreError::Invalid)?;
+            let active = receipt.identity_generation == ledger.version.identity_generation
+                && receipt.revocation_generation == ledger.revocation(receipt.peer)
+                && receipt.policy_revision == ledger.policy_revision
+                && ledger.active_pins.iter().any(|pin| {
+                    pin.peer == receipt.peer
+                        && pin.pin == receipt.peer_pin
+                        && pin.identity_generation == receipt.identity_generation
+                        && pin.revocation_generation == receipt.revocation_generation
+                });
+            active
+                .then_some(OperationalAdmissionSnapshot {
+                    receipt,
+                    store_revision: ledger.version.revision,
+                })
+                .ok_or(StoreError::Invalid)
+        }
+
+        /// Acquires a process-local operational preflight lease only after one
+        /// atomic durable snapshot read.  The lease is never serialized and an
+        /// ordinary drop merely forgets the local token.
+        #[cfg(feature = "pairing-v2-experimental")]
+        pub(crate) fn acquire_operational_preflight_lease(
+            &self,
+            attempt: [u8; 32],
+            view_hash: [u8; 32],
+            connection_binding: [u8; 32],
+        ) -> Result<OperationalPreflightLease, StoreError> {
+            if view_hash == [0; 32] || connection_binding == [0; 32] {
+                return Err(StoreError::Invalid);
+            }
+            let snapshot = self.current_operational_snapshot(attempt)?;
+            let store = self.clone_for_operational_lease()?;
+            let mut token = [0; 32];
+            rand::rngs::OsRng.fill_bytes(&mut token);
+            if token == [0; 32] {
+                return Err(StoreError::Unavailable);
+            }
+            let mut leases = operational_lease_states();
+            if leases.contains_key(&token) {
+                return Err(StoreError::Unavailable);
+            }
+            leases.insert(
+                token,
+                OperationalLeaseState {
+                    snapshot: snapshot.clone(),
+                    phase: OperationalLeasePhase::Preflight {
+                        view_hash,
+                        connection_binding,
+                    },
+                },
+            );
+            Ok(OperationalPreflightLease {
+                store,
+                token,
+                snapshot,
+                view_hash,
+                connection_binding,
+                live: true,
+            })
+        }
+
+        #[cfg(feature = "pairing-v2-experimental")]
+        #[allow(dead_code)] // Used by the sealed final lease once the V01 driver is wired.
+        fn operational_snapshot_still_current(
+            &self,
+            snapshot: &OperationalAdmissionSnapshot,
+        ) -> Result<bool, StoreError> {
+            Ok(self.current_operational_snapshot(snapshot.receipt.attempt)? == *snapshot)
+        }
+
         #[cfg(feature = "pairing-v2-experimental")]
         pub(crate) fn admission_revoker(
             &self,
@@ -1187,6 +1354,101 @@ mod unix {
                 self.pending_dir.remove(&file)?;
             }
             Ok(())
+        }
+    }
+
+    #[cfg(feature = "pairing-v2-experimental")]
+    #[allow(dead_code)] // Sealed default-off operational foundation; no product caller in this phase.
+    impl OperationalPreflightLease {
+        pub(crate) fn snapshot(&self) -> &OperationalAdmissionSnapshot {
+            &self.snapshot
+        }
+
+        /// Final promotion is the local operational linearization point.  It
+        /// re-reads the durable state before changing the in-memory token; no
+        /// connection, stream, or filesystem I/O occurs while the lease mutex
+        /// is held.
+        pub(crate) fn promote(
+            mut self,
+            commitment_hash: [u8; 32],
+        ) -> Result<OperationalFinalLease, StoreError> {
+            if !self.live || commitment_hash == [0; 32] {
+                return Err(StoreError::Invalid);
+            }
+            if !self
+                .store
+                .operational_snapshot_still_current(&self.snapshot)?
+            {
+                return Err(StoreError::Conflict);
+            }
+            let store = self.store.clone_for_operational_lease()?;
+            let mut leases = operational_lease_states();
+            let state = leases.get_mut(&self.token).ok_or(StoreError::Invalid)?;
+            if state.snapshot != self.snapshot
+                || state.phase
+                    != (OperationalLeasePhase::Preflight {
+                        view_hash: self.view_hash,
+                        connection_binding: self.connection_binding,
+                    })
+            {
+                return Err(StoreError::Conflict);
+            }
+            state.phase = OperationalLeasePhase::Final { commitment_hash };
+            self.live = false;
+            Ok(OperationalFinalLease {
+                store,
+                token: self.token,
+                snapshot: self.snapshot.clone(),
+                commitment_hash,
+                live: true,
+            })
+        }
+    }
+
+    #[cfg(feature = "pairing-v2-experimental")]
+    impl Drop for OperationalPreflightLease {
+        fn drop(&mut self) {
+            if self.live {
+                operational_lease_states().remove(&self.token);
+                self.live = false;
+            }
+        }
+    }
+
+    #[cfg(feature = "pairing-v2-experimental")]
+    #[allow(dead_code)] // Sealed default-off operational foundation; no product caller in this phase.
+    impl OperationalFinalLease {
+        /// This is intentionally a check-only capability: callers receive no
+        /// transport, input, or raw TLS handle.  Every record boundary must
+        /// call it, so revoke/rotation wins before another record is accepted.
+        pub(crate) fn assert_current(&self) -> Result<(), StoreError> {
+            if !self.live
+                || !self
+                    .store
+                    .operational_snapshot_still_current(&self.snapshot)?
+            {
+                return Err(StoreError::Conflict);
+            }
+            let leases = operational_lease_states();
+            matches!(
+                leases.get(&self.token),
+                Some(OperationalLeaseState {
+                    snapshot,
+                    phase: OperationalLeasePhase::Final { commitment_hash },
+                }) if snapshot == &self.snapshot && *commitment_hash == self.commitment_hash
+            )
+            .then_some(())
+            .ok_or(StoreError::Conflict)
+        }
+    }
+
+    #[cfg(feature = "pairing-v2-experimental")]
+    impl Drop for OperationalFinalLease {
+        fn drop(&mut self) {
+            if self.live {
+                operational_lease_states().remove(&self.token);
+                self.live = false;
+            }
         }
     }
 }
