@@ -21,8 +21,8 @@ The setup flow has four independently gated layers:
 2. **Confirm** is a mutually visible short-authentication-string (SAS) and two
    local user decisions, bound to the candidate connection.
 3. **Arrange** is a proposal preview, not a saved topology.
-4. **Ready** exists only after the two peers have atomically committed the
-   proposal through an admitted operational session.
+4. **Ready** exists only after a reviewed durable prepare/commit transaction
+   has durably resolved the proposal as committed on both peers.
 
 The V01 reference is authoritative for the session binding, lease promotion,
 revocation, exact ALPN and no-downgrade behavior:
@@ -40,12 +40,19 @@ A LAN candidate is not a durable peer. There are therefore two intentionally
 separate journeys:
 
 1. **New relationship.** A person selects an untrusted LAN locator and enters
-   the separately reviewed *durable pairing bootstrap*. That protocol, not this
-   UI, is responsible for a fresh pairing SAS, mutual proof, pin creation and
-   an atomic durable receipt on both stores. It has no input, clipboard,
-   topology or operational V01 capability. If either receipt write fails,
-   neither side offers Arrange or starts V01. A discovery result never becomes
-   a V01 candidate merely because its display name, address or SAS looked right.
+   the separately reviewed *durable pairing bootstrap*. Its typed states are
+   `BOOTSTRAP_CONNECTING`, `BOOTSTRAP_SAS_PENDING`,
+   `BOOTSTRAP_RECEIPT_PREPARED`, and terminal `BOOTSTRAP_ABORTED`. Its own
+   fresh bootstrap SAS is shown and explicitly confirmed on both peers before
+   either peer prepares a receipt. That SAS has its own bootstrap attempt and
+   deadline; it is neither displayed as nor convertible into the V01 SAS.
+   After mutual confirmation, each peer durably verifies its own prepared
+   receipt, including its local identity/pin/revision binding, before entering
+   `CONFIRMED_RELATIONSHIP`. A peer with a missing, prepared-only, unverifiable
+   or revoked receipt remains outside that state. The pairing bootstrap has no
+   input, clipboard, topology or operational V01 capability. A discovery result
+   never becomes a V01 candidate merely because its display name, address or
+   bootstrap SAS looked right.
 2. **Existing relationship.** Only a locally verified, active durable receipt
    can appear in the “confirmed computers” list. Selecting that receipt starts
    a fresh V01 connection with its pinned leaves. The UI treats that gesture as
@@ -54,9 +61,11 @@ separate journeys:
 The two flows may share native components and visual language, but their
 attempts, short codes, confirmations and cancellation state are never reused
 or translated. In particular, a bootstrap pairing confirmation cannot satisfy
-an operational-session confirmation. A cancelled or failed bootstrap returns
-to the untrusted catalogue and leaves no partial receipt; a revoked durable
-receipt returns to the catalogue and requires the reviewed bootstrap again.
+an operational-session confirmation. A cancelled, rejected, expired or failed
+bootstrap is terminal for that locator: it returns to the untrusted catalogue,
+destroys its bootstrap attempt and cannot fall back to a manual address,
+legacy pairing or a retained candidate connection. A revoked durable receipt
+returns to the catalogue and requires the reviewed bootstrap again.
 
 ### V01 deadline shown honestly
 
@@ -289,7 +298,7 @@ only by the separately reviewed application layer *after* V01 mutual confirm.
 | 4 | `authority_commitment_hash` | exactly 32 bytes from this same V01 bilateral durable commitment. |
 | 5 | `role_a_leaf_hash` | exactly 32 bytes; must match live V01 role A. |
 | 6 | `role_b_leaf_hash` | exactly 32 bytes; must match live V01 role B. |
-| 7 | `base_layout_revision` | nonzero `u64`, loaded atomically with both committed layout records. |
+| 7 | `base_layout_revision` | nonzero `u64`, loaded only after reviewed recovery establishes the last mutually resolved committed record. |
 | 8 | `proposed_layout_revision` | `base + 1`; any other value rejects. |
 | 9 | `inventory_a` | one canonical `layout-inventory-v1` object, at most 32 displays. |
 | 10 | `inventory_b` | one canonical `layout-inventory-v1` object, at most 32 displays. |
@@ -326,16 +335,52 @@ different V01 attempts, different authority commitments, or any stale inventory
 generation is rejected before a preview or persistence write. This makes the
 two maps the same proposal rather than two similar-looking local drawings.
 
-Persisted layout records retain only `schema_version`, `proposal_digest`,
-`proposed_layout_revision`, both inventory digests/generations and placements.
-They never retain `v01_attempt`, SAS, nonces, exporter data or confirmation
-material. Both durable records use compare-and-swap from exactly
-`base_layout_revision` to exactly `proposed_layout_revision`; a failure,
-revocation or lost session commits neither side. A later recovery/reconnect
-loads the latest records and starts a new V01 attempt and a new proposal — it
-does not replay acceptance for a stored digest.
+Persisted committed layout records retain only `schema_version`,
+`proposal_digest`, `proposed_layout_revision`, both inventory
+digests/generations and placements. They never retain `v01_attempt`, SAS,
+nonces, exporter data or confirmation material. Their durable update is **not**
+described as an impossible cross-machine atomic write. It uses the reviewed
+prepare/commit/abort transaction below.
 
-## Screen 5: bilateral preview and atomic commit
+### Durable layout transaction and crash recovery
+
+The future layout authority implementation has three idempotent operations,
+all scoped by `(role-A leaf, role-B leaf, proposal_digest, base_layout_revision,
+proposed_layout_revision)` and guarded by the active V01 session binding:
+
+1. `PrepareLayout` validates the full canonical proposal, local current receipt,
+   inventory generation and base revision. It writes an immutable local
+   **prepared** record with the proposal digest and expires it when the V01
+   attempt terminals. Repeating the same valid prepare returns the same prepared
+   record; a different proposal for the same base revision rejects.
+2. `CommitLayout` is accepted only for that exact prepared record after the
+   reviewed bilateral commit evidence is present. It CASes the local committed
+   layout from base to proposed revision and marks its prepared record committed.
+   Repetition is idempotent only when the exact digest/revision is already
+   committed.
+3. `AbortLayout` marks only the exact uncommitted prepared record aborted and
+   removes its placement payload. It cannot roll back an already committed
+   layout.
+
+The sender and receiver each prepare locally first. Only then may the reviewed
+post-V01 application contract exchange durable prepared acknowledgements and
+commit evidence. If a crash happens after prepare on either side, or after the
+first peer commits but before the other responds, the user-facing state is
+**“Layout saving was interrupted”**, never `LAYOUT_COMMITTED`. The local UI is
+read-only for that proposal and does not enable sharing. On restart, recovery
+reads its prepared/committed records, expires a record that lacks the live V01
+attempt, and uses a separately reviewed recovery exchange to reach one of two
+outcomes: exact-digest commit on both peers, or abort/retain the last committed
+layout. It must not infer the other outcome from a timeout or synthesize an old
+approval. Until recovery finishes, the state is `LAYOUT_RECOVERY_PENDING`, not
+ready.
+
+A reconnect always loads the latest receipts and layout revisions, creates a
+new V01 attempt and never carries a SAS, confirmation, prepared acknowledgement
+or commit evidence into that attempt. A prepared record is an internal recovery
+artifact, not a layout users can edit, export or restore from a shared backup.
+
+## Screen 5: bilateral preview and durable resolution
 
 The other computer sees the same proportional geometry and canonical revision,
 but not a trusted claim about who arranged it. Both sides label the proposal as
@@ -355,12 +400,13 @@ explicit approvals exist.
 └───────────────────────────────────────────────────────────────────────┘
 ```
 
-Acceptance is durable only when the session's reviewed atomic commit reports
-success to both sides. A local success without remote acknowledgement is
-“Saving interrupted,” not “Layout saved.” On rejection, timeout, peer reset,
-revocation, generation mismatch, CAS/revision conflict or write failure, both
-surfaces discard the proposal and keep the last committed layout. Retry returns
-to a fresh inventory snapshot; it never applies a stale proposal.
+Acceptance is durable only when the reviewed prepare/commit transaction resolves
+the exact digest as committed on both sides. A local prepare, one-sided commit,
+or local success without remote resolution is “Layout saving was interrupted,”
+not “Layout saved.” On rejection, timeout, peer reset, revocation, generation
+mismatch, CAS/revision conflict or write failure, both surfaces discard the
+editable proposal and keep the last committed layout. Retry returns to a fresh
+inventory snapshot; it never applies a stale proposal.
 
 `Layout saved` does not activate cursor crossing. A distinct capability gate,
 outside this document, must verify the final operational lease and user
@@ -376,12 +422,20 @@ new local approval or advance a state without the local V01/session checks.
 
 ```text
 UNTRUSTED_CATALOGUE
-  -- local select --> BOOTSTRAP_PENDING
+  -- local select --> BOOTSTRAP_CONNECTING
   -- local cancel/expiry --> UNTRUSTED_CATALOGUE
 
-BOOTSTRAP_PENDING
-  -- reviewed durable receipt on both stores --> CONFIRMED_RELATIONSHIP
+BOOTSTRAP_CONNECTING
+  -- fresh bootstrap SAS --> BOOTSTRAP_SAS_PENDING
+  -- cancel/failure/expiry --> UNTRUSTED_CATALOGUE
+
+BOOTSTRAP_SAS_PENDING
+  -- two explicit bootstrap approvals --> BOOTSTRAP_RECEIPT_PREPARED
   -- decline/failure/revoke --> UNTRUSTED_CATALOGUE
+
+BOOTSTRAP_RECEIPT_PREPARED
+  -- locally verified durable receipt --> CONFIRMED_RELATIONSHIP
+  -- missing/invalid/revoked receipt --> UNTRUSTED_CATALOGUE
 
 CONFIRMED_RELATIONSHIP
   -- local V01 connection selection --> V01_PENDING (deadline <= 30s)
@@ -395,9 +449,22 @@ INVENTORY_CURRENT
   -- local edit --> PROPOSAL_LOCAL
   -- inventory change/revoke/reset --> CONFIRMED_RELATIONSHIP
 
-PROPOSAL_LOCAL / PROPOSAL_REMOTE_REVIEW / COMMIT_PENDING
-  -- both valid approvals + bilateral CAS --> LAYOUT_COMMITTED
+PROPOSAL_LOCAL / PROPOSAL_REMOTE_REVIEW
+  -- both valid approvals --> LAYOUT_PREPARE_PENDING
+  -- cancel/reject/timeout/reset/disappear/revoke --> INVENTORY_CURRENT
+
+LAYOUT_PREPARE_PENDING
+  -- exact immutable prepares on both peers --> LAYOUT_COMMIT_PENDING
   -- cancel/reject/timeout/reset/disappear/revoke/CAS failure --> INVENTORY_CURRENT
+
+LAYOUT_COMMIT_PENDING
+  -- exact durable resolution on both peers --> LAYOUT_COMMITTED
+  -- crash/acknowledgement loss --> LAYOUT_RECOVERY_PENDING
+  -- abort before commit --> INVENTORY_CURRENT
+
+LAYOUT_RECOVERY_PENDING
+  -- reviewed recovery resolves exact digest --> LAYOUT_COMMITTED
+  -- reviewed recovery aborts --> INVENTORY_CURRENT
 
 LAYOUT_COMMITTED
   -- inventory or receipt change --> CONFIRMED_RELATIONSHIP
@@ -411,23 +478,22 @@ preconfirm hash, confirmation choices and unsaved proposal. The UI must not
 show “Try again” as if it retained a confirmation; its action creates a fresh
 V01 connection from `CONFIRMED_RELATIONSHIP`.
 
-`PROPOSAL_LOCAL`, `PROPOSAL_REMOTE_REVIEW` and `COMMIT_PENDING` hold no
-durable approval. A close-window event is Cancel. A remote Cancel/Reject is
-terminal for that proposal but preserves the last committed layout. If a peer
-disappears, the visible result is “The other computer is unavailable; this
-layout was not saved,” and the local editable draft is discarded rather than
-queued for later delivery. A reconnect always returns to
-`CONFIRMED_RELATIONSHIP`, reloads both receipt/layout revisions, and starts a
-new V01 attempt; it cannot restore a SAS or proposal acknowledgement.
+Every V01 preflight failure takes this same route: clear volatile V01 state,
+retain the last locally verified durable receipt without changing it, and return
+to `CONFIRMED_RELATIONSHIP`. The only exception is a receipt/pin/revocation or
+identity failure, which first purges that relationship and returns to
+`UNTRUSTED_CATALOGUE`. The UI never chooses a different candidate, legacy
+address, alternative ALPN or bootstrap shortcut as a preflight retry.
 
-Only `LAYOUT_COMMITTED` persists. Its write is linearized with the bilateral
-CAS described above: the acknowledgement to both UIs is emitted only after both
-stores report the same proposal digest and proposed revision. If the process
-dies after one write or acknowledgement is lost, recovery reads both records;
-unequal revisions/digests are a blocked repair state, not a successful layout
-and not an opportunity to synthesize the missing approval. A future recovery
-protocol requires its own reviewed, atomic repair contract before it can alter
-either record.
+`PROPOSAL_LOCAL` and `PROPOSAL_REMOTE_REVIEW` hold no durable approval. A
+close-window event is Cancel. A remote Cancel/Reject is terminal for that
+proposal but preserves the last committed layout. If a peer disappears before
+prepare, the visible result is “The other computer is unavailable; this layout
+was not saved,” and the local editable draft is discarded rather than queued.
+If it disappears after a local prepare or commit, the result is
+`LAYOUT_RECOVERY_PENDING`; it cannot be silently presented as saved or silently
+aborted. A reconnect always starts from `CONFIRMED_RELATIONSHIP`, reloads
+receipt/layout state, and cannot restore a SAS or proposal acknowledgement.
 
 ## Error and recovery matrix
 
@@ -436,12 +502,52 @@ either record.
 | No LAN candidates | Empty catalogue | Refresh or cancel | no direct fallback is offered implicitly |
 | Candidate disappears | “That computer is no longer nearby” | Back to catalogue | selected handle is revoked |
 | Code differs/expired | “Do not continue” | Start a fresh attempt | discard both approvals and SAS |
-| Session preflight fails | “Could not secure this connection” | Back to catalogue | no legacy/retry ALPN fallback |
+| Session preflight fails | “Could not secure this connection” | Return to the confirmed relationship; start a fresh V01 attempt | no candidate switch, address/legacy/ALPN fallback |
 | Inventory incomplete | quality-specific explanation | retry measurement or cancel | do not invent orientation/size |
 | Inventory changes | “Displays changed” | read new inventory | reject proposal |
 | Layout conflict | “A newer layout was saved” | refresh and review | CAS/revision failure wins |
 | Remote rejects/cancels | “The other computer did not accept this layout” | keep current layout | no partial local commit |
 | Permission revoked | “Sharing is stopped” | follow OS permission guidance | release local control; no automatic re-enable |
+
+## Data minimization, retention and deletion
+
+Discovery locators, bootstrap attempts, V01 attempts, SAS values, TLS/exporter
+material, confirmation choices and uncommitted placement drafts are volatile.
+They must be zeroized or dropped at their terminal transition and never enter
+logs, diagnostics, crash reports, analytics, shared backups, clipboard or
+support exports. A diagnostic report may say `layout: pending` or
+`layout: committed revision 8`, but never include a peer address, SAS, attempt,
+display geometry, layout digest or raw identity material.
+
+A committed layout is correlatable data: its relative geometry, paired leaf
+scope, inventory generations/digests and display descriptors can describe a
+person's equipment. It is stored only in the current user’s protected local
+application storage, encrypted at rest when the platform secure-storage
+boundary supports it, with owner-only filesystem permissions otherwise. It is
+never copied to shared configuration, cloud sync, roaming profiles, generic
+backups, installer logs or diagnostics by this feature. Any platform that
+cannot meet those storage conditions keeps arrangement disabled rather than
+falling back to a public/local-text file.
+
+The interface provides **Forget this computer and its layout**. It explains that
+the action removes the local durable receipt, committed/prepared layouts,
+inventory cache, local names and retained diagnostics for that peer; it is a
+local action and asks for confirmation. The underlying deletion order is:
+
+1. revoke/disable capability and terminally cancel active V01/bootstrap work;
+2. remove prepared and committed layout records plus inventory cache for the
+   scoped leaf pair;
+3. delete the durable receipt/pin according to its reviewed receipt lifecycle;
+4. clear UI/diagnostic caches and schedule secure-storage deletion; and
+5. show “Forgotten on this computer” without asserting deletion on the remote
+   computer.
+
+Receipt revocation, unpair, identity rotation/change and policy-required
+identity removal invoke the same purge for every matching peer scope before a
+new relationship can be displayed. A failed deletion is a blocked local
+privacy state: discovery may remain visible, but the prior relationship and
+layout cannot be used or resurrected. A future backup/restore feature requires
+its own encrypted, per-user, consented design; it is not implied here.
 
 ## Accessibility and platform behavior
 
@@ -466,7 +572,9 @@ a required design test matrix, not a claim that runtime tests exist today.
 | Mutation | Required result / stage |
 | --- | --- |
 | LAN advertisement substitutes a durable receipt or leaf | rejected in `UNTRUSTED_CATALOGUE`, before V01 selection |
+| Bootstrap receipt missing/invalid after two bootstrap approvals | rejected in `BOOTSTRAP_RECEIPT_PREPARED`; cannot enter `CONFIRMED_RELATIONSHIP` |
 | Bootstrap confirmation reused as operational confirmation | rejected before `V01_PENDING` can reach `INVENTORY_CURRENT` |
+| Bootstrap cancellation retried through legacy/manual address | terminal bootstrap failure; return to `UNTRUSTED_CATALOGUE` |
 | V01 deadline altered to 31 seconds or a per-read timer | rejected at schedule validation; both sides cancel at deadline |
 | Old SAS/attempt/preconfirm hash substituted after reconnect | rejected before user confirmation or layout preview |
 | Layout schema version `0`/`2`, unknown tag or unsorted tag | canonical decode rejects before digest |
@@ -475,8 +583,10 @@ a required design test matrix, not a claim that runtime tests exist today.
 | Descriptor size/rotation changed after its inventory digest | inventory digest mismatch rejects before preview |
 | Placement overlaps, omits a display, duplicates one, or loses cardinal touch | geometry validation rejects before approval |
 | Base revision stale or proposed revision not `base + 1` | CAS/revision validation rejects before durable write |
+| Crash after prepare A/B or between commit write 1 and write 2 | `LAYOUT_RECOVERY_PENDING`; no UI reports saved; recovery resolves exact digest or aborts |
 | One-sided acceptance, remote cancellation or acknowledgement loss | neither UI reports saved; no partial success |
 | Revocation, endpoint drop or inventory generation change during commit | terminal cancellation before capability, no replay on reconnect |
+| Revoke/unpair/identity change leaves layout/inventory cache or diagnostic copy | deletion check fails closed; relationship remains unusable |
 
 The static verifier must mutate the actual canonical proposal bytes and framed
 state fixture, recompute framing where necessary, and assert the named stage.
