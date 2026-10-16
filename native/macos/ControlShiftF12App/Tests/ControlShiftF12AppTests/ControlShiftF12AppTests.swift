@@ -47,6 +47,17 @@ final class ControlShiftF12AppTests: XCTestCase {
         XCTAssertEqual(child.startDiscoveryCalls, 1)
     }
 
+    func testStopDiscoverySendsOnlyTheDedicatedTypedRequestWhileOpen() {
+        let child = RecordingChild()
+        let lifecycle = ChildLifecycle(child: child)
+
+        lifecycle.stopDiscovery()
+        lifecycle.close()
+        lifecycle.stopDiscovery()
+
+        XCTAssertEqual(child.stopDiscoveryCalls, 1)
+    }
+
     func testStartDiscoveryAcknowledgementIsAcceptedWithoutEnablingSharing() throws {
         let child = RecordingChild()
         let session = DiagnosticsSession(lifecycle: ChildLifecycle(child: child))
@@ -295,9 +306,11 @@ private class RecordingChild: ChildLifecycleChild {
     var terminateCalls = 0
     var reapCalls = 0
     var startDiscoveryCalls = 0
+    var stopDiscoveryCalls = 0
 
     func sendRefresh() throws {}
     func sendStartDiscovery() throws { startDiscoveryCalls += 1 }
+    func sendStopDiscovery() throws { stopDiscoveryCalls += 1 }
     func closeInput() { inputClosed = true }
     func closeOutput() { outputClosed = true }
     func closeError() { errorClosed = true }

@@ -267,7 +267,7 @@ final class DiagnosticsFrameController {
               let version = object["v"] as? Int,
               version == 1,
               let id = object["id"] as? String,
-              ["mac-refresh", "mac-start-discovery"].contains(id),
+              ["mac-refresh", "mac-start-discovery", "mac-stop-discovery"].contains(id),
               let ok = object["ok"] as? Bool,
               ok
         else { throw HostError.invalidFrame }
@@ -302,6 +302,7 @@ private func bigEndianLength(_ bytes: Data.SubSequence) -> UInt32 {
 protocol ChildLifecycleChild: AnyObject {
     func sendRefresh() throws
     func sendStartDiscovery() throws
+    func sendStopDiscovery() throws
     func closeInput()
     func closeOutput()
     func closeError()
@@ -336,6 +337,11 @@ final class ChildLifecycle {
     func startDiscovery() {
         guard !isClosed else { return }
         try? child.sendStartDiscovery()
+    }
+
+    func stopDiscovery() {
+        guard !isClosed else { return }
+        try? child.sendStopDiscovery()
     }
 
     func close() {
@@ -440,6 +446,10 @@ final class BundledChild: ChildLifecycleChild {
 
     func sendStartDiscovery() throws {
         try sendFixedRequest(id: "mac-start-discovery", command: "ui.start_discovery")
+    }
+
+    func sendStopDiscovery() throws {
+        try sendFixedRequest(id: "mac-stop-discovery", command: "ui.stop_discovery")
     }
 
     private func sendFixedRequest(id: String, command: String) throws {
@@ -592,15 +602,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     }
 
     @objc private func startDiscovery() {
-        guard diagnostics.shell.findNearbyEnabled else { return }
-        lifecycle?.startDiscovery()
+        if diagnostics.shell.findNearbyEnabled {
+            lifecycle?.startDiscovery()
+        } else if diagnostics.shell == .browsing {
+            lifecycle?.stopDiscovery()
+        }
     }
 
     private func updateJourney() {
         let shell = diagnostics.shell
         journeyHeading?.stringValue = shell.title
         journeyStatus?.stringValue = shell.connectionStatus
-        pairingButton?.isEnabled = shell.findNearbyEnabled
+        pairingButton?.isEnabled = shell.findNearbyEnabled || shell == .browsing
+        pairingButton?.title = shell == .browsing ? "Stop searching" : "Find nearby computers"
     }
 
     private func desktopJourneyView() -> NSView {
