@@ -32,4 +32,18 @@ public sealed class ChildSessionStateTests
         Assert.False(state.CanRefresh);
         Assert.True(state.CanRestart);
     }
+
+    [Fact]
+    public void Local_close_clears_the_projection_before_a_restart_is_possible()
+    {
+        var state = ChildSessionState.Starting()
+            .ReceiveCurrentProjection(generation: 1);
+
+        state = state.LocalClose();
+
+        Assert.Equal(ChildSessionPhase.Terminal, state.Phase);
+        Assert.Null(state.CurrentProjectionGeneration);
+        Assert.False(state.CanRefresh);
+        Assert.True(state.CanRestart);
+    }
 }

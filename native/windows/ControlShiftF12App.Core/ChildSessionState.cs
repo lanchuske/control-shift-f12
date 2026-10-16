@@ -35,4 +35,6 @@ public sealed record ChildSessionState(
     public ChildSessionState EndOfFile() => new(ChildSessionPhase.Terminal, null);
 
     public ChildSessionState ChannelFailure() => new(ChildSessionPhase.Terminal, null);
+
+    public ChildSessionState LocalClose() => new(ChildSessionPhase.Terminal, null);
 }
