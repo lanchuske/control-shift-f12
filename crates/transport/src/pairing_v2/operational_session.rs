@@ -9,6 +9,7 @@ use super::{
     codec::{Value, decode, encode},
 };
 use hmac::{Hmac, Mac};
+use rand::RngCore;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use sha2::{Digest, Sha256};
 use std::{net::SocketAddr, time::Duration};
@@ -169,8 +170,6 @@ impl AuthorityView {
         if view.self_fingerprint == [0; 32]
             || view.peer_fingerprint == [0; 32]
             || view.admission_attempt == [0; 32]
-            || view.policy_revision == 0
-            || view.identity_generation == 0
             || view.receipt_revision == 0
             || view.encode()? != raw
         {
@@ -180,11 +179,13 @@ impl AuthorityView {
     }
 
     pub(crate) fn encode(&self) -> Result<Vec<u8>, Invalid> {
+        // The durable store starts both policy and identity generations at zero.
+        // V01 requires equality with the active receipt, not a nonzero counter;
+        // receipt revision and the admission attempt remain nonzero capability
+        // discriminators.
         if self.self_fingerprint == [0; 32]
             || self.peer_fingerprint == [0; 32]
             || self.admission_attempt == [0; 32]
-            || self.policy_revision == 0
-            || self.identity_generation == 0
             || self.receipt_revision == 0
             || !self.suite.is_ascii()
             || self.suite.len() > 64
@@ -662,6 +663,7 @@ fn bounded_bytes(value: &Value, limit: usize) -> Result<Vec<u8>, Invalid> {
 pub(crate) struct OperationalEndpoint {
     endpoint: quinn::Endpoint,
     client: super::provisional_tls::StrictClient,
+    local_leaf: [u8; 32],
 }
 
 impl OperationalEndpoint {
@@ -670,10 +672,15 @@ impl OperationalEndpoint {
         certificate: Vec<u8>,
         key: PrivateKeyDer<'static>,
     ) -> Result<Self, Invalid> {
+        let local_leaf = hash(&certificate);
         let (server, client) =
             super::provisional_tls::strict_configs(certificate, key, ALPN, 1, 0)?;
         let endpoint = quinn::Endpoint::server(server, address).map_err(|_| Invalid)?;
-        Ok(Self { endpoint, client })
+        Ok(Self {
+            endpoint,
+            client,
+            local_leaf,
+        })
     }
 
     pub(crate) fn local_addr(&self) -> Result<SocketAddr, Invalid> {
@@ -716,6 +723,39 @@ impl OperationalEndpoint {
         .await
         .map_err(|_| Invalid)??;
         OperationalChannel::observe(connection, expected_peer_pin)
+    }
+
+    pub(crate) async fn connect_admitted(
+        &self,
+        peer: SocketAddr,
+        authority: &super::admission_authority::AdmissionAuthorityStore,
+        durable_attempt: [u8; 32],
+    ) -> Result<OperationalAttempt, Invalid> {
+        let snapshot = authority
+            .operational_admission_snapshot(durable_attempt)
+            .map_err(|_| Invalid)?;
+        let view = AuthorityView::from_snapshot(self.local_leaf, &snapshot)?;
+        if view.self_fingerprint >= view.peer_fingerprint {
+            return Err(Invalid);
+        }
+        let channel = self.connect(peer, view.peer_fingerprint).await?;
+        OperationalAttempt::new(channel, Role::A, authority, durable_attempt, view).await
+    }
+
+    pub(crate) async fn accept_admitted(
+        &self,
+        authority: &super::admission_authority::AdmissionAuthorityStore,
+        durable_attempt: [u8; 32],
+    ) -> Result<OperationalAttempt, Invalid> {
+        let snapshot = authority
+            .operational_admission_snapshot(durable_attempt)
+            .map_err(|_| Invalid)?;
+        let view = AuthorityView::from_snapshot(self.local_leaf, &snapshot)?;
+        if view.self_fingerprint <= view.peer_fingerprint {
+            return Err(Invalid);
+        }
+        let channel = self.accept(view.peer_fingerprint).await?;
+        OperationalAttempt::new(channel, Role::B, authority, durable_attempt, view).await
     }
 }
 
@@ -841,6 +881,322 @@ impl OperationalChannel {
             }
         }
     }
+
+    fn exporter(&self, label: &[u8], context: &[u8]) -> Result<[u8; 32], Invalid> {
+        let mut value = [0; 32];
+        self.connection
+            .export_keying_material(&mut value, label, context)
+            .map_err(|_| Invalid)?;
+        Ok(value)
+    }
+}
+
+/// A sealed, non-cloneable V01 attempt.  Construction is possible only from
+/// an atomic durable snapshot and the selected authenticated TLS connection.
+pub(crate) struct OperationalAttempt {
+    channel: OperationalChannel,
+    role: Role,
+    view: AuthorityView,
+    preflight: crate::pairing_pending::OperationalPreflightLease,
+}
+
+impl OperationalAttempt {
+    async fn new(
+        channel: OperationalChannel,
+        role: Role,
+        authority: &super::admission_authority::AdmissionAuthorityStore,
+        durable_attempt: [u8; 32],
+        view: AuthorityView,
+    ) -> Result<Self, Invalid> {
+        let encoded_view = view.encode()?;
+        let view_hash = hash(&encoded_view);
+        let (a, b) = match role {
+            Role::A => (view.self_fingerprint, view.peer_fingerprint),
+            Role::B => (view.peer_fingerprint, view.self_fingerprint),
+        };
+        let context = encode(
+            "operational-session-preflight-lease-context-v1",
+            &[
+                Value::Text("csf12-operational/1".to_owned()),
+                Value::Text(
+                    match role {
+                        Role::A => "A",
+                        Role::B => "B",
+                    }
+                    .to_owned(),
+                ),
+                Value::Bytes(a.to_vec()),
+                Value::Bytes(b.to_vec()),
+                Value::Bytes(view_hash.to_vec()),
+            ],
+        )?;
+        let exporter = channel.exporter(
+            b"EXPORTER-ControlShiftF12-OperationalPreflightLease-v1",
+            &context,
+        )?;
+        let binding = hash(&encode(
+            "operational-session-preflight-lease-binding-v1",
+            &[
+                Value::Text(
+                    match role {
+                        Role::A => "A",
+                        Role::B => "B",
+                    }
+                    .to_owned(),
+                ),
+                Value::Bytes(view_hash.to_vec()),
+                Value::Bytes(hash(&context).to_vec()),
+                Value::Bytes(hash(&exporter).to_vec()),
+            ],
+        )?);
+        let preflight = authority
+            .acquire_operational_preflight_lease(durable_attempt, view_hash, binding)
+            .map_err(|_| Invalid)?;
+        Ok(Self {
+            channel,
+            role,
+            view,
+            preflight,
+        })
+    }
+
+    /// Runs the dynamic V01 transcript. The only values constructed here are
+    /// fresh opaque attempt/session/nonces and the exact durable/TLS bindings.
+    pub(crate) async fn complete(self) -> Result<(), Invalid> {
+        let mut attempt = [0; 32];
+        let mut session = [0; 16];
+        let mut nonce_a = [0; 32];
+        if self.role == Role::A {
+            rand::rngs::OsRng.fill_bytes(&mut attempt);
+            rand::rngs::OsRng.fill_bytes(&mut session);
+            rand::rngs::OsRng.fill_bytes(&mut nonce_a);
+        }
+        let (mut send, mut recv) = match self.role {
+            Role::A => self
+                .channel
+                .connection
+                .open_bi()
+                .await
+                .map_err(|_| Invalid)?,
+            Role::B => self
+                .channel
+                .connection
+                .accept_bi()
+                .await
+                .map_err(|_| Invalid)?,
+        };
+        let first = if self.role == Role::A {
+            record(
+                0,
+                "operational-session-preflight-open-v1",
+                &[
+                    Value::Bytes(attempt.to_vec()),
+                    Value::Text("A".into()),
+                    Value::Bytes(session.to_vec()),
+                    Value::Bytes(nonce_a.to_vec()),
+                    Value::Bytes(self.view.encode()?),
+                    Value::Bytes(self.view.self_fingerprint.to_vec()),
+                    Value::Bytes(self.view.peer_fingerprint.to_vec()),
+                ],
+            )?
+        } else {
+            read_one_record(&mut recv).await?
+        };
+        if self.role == Role::A {
+            send.write_all(&first.encode()?)
+                .await
+                .map_err(|_| Invalid)?;
+        }
+        let a = preflight_open(&first)?;
+        if self.role == Role::B {
+            attempt = a.attempt;
+            session = a.session_id;
+            nonce_a = a.nonce_a;
+            if !self.view.inverse_of(&a.a_view) {
+                return Err(Invalid);
+            }
+        }
+        let mut nonce_b = [0; 32];
+        if self.role == Role::B {
+            rand::rngs::OsRng.fill_bytes(&mut nonce_b);
+        }
+        let second = if self.role == Role::B {
+            record(
+                1,
+                "operational-session-preflight-accept-v1",
+                &[
+                    Value::Bytes(attempt.to_vec()),
+                    Value::Text("B".into()),
+                    Value::Bytes(session.to_vec()),
+                    Value::Bytes(nonce_a.to_vec()),
+                    Value::Bytes(nonce_b.to_vec()),
+                    Value::Bytes(self.view.encode()?),
+                    Value::Bytes(a.a_leaf.to_vec()),
+                    Value::Bytes(a.b_leaf.to_vec()),
+                ],
+            )?
+        } else {
+            read_one_record(&mut recv).await?
+        };
+        if self.role == Role::B {
+            send.write_all(&second.encode()?)
+                .await
+                .map_err(|_| Invalid)?;
+        }
+        let b = preflight_accept(&second)?;
+        if self.role == Role::A {
+            nonce_b = b.nonce_b;
+            if !self.view.inverse_of(&b.b_view) {
+                return Err(Invalid);
+            }
+        }
+        let commitment = authority_commitment(&a.a_view, &b.b_view)?;
+        let ch = hash(&commitment);
+        let final_lease = self.preflight.promote(ch).map_err(|_| Invalid)?;
+        final_lease.assert_current().map_err(|_| Invalid)?;
+        let context = exporter_context(a.a_leaf, a.b_leaf, ch, nonce_a, nonce_b)?;
+        let cx = hash(&context);
+        let exporter = self
+            .channel
+            .exporter(b"EXPORTER-ControlShiftF12-OperationalSession-v1", &context)?;
+        let key = confirm_key(exporter, cx)?;
+        let open = if self.role == Role::A {
+            record(
+                2,
+                "operational-session-open-v1",
+                &[
+                    Value::Bytes(attempt.to_vec()),
+                    Value::Text("A".into()),
+                    Value::Bytes(session.to_vec()),
+                    Value::Bytes(ch.to_vec()),
+                    Value::Bytes(cx.to_vec()),
+                ],
+            )?
+        } else {
+            read_one_record(&mut recv).await?
+        };
+        if self.role == Role::A {
+            send.write_all(&open.encode()?).await.map_err(|_| Invalid)?;
+        }
+        let accept = if self.role == Role::B {
+            record(
+                3,
+                "operational-session-accept-v1",
+                &[
+                    Value::Bytes(attempt.to_vec()),
+                    Value::Text("B".into()),
+                    Value::Bytes(session.to_vec()),
+                    Value::Bytes(hash(open.payload()).to_vec()),
+                    Value::Bytes(ch.to_vec()),
+                    Value::Bytes(cx.to_vec()),
+                ],
+            )?
+        } else {
+            read_one_record(&mut recv).await?
+        };
+        if self.role == Role::B {
+            send.write_all(&accept.encode()?)
+                .await
+                .map_err(|_| Invalid)?;
+        }
+        let prior = hash(accept.payload());
+        let ca = confirmation(&key, Role::A, attempt, session, prior)?;
+        let confirm_a = if self.role == Role::A {
+            record(
+                4,
+                "operational-session-confirm-v1",
+                &[
+                    Value::Bytes(attempt.to_vec()),
+                    Value::Text("A".into()),
+                    Value::Bytes(session.to_vec()),
+                    Value::Bytes(prior.to_vec()),
+                    Value::Bytes(ca.to_vec()),
+                ],
+            )?
+        } else {
+            read_one_record(&mut recv).await?
+        };
+        if self.role == Role::A {
+            send.write_all(&confirm_a.encode()?)
+                .await
+                .map_err(|_| Invalid)?;
+        }
+        let prior_b = hash(confirm_a.payload());
+        let cb = confirmation(&key, Role::B, attempt, session, prior_b)?;
+        let confirm_b = if self.role == Role::B {
+            record(
+                5,
+                "operational-session-confirm-v1",
+                &[
+                    Value::Bytes(attempt.to_vec()),
+                    Value::Text("B".into()),
+                    Value::Bytes(session.to_vec()),
+                    Value::Bytes(prior_b.to_vec()),
+                    Value::Bytes(cb.to_vec()),
+                ],
+            )?
+        } else {
+            read_one_record(&mut recv).await?
+        };
+        if self.role == Role::B {
+            send.write_all(&confirm_b.encode()?)
+                .await
+                .map_err(|_| Invalid)?;
+        }
+        let records = vec![first, second, open, accept, confirm_a, confirm_b];
+        derive_and_verify_confirmation_key(&records, exporter)?;
+        final_lease.assert_current().map_err(|_| Invalid)?;
+        send.finish().map_err(|_| Invalid)?;
+        // A sender must not drop the sealed channel until the peer has also
+        // finished its sending half.  Otherwise the final confirmation can be
+        // discarded by `OperationalChannel::drop` before the other side reads
+        // it.  Any trailing byte is still an immediate protocol violation.
+        let mut trailing = [0; 1];
+        match recv.read(&mut trailing).await {
+            Ok(None) => {}
+            // Quinn can surface the peer's final normal application close
+            // instead of EOF after it has already consumed both exporter-HMAC
+            // confirmations. The transcript check above is therefore the
+            // linear evidence that neither confirm was lost; any delivered
+            // trailing byte remains a hard failure below.
+            Err(quinn::ReadError::ConnectionLost(quinn::ConnectionError::ApplicationClosed(_))) => {
+            }
+            Ok(Some(_)) | Err(_) => return Err(Invalid),
+        }
+        Ok(())
+    }
+}
+
+fn record(sequence: u32, kind: &str, fields: &[Value]) -> Result<OperationalRecord, Invalid> {
+    OperationalRecord::new(sequence, encode(kind, fields)?)
+}
+fn confirm_key(exporter: [u8; 32], context: [u8; 32]) -> Result<[u8; 32], Invalid> {
+    let mut x = Hmac::<Sha256>::new_from_slice(&context).map_err(|_| Invalid)?;
+    x.update(&exporter);
+    let p = x.finalize().into_bytes();
+    let mut y = Hmac::<Sha256>::new_from_slice(&p).map_err(|_| Invalid)?;
+    y.update(b"CSF12 operational session confirm key v1\0");
+    y.update(&context);
+    y.update(&[1]);
+    Ok(y.finalize().into_bytes().into())
+}
+fn confirmation(
+    key: &[u8; 32],
+    role: Role,
+    attempt: [u8; 32],
+    session: [u8; 16],
+    prior: [u8; 32],
+) -> Result<[u8; 32], Invalid> {
+    let mut m = Hmac::<Sha256>::new_from_slice(key).map_err(|_| Invalid)?;
+    m.update(b"CSF12 operational session confirm v1\0");
+    m.update(match role {
+        Role::A => b"A",
+        Role::B => b"B",
+    });
+    m.update(&attempt);
+    m.update(&session);
+    m.update(&prior);
+    Ok(m.finalize().into_bytes().into())
 }
 
 async fn read_one_record(recv: &mut quinn::RecvStream) -> Result<OperationalRecord, Invalid> {
@@ -862,7 +1218,10 @@ async fn read_one_record(recv: &mut quinn::RecvStream) -> Result<OperationalReco
 
 impl Drop for OperationalChannel {
     fn drop(&mut self) {
-        self.connection
-            .close(APPLICATION_ERROR.into(), b"operational channel closed");
+        // `Connection`'s own last-handle close preserves a peer's already
+        // finished final record. Explicit application close here races the
+        // reciprocal EOF read that proves both confirmations were consumed.
+        // Every fail-closed path still calls `close` explicitly before this
+        // wrapper can be returned to the caller.
     }
 }

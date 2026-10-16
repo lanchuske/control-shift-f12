@@ -1,3 +1,4 @@
+use super::admission_authority::AdmissionAuthorityStore;
 use super::operational_session::{
     AuthorityView, OperationalEndpoint, OperationalRecord, RecordType, Role,
     derive_and_verify_confirmation_key, validate_v01_schedule,
@@ -226,6 +227,120 @@ async fn v01_exchanges_exactly_six_records_on_one_bidirectional_stream() {
     );
     assert!(a_result.is_ok(), "{a_result:?}");
     assert!(b_result.is_ok(), "{b_result:?}");
+}
+
+#[tokio::test]
+async fn v01_dynamic_attempt_uses_live_tls_exporter_and_durable_snapshots() {
+    let (a_der, a_key) = identity();
+    let (b_der, b_key) = identity();
+    let a_pin: [u8; 32] = Sha256::digest(&a_der).into();
+    let b_pin: [u8; 32] = Sha256::digest(&b_der).into();
+    let a_root = tempfile::tempdir().unwrap();
+    let b_root = tempfile::tempdir().unwrap();
+    let a_store = AdmissionAuthorityStore::open(a_root.path()).unwrap();
+    let b_store = AdmissionAuthorityStore::open(b_root.path()).unwrap();
+    let ar = a_store
+        .prepare(a_store.version().unwrap(), [31; 32], [32; 32])
+        .unwrap();
+    let br = b_store
+        .prepare(b_store.version().unwrap(), [33; 32], [34; 32])
+        .unwrap();
+    a_store.commit_operational_test_receipt(&ar, b_pin).unwrap();
+    b_store.commit_operational_test_receipt(&br, a_pin).unwrap();
+    let a = OperationalEndpoint::bind("127.0.0.1:0".parse().unwrap(), a_der, a_key).unwrap();
+    let b = OperationalEndpoint::bind("127.0.0.1:0".parse().unwrap(), b_der, b_key).unwrap();
+    let (aa, bb) = if a_pin < b_pin {
+        tokio::join!(
+            a.connect_admitted(b.local_addr().unwrap(), &a_store, ar.attempt_id),
+            b.accept_admitted(&b_store, br.attempt_id)
+        )
+    } else {
+        tokio::join!(
+            b.connect_admitted(a.local_addr().unwrap(), &b_store, br.attempt_id),
+            a.accept_admitted(&a_store, ar.attempt_id)
+        )
+    };
+    assert!(aa.is_ok(), "initiator admission failed");
+    assert!(bb.is_ok(), "acceptor admission failed");
+    let (ra, rb) = tokio::join!(aa.unwrap().complete(), bb.unwrap().complete());
+    assert!(ra.is_ok() && rb.is_ok(), "a={ra:?}; b={rb:?}");
+}
+
+#[tokio::test]
+async fn v01_dynamic_attempt_rejects_a_durable_tuple_with_the_wrong_tls_pin() {
+    let (a_der, a_key) = identity();
+    let (b_der, b_key) = identity();
+    let a_pin: [u8; 32] = Sha256::digest(&a_der).into();
+    let b_pin: [u8; 32] = Sha256::digest(&b_der).into();
+    let a_root = tempfile::tempdir().unwrap();
+    let b_root = tempfile::tempdir().unwrap();
+    let a_store = AdmissionAuthorityStore::open(a_root.path()).unwrap();
+    let b_store = AdmissionAuthorityStore::open(b_root.path()).unwrap();
+    let ar = a_store
+        .prepare(a_store.version().unwrap(), [41; 32], [42; 32])
+        .unwrap();
+    let br = b_store
+        .prepare(b_store.version().unwrap(), [43; 32], [44; 32])
+        .unwrap();
+    // The durable peer pin is a tuple member, not a hint: an authenticated
+    // connection with a different selected leaf cannot acquire a lease.
+    a_store
+        .commit_operational_test_receipt(&ar, [99; 32])
+        .unwrap();
+    b_store.commit_operational_test_receipt(&br, a_pin).unwrap();
+    let a = OperationalEndpoint::bind("127.0.0.1:0".parse().unwrap(), a_der, a_key).unwrap();
+    let b = OperationalEndpoint::bind("127.0.0.1:0".parse().unwrap(), b_der, b_key).unwrap();
+    let (client, server) = tokio::join!(
+        a.connect_admitted(b.local_addr().unwrap(), &a_store, ar.attempt_id),
+        b.accept_admitted(&b_store, br.attempt_id)
+    );
+    assert!(client.is_err());
+    drop(server);
+    assert_ne!(b_pin, [99; 32]);
+}
+
+#[tokio::test]
+async fn v01_dynamic_attempt_fails_closed_when_revocation_wins_before_promotion() {
+    let (a_der, a_key) = identity();
+    let (b_der, b_key) = identity();
+    let a_pin: [u8; 32] = Sha256::digest(&a_der).into();
+    let b_pin: [u8; 32] = Sha256::digest(&b_der).into();
+    let a_root = tempfile::tempdir().unwrap();
+    let b_root = tempfile::tempdir().unwrap();
+    let a_store = AdmissionAuthorityStore::open(a_root.path()).unwrap();
+    let b_store = AdmissionAuthorityStore::open(b_root.path()).unwrap();
+    let ar = a_store
+        .prepare(a_store.version().unwrap(), [51; 32], [52; 32])
+        .unwrap();
+    let br = b_store
+        .prepare(b_store.version().unwrap(), [53; 32], [54; 32])
+        .unwrap();
+    a_store.commit_operational_test_receipt(&ar, b_pin).unwrap();
+    b_store.commit_operational_test_receipt(&br, a_pin).unwrap();
+    let a = OperationalEndpoint::bind("127.0.0.1:0".parse().unwrap(), a_der, a_key).unwrap();
+    let b = OperationalEndpoint::bind("127.0.0.1:0".parse().unwrap(), b_der, b_key).unwrap();
+    let (aa, bb) = if a_pin < b_pin {
+        tokio::join!(
+            a.connect_admitted(b.local_addr().unwrap(), &a_store, ar.attempt_id),
+            b.accept_admitted(&b_store, br.attempt_id)
+        )
+    } else {
+        tokio::join!(
+            b.connect_admitted(a.local_addr().unwrap(), &b_store, br.attempt_id),
+            a.accept_admitted(&a_store, ar.attempt_id)
+        )
+    };
+    let aa = aa.unwrap();
+    let bb = bb.unwrap();
+    a_store
+        .revoke_candidate(a_store.version().unwrap(), ar.peer_fingerprint)
+        .unwrap();
+    let (ra, rb) = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        tokio::join!(aa.complete(), bb.complete())
+    })
+    .await
+    .expect("revocation must close the live attempt without waiting for its deadline");
+    assert!(ra.is_err() || rb.is_err());
 }
 
 #[tokio::test]

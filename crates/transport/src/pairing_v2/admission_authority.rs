@@ -127,6 +127,29 @@ impl AdmissionAuthorityStore {
     /// Test-only synthetic entry point. Production can commit only a live sealed
     /// handshake witness through `commit_sealed_foundation`.
     #[cfg(test)]
+    pub(crate) fn commit_operational_test_receipt(
+        &self,
+        record: &PendingRecord,
+        peer_pin: [u8; 32],
+    ) -> Result<PromotionReceipt, StoreError> {
+        self.commit_metadata(
+            self.version()?,
+            record.revocation_generation,
+            record,
+            EvidenceFields {
+                attempt: record.attempt_id,
+                peer: record.peer_fingerprint,
+                peer_pin,
+                fc: [22; 32],
+                role: 0,
+                suite: super::SUITE,
+                transcript: [23; 32],
+                binding: [24; 32],
+            },
+        )
+    }
+
+    #[cfg(test)]
     fn commit_metadata(
         &self,
         expected: StoreVersion,
