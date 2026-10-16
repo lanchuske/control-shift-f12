@@ -180,6 +180,98 @@ mod native {
 
     const INJECTED_EVENT_MARKER: i64 = 0x0053_494d_4143_4f53;
 
+    #[repr(u8)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum CaptureSafetyState {
+        Local = 0,
+        Remote = 1,
+        RecoveryPending = 2,
+    }
+
+    struct RecoveryLatch(AtomicU8);
+
+    impl RecoveryLatch {
+        fn new(mode: CaptureMode) -> Self {
+            Self(AtomicU8::new(match mode {
+                CaptureMode::Local => CaptureSafetyState::Local as u8,
+                CaptureMode::Remote => CaptureSafetyState::Remote as u8,
+            }))
+        }
+
+        fn request(&self) {
+            self.0
+                .store(CaptureSafetyState::RecoveryPending as u8, Ordering::Release);
+        }
+
+        fn request_shortcut_recovery(&self) {
+            self.request();
+        }
+
+        fn request_overflow_recovery(&self) {
+            self.request();
+        }
+
+        fn set_remote(&self, remote: bool) -> bool {
+            if !remote {
+                return self
+                    .0
+                    .compare_exchange(
+                        CaptureSafetyState::Remote as u8,
+                        CaptureSafetyState::Local as u8,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .is_ok();
+            }
+            loop {
+                match self.0.load(Ordering::Acquire) {
+                    value if value == CaptureSafetyState::RecoveryPending as u8 => return false,
+                    value if value == CaptureSafetyState::Remote as u8 => return true,
+                    value if value == CaptureSafetyState::Local as u8 => {
+                        if self
+                            .0
+                            .compare_exchange(
+                                value,
+                                CaptureSafetyState::Remote as u8,
+                                Ordering::AcqRel,
+                                Ordering::Acquire,
+                            )
+                            .is_ok()
+                        {
+                            return true;
+                        }
+                    }
+                    _ => return false,
+                }
+            }
+        }
+
+        fn acknowledge_local(&self) -> bool {
+            self.0
+                .compare_exchange(
+                    CaptureSafetyState::RecoveryPending as u8,
+                    CaptureSafetyState::Local as u8,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+        }
+
+        fn is_remote(&self) -> bool {
+            self.0.load(Ordering::Acquire) == CaptureSafetyState::Remote as u8
+        }
+
+        #[cfg(test)]
+        fn state(&self) -> CaptureSafetyState {
+            match self.0.load(Ordering::Acquire) {
+                0 => CaptureSafetyState::Local,
+                1 => CaptureSafetyState::Remote,
+                2 => CaptureSafetyState::RecoveryPending,
+                _ => unreachable!(),
+            }
+        }
+    }
+
     #[link(name = "ApplicationServices", kind = "framework")]
     unsafe extern "C" {
         fn AXIsProcessTrusted() -> bool;
@@ -302,7 +394,7 @@ mod native {
     }
 
     pub struct MacEventTap {
-        mode: Arc<AtomicU8>,
+        safety: Arc<RecoveryLatch>,
         stop: Arc<AtomicBool>,
         worker: Option<std::thread::JoinHandle<()>>,
     }
@@ -311,10 +403,10 @@ mod native {
             mode: CaptureMode,
             callback: impl Fn(CaptureOutcome) -> CaptureCallbackAction + Send + Sync + 'static,
         ) -> Result<Self, InputError> {
-            let mode_value = Arc::new(AtomicU8::new(mode as u8));
+            let safety = Arc::new(RecoveryLatch::new(mode));
             let callback = Arc::new(callback);
-            let callback_mode = Arc::clone(&mode_value);
-            let emergency_mode = Arc::clone(&mode_value);
+            let callback_safety = Arc::clone(&safety);
+            let emergency_safety = Arc::clone(&safety);
             let stop = Arc::new(AtomicBool::new(false));
             let worker_stop = Arc::clone(&stop);
             let (ready_sender, ready_receiver) = std::sync::mpsc::sync_channel(1);
@@ -369,8 +461,7 @@ mod native {
                                     .all(|modifier| held.contains(modifier))
                                 {
                                     held.clear();
-                                    emergency_mode
-                                        .store(CaptureMode::Local as u8, Ordering::Relaxed);
+                                    emergency_safety.request_shortcut_recovery();
                                     let _ = callback(CaptureOutcome {
                                         disposition: EventDisposition::PassThrough,
                                         event: None,
@@ -379,8 +470,7 @@ mod native {
                                     return CallbackResult::Keep;
                                 }
                             }
-                            let remote =
-                                callback_mode.load(Ordering::Relaxed) == CaptureMode::Remote as u8;
+                            let remote = callback_safety.is_remote();
                             if let Some(input) = input {
                                 let action = callback(CaptureOutcome {
                                     disposition: if remote {
@@ -392,8 +482,7 @@ mod native {
                                     emergency: false,
                                 });
                                 if action == CaptureCallbackAction::RecoverLocal {
-                                    callback_mode
-                                        .store(CaptureMode::Local as u8, Ordering::Release);
+                                    callback_safety.request_overflow_recovery();
                                     return CallbackResult::Keep;
                                 }
                             }
@@ -433,13 +522,17 @@ mod native {
                 .recv()
                 .map_err(|_| InputError::CoreGraphics)??;
             Ok(Self {
-                mode: mode_value,
+                safety,
                 stop,
                 worker: Some(worker),
             })
         }
-        pub fn set_mode(&self, mode: CaptureMode) {
-            self.mode.store(mode as u8, Ordering::Relaxed);
+        pub fn set_remote(&self, remote: bool) -> bool {
+            self.safety.set_remote(remote)
+        }
+
+        pub fn acknowledge_local_recovery(&self) -> bool {
+            self.safety.acknowledge_local()
         }
     }
 
@@ -572,6 +665,51 @@ mod native {
     }
     fn keycode_to_hid(code: u16) -> Option<u16> {
         (0u16..=0xff).find(|hid| hid_to_keycode(*hid) == Some(code))
+    }
+
+    #[cfg(test)]
+    mod recovery_latch_tests {
+        use super::*;
+
+        #[test]
+        fn recovery_request_cannot_be_overwritten_by_stale_remote_update() {
+            let latch = RecoveryLatch::new(CaptureMode::Remote);
+            latch.request();
+            assert!(!latch.set_remote(true));
+            assert_eq!(latch.state(), CaptureSafetyState::RecoveryPending);
+        }
+
+        #[test]
+        fn recovery_interleaved_between_drain_and_remote_refresh_stays_pending() {
+            let latch = RecoveryLatch::new(CaptureMode::Remote);
+            let remote_observed_before_drain = true;
+            latch.request();
+            assert!(!latch.set_remote(remote_observed_before_drain));
+            assert_eq!(latch.state(), CaptureSafetyState::RecoveryPending);
+        }
+
+        #[test]
+        fn acknowledgement_leaves_capture_local_until_a_later_crossing() {
+            let latch = RecoveryLatch::new(CaptureMode::Remote);
+            latch.request();
+            assert!(latch.acknowledge_local());
+            assert_eq!(latch.state(), CaptureSafetyState::Local);
+            assert!(latch.set_remote(true));
+            assert_eq!(latch.state(), CaptureSafetyState::Remote);
+        }
+
+        #[test]
+        fn shortcut_and_overflow_share_the_same_recovery_guarantee() {
+            for request in [
+                RecoveryLatch::request_shortcut_recovery,
+                RecoveryLatch::request_overflow_recovery,
+            ] {
+                let latch = RecoveryLatch::new(CaptureMode::Remote);
+                request(&latch);
+                assert!(!latch.set_remote(true));
+                assert_eq!(latch.state(), CaptureSafetyState::RecoveryPending);
+            }
+        }
     }
 }
 

@@ -597,6 +597,7 @@ impl NativeSupervisor {
     async fn drain_capture(&mut self, now_ms: u64, budget: usize) -> Result<(), SupervisorError> {
         let captured = self.capture.drain(budget);
         for captured in captured {
+            let recovery_pending = captured.emergency;
             let effects = if captured.emergency {
                 self.runtime.emergency_return()
             } else if let Some(event) = captured.event {
@@ -665,7 +666,13 @@ impl NativeSupervisor {
             } else {
                 Vec::new()
             };
-            self.execute_effects(effects).await?;
+            if recovery_pending {
+                acknowledge_recovery_after(self.execute_effects(effects).await, || {
+                    self.capture.acknowledge_local_recovery()
+                })?;
+            } else {
+                self.execute_effects(effects).await?;
+            }
         }
         Ok(())
     }
@@ -733,6 +740,15 @@ impl NativeSupervisor {
         }
         Ok(())
     }
+}
+
+fn acknowledge_recovery_after<T, E>(
+    result: Result<T, E>,
+    acknowledge: impl FnOnce(),
+) -> Result<T, E> {
+    let value = result?;
+    acknowledge();
+    Ok(value)
 }
 
 fn create_peer_link(
@@ -1090,7 +1106,7 @@ impl CaptureBuffer {
 mod capture_buffer_tests {
     use super::{
         CAPTURE_DRAIN_BUDGET, CaptureBuffer, CaptureEnqueueAction, CapturedInput,
-        INPUT_SERVICE_INTERVAL,
+        INPUT_SERVICE_INTERVAL, acknowledge_recovery_after,
     };
     use seamless_input_protocol::{Button, InputEvent, Modifier};
 
@@ -1265,6 +1281,22 @@ mod capture_buffer_tests {
         assert!(INPUT_SERVICE_INTERVAL < std::time::Duration::from_millis(250));
         assert!((1..=64).contains(&CAPTURE_DRAIN_BUDGET));
     }
+
+    #[test]
+    fn recovery_is_acknowledged_only_after_successful_release() {
+        let mut acknowledged = false;
+        let result: Result<(), &str> = acknowledge_recovery_after(Err("release failed"), || {
+            acknowledged = true;
+        });
+        assert_eq!(result, Err("release failed"));
+        assert!(!acknowledged);
+
+        assert_eq!(
+            acknowledge_recovery_after(Ok::<_, &str>(()), || acknowledged = true),
+            Ok(())
+        );
+        assert!(acknowledged);
+    }
 }
 
 #[cfg(all(target_os = "macos", not(test)))]
@@ -1299,11 +1331,10 @@ impl NativeCapture {
         self.buffer.drain(budget)
     }
     fn set_remote(&self, remote: bool) {
-        self.tap.set_mode(if remote {
-            seamless_input_core::platform::CaptureMode::Remote
-        } else {
-            seamless_input_core::platform::CaptureMode::Local
-        });
+        let _ = self.tap.set_remote(remote);
+    }
+    fn acknowledge_local_recovery(&self) {
+        let _ = self.tap.acknowledge_local_recovery();
     }
 }
 
@@ -1332,6 +1363,7 @@ impl NativeCapture {
     fn set_remote(&self, remote: bool) {
         self.hooks.set_remote_capture(remote);
     }
+    fn acknowledge_local_recovery(&self) {}
 }
 
 // Supervisor unit tests exercise orchestration, topology, and the peer data
@@ -1354,6 +1386,8 @@ impl NativeCapture {
     }
 
     fn set_remote(&self, _remote: bool) {}
+
+    fn acknowledge_local_recovery(&self) {}
 }
 
 fn display(node: NodeId, value: &LogicalDisplay) -> Display {
