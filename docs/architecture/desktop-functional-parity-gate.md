@@ -57,7 +57,10 @@ Presented state is a projection, never action authority. A disabled or visible
 control must not be treated as an engine command, and every future enabled
 control needs the typed gate below. “Future schema” names a review target; it
 does not add a current host-to-child command. The current host-to-child
-allowlist remains exactly `ui.refresh` and `ui.confirm_v01`.
+allowlist remains exactly `ui.refresh`, `ui.start_discovery`,
+`ui.stop_discovery`, and `ui.confirm_v01`. The discovery actions are only
+local browsing-state transitions until a separately reviewed engine owner
+publishes candidates.
 
 | User action | Future typed gate and engine owner | Required presented state / preconditions | Allowed effect | Fail-closed rejection and no fallback | Current status |
 | --- | --- | --- | --- | --- | --- |

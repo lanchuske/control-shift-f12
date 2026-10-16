@@ -520,8 +520,8 @@ class NativeHostBoundaryTests(unittest.TestCase):
         native_readme = NATIVE_README.read_text()
         host_to_child = design.split("| Host → child |", 1)[1].split("\n", 1)[0]
         self.assertEqual(
-            host_to_child,
-            " `ui.refresh` and `ui.confirm_v01` only, using the existing request envelope and idempotent request IDs |",
+        host_to_child,
+        " `ui.refresh`, `ui.start_discovery`, `ui.stop_discovery`, and `ui.confirm_v01` only, using the existing request envelope and idempotent request IDs |",
         )
         for text in (design, boundary, native_readme):
             self.assertNotIn("send the existing typed shutdown request", text)
@@ -554,7 +554,7 @@ class NativeHostBoundaryTests(unittest.TestCase):
             "Allowed effect",
             "Fail-closed rejection and no fallback",
             "Current status",
-            "allowlist remains exactly `ui.refresh` and `ui.confirm_v01`",
+            "allowlist remains exactly `ui.refresh`, `ui.start_discovery`,",
         ):
             self.assertIn(column, plan)
         for action in (

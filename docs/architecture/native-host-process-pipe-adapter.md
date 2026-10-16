@@ -100,8 +100,15 @@ The typed adapter's direction is closed:
 
 | Direction | Allowed values |
 | --- | --- |
-| Host → child | `ui.refresh` and `ui.confirm_v01` only, using the existing request envelope and idempotent request IDs |
+| Host → child | `ui.refresh`, `ui.start_discovery`, `ui.stop_discovery`, and `ui.confirm_v01` only, using the existing request envelope and idempotent request IDs |
 | Child → host | `ui_snapshot_v1`, `ui_diagnostics_v1`, `ui_response_v1`, and the transient `sas_display_v1` frame only |
+
+`ui.start_discovery` and `ui.stop_discovery` transition only the bounded local
+UI controller between its inert and browsing presentations. They do not create
+a listener, select a locator, expose an address, start a pairing transport, or
+grant an input, clipboard, inventory, layout, or relationship capability. A
+future engine-owned discovery owner must publish current candidates separately
+before the UI can select anything.
 
 Malformed, zero-length, truncated, oversized, unknown-version, unknown-field,
 wrong-direction, or invalid-JSON frames are terminal local pipe failures. The
@@ -232,7 +239,7 @@ simulated pipe never proves the target platform.
 | Engine admission | Test that the exact child vector routes to the reviewed typed adapter, with one shared monotonic epoch; foundations `control_engine` is rejected for a UI host. | Review confirms no argument or environment fallback. |
 | Launch boundary | Mutation tests reject shell text, relative/user/environment paths, extra arguments, inherited handles, named/public pipes, and non-allowlisted environment entries. | Package-resource path failures remain local and launch nothing else. |
 | Framing | Fuzz/mutation tests cover zero, truncated, oversized, invalid JSON, unknown schema, wrong direction, and partial writes/reads at the 256 KiB boundary. | Both platforms close/clear/reap; no retry route. |
-| Host allowlist | Integration tests reject every host request except `ui.refresh` and `ui.confirm_v01`, including recursive SAS shapes and request-ID conflicts/replays. | Host cannot cause input, clipboard, transport, discovery, or layout authority. |
+| Host allowlist | Integration tests reject every host request except `ui.refresh`, `ui.start_discovery`, `ui.stop_discovery`, and `ui.confirm_v01`, including recursive SAS shapes and request-ID conflicts/replays. | Host cannot cause input, clipboard, transport, candidate selection, or layout authority; discovery actions alone only alter the local browsing presentation. |
 | SAS lifetime | Tests cover current display, duplicate/stale frame, terminal invalidation, local expiry without traffic, backward clock, child exit, UI close, and restart. | Code/suffix clears immediately and cannot appear in history, logs, clipboard, notification, title, tooltip, accessibility cache, or next session. |
 | macOS pipe owner | AppKit-targeted test exercises a blocked read, cancellation, child exit, stdout write failure, bounded wait, reaping, and main-thread handoff. | No detached task or descriptor leak; UI is never updated off main. |
 | Windows pipe owner | WinForms/Windows-targeted test exercises the selected cancellable-read strategy, blocked read, child exit, stdout write failure, bounded wait, reaping, and UI-thread handoff. | No blocked worker, handle leak, or UI-thread violation. |
