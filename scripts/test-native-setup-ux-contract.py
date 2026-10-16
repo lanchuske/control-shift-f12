@@ -61,6 +61,10 @@ class ZeroCasAbort:
     assertion_a: str
     assertion_b: str
     algorithm: str
+    lock_state_a: str
+    lock_version_a: int
+    lock_state_b: str
+    lock_version_b: int
     signature_a: str = ""
     signature_b: str = ""
 
@@ -68,7 +72,8 @@ class ZeroCasAbort:
         return "|".join(map(str, (
             self.version, self.commit_digest, self.role_a, self.role_b,
             self.receipt_a, self.receipt_b, self.base, self.proposed,
-            self.assertion_a, self.assertion_b, self.algorithm)))
+            self.assertion_a, self.assertion_b, self.algorithm, self.lock_state_a,
+            self.lock_version_a, self.lock_state_b, self.lock_version_b)))
 
     def message(self) -> str:
         return "CSF12 layout zero-cas abort v1\\0" + self.unsigned()
@@ -77,7 +82,8 @@ class ZeroCasAbort:
     def for_certificate(cls, cert: Certificate) -> "ZeroCasAbort":
         raw = cls(1, cert.digest, "leaf:A", "leaf:B", cert.receipt_a,
                   cert.receipt_b, cert.base, cert.proposed, "not_committed",
-                  "not_committed", "ed25519")
+                  "not_committed", "ed25519", "ABORT_LOCKED", 2,
+                  "ABORT_LOCKED", 2)
         return replace(raw, signature_a="zero:A:" + raw.message(),
                        signature_b="zero:B:" + raw.message())
 
@@ -89,6 +95,8 @@ class ZeroCasAbort:
             and self.base == cert.base and self.proposed == cert.proposed == cert.base + 1
             and self.assertion_a == self.assertion_b == "not_committed"
             and self.algorithm == "ed25519"
+            and self.lock_state_a == self.lock_state_b == "ABORT_LOCKED"
+            and self.lock_version_a == self.lock_version_b == 2
             and self.signature_a == "zero:A:" + self.message()
             and self.signature_b == "zero:B:" + self.message()
         )
@@ -207,17 +215,27 @@ def rejects(action) -> None:
     raise AssertionError("named mutation unexpectedly succeeded")
 
 
-def abort_bilateral(a: Store, b: Store, evidence: ZeroCasAbort) -> None:
-    # Models the durable bilateral evidence check before either local delete.
+def record_abort_ack(local: Store, remote: Store, evidence: ZeroCasAbort) -> None:
+    """Persist one ack; this deliberately cannot delete any local record."""
+    cert = local.certificate
+    assert cert is not None and cert == remote.certificate and evidence.valid(cert)
+    assert local.committed is None and remote.committed is None
+    assert local.transaction_state == remote.transaction_state == "ABORT_LOCKED"
+    assert local.transaction_state_version == remote.transaction_state_version == 2
+    assert not local.abort_ack
+    local.abort_ack = True
+
+
+def final_delete_after_bilateral_abort_acks(a: Store, b: Store, evidence: ZeroCasAbort) -> None:
+    """Terminal delete requires both independently persisted acknowledgements."""
     cert = a.certificate
     assert cert is not None and cert == b.certificate and evidence.valid(cert)
     assert a.committed is None and b.committed is None
     assert a.transaction_state == b.transaction_state == "ABORT_LOCKED"
     assert a.transaction_state_version == b.transaction_state_version == 2
-    # Model both durable persists/verification before either delete.
-    assert evidence.valid(a.certificate) and evidence.valid(b.certificate)
-    a.transaction_state, a.transaction_state_version, a.abort_ack = "ABORTED", 3, True
-    b.transaction_state, b.transaction_state_version, b.abort_ack = "ABORTED", 3, True
+    assert a.abort_ack and b.abort_ack
+    a.transaction_state, a.transaction_state_version = "ABORTED", 3
+    b.transaction_state, b.transaction_state_version = "ABORTED", 3
     a.prepared = a.certificate = None
     b.prepared = b.certificate = None
     a.fenced = a.remote_outcome_unknown = False
@@ -270,7 +288,10 @@ def main() -> None:
     a.abort_prepare(cert); b.abort_prepare(cert)
     a.terminal_after_bilateral_prepare(); b.terminal_after_bilateral_prepare()
     evidence = ZeroCasAbort.for_certificate(cert)
-    abort_bilateral(a, b, evidence)
+    record_abort_ack(a, b, evidence)
+    rejects(lambda: final_delete_after_bilateral_abort_acks(a, b, evidence))
+    record_abort_ack(b, a, evidence)
+    final_delete_after_bilateral_abort_acks(a, b, evidence)
     assert a.certificate is b.certificate is None and a.can_start_v01() and b.can_start_v01()
     assert a.transaction_state == b.transaction_state == "ABORTED"
 
@@ -307,6 +328,8 @@ def main() -> None:
     rejects(lambda: replace(evidence, base=6).valid(cert) or (_ for _ in ()).throw(AssertionError()))
     rejects(lambda: replace(evidence, proposed=9).valid(cert) or (_ for _ in ()).throw(AssertionError()))
     rejects(lambda: replace(evidence, assertion_a="committed").valid(cert) or (_ for _ in ()).throw(AssertionError()))
+    rejects(lambda: replace(evidence, lock_state_a="PREPARED").valid(cert) or (_ for _ in ()).throw(AssertionError()))
+    rejects(lambda: replace(evidence, lock_version_b=3).valid(cert) or (_ for _ in ()).throw(AssertionError()))
     rejects(lambda: replace(evidence, signature_a="bad").valid(cert) or (_ for _ in ()).throw(AssertionError()))
     rejects(lambda: replace(evidence, signature_b="bad").valid(cert) or (_ for _ in ()).throw(AssertionError()))
     rejects(lambda: replace(evidence, version=2).valid(cert) or (_ for _ in ()).throw(AssertionError()))
@@ -321,8 +344,19 @@ def main() -> None:
     a.prepare(cert, b); b.prepare(cert, a); b.commit(cert, a)
     rejects(lambda: b.abort_prepare(cert))
     a.abort_prepare(cert)
-    rejects(lambda: abort_bilateral(a, b, ZeroCasAbort.for_certificate(cert)))
+    rejects(lambda: record_abort_ack(a, b, ZeroCasAbort.for_certificate(cert)))
     assert a.transaction_state == "ABORT_LOCKED" and b.transaction_state == "COMMITTED"
+
+    # Zero-CAS cannot be started from prepared/committed/unknown records lacking exact locks.
+    a, b, cert = Store(), Store(), certificate("no-lock-prepared")
+    a.prepare(cert, b); b.prepare(cert, a)
+    rejects(lambda: record_abort_ack(a, b, ZeroCasAbort.for_certificate(cert)))
+    a, b, cert = Store(), Store(), certificate("no-lock-committed")
+    a.prepare(cert, b); b.prepare(cert, a); a.commit(cert, b)
+    rejects(lambda: record_abort_ack(a, b, ZeroCasAbort.for_certificate(cert)))
+    a, b, cert = Store(), Store(), certificate("no-lock-unknown")
+    a.prepare(cert, b); b.prepare(cert, a); a.terminal_after_bilateral_prepare(); b.terminal_after_bilateral_prepare()
+    rejects(lambda: record_abort_ack(a, b, ZeroCasAbort.for_certificate(cert)))
 
     # Revoke/inventory/V01 terminal after prepare fence rather than silently abort.
     a, b, cert = Store(), Store(), certificate("d4")
@@ -338,6 +372,14 @@ def main() -> None:
     a.prepare(cert, b); b.prepare(cert, a); a.commit(cert, b); b.commit(cert, a)
     a.asymmetric_finalization(); b.asymmetric_finalization()
     assert not a.finalized and not b.finalized and not a.can_start_v01() and not b.can_start_v01()
+
+    # Tombstones reject a delayed CommitLayout after both abort acks and deletion.
+    a, b, cert = Store(), Store(), certificate("delayed")
+    a.prepare(cert, b); b.prepare(cert, a); a.abort_prepare(cert); b.abort_prepare(cert)
+    evidence = ZeroCasAbort.for_certificate(cert)
+    record_abort_ack(a, b, evidence); record_abort_ack(b, a, evidence)
+    final_delete_after_bilateral_abort_acks(a, b, evidence)
+    rejects(lambda: a.commit(cert, b))
 
     print("PASS: native UX bilateral-outcome state-machine and 28 guard mutations")
 

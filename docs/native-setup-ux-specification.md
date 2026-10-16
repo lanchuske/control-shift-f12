@@ -470,7 +470,7 @@ missing local CAS. Each canonical TLV record is exactly
 `tag:u8 || length:u16be || value`, with strictly ascending, unique tags and no
 unknown tags. `u64` values are exactly 8-byte big-endian; bytes32 values have
 length 32; fixed ASCII values have their listed byte length. The unsigned body
-is the direct concatenation of tags 1–11 in that order (no enclosing length,
+is the direct concatenation of tags 1–15 in that order (no enclosing length,
 whitespace, JSON, text normalization or omitted empty field):
 
 | Tag | Field | Exact requirement |
@@ -486,29 +486,36 @@ whitespace, JSON, text normalization or omitted empty field):
 | 9 | `role_a_local_cas_assertion` | ASCII exactly `not_committed` |
 | 10 | `role_b_local_cas_assertion` | ASCII exactly `not_committed` |
 | 11 | `signature_algorithm` | ASCII exactly `ed25519` |
-| 12 | `abort_a_signature` | exactly 64-byte Ed25519 signature by role A |
-| 13 | `abort_b_signature` | exactly 64-byte Ed25519 signature by role B |
+| 12 | `role_a_abort_lock_state` | ASCII exactly `ABORT_LOCKED` |
+| 13 | `role_a_abort_lock_version` | `u64` matching A's durable AbortPrepare version |
+| 14 | `role_b_abort_lock_state` | ASCII exactly `ABORT_LOCKED` |
+| 15 | `role_b_abort_lock_version` | `u64` matching B's durable AbortPrepare version |
+| 16 | `abort_a_signature` | exactly 64-byte Ed25519 signature by role A |
+| 17 | `abort_b_signature` | exactly 64-byte Ed25519 signature by role B |
 
 The exact signed message is the 31 ASCII bytes of domain separator
 `CSF12 layout zero-cas abort v1\0` followed directly by those unsigned bytes.
 `abort_a_signature` and `abort_b_signature` verify that exact message with the
 receipt-pinned role-A and role-B leaf public keys respectively;
-roles, leaf hashes, receipt epochs, digest, both revisions, assertions and
-algorithm are therefore signed. Each peer verifies the entire object, its own
-durable local CAS state is `not_committed`, and the inverse remote assertion is
-authenticated by the remote leaf. It then durably persists the same canonical
-bytes before acknowledging the other peer. Only after both durable
-acknowledgements may either delete its prepared record, certificate or
+roles, leaf hashes, receipt epochs, digest, both revisions, assertions, abort
+lock states/versions and algorithm are therefore signed. Each peer verifies the
+entire object, its own durable record is exactly `ABORT_LOCKED` at the signed
+lock version with local CAS state `not_committed`, and the inverse remote
+assertion/lock is authenticated by the remote leaf. It then durably persists
+the same canonical bytes and a local acknowledgement bound to
+`(commit_certificate_digest, role, abort_lock_version)` before acknowledging
+the other peer. Only after both durable acknowledgements may either execute the
+terminal `ABORTED` transition and delete its prepared payload, certificate or
 signatures. A zero-CAS certificate cannot be minted by a reconnect merely
 because a prior V01 died; after that death it needs a separately reviewed
 resolution protocol with fresh authentication and approvals.
 
 The following named mutations must reject before any deletion: changed
 commit-certificate digest, swapped role A/B leaf fields, either receipt epoch,
-base or proposed revision, either `not_committed` assertion, either signature,
-an invalid signature length, unknown/duplicate tag, or an assertion when either
-peer already has a local CAS. These are evidence mutations, not display-only
-checks.
+base or proposed revision, either `not_committed` assertion, either abort lock
+state/version, either signature, an invalid signature length, unknown/duplicate
+tag, or an assertion when either peer already has a local CAS. These are
+evidence mutations, not display-only checks.
 
 ## Screen 5: bilateral preview and durable resolution
 
@@ -610,19 +617,20 @@ LAYOUT_ABORT_LOCKED
 LAYOUT_COMMIT_PENDING
   -- both durable commits recognized --> FINALIZE_PENDING
   -- crash/acknowledgement loss / remote TOCTOU revoke --> fence, capability off, REMOTE_OUTCOME_UNKNOWN
-  -- abort only with bilateral durable zero-CAS certificate --> INVENTORY_CURRENT
+  -- verified bilateral AbortPrepare locks for exact digest/version --> LAYOUT_ABORT_LOCKED
+  -- otherwise no abort path --> remain fenced
 
 FINALIZE_PENDING
   -- both finalizations acknowledge deletion of ephemeral material --> LAYOUT_COMMITTED
   -- crash/acknowledgement loss --> REMOTE_OUTCOME_UNKNOWN
 
 REMOTE_OUTCOME_UNKNOWN
-  -- bilateral durable zero-CAS abort certificate --> purge prepared, then CONFIRMED_RELATIONSHIP
+  -- verified bilateral AbortPrepare locks for exact digest/version --> LAYOUT_ABORT_LOCKED
   -- local/remote CAS evidence or missing evidence --> LAYOUT_RECOVERY_PENDING
   -- no new V01, proposal or base-revision reuse --> REMOTE_OUTCOME_UNKNOWN
 
 LAYOUT_RECOVERY_PENDING
-  -- bilateral durable zero-CAS abort certificate --> purge prepared, then CONFIRMED_RELATIONSHIP
+  -- verified bilateral AbortPrepare locks for exact digest/version --> LAYOUT_ABORT_LOCKED
   -- local CAS / missing or fenced certificate --> remain fenced, capability off
   -- no new V01, proposal or base-revision reuse --> LAYOUT_RECOVERY_PENDING
   -- new recovery protocol with fresh authentication + both approvals --> outside this specification
@@ -798,8 +806,10 @@ a required design test matrix, not a claim that runtime tests exist today.
 | Timeout/reset/disappear from either proposal state | discard draft and return `CONFIRMED_RELATIONSHIP` |
 | Timeout/reset/crash/ack-loss after bilateral prepare, even with local no-CAS | `REMOTE_OUTCOME_UNKNOWN`; no new V01/proposal/base reuse without bilateral zero-CAS evidence |
 | Crash/restart after prepare A/B or between commit write 1 and write 2 | old V01 is terminal; no completion from certificate; local/remote outcome is fenced/capability-off |
-| Zero-CAS digest/role/epoch/base/proposed/assertion/signature mutation | reject certificate before either prepared record is deleted |
+| Zero-CAS digest/role/epoch/base/proposed/assertion/lock-version/signature mutation | reject certificate before either prepared record is deleted |
 | AbortPrepare races CommitLayout on either peer | one versioned local transition wins; loser rejects, and no ack/delete can revive its opposite transition |
+| Zero-CAS from `PREPARED`, `COMMITTED`, unknown/recovery without both exact locks, or one abort acknowledgement | reject/fence; no delete and no direct inventory transition |
+| Delayed `CommitLayout` after `ABORTED` tombstone | reject at durable state/version condition |
 | Crash/ack-loss after finalization on one peer | both remain fenced; neither reports ready or reuses the base until durable bilateral resolution |
 | One-sided acceptance, remote cancellation or acknowledgement loss | neither UI reports saved; no partial success |
 | Revocation, endpoint drop or inventory generation change during commit | pre-CAS purge or post-CAS fence; capability off, no replay on reconnect |
