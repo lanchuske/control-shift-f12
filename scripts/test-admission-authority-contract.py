@@ -7,11 +7,12 @@ import re
 
 ROOT = Path(__file__).resolve().parents[1]
 HANDSHAKE = ROOT / "crates/transport/src/pairing_v2/provisional_tls/handshake_io.rs"
+PROVISIONAL = ROOT / "crates/transport/src/pairing_v2/provisional_tls.rs"
 AUTHORITY = ROOT / "crates/transport/src/pairing_v2/admission_authority.rs"
 PENDING = ROOT / "crates/transport/src/pairing_pending.rs"
 
 
-def validate(handshake: str, authority: str, pending: str) -> None:
+def validate(handshake: str, provisional: str, authority: str, pending: str) -> None:
     assert "pub fn local_binding" not in handshake
     assert "pub(super) fn local_binding" not in handshake
     assert "pub(crate) fn local_binding" not in handshake
@@ -23,16 +24,25 @@ def validate(handshake: str, authority: str, pending: str) -> None:
         handshake,
     )
     assert authority.count("evidence.revalidate()") >= 2
-    assert "let frozen = evidence.freeze().await" in authority
+    assert re.search(r"let frozen = evidence\s*\.freeze\(store\)\s*\.await", authority)
     assert "CommitWitness::Live(Box::new(frozen))" in authority
     frozen_body = handshake.split("pub(crate) struct FrozenPromotionEvidence", 1)[1].split("}", 1)[0]
     assert "ProvisionalChannel" not in frozen_body
     assert "Stream" not in frozen_body
-    watcher = handshake.split("let disposition = tokio::select!", 1)[1].split("};", 1)[0]
-    assert watcher.find("watch_request") < watcher.find("_=&mut freeze_request")
-    assert watcher.find("accept_bi") < watcher.find("_=&mut freeze_request")
-    assert watcher.find("accept_uni") < watcher.find("_=&mut freeze_request")
+    watcher = handshake.split("let disposition = tokio::select!", 1)[1].split("if disposition", 1)[0]
+    freeze_arm = "request=&mut freeze_request"
+    assert watcher.find("watch_request") < watcher.find(freeze_arm)
+    assert watcher.find("accept_bi") < watcher.find(freeze_arm)
+    assert watcher.find("accept_uni") < watcher.find(freeze_arm)
     assert "connection.close(APPLICATION_ERROR.into(), b\"pairing ingress frozen\")" in watcher
+    assert watcher.find("scope.freeze(revoker)") < watcher.find("connection.close")
+    assert "if state.phase != ConsentPhase::Active" in provisional
+    drop_body = provisional.split("impl Drop for ProvisionalEndpoint", 1)[1].split("impl Drop for ProvisionalChannel", 1)[0]
+    revoke_scope_at = drop_body.find("let revoker = self.scope.revoke()")
+    revoke_store_at = drop_body.find("revoker.revoke()")
+    close_at = drop_body.find("self.endpoint.close")
+    assert 0 <= revoke_scope_at < close_at
+    assert 0 <= revoke_store_at < close_at
     assert "use crate::identity_store::IdentityStore" not in authority
     assert ": IdentityStore" not in authority
     assert "pub(crate) async fn commit_sealed_foundation" in authority
@@ -68,6 +78,7 @@ def validate(handshake: str, authority: str, pending: str) -> None:
 def main() -> None:
     sources = {
         "handshake": HANDSHAKE.read_text(),
+        "provisional": PROVISIONAL.read_text(),
         "authority": AUTHORITY.read_text(),
         "pending": PENDING.read_text(),
     }
@@ -77,10 +88,13 @@ def main() -> None:
         "borrowed-seal": ("handshake", "pub(crate) async fn seal_for_promotion(\n        self,", "pub(crate) async fn seal_for_promotion(\n        &self,"),
         "clone-sealed": ("handshake", "pub(crate) struct SealedPromotionEvidence", "#[derive(Clone)]\npub(crate) struct SealedPromotionEvidence"),
         "single-revalidation": ("authority", "evidence.revalidate()", "Ok(())"),
-        "drop-freeze": ("authority", "let frozen = evidence.freeze().await", "let frozen = evidence"),
+        "drop-freeze": ("authority", ".freeze(store)\n            .await", ".freeze(store)"),
         "unfrozen-live-witness": ("authority", "CommitWitness::Live(Box::new(frozen))", "CommitWitness::Live(Box::new(evidence))"),
-        "freeze-beats-queued-violation": ("handshake", "_=watch_request(&mut incoming.recv)=>true,", "_=&mut freeze_request=>{ connection.close(APPLICATION_ERROR.into(), b\"pairing ingress frozen\"); false },\n                _=watch_request(&mut incoming.recv)=>true,"),
+        "freeze-beats-queued-violation": ("handshake", "_=watch_request(&mut incoming.recv)=>true,", "request=&mut freeze_request=>{ let _ = request; false },\n                _=watch_request(&mut incoming.recv)=>true,"),
         "freeze-without-closing-ingress": ("handshake", "connection.close(APPLICATION_ERROR.into(), b\"pairing ingress frozen\");", "let _ = &connection;"),
+        "drop-scope-check": ("provisional", "if state.phase != ConsentPhase::Active", "if false"),
+        "freeze-before-scope-cas": ("handshake", "if scope.freeze(revoker).is_err()", "connection.close(APPLICATION_ERROR.into(), b\"pairing ingress frozen\");\n                    if scope.freeze(revoker).is_err()"),
+        "omit-durable-drop-revocation": ("provisional", "let _ = revoker.revoke();", "let _ = revoker;"),
         "frozen-retains-runtime-channel": ("handshake", "pub(crate) struct FrozenPromotionEvidence {", "pub(crate) struct FrozenPromotionEvidence {\n    channel: ProvisionalChannel,"),
         "return-before-durability": ("pending", "self.save(&ledger)?;\n            self.pending_dir.remove(&filename(receipt.attempt))?;", "return Ok(receipt.clone());\n            self.save(&ledger)?;\n            self.pending_dir.remove(&filename(receipt.attempt))?;"),
         "legacy-identity-owner": ("authority", "use std::path::Path;", "use std::path::Path;\nuse crate::identity_store::IdentityStore;"),

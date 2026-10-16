@@ -125,7 +125,7 @@ pub(crate) struct SealedPromotionEvidence {
     watcher: IngressWatcher,
 }
 struct IngressWatcher {
-    freeze: Option<oneshot::Sender<()>>,
+    freeze: Option<oneshot::Sender<crate::pairing_pending::AdmissionRevoker>>,
     task: tokio::task::JoinHandle<IngressDisposition>,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -229,9 +229,15 @@ impl SealedPromotionEvidence {
     /// post-handshake inputs. The biased state transition is the protocol
     /// linearization point: a queued violation wins; otherwise freeze wins,
     /// closes QUIC, and removes every channel from the resulting evidence.
-    pub(crate) async fn freeze(mut self) -> Result<FrozenPromotionEvidence, HandshakeError> {
+    pub(crate) async fn freeze(
+        mut self,
+        store: &PendingStore,
+    ) -> Result<FrozenPromotionEvidence, HandshakeError> {
         let signal = self.watcher.freeze.take().ok_or(HandshakeError::Rejected)?;
-        signal.send(()).map_err(|_| HandshakeError::Rejected)?;
+        let revoker = store
+            .admission_revoker(self.pending.peer_fingerprint)
+            .map_err(|_| HandshakeError::Rejected)?;
+        signal.send(revoker).map_err(|_| HandshakeError::Rejected)?;
         let static_result = self.revalidate_static();
         let task = self.watcher.task;
         match task.await.map_err(|_| HandshakeError::Rejected)? {
@@ -631,9 +637,9 @@ impl ProvisionalChannel {
             }
         }
     }
-    fn active(&self) -> Result<std::sync::MutexGuard<'_, bool>, Invalid> {
-        let active = self.scope.lock().map_err(|_| Invalid)?;
-        if !*active
+    fn active(&self) -> Result<std::sync::MutexGuard<'_, super::ConsentState>, Invalid> {
+        let active = self.scope.0.lock().map_err(|_| Invalid)?;
+        if active.phase != super::ConsentPhase::Active
             || self.connection.close_reason().is_some()
             || self.id != format!("quic-{}", self.connection.stable_id())
         {
@@ -905,6 +911,7 @@ impl ProvisionalChannel {
         let failed = Arc::new(AtomicBool::new(false));
         let signal = failed.clone();
         let connection = self.connection.clone();
+        let scope = self.scope.clone();
         let (freeze, mut freeze_request) = oneshot::channel();
         // Successful control FIN does not forgive DATA on the request half,
         // extra streams or a later protocol error. Keep this monitor sealed.
@@ -913,7 +920,15 @@ impl ProvisionalChannel {
                 _=watch_request(&mut incoming.recv)=>true,
                 extra=connection.accept_bi()=>{if let Ok(pair)=extra{drop(Stream::new(pair));}true},
                 extra=connection.accept_uni()=>{if let Ok(mut recv)=extra{let _=recv.stop(APPLICATION_ERROR.into());}true},
-                _=&mut freeze_request=>{
+                request=&mut freeze_request=>{
+                    let Ok(revoker) = request else {
+                        signal.store(true, Ordering::Release);
+                        return IngressDisposition::Invalid;
+                    };
+                    if scope.freeze(revoker).is_err() {
+                        signal.store(true, Ordering::Release);
+                        return IngressDisposition::Invalid;
+                    }
                     connection.close(APPLICATION_ERROR.into(), b"pairing ingress frozen");
                     false
                 },

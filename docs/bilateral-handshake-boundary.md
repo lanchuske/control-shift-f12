@@ -34,6 +34,16 @@ starve violation detection. A post-freeze peer send is transport-rejected, not
 an unobserved protocol event. Durable `PromotionReceipt` remains metadata only
 and cannot authorize input, clipboard, topology or a session.
 
+Endpoint consent and watcher freeze also share one synchronous three-state
+transition (`Active`, `Frozen`, `Revoked`). Endpoint Drop wins by moving to
+`Revoked`, which prevents freeze. Freeze wins by atomically installing a
+store-owned revoker while moving to `Frozen`; a later endpoint Drop first marks
+the scope revoked, then performs durable pin revocation outside the state lock,
+and only then closes the endpoint. Thus no lock is held across disk or network
+I/O, a paused save cannot deadlock Drop, and any future runtime-authority phase
+must observe both the channel-free frozen type and the durable revocation. This
+phase still has no method that emits runtime authority.
+
 ## Durability and failure
 
 After both signed approvals, `PendingStore::prepare` creates only physically separate pending evidence. The existing CAS/revision/identity-generation/tombstone checks govern each write. Before returning local Commit, CommitAck or Complete bytes to the I/O adapter, the role-specific `Finalizer` must persist and flush its journal and manifest. Storage failure latches failure and returns no bytes to emit. No retry refreshes a failed CAS behind the caller's back.

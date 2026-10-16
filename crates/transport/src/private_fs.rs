@@ -123,6 +123,14 @@ fn validate(file: &File, directory: bool) -> Result<(), StoreError> {
 }
 
 impl PrivateDir {
+    #[cfg(feature = "pairing-v2-experimental")]
+    pub(crate) fn try_clone(&self) -> Result<Self, StoreError> {
+        self.0
+            .try_clone()
+            .map(Self)
+            .map_err(|_| StoreError::Unavailable)
+    }
+
     pub fn root(path: &Path) -> Result<Self, StoreError> {
         if !path.is_absolute() {
             return Err(StoreError::Invalid);

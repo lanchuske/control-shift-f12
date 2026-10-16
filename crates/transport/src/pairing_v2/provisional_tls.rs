@@ -282,7 +282,61 @@ pub struct ProvisionalEndpoint {
     endpoint: quinn::Endpoint,
     client: StrictClient,
     owner: &'static ProcessOwner,
-    scope: Arc<std::sync::Mutex<bool>>,
+    scope: Arc<ConsentScope>,
+    #[cfg(test)]
+    drop_pause: Option<EndpointDropPause>,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ConsentPhase {
+    Active,
+    Frozen,
+    Revoked,
+}
+struct ConsentState {
+    phase: ConsentPhase,
+    revoker: Option<crate::pairing_pending::AdmissionRevoker>,
+}
+struct ConsentScope(std::sync::Mutex<ConsentState>);
+impl ConsentScope {
+    fn new() -> Self {
+        Self(std::sync::Mutex::new(ConsentState {
+            phase: ConsentPhase::Active,
+            revoker: None,
+        }))
+    }
+    fn is_active(&self) -> Result<bool, Invalid> {
+        Ok(self.0.lock().map_err(|_| Invalid)?.phase == ConsentPhase::Active)
+    }
+    fn freeze(&self, revoker: crate::pairing_pending::AdmissionRevoker) -> Result<(), Invalid> {
+        let mut state = self.0.lock().map_err(|_| Invalid)?;
+        if state.phase != ConsentPhase::Active {
+            return Err(Invalid);
+        }
+        state.phase = ConsentPhase::Frozen;
+        state.revoker = Some(revoker);
+        Ok(())
+    }
+    fn revoke(&self) -> Option<crate::pairing_pending::AdmissionRevoker> {
+        let Ok(mut state) = self.0.lock() else {
+            return None;
+        };
+        state.phase = ConsentPhase::Revoked;
+        state.revoker.take()
+    }
+}
+#[cfg(test)]
+#[derive(Clone)]
+struct EndpointDropPause {
+    reached: Arc<std::sync::Barrier>,
+    release: Arc<std::sync::Barrier>,
+}
+#[cfg(test)]
+struct EndpointDropPauseHandle(EndpointDropPause);
+#[cfg(test)]
+impl EndpointDropPauseHandle {
+    fn release(self) {
+        self.0.release.wait();
+    }
 }
 impl ProvisionalEndpoint {
     pub fn bind(
@@ -296,8 +350,19 @@ impl ProvisionalEndpoint {
             endpoint,
             client,
             owner: process_owner(),
-            scope: Arc::new(std::sync::Mutex::new(true)),
+            scope: Arc::new(ConsentScope::new()),
+            #[cfg(test)]
+            drop_pause: None,
         })
+    }
+    #[cfg(test)]
+    fn test_pause_drop_after_scope_revocation(&mut self) -> EndpointDropPauseHandle {
+        let pause = EndpointDropPause {
+            reached: Arc::new(std::sync::Barrier::new(2)),
+            release: Arc::new(std::sync::Barrier::new(2)),
+        };
+        self.drop_pause = Some(pause.clone());
+        EndpointDropPauseHandle(pause)
     }
     pub fn local_addr(&self) -> Result<std::net::SocketAddr, Invalid> {
         self.endpoint.local_addr().map_err(|_| Invalid)
@@ -348,8 +413,14 @@ impl ProvisionalEndpoint {
 }
 impl Drop for ProvisionalEndpoint {
     fn drop(&mut self) {
-        if let Ok(mut active) = self.scope.lock() {
-            *active = false;
+        let revoker = self.scope.revoke();
+        #[cfg(test)]
+        if let Some(pause) = self.drop_pause.take() {
+            pause.reached.wait();
+            pause.release.wait();
+        }
+        if let Some(revoker) = revoker {
+            let _ = revoker.revoke();
         }
         self.endpoint.close(0u32.into(), b"consent scope closed");
     }
@@ -379,7 +450,7 @@ pub struct ProvisionalChannel {
     id: String,
     generation: u64,
     owner: &'static ProcessOwner,
-    scope: Arc<std::sync::Mutex<bool>>,
+    scope: Arc<ConsentScope>,
     attempted: bool,
 }
 impl ProvisionalChannel {
@@ -388,7 +459,7 @@ impl ProvisionalChannel {
         connection: quinn::Connection,
         generation: u64,
         owner: &'static ProcessOwner,
-        scope: Arc<std::sync::Mutex<bool>>,
+        scope: Arc<ConsentScope>,
         local_identity: Arc<rustls::sign::CertifiedKey>,
     ) -> Result<Self, Invalid> {
         let observed = (|| {
@@ -442,8 +513,10 @@ impl ProvisionalChannel {
         let result = (|| {
             // Linearize binding against scope revocation, independently of the
             // asynchronous QUIC close notification. Poison is fail-closed.
-            let active = self.scope.lock().map_err(|_| Invalid)?;
-            if !*active || self.attempted || self.connection.close_reason().is_some() {
+            if !self.scope.is_active()?
+                || self.attempted
+                || self.connection.close_reason().is_some()
+            {
                 return Err(Invalid);
             }
             self.attempted = true;

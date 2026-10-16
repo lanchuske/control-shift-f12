@@ -408,27 +408,134 @@ async fn concurrent_real_late_extra_and_freeze_has_one_safe_winner() {
                         .await
                 })
         });
-        let late_won = b.test_try_late_extra().await;
+        let _remote_write_observation = b.test_try_late_extra().await;
         let result = tokio::task::spawn_blocking(move || commit.join().unwrap())
             .await
             .unwrap();
         let reopened =
             crate::pairing_v2::admission_authority::AdmissionAuthorityStore::open(ta.path())
                 .unwrap();
-        if late_won {
-            assert_eq!(result, Err(crate::pairing_pending::StoreError::Invalid));
-            assert_ne!(
+        match result {
+            Err(crate::pairing_pending::StoreError::Invalid) => assert_ne!(
                 reopened.reconcile(attempt).unwrap(),
                 crate::pairing_v2::admission_authority::ReconcileAdmission::Promoted
-            );
-        } else {
-            assert!(result.is_ok());
-            assert_eq!(
+            ),
+            Ok(_) => assert_eq!(
                 reopened.reconcile(attempt).unwrap(),
                 crate::pairing_v2::admission_authority::ReconcileAdmission::Promoted
-            );
+            ),
+            other => panic!("unexpected race result: {other:?}"),
         }
     }
+}
+
+#[tokio::test]
+async fn endpoint_drop_that_revokes_scope_before_freeze_blocks_publication() {
+    let (mut ea, _eb, a, b, _) = pair().await;
+    let ta = tempfile::tempdir().unwrap();
+    let tb = tempfile::tempdir().unwrap();
+    let sa = crate::pairing_pending::PendingStore::open(ta.path()).unwrap();
+    let sb = crate::pairing_pending::PendingStore::open(tb.path()).unwrap();
+    let (a, b) = tokio::join!(
+        a.handshake(
+            handshake_config(1, 2),
+            &sa,
+            |p| async move { p.decision(true) }
+        ),
+        b.handshake(
+            handshake_config(2, 1),
+            &sb,
+            |p| async move { p.decision(true) }
+        )
+    );
+    let a = a.unwrap();
+    let _b = b.unwrap();
+    let attempt = a.test_attempt();
+    let drop_pause = ea.test_pause_drop_after_scope_revocation();
+    let drop_thread = std::thread::spawn(move || drop(ea));
+    let waiter = drop_pause.0.clone();
+    tokio::task::spawn_blocking(move || waiter.reached.wait())
+        .await
+        .unwrap();
+
+    let store =
+        crate::pairing_v2::admission_authority::AdmissionAuthorityStore::open(ta.path()).unwrap();
+    let result = store
+        .commit_sealed_foundation(store.version().unwrap(), a)
+        .await;
+    drop_pause.release();
+    drop_thread.join().unwrap();
+    assert_eq!(result, Err(crate::pairing_pending::StoreError::Invalid));
+    assert_ne!(
+        store.reconcile(attempt).unwrap(),
+        crate::pairing_v2::admission_authority::ReconcileAdmission::Promoted
+    );
+}
+
+#[tokio::test]
+async fn freeze_before_endpoint_drop_is_durably_revoked_before_future_authority() {
+    let (mut ea, _eb, a, b, _) = pair().await;
+    let ta = tempfile::tempdir().unwrap();
+    let tb = tempfile::tempdir().unwrap();
+    let sa = crate::pairing_pending::PendingStore::open(ta.path()).unwrap();
+    let sb = crate::pairing_pending::PendingStore::open(tb.path()).unwrap();
+    let (a, b) = tokio::join!(
+        a.handshake(
+            handshake_config(1, 2),
+            &sa,
+            |p| async move { p.decision(true) }
+        ),
+        b.handshake(
+            handshake_config(2, 1),
+            &sb,
+            |p| async move { p.decision(true) }
+        )
+    );
+    let a = a.unwrap();
+    let _b = b.unwrap();
+    let attempt = a.test_attempt();
+    let root = ta.path().to_owned();
+    let save_pause = crate::private_fs::faults::pause_before_rename();
+    let commit_pause = save_pause.clone();
+    let commit = std::thread::spawn(move || {
+        commit_pause.arm_on_current_thread();
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async move {
+                let store =
+                    crate::pairing_v2::admission_authority::AdmissionAuthorityStore::open(&root)
+                        .unwrap();
+                store
+                    .commit_sealed_foundation(store.version().unwrap(), a)
+                    .await
+            })
+    });
+    let waiter = save_pause.clone();
+    tokio::task::spawn_blocking(move || waiter.wait_until_reached())
+        .await
+        .unwrap();
+
+    let drop_pause = ea.test_pause_drop_after_scope_revocation();
+    let drop_thread = std::thread::spawn(move || drop(ea));
+    let drop_waiter = drop_pause.0.clone();
+    tokio::task::spawn_blocking(move || drop_waiter.reached.wait())
+        .await
+        .unwrap();
+    save_pause.release();
+    let result = tokio::task::spawn_blocking(move || commit.join().unwrap())
+        .await
+        .unwrap();
+    drop_pause.release();
+    drop_thread.join().unwrap();
+    assert!(result.is_ok());
+    let reopened =
+        crate::pairing_v2::admission_authority::AdmissionAuthorityStore::open(ta.path()).unwrap();
+    assert_eq!(
+        reopened.reconcile(attempt).unwrap(),
+        crate::pairing_v2::admission_authority::ReconcileAdmission::Revoked
+    );
 }
 #[tokio::test]
 async fn bilateral_rejection_issues_real_reset_and_stop_independently_of_connection_close() {
@@ -935,8 +1042,9 @@ async fn owner_generations_are_distinct_and_endpoint_drop_revokes_channels() {
     let (client, _server, mut channel, peer, der) = pair().await;
     assert_ne!(channel.generation, peer.generation);
     drop(client);
-    assert!(
-        !*channel.scope.lock().unwrap(),
+    assert_eq!(
+        channel.scope.0.lock().unwrap().phase,
+        super::ConsentPhase::Revoked,
         "scope revoked synchronously"
     );
     let request = CandidateRequest::new([1; 16], [2; 16], [3; 16])
@@ -948,7 +1056,7 @@ async fn owner_generations_are_distinct_and_endpoint_drop_revokes_channels() {
 async fn revoked_scope_rejects_before_any_network_close_notification() {
     let (_client, _server, mut channel, _peer, der) = pair().await;
     // Inject the local revocation boundary without delivering a network close.
-    *channel.scope.lock().unwrap() = false;
+    channel.scope.revoke();
     assert!(channel.connection.close_reason().is_none());
     let request = CandidateRequest::new([1; 16], [2; 16], [3; 16])
         .encode()
@@ -961,7 +1069,7 @@ async fn poisoned_scope_is_fail_closed() {
     let scope = channel.scope.clone();
     assert!(
         std::thread::spawn(move || {
-            let _guard = scope.lock().unwrap();
+            let _guard = scope.0.lock().unwrap();
             panic!("injected scope poison");
         })
         .join()

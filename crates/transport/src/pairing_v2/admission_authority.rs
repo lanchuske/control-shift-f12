@@ -149,7 +149,8 @@ impl AdmissionAuthorityStore {
         expected: StoreVersion,
         authority: super::provisional_tls::HandshakeCompletePendingAuthority,
     ) -> Result<PromotionReceipt, StoreError> {
-        let commit = SealedAdmissionCommit::from_authority(expected, authority).await?;
+        let commit =
+            SealedAdmissionCommit::from_authority(expected, authority, &self.store).await?;
         let stored = self.store.commit_sealed_admission(expected, commit)?;
         Ok(PromotionReceipt {
             attempt: stored.attempt,
@@ -222,13 +223,17 @@ impl SealedAdmissionCommit {
     async fn from_authority(
         expected: StoreVersion,
         authority: super::provisional_tls::HandshakeCompletePendingAuthority,
+        store: &PendingStore,
     ) -> Result<Self, StoreError> {
         let evidence = authority
             .seal_for_promotion()
             .await
             .map_err(|_| StoreError::Invalid)?;
         evidence.revalidate().map_err(|_| StoreError::Invalid)?;
-        let frozen = evidence.freeze().await.map_err(|_| StoreError::Invalid)?;
+        let frozen = evidence
+            .freeze(store)
+            .await
+            .map_err(|_| StoreError::Invalid)?;
         frozen.revalidate().map_err(|_| StoreError::Invalid)?;
         let fields = frozen.fields();
         let receipt = AdmissionReceiptRecord {

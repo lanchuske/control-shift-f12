@@ -62,6 +62,19 @@ pub struct PendingStore {
     ledger_dir: crate::private_fs::PrivateDir,
 }
 
+#[cfg(feature = "pairing-v2-experimental")]
+pub(crate) struct AdmissionRevoker {
+    store: PendingStore,
+    peer: [u8; 32],
+}
+
+#[cfg(feature = "pairing-v2-experimental")]
+impl AdmissionRevoker {
+    pub(crate) fn revoke(self) -> Result<(), StoreError> {
+        self.store.revoke_current(self.peer)
+    }
+}
+
 impl PendingStore {
     /// There is intentionally no boolean or caller-supplied "verified" bypass.
     /// A later reviewed protocol must introduce an unforgeable validated-proof type.
@@ -350,6 +363,69 @@ mod unix {
     }
 
     impl PendingStore {
+        #[cfg(feature = "pairing-v2-experimental")]
+        pub(crate) fn admission_revoker(
+            &self,
+            peer: [u8; 32],
+        ) -> Result<AdmissionRevoker, StoreError> {
+            Ok(AdmissionRevoker {
+                store: PendingStore {
+                    pending_dir: self.pending_dir.try_clone()?,
+                    ledger_dir: self.ledger_dir.try_clone()?,
+                },
+                peer,
+            })
+        }
+
+        #[cfg(feature = "pairing-v2-experimental")]
+        pub(super) fn revoke_current(&self, peer: [u8; 32]) -> Result<(), StoreError> {
+            let _lock = self.ledger_dir.lock()?;
+            let mut ledger = self.load_validated_manifest()?;
+            let expected = ledger.version;
+            ledger.advance(expected)?;
+            if peer == [0; 32] {
+                return Err(StoreError::Invalid);
+            }
+            if let Some(revocation) = ledger.revocations.iter_mut().find(|r| r.peer == peer) {
+                revocation.generation = revocation
+                    .generation
+                    .checked_add(1)
+                    .ok_or(StoreError::Limit)?;
+            } else {
+                ledger.revocations.push(Revocation {
+                    peer,
+                    generation: 1,
+                });
+            }
+            ledger.active_pins.retain(|pin| pin.peer != peer);
+            let removed: Vec<_> = ledger
+                .pending
+                .iter()
+                .filter(|entry| entry.record.peer_fingerprint == peer)
+                .map(|entry| entry.record.attempt_id)
+                .collect();
+            let old_journals: Vec<_> = ledger
+                .journals
+                .iter()
+                .filter(|entry| removed.contains(&entry.attempt))
+                .map(journal_filename)
+                .collect();
+            ledger
+                .pending
+                .retain(|entry| entry.record.peer_fingerprint != peer);
+            ledger
+                .journals
+                .retain(|entry| !removed.contains(&entry.attempt));
+            ledger.tombstones.extend(&removed);
+            self.save(&ledger)?;
+            for attempt in removed {
+                self.pending_dir.remove(&filename(attempt))?;
+            }
+            for file in old_journals {
+                self.pending_dir.remove(&file)?;
+            }
+            Ok(())
+        }
         #[cfg(feature = "pairing-v2-experimental")]
         pub fn reconcile_pairing(
             &self,
