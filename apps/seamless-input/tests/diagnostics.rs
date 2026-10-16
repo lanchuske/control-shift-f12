@@ -3,12 +3,13 @@ use seamless_input::{
         ClipboardObservation, DiagnosticFacts, DiagnosticSnapshot, DiscoveryObservation,
         DisplayObservation, PairedSessionObservation, RelationshipObservation, RuntimeObservation,
     },
-    runtime_status::RuntimeStatus,
+    runtime_status::{RuntimeStatus, RuntimeStatusStore},
     ui_contract::{
         DiagnosticAction, DiagnosticDetail, DiagnosticFailureCode, DiagnosticId, DiagnosticState,
     },
 };
 use seamless_input_core::platform::AccessState;
+use std::time::{Duration, UNIX_EPOCH};
 
 fn current_runtime(sessions: usize) -> RuntimeObservation {
     RuntimeObservation::Current(RuntimeStatus {
@@ -128,4 +129,70 @@ fn unavailable_discovery_and_unconfigured_session_stay_truthful_without_authorit
     let session = row(&snapshot, DiagnosticId::Session);
     assert_eq!(session.state, DiagnosticState::NotConfigured);
     assert_eq!(session.detail, DiagnosticDetail::NotConfigured);
+}
+
+#[test]
+fn runtime_observation_reads_current_missing_stale_and_malformed_owner_status() {
+    let root = tempfile::tempdir().unwrap();
+    let store = RuntimeStatusStore::within(root.path(), 4242);
+    let now = UNIX_EPOCH + Duration::from_secs(100);
+
+    assert_eq!(
+        RuntimeObservation::from_owner_status(root.path(), now),
+        RuntimeObservation::Missing
+    );
+
+    store
+        .publish(&RuntimeStatus {
+            process_id: 4242,
+            updated_unix_ms: 100_000,
+            displays: 2,
+            authenticated_sessions: 1,
+        })
+        .unwrap();
+    assert!(matches!(
+        RuntimeObservation::from_owner_status(root.path(), now),
+        RuntimeObservation::Current(status) if status.process_id == 4242
+    ));
+
+    store
+        .publish(&RuntimeStatus {
+            process_id: 4242,
+            updated_unix_ms: 10_000,
+            displays: 2,
+            authenticated_sessions: 1,
+        })
+        .unwrap();
+    assert_eq!(
+        RuntimeObservation::from_owner_status(root.path(), now),
+        RuntimeObservation::Stale
+    );
+
+    std::fs::write(store.path(), "malformed\n").unwrap();
+    assert_eq!(
+        RuntimeObservation::from_owner_status(root.path(), now),
+        RuntimeObservation::Malformed
+    );
+
+    store
+        .publish(&RuntimeStatus {
+            process_id: 4242,
+            updated_unix_ms: 101_001,
+            displays: 2,
+            authenticated_sessions: 1,
+        })
+        .unwrap();
+    assert_eq!(
+        RuntimeObservation::from_owner_status(root.path(), now),
+        RuntimeObservation::Malformed,
+        "a future heartbeat must not be treated as current"
+    );
+
+    let unreadable_root = root.path().join("not-a-directory");
+    std::fs::write(&unreadable_root, "not a status root").unwrap();
+    assert_eq!(
+        RuntimeObservation::from_owner_status(&unreadable_root, now),
+        RuntimeObservation::Malformed,
+        "status I/O failures must not claim a running runtime"
+    );
 }

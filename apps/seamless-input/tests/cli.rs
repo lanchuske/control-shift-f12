@@ -329,6 +329,34 @@ fn doctor_measures_real_local_capabilities() {
 }
 
 #[test]
+fn doctor_projects_the_owner_runtime_status_without_replaying_a_stale_success() {
+    let home = test_home();
+    let pid = 42_424;
+    let store = seamless_input::runtime_status::RuntimeStatusStore::within(&home, pid);
+    store
+        .publish(
+            &seamless_input::runtime_status::RuntimeStatus::live(pid, 1, 1)
+                .expect("current heartbeat"),
+        )
+        .unwrap();
+
+    let current = Command::new(env!("CARGO_BIN_EXE_seamless-input"))
+        .arg("doctor")
+        .env("SEAMLESS_INPUT_HOME", &home)
+        .output()
+        .unwrap();
+    assert!(String::from_utf8_lossy(&current.stdout).contains("runtime: PASS"));
+
+    std::fs::write(store.path(), "malformed\n").unwrap();
+    let malformed = Command::new(env!("CARGO_BIN_EXE_seamless-input"))
+        .arg("doctor")
+        .env("SEAMLESS_INPUT_HOME", &home)
+        .output()
+        .unwrap();
+    assert!(String::from_utf8_lossy(&malformed.stdout).contains("runtime: UNKNOWN"));
+}
+
+#[test]
 fn doctor_report_is_opt_in_redacted_and_stable_identifier_free() {
     let output = run_with_sensitive_environment(&["doctor", "--report"]);
     assert!(output.status.success());

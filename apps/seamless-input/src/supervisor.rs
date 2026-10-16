@@ -314,12 +314,11 @@ impl CapabilityReport {
         }
     }
 
-    /// Project only local, current capability measurements. This standalone
-    /// doctor invocation has no owner PID, so it must not claim a runtime or
-    /// authenticated session is currently live.
-    pub fn diagnostics(&self) -> DiagnosticSnapshot {
+    /// Project local measurements and the owner heartbeat supplied by the
+    /// caller. The heartbeat determines whether a session can be current.
+    pub fn diagnostics(&self, runtime: RuntimeObservation) -> DiagnosticSnapshot {
         DiagnosticSnapshot::from_live(DiagnosticFacts {
-            runtime: RuntimeObservation::Missing,
+            runtime,
             input_access: self.diagnostic_input,
             clipboard: self.diagnostic_clipboard,
             displays: self.diagnostic_displays,

@@ -8,7 +8,7 @@ use std::{
 use clap::{Args, Parser, Subcommand};
 use seamless_discovery::{Discovery, manual_address};
 use seamless_input::{
-    diagnostics::compatibility_lines,
+    diagnostics::{RuntimeObservation, compatibility_lines},
     runtime_status::{RuntimeStatus, RuntimeStatusStore},
     supervisor::{AppPaths, CapabilityReport, INPUT_SERVICE_INTERVAL, NativeSupervisor},
     tui,
@@ -442,7 +442,10 @@ fn config(paths: &AppPaths, command: ConfigCommands) -> Result<(), OperationalEr
 
 fn doctor(paths: &AppPaths, report: bool) {
     let measured = CapabilityReport::measure(paths);
-    let diagnostics = measured.diagnostics();
+    let diagnostics = measured.diagnostics(RuntimeObservation::from_owner_status(
+        &paths.root,
+        SystemTime::now(),
+    ));
     if report {
         println!("Control Shift F12 diagnostic report");
         println!("privacy: redacted");

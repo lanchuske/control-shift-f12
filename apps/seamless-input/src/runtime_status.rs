@@ -147,6 +147,51 @@ impl RuntimeStatusStore {
         Ok(RuntimeStatusRead::Current(status))
     }
 
+    /// Read the one current owner heartbeat under an application root.
+    ///
+    /// A malformed, mismatched or ambiguous owner record is rejected rather
+    /// than selecting an arbitrary success. A stale record remains distinct
+    /// from an absent record so diagnostics cannot replay an old runtime.
+    pub fn read_owner_state(
+        root: &Path,
+        now: SystemTime,
+    ) -> Result<RuntimeStatusRead, RuntimeStatusError> {
+        let entries = match fs::read_dir(root) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok(RuntimeStatusRead::Missing);
+            }
+            Err(error) => return Err(error.into()),
+        };
+
+        let mut saw_stale = false;
+        let mut current = None;
+        for entry in entries {
+            let entry = entry?;
+            let Some(owner_pid) = owner_pid_from_path(&entry.path()) else {
+                continue;
+            };
+            let store = Self::new(entry.path());
+            match store.read_state(now)? {
+                RuntimeStatusRead::Current(status) if status.process_id == owner_pid => {
+                    if current.replace(status).is_some() {
+                        return Err(RuntimeStatusError::Invalid);
+                    }
+                }
+                RuntimeStatusRead::Current(_) => return Err(RuntimeStatusError::Invalid),
+                RuntimeStatusRead::Stale => saw_stale = true,
+                RuntimeStatusRead::Missing => {}
+            }
+        }
+        if let Some(status) = current {
+            Ok(RuntimeStatusRead::Current(status))
+        } else if saw_stale {
+            Ok(RuntimeStatusRead::Stale)
+        } else {
+            Ok(RuntimeStatusRead::Missing)
+        }
+    }
+
     pub fn clear_owned(&self, owner_pid: u32) -> Result<(), RuntimeStatusError> {
         if self.owner_pid != Some(owner_pid) {
             return Err(RuntimeStatusError::Invalid);
@@ -219,6 +264,14 @@ fn temp_path(path: &Path) -> PathBuf {
     let mut name = path.as_os_str().to_owned();
     name.push(".tmp");
     PathBuf::from(name)
+}
+
+fn owner_pid_from_path(path: &Path) -> Option<u32> {
+    let name = path.file_name()?.to_str()?;
+    name.strip_prefix("runtime-status.")?
+        .strip_suffix(".v1")?
+        .parse()
+        .ok()
 }
 
 fn sync_parent(path: &Path) -> Result<(), RuntimeStatusError> {

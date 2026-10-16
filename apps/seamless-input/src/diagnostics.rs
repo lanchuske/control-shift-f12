@@ -6,13 +6,14 @@
 //! rows.
 
 use crate::{
-    runtime_status::{RuntimeStatus, RuntimeStatusRead},
+    runtime_status::{RuntimeStatus, RuntimeStatusRead, RuntimeStatusStore},
     ui_contract::{
         DiagnosticAction, DiagnosticDetail, DiagnosticFailureCode, DiagnosticId, DiagnosticLabel,
         DiagnosticRow, DiagnosticState,
     },
 };
 use seamless_input_core::platform::AccessState;
+use std::{path::Path, time::SystemTime};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RuntimeObservation {
@@ -29,6 +30,14 @@ impl From<RuntimeStatusRead> for RuntimeObservation {
             RuntimeStatusRead::Missing => Self::Missing,
             RuntimeStatusRead::Stale => Self::Stale,
         }
+    }
+}
+
+impl RuntimeObservation {
+    pub fn from_owner_status(root: &Path, now: SystemTime) -> Self {
+        RuntimeStatusStore::read_owner_state(root, now)
+            .map(Self::from)
+            .unwrap_or(Self::Malformed)
     }
 }
 
