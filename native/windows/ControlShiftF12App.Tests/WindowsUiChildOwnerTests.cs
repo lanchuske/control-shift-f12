@@ -24,6 +24,13 @@ public sealed class WindowsUiChildOwnerTests
 
         Assert.Equal(ChildSessionPhase.Running, session.State.Phase);
         Assert.NotNull(session.Snapshot);
+
+        var browsing = await owner.StartDiscoveryAsync(TimeSpan.FromSeconds(5));
+
+        Assert.Equal("browsing", browsing.Snapshot!.State);
+        Assert.Empty(browsing.Snapshot.Nearby);
+        Assert.False(browsing.Snapshot.InputEnabled);
+        Assert.False(browsing.Snapshot.ClipboardEnabled);
         await owner.CloseAsync();
         Assert.True(owner.HasExited);
         Assert.Equal(ChildSessionPhase.Terminal, owner.Session.State.Phase);

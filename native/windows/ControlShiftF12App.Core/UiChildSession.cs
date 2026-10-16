@@ -18,8 +18,14 @@ public sealed class UiChildSession
     public DiagnosticsProjection? Diagnostics { get; private set; }
 
     public static byte[] InitialRefreshFrame()
+        => CreateFixedRequest("windows-refresh", "ui.refresh");
+
+    public static byte[] StartDiscoveryFrame()
+        => CreateFixedRequest("windows-start-discovery", "ui.start_discovery");
+
+    private static byte[] CreateFixedRequest(string id, string command)
     {
-        var payload = Encoding.UTF8.GetBytes("{\"v\":1,\"id\":\"windows-refresh\",\"command\":\"ui.refresh\",\"args\":{}}");
+        var payload = Encoding.UTF8.GetBytes($"{{\"v\":1,\"id\":\"{id}\",\"command\":\"{command}\",\"args\":{{}}}}");
         var frame = new byte[sizeof(uint) + payload.Length];
         frame[0] = (byte)(payload.Length >> 24);
         frame[1] = (byte)(payload.Length >> 16);
@@ -114,7 +120,7 @@ public sealed class UiChildSession
                     }
                     Diagnostics = diagnostics;
                     return;
-                case "ui_response_v1" when IsRefreshResponse(document.RootElement):
+                case "ui_response_v1" when IsRecognizedResponse(document.RootElement):
                     return;
                 default:
                     Fault();
@@ -127,13 +133,14 @@ public sealed class UiChildSession
         }
     }
 
-    private static bool IsRefreshResponse(JsonElement root) =>
+    private static bool IsRecognizedResponse(JsonElement root) =>
         root.ValueKind == JsonValueKind.Object
         && root.EnumerateObject().Select(property => property.Name).ToHashSet(StringComparer.Ordinal)
             .SetEquals(["v", "kind", "id", "ok"])
         && root.TryGetProperty("v", out var version) && version.TryGetInt32(out var v) && v == 1
         && root.TryGetProperty("kind", out var kind) && kind.GetString() == "ui_response_v1"
-        && root.TryGetProperty("id", out var id) && id.GetString() == "windows-refresh"
+        && root.TryGetProperty("id", out var id)
+        && id.GetString() is "windows-refresh" or "windows-start-discovery"
         && root.TryGetProperty("ok", out var ok) && ok.ValueKind == JsonValueKind.True;
 
     private void Fault()

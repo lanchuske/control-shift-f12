@@ -21,6 +21,18 @@ public sealed class UiChildSessionTests
     }
 
     [Fact]
+    public void Discovery_request_is_a_fixed_empty_command()
+    {
+        var request = UiChildSession.StartDiscoveryFrame();
+        var length = (request[0] << 24) | (request[1] << 16) | (request[2] << 8) | request[3];
+        using var document = JsonDocument.Parse(request.Skip(4).Take(length).ToArray());
+
+        Assert.Equal("ui.start_discovery", document.RootElement.GetProperty("command").GetString());
+        Assert.Equal("windows-start-discovery", document.RootElement.GetProperty("id").GetString());
+        Assert.False(document.RootElement.GetProperty("args").EnumerateObject().Any());
+    }
+
+    [Fact]
     public void Current_snapshot_advances_then_eof_clears_every_projection()
     {
         var session = new UiChildSession();

@@ -9,7 +9,7 @@ namespace ControlShiftF12App;
 
 /// <summary>
 /// The sole owner for one local engine child. It has no network, shell or
-/// capability API: it can only request the initial, redacted UI projection.
+/// capability API: it can only request fixed, redacted UI projections.
 /// </summary>
 public sealed class WindowsUiChildOwner : IAsyncDisposable
 {
@@ -57,13 +57,40 @@ public sealed class WindowsUiChildOwner : IAsyncDisposable
     public async Task<UiChildSession> ReadInitialProjectionAsync(TimeSpan timeout)
     {
         ThrowIfClosed();
+        if (Session.State.Phase != ChildSessionPhase.Starting)
+        {
+            throw new InvalidOperationException("The initial projection has already been requested.");
+        }
+
+        await WriteFixedRequestAsync(UiChildSession.InitialRefreshFrame(), timeout);
+        return await ReadUntilProjectionAsync(previousGeneration: null, timeout);
+    }
+
+    public async Task<UiChildSession> StartDiscoveryAsync(TimeSpan timeout)
+    {
+        ThrowIfClosed();
+        if (Session.State.Phase != ChildSessionPhase.Running
+            || Session.Snapshot is not { State: "not_started" } previous)
+        {
+            throw new InvalidOperationException("Discovery is unavailable outside the reviewed local starting state.");
+        }
+
+        await WriteFixedRequestAsync(UiChildSession.StartDiscoveryFrame(), timeout);
+        return await ReadUntilProjectionAsync(previous.Generation, timeout);
+    }
+
+    private async Task WriteFixedRequestAsync(byte[] request, TimeSpan timeout)
+    {
         using var cancellation = new CancellationTokenSource(timeout);
-        var request = UiChildSession.InitialRefreshFrame();
         await child.StandardInput.BaseStream.WriteAsync(request, cancellation.Token);
         await child.StandardInput.BaseStream.FlushAsync(cancellation.Token);
+    }
 
+    private async Task<UiChildSession> ReadUntilProjectionAsync(ulong? previousGeneration, TimeSpan timeout)
+    {
+        using var cancellation = new CancellationTokenSource(timeout);
         var buffer = new byte[8192];
-        while (Session.State.Phase == ChildSessionPhase.Starting)
+        while (Session.State.Phase != ChildSessionPhase.Terminal)
         {
             var read = await child.StandardOutput.BaseStream.ReadAsync(buffer, cancellation.Token);
             if (read == 0)
@@ -72,6 +99,11 @@ public sealed class WindowsUiChildOwner : IAsyncDisposable
                 return Session;
             }
             Session.ReceiveOutput(buffer.AsSpan(0, read).ToArray());
+            if (Session.Snapshot is { } snapshot
+                && (previousGeneration is null || snapshot.Generation > previousGeneration))
+            {
+                return Session;
+            }
         }
         return Session;
     }
