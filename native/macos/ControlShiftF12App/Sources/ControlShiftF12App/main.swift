@@ -29,9 +29,9 @@ struct DiagnosticsPresentation: Equatable {
     let showsSessionCount: Bool
     let rows: [DiagnosticPresentationRow]
 
-    init(runtime: RuntimeStatus, rows: [DiagnosticSourceRow]) {
+    init(runtime: RuntimeStatus, rows: [DiagnosticSourceRow], refreshEnabled: Bool = true) {
         statusText = runtime == .currentPass ? "Running" : "Not running"
-        refreshEnabled = true
+        self.refreshEnabled = refreshEnabled
         // This diagnostics host renders only current local facts. It has no
         // relationship/session action or count surface.
         showsSessionCount = false
@@ -137,7 +137,7 @@ final class DiagnosticsFrameController {
 
     func invalidate() {
         isClosed = true
-        presentation = DiagnosticsPresentation(runtime: .unknown, rows: [])
+        presentation = DiagnosticsPresentation(runtime: .unknown, rows: [], refreshEnabled: false)
     }
 
     private func completePayload(from frame: Data) throws -> Data {
@@ -390,6 +390,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     private var session: DiagnosticsSession?
     private let statusLabel = NSTextField(labelWithString: "Not running")
     private let table = NSTableView()
+    private let refreshButton = NSButton(title: "Refresh", target: nil, action: nil)
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         let window = NSWindow(
@@ -408,8 +409,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         let detail = NSTextField(wrappingLabelWithString: "Local checks are shown individually. Remote control stays off.")
         detail.textColor = .secondaryLabelColor
         statusLabel.font = .systemFont(ofSize: 13, weight: .medium)
-        let refresh = NSButton(title: "Refresh", target: self, action: #selector(refreshDiagnostics))
-        refresh.setAccessibilityLabel("Refresh diagnostics")
+        refreshButton.target = self
+        refreshButton.action = #selector(refreshDiagnostics)
+        refreshButton.setAccessibilityLabel("Refresh diagnostics")
 
         let scroll = NSScrollView()
         let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("diagnostic"))
@@ -421,7 +423,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         scroll.documentView = table
         scroll.hasVerticalScroller = true
 
-        let stack = NSStackView(views: [title, detail, statusLabel, scroll, refresh])
+        let stack = NSStackView(views: [title, detail, statusLabel, scroll, refreshButton])
         stack.orientation = .vertical
         stack.alignment = .leading
         stack.spacing = 12
@@ -455,6 +457,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     }
 
     @objc private func refreshDiagnostics() {
+        guard session?.presentation.refreshEnabled == true else { return }
         lifecycle?.refresh()
     }
 
@@ -466,6 +469,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
                 guard !lifecycle.isClosed, lifecycle.generation == generation else { return }
                 try? session.receive(event)
                 self.statusLabel.stringValue = self.diagnostics.presentation.statusText
+                self.refreshButton.isEnabled = self.diagnostics.presentation.refreshEnabled
                 self.table.reloadData()
             }
         }

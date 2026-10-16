@@ -227,6 +227,7 @@ class NativeHostBoundaryTests(unittest.TestCase):
         self.assertIn("process.terminationHandler", source)
         self.assertIn("case .endOfFile, .pipeFailure, .termination", source)
         self.assertIn("controller.invalidate()", source)
+        self.assertIn("self.refreshButton.isEnabled = self.diagnostics.presentation.refreshEnabled", source)
         self.assertEqual(source.count("Process()"), 1)
         self.assertEqual(source.count("kill(process.processIdentifier, SIGKILL)"), 1)
         self.assertIn("func refresh()", source)

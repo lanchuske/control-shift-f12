@@ -96,6 +96,7 @@ final class ControlShiftF12AppTests: XCTestCase {
         try session.receive(.endOfFile)
 
         XCTAssertEqual(session.presentation.statusText, "Not running")
+        XCTAssertFalse(session.presentation.refreshEnabled)
         XCTAssertTrue(session.isTerminal)
         XCTAssertEqual(child.terminateCalls, 1)
         XCTAssertEqual(child.reapCalls, 1)
@@ -111,6 +112,7 @@ final class ControlShiftF12AppTests: XCTestCase {
 
         XCTAssertEqual(session.presentation.statusText, "Not running")
         XCTAssertTrue(session.presentation.rows.isEmpty)
+        XCTAssertFalse(session.presentation.refreshEnabled)
         XCTAssertEqual(child.terminateCalls, 1)
     }
 
@@ -126,6 +128,7 @@ final class ControlShiftF12AppTests: XCTestCase {
 
         XCTAssertEqual(session.presentation.statusText, "Not running")
         XCTAssertTrue(session.presentation.rows.isEmpty)
+        XCTAssertFalse(session.presentation.refreshEnabled)
         XCTAssertEqual(child.terminateCalls, 1)
     }
 
