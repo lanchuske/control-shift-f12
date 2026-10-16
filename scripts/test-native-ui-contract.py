@@ -15,6 +15,7 @@ MACOS_MANIFEST = ROOT / "native/macos/ControlShiftF12App/Package.swift"
 WINDOWS_MANIFEST = ROOT / "native/windows/ControlShiftF12App/ControlShiftF12App.csproj"
 NATIVE_README = ROOT / "native/README.md"
 BOUNDARY_RECORD = ROOT / "docs/architecture/native-host-boundary.md"
+SAS_MATRIX = ROOT / "docs/architecture/discovery-sas-security-matrix.md"
 NONSHIPPING_NATIVE_PATHS = frozenset(
     {
         "native/README.md",
@@ -181,6 +182,24 @@ class NativeHostBoundaryTests(unittest.TestCase):
             self.assertIn("allowlist", text)
             self.assertIn("non-shipping", text)
         self.assertIn("pub const MAX_FRAME_BYTES: usize = 256 * 1024", control_api)
+
+    def test_sas_display_is_ephemeral_and_cannot_become_host_history(self):
+        """The one visible secret has a narrow current-view-only exception."""
+        matrix = SAS_MATRIX.read_text()
+        boundary_record = BOUNDARY_RECORD.read_text()
+
+        for text in (matrix, boundary_record):
+            normalized = " ".join(text.split())
+            self.assertIn("SasDisplayView", normalized)
+            self.assertIn("non-serializable", normalized)
+            self.assertIn("not persistible", normalized)
+            self.assertIn("not loggable", normalized)
+            self.assertIn("not copyable", normalized)
+            self.assertIn("terminal", normalized)
+            self.assertIn("timeout", normalized)
+
+        self.assertIn("accessibility cache/history", matrix)
+        self.assertIn("details suffix", matrix)
 
 
 if __name__ == "__main__":

@@ -68,6 +68,37 @@ revoke, identity change, or permission loss. A new V01 attempt needs fresh
 connection-scoped values; repaint, sleep, a dialog, discovery refresh and a
 network read cannot extend its 30-second deadline.
 
+### Ephemeral `SasDisplayView` presentation boundary
+
+`SasDisplayView` is a deliberately narrow, current-screen-only presentation
+value produced by the reviewed engine adapter for an active bootstrap or V01
+attempt. It is not a wire object, a durable receipt field, or a host capability.
+It may carry only the grouped human-comparison code, the current remaining-time
+view, and an optional details suffix **only if needed** by the reviewed UX. It
+does not carry a locator, identity, certificate, raw transcript, exporter,
+receipt, approval, layout data, or any authority.
+
+`SasDisplayView` is non-serializable, not persistible, not loggable and not
+copyable. A host may hold it only while that exact confirmation screen is
+visible and current; it must drop it, clear the visible control and invalidate
+any view reference on every terminal state, timeout, mismatch, cancel,
+candidate/attempt change, reset, disappearance, revoke, identity change or
+permission loss. It must reject a request to put the view in a cache, history,
+clipboard, drag payload, share sheet, notification, window title, crash report,
+diagnostic/support export, tooltip, help text or analytics event. The details
+suffix follows the same lifetime and must not contain the code or a locator.
+
+Accessibility is part of the visible local screen, not a side channel. The
+current focused confirmation control may expose the grouped code to the local
+assistive technology that is reading that control, but the application must not
+put the code or suffix in a global announcement, window title, notification,
+unfocused accessibility label, or accessibility cache/history. This cannot
+hide pixels or focused accessible content from a local person, screen capture,
+a trusted accessibility client, or an operating-system feature permitted by the
+current user. The boundary truthfully limits the product's own retention and
+secondary disclosure; it does not claim a secure-screen facility that macOS or
+Windows has not provided to this application.
+
 ## Design and adversarial test matrix
 
 | Area | Required invariant | Test / mutation evidence | Required failure result |
@@ -77,6 +108,7 @@ network read cannot extend its 30-second deadline.
 | Discovery identity conflict | Advertisement never proves a durable peer | Substitute advertisement leaf/receipt for the active store tuple | Reject before bootstrap/V01; no trust promotion |
 | Bootstrap/V01 separation | Bootstrap SAS cannot satisfy V01 confirmation | Reuse bootstrap code/approval in a V01 state | Reject before `V01_PENDING -> INVENTORY_CURRENT` |
 | SAS provenance | V01 code is supplied only by an active reviewed V01 attempt | Feed code without matching live lease/attempt/transcript | Reject; clear volatile values |
+| SAS display boundary | `SasDisplayView` is current-only and cannot become host history | Attempt serialize/persist/log/copy/cache; inject it into title, notification, diagnostics, analytics, tooltip, accessibility cache/history or a stale screen | Reject/suppress; clear the display at the next terminal state or timeout |
 | Both-screen visibility | Each display renders the same grouped code from its own V01 session | Mutate one code group, reorder groups, or present an old code | Local mismatch/cancel; no receipt, inventory or capability advance |
 | Double local confirmation | Each side needs its own explicit approval | Deliver remote approve before local approve; duplicate/replay approval | Remote fact alone cannot advance; duplicate rejects/fences |
 | Deadline | One monotonic deadline is <= 30 seconds | Change to 31 seconds; per-read timer; confirm at deadline; pause/repaint | Terminal cancel, clear SAS/approvals; fresh attempt required |

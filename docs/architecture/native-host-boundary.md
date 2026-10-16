@@ -65,8 +65,26 @@ and request-ID idempotence.
 
 The host may render only a redacted typed projection supplied by a future
 reviewed adapter. It does not retain discovery addresses, certificates,
-identity keys, exporter material, SAS values, durable receipts, raw layout
-drafts, or input/clipboard capabilities.
+identity keys, exporter material, durable receipts, raw layout drafts, or
+input/clipboard capabilities.
+
+The sole presentation exception is an ephemeral `SasDisplayView` for a current
+bootstrap or V01 confirmation screen. It is non-serializable, not persistible,
+not loggable and not copyable; it is neither a request field nor a host-side
+capability. The host may render it only while the exact attempt is current, and
+must clear/drop it on every terminal state or timeout. It must reject any cache,
+history, clipboard, drag payload, share sheet, notification, title, tooltip,
+help, crash report, diagnostic/support export or analytics use. An optional
+details suffix exists only if needed by reviewed UX, has the same lifetime, and
+contains neither the code nor a locator.
+
+The focused confirmation control may expose its grouped code to the current
+local assistive technology, but code and suffix must not enter a global
+announcement, window title, unfocused accessibility label, or accessibility
+cache/history. This boundary cannot prevent a local user, permitted screen
+capture, or trusted assistive technology from observing content visibly shown
+on that user's screen; it prohibits only product-controlled retention and
+secondary disclosure.
 
 Closing a GUI sends the existing shutdown request while the inherited pipe is
 healthy, closes the pipes, and reaps the child. If shutdown fails, the host
