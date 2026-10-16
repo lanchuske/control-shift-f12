@@ -3,9 +3,11 @@
 ## Status, scope, and admission gate
 
 This is a reviewed boundary record for Tasks 6 and 7. The admitted Rust child
-entrypoint and one guarded AppKit diagnostics projection source do not add a
-product bundle, WinForms source, network, or product sharing UI. In particular,
-they do not make either manifest under `native/` shippable.
+entrypoint, one guarded AppKit diagnostics projection source, and one
+presentation-only WinForms shell do not add a product bundle, a Windows pipe
+owner, network, or product sharing UI. The WinForms shell renders only local,
+unavailable states and owns no engine process or capability. In particular,
+these sources do not make either manifest under `native/` shippable.
 
 The candidate contains a bounded Rust `UiStdioAdapter`, a process-owned
 inherited-stdin reader for the Rust child, and a `TimedRequestReader`
@@ -19,7 +21,10 @@ blocked until its own target-platform owner/tests are admitted.
 
 The UI entrypoint is admitted. In particular, only the guarded AppKit
 diagnostics source may use this document as authority to launch its fixed child
-process. A Windows diagnostics parser/test pair and platform-neutral lifecycle,
+process. The admitted WinForms shell is a local presentation-only surface: it
+may render unavailable onboarding, display-map and sharing controls, but it
+cannot launch a child, open a pipe, enable a control, or claim a connection.
+A Windows diagnostics parser/test pair and platform-neutral lifecycle,
 journey-state, fixed child-launch specification, or closed initial-snapshot
 projection may validate redacted frames, terminal projection clearing,
 unavailable product actions, the immutable package-child command/environment
@@ -235,14 +240,14 @@ simulated pipe never proves the target platform.
 | Accessibility | Platform UI tests verify keyboard-only operation, focus order, semantic status, focused SAS exposure, and terminal clearing. | No global SAS announcement/history; documented OS visibility limits remain visible to reviewers. |
 | Physical QA | Signed package tests on a real Mac and a real Windows target measure start/stop/restart, permission loss, process cleanup, memory/CPU, and no-network-endpoint behavior. | Record PASS/FAIL/NOT MEASURED separately; no stable release claim from a harness-only pass. |
 
-Until this evidence exists, no additional native host source, product build,
-signing, packaging, or release is permitted. The guarded AppKit diagnostics
-source is non-shipping test material only; it does not satisfy full platform
-parity or release evidence.
+Until this evidence exists, no additional pipe-owning native host source,
+product build, signing, packaging, or release is permitted. The guarded AppKit
+diagnostics source and presentation-only WinForms shell are non-shipping test
+material only; neither satisfies full platform parity or release evidence.
 
 ## Non-goals
 
-This design does not add a GUI, native source, process spawning code, an IPC
+This design does not add a pipe-owning GUI, process spawning code, an IPC
 implementation, networking, transport, discovery, pairing, a layout save,
 input sharing, clipboard sharing, a CI workflow, or a publication path. It
 does not resolve the separately paused post-V01 operational-layout protocol.

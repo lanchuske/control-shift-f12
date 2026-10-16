@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Static boundary checks for admitted non-shipping diagnostics contracts.
+"""Static boundary checks for admitted non-shipping native contracts.
 
 The checks admit one reviewable AppKit source tree and a Windows-only parser
-plus tests. They do not admit a Windows host, bundles, build output, a network
-endpoint, or any host capability beyond the fixed local child projection pipe.
+plus tests and a presentation-only Windows shell. They do not admit a Windows
+pipe owner, bundles, build output, a network endpoint, or host capabilities.
 """
 
 from pathlib import Path
@@ -57,6 +57,12 @@ ADMITTED_WINDOWS_CONTRACT_PATHS = frozenset(
         "native/windows/ControlShiftF12App.Tests/WindowsDiagnosticsProjectionTests.cs",
     }
 )
+ADMITTED_WINDOWS_SHELL_PATHS = frozenset(
+    {
+        "native/windows/ControlShiftF12App/Program.cs",
+        "native/windows/ControlShiftF12App/DesktopShellForm.cs",
+    }
+)
 HOST_SOURCE_SUFFIXES = (".swift", ".cs", ".m", ".mm", ".h")
 BUILD_OUTPUT_SUFFIXES = (
     ".dll",
@@ -96,6 +102,7 @@ def is_nonshipping_native_path(path):
         NONSHIPPING_NATIVE_PATHS
         | ADMITTED_MACOS_HOST_PATHS
         | ADMITTED_WINDOWS_CONTRACT_PATHS
+        | ADMITTED_WINDOWS_SHELL_PATHS
     )
 
 
@@ -217,12 +224,13 @@ class NativeHostBoundaryTests(unittest.TestCase):
             NONSHIPPING_NATIVE_PATHS
             | ADMITTED_MACOS_HOST_PATHS
             | ADMITTED_WINDOWS_CONTRACT_PATHS
+            | ADMITTED_WINDOWS_SHELL_PATHS
         )
         unexpected = sorted(tracked - admitted)
         self.assertEqual(
             unexpected,
             [],
-            "only approved diagnostics contracts may be tracked",
+            "only approved non-shipping native sources may be tracked",
         )
         self.assertEqual(tracked, admitted)
         blocked = sorted(path for path in tracked if is_blocked_native_artifact(path))
@@ -231,7 +239,7 @@ class NativeHostBoundaryTests(unittest.TestCase):
     def test_allowlist_rejects_other_host_sources_bundles_and_build_outputs(self):
         prohibited = (
             "native/macos/ControlShiftF12App/Sources/App.swift",
-            "native/windows/ControlShiftF12App/Program.cs",
+            "native/windows/ControlShiftF12App/UnreviewedHost.cs",
             "native/macos/ControlShiftF12App/ControlShiftF12.app/Contents/MacOS/ControlShiftF12",
             "native/windows/ControlShiftF12App/bin/Release/ControlShiftF12App.exe",
             "native/windows/ControlShiftF12App/obj/Release/ControlShiftF12App.dll",
@@ -398,6 +406,32 @@ class NativeHostBoundaryTests(unittest.TestCase):
         for forbidden in ("cmd.exe", "powershell", "pwsh", "http://", "https://", "Socket"):
             self.assertNotIn(forbidden, probe, forbidden)
 
+    def test_windows_shell_is_presentation_only_until_a_pipe_owner_is_admitted(self):
+        shell = (ROOT / "native/windows/ControlShiftF12App/DesktopShellForm.cs").read_text()
+        for expected in (
+            "DesktopShellPresentation",
+            "Find nearby computers",
+            "Input sharing",
+            "Clipboard sharing",
+            "Automatic updates",
+            "Not connected",
+        ):
+            self.assertIn(expected, shell)
+        for forbidden in (
+            "ProcessStartInfo",
+            "Process.Start",
+            "System.IO.Pipes",
+            "Socket",
+            "HttpClient",
+            "http://",
+            "https://",
+            "cmd.exe",
+            "powershell",
+            "Clipboard.Set",
+            "SendKeys",
+        ):
+            self.assertNotIn(forbidden, shell, forbidden)
+
     def test_hosts_are_declared_as_nonshipping_pipe_clients_of_the_existing_engine(self):
         macos_manifest = MACOS_MANIFEST.read_text()
         windows_manifest = WINDOWS_MANIFEST.read_text()
@@ -457,8 +491,8 @@ class NativeHostBoundaryTests(unittest.TestCase):
         for request in fixture["invalid_host_requests"]:
             self.assertTrue(host_request_contains_sas(request), request)
 
-    def test_native_host_pipe_design_limits_native_source_to_diagnostics_host(self):
-        """The host plan admits only the guarded diagnostics owner and safety gates."""
+    def test_native_host_pipe_design_limits_native_source_to_safe_presentations_and_gates(self):
+        """The host plan admits only non-shipping presentations and safety gates."""
         design = HOST_PIPE_DESIGN.read_text()
         required = (
             "control_engine::run_stdio",
@@ -472,7 +506,7 @@ class NativeHostBoundaryTests(unittest.TestCase):
             "terminal `sas_display_v1 current:false`",
             "Platform-specific reader cancellation is intentionally not unified",
             "only the guarded AppKit",
-            "no additional native host source, product build,",
+            "no additional pipe-owning native host source,",
         )
         for invariant in required:
             self.assertIn(invariant, design)
