@@ -20,6 +20,7 @@ SPEC = ROOT / "docs" / "operational-session-interoperability.md"
 FIXTURE = ROOT / "crates/transport/tests/fixtures/pairing-v2/operational-session-v01.json"
 MAGIC = b"CSF12S1\x00"
 VERSION = 1
+PAIRING_RECEIPT_VERSION = 2
 ALPN = "csf12-operational/1"
 EXPORTER_LABEL = "EXPORTER-ControlShiftF12-OperationalSession-v1"
 LIMIT = 4096
@@ -102,7 +103,7 @@ def authority_view(fields: dict[str, str | int]) -> bytes:
             (1, 2, hx(str(fields["self_fingerprint_sha256_hex"]))),
             (2, 2, hx(str(fields["peer_fingerprint_sha256_hex"]))),
             (3, 3, str(fields["suite"]).encode("ascii")),
-            (4, 1, struct.pack(">Q", int(fields["protocol_version"]))),
+            (4, 1, struct.pack(">Q", int(fields["pairing_receipt_protocol_version"]))),
             (5, 1, struct.pack(">Q", int(fields["policy_revision"]))),
             (6, 1, struct.pack(">Q", int(fields["identity_generation"]))),
             (7, 1, struct.pack(">Q", int(fields["revocation_generation"]))),
@@ -220,10 +221,9 @@ def validate(vector: dict[str, object], spec: str) -> None:
     assert vector["wire_attempt_source"] == "A-csprng-32-bytes-one-use-not-durable"
     assert vector["quic_client_role"] == "A-lower-fingerprint"
     assert vector["stream_count"] == 1
-    lease = vector["preflight_lease"]
-    assert lease["stage"] == "local-view-plus-selected-tls-before-stream"
-    assert lease["promotion"] == "atomic-revalidate-after-bilateral-preflight"
-    assert lease["exporter_label"] == "EXPORTER-ControlShiftF12-OperationalPreflightLease-v1"
+    assert vector["operational_wire_version"] == VERSION
+    assert vector["authority_view_a"]["pairing_receipt_protocol_version"] == PAIRING_RECEIPT_VERSION
+    assert vector["authority_view_b"]["pairing_receipt_protocol_version"] == PAIRING_RECEIPT_VERSION
     assert hx(vector["role_a_fingerprint_sha256_hex"]) < hx(vector["role_b_fingerprint_sha256_hex"])
     a_view, b_view = authority_view(vector["authority_view_a"]), authority_view(vector["authority_view_b"])
     assert a_view.hex() == vector["authority_commitment_a_view_hex"]
@@ -242,11 +242,6 @@ def validate(vector: dict[str, object], spec: str) -> None:
     assert exporter_context.hex() == vector["exporter_context_hex"]
     assert hashlib.sha256(exporter_context).hexdigest() == vector["exporter_context_sha256_hex"]
     assert len(hx(vector["expected_exporter_output_hex"])) == 32
-    assert len(hx(lease["a_exporter_output_hex"])) == len(hx(lease["b_exporter_output_hex"])) == 32
-    assert preflight_lease_context(vector, b"A").hex() == lease["a_context_hex"]
-    assert preflight_lease_context(vector, b"B").hex() == lease["b_context_hex"]
-    assert preflight_lease_binding(vector, b"A").hex() == lease["a_binding_hex"]
-    assert preflight_lease_binding(vector, b"B").hex() == lease["b_binding_hex"]
     payloads = [hx(item) for item in vector["canonical_payloads_hex"]]
     records = [hx(item) for item in vector["records_hex"]]
     assert len(payloads) == len(records) == len(SCHEDULE)
@@ -255,6 +250,17 @@ def validate(vector: dict[str, object], spec: str) -> None:
         assert record == frame(message_type, direction, sequence, payload)
         assert decode_frame(record) == (message_type, direction, sequence, payload)
         decoded.append(decode_canonical(kind, payload))
+    assert actual_remote_receipt_version(vector, 0, 5) == PAIRING_RECEIPT_VERSION
+    assert actual_remote_receipt_version(vector, 1, 6) == PAIRING_RECEIPT_VERSION
+    lease = vector["preflight_lease"]
+    assert lease["stage"] == "local-view-plus-selected-tls-before-stream"
+    assert lease["promotion"] == "atomic-revalidate-after-bilateral-preflight"
+    assert lease["exporter_label"] == "EXPORTER-ControlShiftF12-OperationalPreflightLease-v1"
+    assert len(hx(lease["a_exporter_output_hex"])) == len(hx(lease["b_exporter_output_hex"])) == 32
+    assert preflight_lease_context(vector, b"A").hex() == lease["a_context_hex"]
+    assert preflight_lease_context(vector, b"B").hex() == lease["b_context_hex"]
+    assert preflight_lease_binding(vector, b"A").hex() == lease["a_binding_hex"]
+    assert preflight_lease_binding(vector, b"B").hex() == lease["b_binding_hex"]
     attempt, session = hx(vector["wire_attempt_hex"]), hx(vector["session_id_hex"])
     nonce_a, nonce_b = hx(vector["nonce_a_hex"]), hx(vector["nonce_b_hex"])
     commitment_hash = hashlib.sha256(commitment).digest()
@@ -289,6 +295,8 @@ def validate(vector: dict[str, object], spec: str) -> None:
         "PromoteSessionLease",
         "A hash alone is never treated as evidence",
         "canonical A authority view(5 bytes≤512)",
+        "pairing_receipt_protocol_version",
+        "They are never compared for equality",
         "linearization",
     ):
         assert phrase in spec
@@ -299,6 +307,29 @@ def record_byte(index: int, byte_index: int, replacement: int):
         raw = bytearray(hx(vector["records_hex"][index]))
         raw[byte_index] = replacement
         vector["records_hex"][index] = raw.hex()
+    return apply
+
+
+def rewrite_frame_version(index: int, version: int):
+    def apply(vector: dict[str, object]) -> None:
+        raw = bytearray(hx(vector["records_hex"][index]))
+        struct.pack_into(">H", raw, 8, version)
+        vector["records_hex"][index] = raw.hex()
+    return apply
+
+
+def mutate_preflight_receipt(index: int, outer_tag: int, version: int):
+    """Mutate tag 4 inside the authority view carried by a real preflight frame."""
+    def apply(vector: dict[str, object]) -> None:
+        message_type, direction, sequence, payload = decode_frame(hx(vector["records_hex"][index]))
+        outer = decode_canonical(KINDS[index], payload)
+        remote = decode_canonical("operational-authority-view-v1", outer[outer_tag][1])
+        remote[4] = (1, struct.pack(">Q", version))
+        rebuilt_remote = canonical("operational-authority-view-v1", [(tag, value_type, value) for tag, (value_type, value) in remote.items()])
+        outer[outer_tag] = (2, rebuilt_remote)
+        rebuilt_payload = canonical(KINDS[index], [(tag, value_type, value) for tag, (value_type, value) in outer.items()])
+        vector["canonical_payloads_hex"][index] = rebuilt_payload.hex()
+        vector["records_hex"][index] = frame(message_type, direction, sequence, rebuilt_payload).hex()
     return apply
 
 
@@ -326,10 +357,117 @@ def mutate_framed_payload_field(index: int, tag: int):
     return apply
 
 
+def actual_remote_receipt_version(vector: dict[str, object], index: int, outer_tag: int) -> int:
+    _message_type, _direction, _sequence, payload = decode_frame(hx(vector["records_hex"][index]))
+    outer = decode_canonical(KINDS[index], payload)
+    remote = decode_canonical("operational-authority-view-v1", outer[outer_tag][1])
+    value_type, value = remote[4]
+    assert value_type == 1 and len(value) == 8
+    return struct.unpack(">Q", value)[0]
+
+
+def frame_rejected(vector: dict[str, object], index: int) -> bool:
+    try:
+        decode_frame(hx(vector["records_hex"][index]))
+    except (AssertionError, ValueError, struct.error, IndexError):
+        return True
+    return False
+
+
+def schedule_rejected(vector: dict[str, object], index: int) -> bool:
+    try:
+        message_type, direction, sequence, _payload = decode_frame(hx(vector["records_hex"][index]))
+    except (AssertionError, ValueError, struct.error, IndexError):
+        return True
+    return (message_type, direction) != SCHEDULE[index] or sequence != index
+
+
+MUTATION_STAGES = {
+    "alpn-downgrade": "metadata",
+    "wire-version-downgrade": "frame",
+    "operational-wire-version-two": "frame",
+    "magic-substitution": "frame",
+    "type-substitution": "frame",
+    "direction-substitution": "frame",
+    "sequence-replay": "frame",
+    "payload-trailing": "frame",
+    "payload-oversize": "frame",
+    "tuple-revision-substitution": "preflight-local",
+    "tuple-revocation-substitution": "preflight-local",
+    "pairing-receipt-version-one": "preflight-remote",
+    "pairing-receipt-version-three": "preflight-remote",
+    "observed-leaf-substitution": "preflight-local",
+    "exporter-label-substitution": "exporter",
+    "exporter-context-substitution": "exporter",
+    "exporter-cross-connection-substitution": "exporter",
+    "nonce-substitution": "exporter",
+    "open-hash-substitution": "accept",
+    "confirm-mac-substitution": "confirm",
+    "one-sided-confirm": "confirm",
+    "early-fin": "confirm",
+    "extra-stream": "metadata",
+    "zero-rtt": "metadata",
+    "resumption-ticket": "metadata",
+    "reconnect-reuse": "metadata",
+    "post-revocation-reconnect": "preflight-local",
+}
+
+
+def mutation_stage(name: str, vector: dict[str, object]) -> str:
+    if name == "alpn-downgrade":
+        assert vector["alpn"] != ALPN
+    elif name in {"wire-version-downgrade", "operational-wire-version-two", "magic-substitution", "payload-trailing", "payload-oversize"}:
+        assert frame_rejected(vector, 0)
+    elif name in {"type-substitution", "direction-substitution"}:
+        assert schedule_rejected(vector, 0)
+    elif name == "sequence-replay":
+        assert schedule_rejected(vector, 1)
+    elif name == "tuple-revision-substitution":
+        assert vector["authority_view_a"]["receipt_revision"] != 12
+    elif name == "tuple-revocation-substitution":
+        assert vector["authority_view_b"]["revocation_generation"] != 5
+    elif name == "pairing-receipt-version-one":
+        assert actual_remote_receipt_version(vector, 0, 5) == 1
+    elif name == "pairing-receipt-version-three":
+        assert actual_remote_receipt_version(vector, 1, 6) == 3
+    elif name == "observed-leaf-substitution":
+        assert vector["role_b_fingerprint_sha256_hex"] != "22" * 32
+    elif name == "exporter-label-substitution":
+        assert vector["exporter_label"] != EXPORTER_LABEL
+    elif name == "exporter-context-substitution":
+        assert vector["exporter_context_hex"] != context(vector).hex()
+    elif name == "exporter-cross-connection-substitution":
+        assert vector["expected_exporter_output_hex"] != "66" * 32
+    elif name == "nonce-substitution":
+        assert vector["nonce_b_hex"] != "44" * 32
+    elif name == "open-hash-substitution":
+        assert decode_canonical(KINDS[3], decode_frame(hx(vector["records_hex"][3]))[3])[4][1] != hashlib.sha256(hx(vector["canonical_payloads_hex"][2])).digest()
+    elif name == "confirm-mac-substitution":
+        assert decode_canonical(KINDS[4], decode_frame(hx(vector["records_hex"][4]))[3])[5][1] != mac(*confirmation_key(vector)[1:], b"A", hx(vector["wire_attempt_hex"]), hx(vector["session_id_hex"]), hashlib.sha256(hx(vector["canonical_payloads_hex"][3])).digest())
+    elif name == "one-sided-confirm":
+        assert len(vector["records_hex"]) == 5
+    elif name == "early-fin":
+        assert len(vector["canonical_payloads_hex"]) == 5
+    elif name == "extra-stream":
+        assert vector["stream_count"] != 1
+    elif name == "zero-rtt":
+        assert vector["resumption"]["zero_rtt"] != "forbidden"
+    elif name == "resumption-ticket":
+        assert vector["resumption"]["tickets"] != "forbidden"
+    elif name == "reconnect-reuse":
+        assert vector["wire_attempt_source"] != "A-csprng-32-bytes-one-use-not-durable"
+    elif name == "post-revocation-reconnect":
+        assert vector["authority_view_a"]["revocation_generation"] != 3
+    else:
+        raise AssertionError(f"missing stage probe for {name}")
+    return MUTATION_STAGES[name]
+
+
 MUTATIONS = {
     "alpn-downgrade": lambda v: v.__setitem__("alpn", "csf12-pair/2"),
-    "wire-version-downgrade": lambda v: v.__setitem__("wire_version", 0),
-    "magic-substitution": lambda v: v.__setitem__("wire_magic_hex", "00" * 8),
+    "wire-version-downgrade": rewrite_frame_version(0, 0),
+    "operational-wire-version-two": rewrite_frame_version(0, 2),
+    "magic-substitution": record_byte(0, 0, 0),
     "type-substitution": record_byte(0, 10, 5),
     "direction-substitution": record_byte(0, 11, 2),
     "sequence-replay": record_byte(1, 15, 0),
@@ -337,6 +475,8 @@ MUTATIONS = {
     "payload-oversize": lambda v: v["records_hex"].__setitem__(0, v["records_hex"][0][:32] + "00001001" + v["records_hex"][0][40:]),
     "tuple-revision-substitution": lambda v: v["authority_view_a"].__setitem__("receipt_revision", 13),
     "tuple-revocation-substitution": lambda v: v["authority_view_b"].__setitem__("revocation_generation", 4),
+    "pairing-receipt-version-one": mutate_preflight_receipt(0, 5, 1),
+    "pairing-receipt-version-three": mutate_preflight_receipt(1, 6, 3),
     "observed-leaf-substitution": lambda v: v.__setitem__("role_b_fingerprint_sha256_hex", "99" * 32),
     "exporter-label-substitution": lambda v: v.__setitem__("exporter_label", "wrong"),
     "exporter-context-substitution": lambda v: v.__setitem__("exporter_context_hex", "00"),
@@ -361,6 +501,7 @@ def main() -> None:
     for name, change in MUTATIONS.items():
         candidate = deepcopy(vector)
         change(candidate)
+        assert mutation_stage(name, candidate) == MUTATION_STAGES[name]
         try:
             validate(candidate, spec)
         except (AssertionError, ValueError, struct.error, IndexError):

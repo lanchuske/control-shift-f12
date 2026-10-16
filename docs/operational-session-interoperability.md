@@ -20,6 +20,15 @@ this exact ASCII ALPN must fail the attempt; it must not retry with
 `csf12-pair/2`, a legacy ALPN, a different spelling/case, or a lower version.
 No downgrade is permitted.
 
+V01 has two deliberately independent version domains. The operational stream
+wire version is exactly `1` (the header `version:u16be` and
+`operational_wire_version` fixture field). The durable pairing receipt protocol
+version is exactly `2`; it is copied into the authority view as
+`pairing_receipt_protocol_version`. They are never compared for equality or
+used as fallback for one another. A receipt version other than `2` is rejected
+before preflight; a wire version other than `1` is rejected before payload
+parsing. There is no migration, reinterpretation, or downgrade path for either.
+
 The only cryptographic primitives used here are the project precedents already
 used in the frozen pairing references: TLS 1.3 with mutual Ed25519 identity
 certificates, SHA-256, HKDF-SHA256 and HMAC-SHA256, plus the established
@@ -116,7 +125,7 @@ The view has the following ordered, mandatory fields. Integers are unsigned
 | 1 | `self_fingerprint_sha256` | The local actual leaf hash. |
 | 2 | `peer_fingerprint_sha256` | Active durable pin; equals the expected remote leaf hash. |
 | 3 | `suite` | Durable receipt suite; exact ASCII `x25519-hkdf-sha256-ed25519-v1`. |
-| 4 | `protocol_version` | Durable receipt protocol version; exact `1`. |
+| 4 | `pairing_receipt_protocol_version` | Copied durable pairing receipt protocol version; exact `2`, distinct from operational wire version `1`. |
 | 5 | `policy_revision` | Store policy revision, equal to the receipt. |
 | 6 | `identity_generation` | Store identity generation, equal to the receipt. |
 | 7 | `revocation_generation` | Store generation, equal to receipt and active-pin record. |
@@ -299,10 +308,12 @@ pairing, not a recovery path.
 ## Negative cases and implementation gate
 
 The fixture names these mandatory negative mutations:
-`alpn-downgrade`, `wire-version-downgrade`, `magic-substitution`,
+`alpn-downgrade`, `wire-version-downgrade`, `operational-wire-version-two`,
+`magic-substitution`,
 `type-substitution`, `direction-substitution`, `sequence-replay`,
 `payload-trailing`, `payload-oversize`, `tuple-revision-substitution`,
-`tuple-revocation-substitution`, `observed-leaf-substitution`,
+`tuple-revocation-substitution`, `pairing-receipt-version-one`,
+`pairing-receipt-version-three`, `observed-leaf-substitution`,
 `exporter-label-substitution`, `exporter-context-substitution`,
 `exporter-cross-connection-substitution`, `nonce-substitution`,
 `open-hash-substitution`, `confirm-mac-substitution`, `one-sided-confirm`,
@@ -310,7 +321,10 @@ The fixture names these mandatory negative mutations:
 `reconnect-reuse`, and `post-revocation-reconnect`.
 
 Each must fail closed in a future independently written parser. The static
-fixture verifier proves only that frozen bytes and declared mutations stay
+fixture verifier executes every declared mutation and checks its intended stage
+matrix (metadata, frame, preflight, exporter, Accept or Confirm); wire-version
+and remote-receipt mutations alter actual framed bytes rather than only fixture
+metadata. It proves only that frozen bytes and declared mutations stay
 internally consistent. It does not prove TLS exporter behavior, QUIC semantics,
 storage atomicity, native UI behavior, network policy, hardware key security,
 or Mac–Windows interoperability. Independent security/protocol review is a
