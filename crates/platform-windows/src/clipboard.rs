@@ -16,6 +16,8 @@ pub trait ClipboardBackend {
 
 #[derive(Debug, thiserror::Error, Clone, PartialEq, Eq)]
 pub enum ClipboardError {
+    #[error("clipboard is temporarily held by another process")]
+    Busy,
     #[error("clipboard access is unavailable")]
     AccessUnavailable,
     #[error("clipboard content exceeds the protocol limit")]
@@ -34,6 +36,7 @@ pub struct WindowsClipboard {
     pending_since: Option<u64>,
     last_now: u64,
     last_hash: Option<[u8; 32]>,
+    pending_remote: Option<ClipboardContent>,
 }
 
 impl WindowsClipboard {
@@ -44,6 +47,7 @@ impl WindowsClipboard {
             pending_since: None,
             last_now: 0,
             last_hash: None,
+            pending_remote: None,
         }
     }
 
@@ -97,6 +101,16 @@ impl PlatformClipboard for WindowsClipboard {
             return Err(ClipboardError::ClockWentBackwards);
         }
         self.last_now = now_ms;
+        if let Some(content) = self.pending_remote.take() {
+            match self.backend.write(&content) {
+                Ok(()) => self.last_hash = Some(Self::hash(&content)),
+                Err(ClipboardError::Busy) => {
+                    self.pending_remote = Some(content);
+                    return Ok(ClipboardOutcome::Pending);
+                }
+                Err(error) => return Err(error),
+            }
+        }
         if !self.backend.available() {
             return Ok(ClipboardOutcome::Disabled);
         }
@@ -115,7 +129,7 @@ impl PlatformClipboard for WindowsClipboard {
         let content = match self.backend.read() {
             // Another process may acquire the clipboard after available() succeeds.
             // Keep this sequence pending so a later tick can retry it.
-            Err(ClipboardError::AccessUnavailable) => {
+            Err(ClipboardError::Busy | ClipboardError::AccessUnavailable) => {
                 self.pending_since = Some(now_ms);
                 return Ok(ClipboardOutcome::Pending);
             }
@@ -135,13 +149,22 @@ impl PlatformClipboard for WindowsClipboard {
     }
 
     fn write_remote(&mut self, content: &ClipboardContent) -> Result<(), Self::Error> {
-        if !self.backend.available() {
-            return Err(ClipboardError::AccessUnavailable);
-        }
         Self::validate(content)?;
-        self.backend.write(content)?;
-        self.last_hash = Some(Self::hash(content));
-        Ok(())
+        // The read-only access probe is a snapshot; the native write must get
+        // its own bounded open attempts. Retain only the latest validated update
+        // if those attempts encounter contention, without committing its hash.
+        self.pending_remote = None;
+        match self.backend.write(content) {
+            Ok(()) => {
+                self.last_hash = Some(Self::hash(content));
+                Ok(())
+            }
+            Err(ClipboardError::Busy) => {
+                self.pending_remote = Some(content.clone());
+                Ok(())
+            }
+            Err(error) => Err(error),
+        }
     }
 }
 
@@ -157,9 +180,8 @@ mod native {
 
     fn backend_error(error: arboard::Error) -> ClipboardError {
         match error {
-            arboard::Error::ClipboardOccupied | arboard::Error::ClipboardNotSupported => {
-                ClipboardError::AccessUnavailable
-            }
+            arboard::Error::ClipboardOccupied => ClipboardError::Busy,
+            arboard::Error::ClipboardNotSupported => ClipboardError::AccessUnavailable,
             arboard::Error::ConversionFailure => ClipboardError::Conversion,
             _ => ClipboardError::Backend,
         }
@@ -259,7 +281,7 @@ mod native {
         fn native_busy_error_is_retryable_but_conversion_and_unknown_errors_are_not() {
             assert_eq!(
                 backend_error(arboard::Error::ClipboardOccupied),
-                ClipboardError::AccessUnavailable
+                ClipboardError::Busy
             );
             assert_eq!(
                 backend_error(arboard::Error::ConversionFailure),
