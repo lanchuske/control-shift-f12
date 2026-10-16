@@ -261,6 +261,7 @@ async fn bilateral_sealed_evidence_commits_only_durable_metadata_not_runtime_aut
     drop(b.unwrap());
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn real_late_extra_between_validation_and_rename_cannot_publish_authority() {
     let (_ea, _eb, a, b, _) = pair().await;
@@ -472,6 +473,7 @@ async fn endpoint_drop_that_revokes_scope_before_freeze_blocks_publication() {
     );
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn freeze_before_endpoint_drop_is_durably_revoked_before_future_authority() {
     let (mut ea, _eb, a, b, _) = pair().await;
