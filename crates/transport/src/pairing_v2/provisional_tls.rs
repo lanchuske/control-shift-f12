@@ -15,7 +15,12 @@ use rustls::{
     pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime},
     server::danger::{ClientCertVerified, ClientCertVerifier},
 };
-use std::sync::Arc;
+use std::sync::{
+    Arc, OnceLock,
+    atomic::{AtomicBool, AtomicU64, Ordering},
+};
+#[cfg(test)]
+mod tests;
 fn utc() -> Result<i64, Invalid> {
     i64::try_from(
         std::time::SystemTime::now()
@@ -134,10 +139,10 @@ impl ClientCertVerifier for ProfileVerifier {
 }
 /// No socket is opened here. Callers must own a bounded consent/listener lease.
 /// These configs do not read/write active trust and cannot admit application I/O.
-pub fn configs(
+fn configs(
     certificate: Vec<u8>,
     key: PrivateKeyDer<'static>,
-) -> Result<(quinn::ServerConfig, quinn::ClientConfig), Invalid> {
+) -> Result<(quinn::ServerConfig, StrictClient), Invalid> {
     profile(&certificate, utc()?)?;
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let verifier = Arc::new(ProfileVerifier(provider.clone()));
@@ -177,27 +182,182 @@ pub fn configs(
         quinn::crypto::rustls::QuicServerConfig::try_from(server).map_err(|_| Invalid)?,
     ));
     server.transport_config(limits.clone());
-    let mut client = quinn::ClientConfig::new(Arc::new(
-        quinn::crypto::rustls::QuicClientConfig::try_from(client).map_err(|_| Invalid)?,
-    ));
-    client.transport_config(limits);
-    Ok((server, client))
+    Ok((
+        server,
+        StrictClient {
+            config: client,
+            limits,
+        },
+    ))
 }
+struct StrictClient {
+    config: rustls::ClientConfig,
+    limits: Arc<quinn::TransportConfig>,
+}
+#[derive(Debug)]
+struct ClientAuthEvidence {
+    resolver: Arc<dyn rustls::client::ResolvesClientCert>,
+    requested: AtomicBool,
+}
+impl rustls::client::ResolvesClientCert for ClientAuthEvidence {
+    fn resolve(
+        &self,
+        hints: &[&[u8]],
+        schemes: &[rustls::SignatureScheme],
+    ) -> Option<Arc<rustls::sign::CertifiedKey>> {
+        let key = self.resolver.resolve(hints, schemes);
+        if key.is_some() {
+            self.requested.store(true, Ordering::Release);
+        }
+        key
+    }
+    fn has_certs(&self) -> bool {
+        self.resolver.has_certs()
+    }
+}
+impl StrictClient {
+    fn fresh(&self) -> Result<(quinn::ClientConfig, Arc<ClientAuthEvidence>), Invalid> {
+        let mut config = self.config.clone();
+        let evidence = Arc::new(ClientAuthEvidence {
+            resolver: config.client_auth_cert_resolver.clone(),
+            requested: AtomicBool::new(false),
+        });
+        config.client_auth_cert_resolver = evidence.clone();
+        let mut client = quinn::ClientConfig::new(Arc::new(
+            quinn::crypto::rustls::QuicClientConfig::try_from(config).map_err(|_| Invalid)?,
+        ));
+        client.transport_config(self.limits.clone());
+        Ok((client, evidence))
+    }
+}
+// One process owner, no public constructors, no registry injection or reset.
+// State survives endpoint/consent turnover; only process restart clears it.
+struct ProcessOwner {
+    replay: TransportReplayRegistry,
+    generation: AtomicU64,
+}
+fn process_owner() -> &'static ProcessOwner {
+    static OWNER: OnceLock<ProcessOwner> = OnceLock::new();
+    OWNER.get_or_init(|| ProcessOwner {
+        replay: TransportReplayRegistry::default(),
+        generation: AtomicU64::new(1),
+    })
+}
+impl ProcessOwner {
+    fn generation(&self) -> Result<u64, Invalid> {
+        self.generation
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_add(1))
+            .map_err(|_| Invalid)
+    }
+}
+/// A consent-scoped endpoint owns strict configs and all connect/accept paths.
+/// The app does not instantiate it while HandshakeEnvelopePending is active.
+/// No raw endpoint, connection, config, registry or channel constructor is exposed.
+/// Dropping the endpoint revokes all its channels. The process replay owner is
+/// never reset by dropping/recreating an endpoint.
+/// ```compile_fail
+/// use seamless_transport::pairing_v2::provisional_tls::ProvisionalEndpoint;
+/// fn replace(e: &mut ProvisionalEndpoint, raw: quinn::Endpoint) { e.endpoint = raw; }
+/// ```
+/// ```compile_fail
+/// use seamless_transport::pairing_v2::provisional_tls::configs;
+/// ```
+pub struct ProvisionalEndpoint {
+    endpoint: quinn::Endpoint,
+    client: StrictClient,
+    owner: &'static ProcessOwner,
+    scope: Arc<std::sync::Mutex<bool>>,
+}
+impl ProvisionalEndpoint {
+    pub fn bind(
+        address: std::net::SocketAddr,
+        certificate: Vec<u8>,
+        key: PrivateKeyDer<'static>,
+    ) -> Result<Self, Invalid> {
+        let (server, client) = configs(certificate, key)?;
+        let endpoint = quinn::Endpoint::server(server, address).map_err(|_| Invalid)?;
+        Ok(Self {
+            endpoint,
+            client,
+            owner: process_owner(),
+            scope: Arc::new(std::sync::Mutex::new(true)),
+        })
+    }
+    pub fn local_addr(&self) -> Result<std::net::SocketAddr, Invalid> {
+        self.endpoint.local_addr().map_err(|_| Invalid)
+    }
+    pub async fn connect(&self, peer: std::net::SocketAddr) -> Result<ProvisionalChannel, Invalid> {
+        let (config, auth) = self.client.fresh()?;
+        let generation = self.owner.generation()?;
+        let connecting = self
+            .endpoint
+            .connect_with(config, peer, "pairing.local")
+            .map_err(|_| Invalid)?;
+        let connection = tokio::time::timeout(std::time::Duration::from_secs(30), connecting)
+            .await
+            .map_err(|_| Invalid)?
+            .map_err(|_| Invalid)?;
+        if !auth.requested.load(Ordering::Acquire) {
+            connection.close(2u32.into(), b"mutual authentication required");
+            return Err(Invalid);
+        }
+        ProvisionalChannel::observe(connection, generation, self.owner, self.scope.clone())
+    }
+    pub async fn accept(&self) -> Result<ProvisionalChannel, Invalid> {
+        let generation = self.owner.generation()?;
+        let connection = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            self.endpoint
+                .accept()
+                .await
+                .ok_or(Invalid)?
+                .await
+                .map_err(|_| Invalid)
+        })
+        .await
+        .map_err(|_| Invalid)??;
+        ProvisionalChannel::observe(connection, generation, self.owner, self.scope.clone())
+    }
+}
+impl Drop for ProvisionalEndpoint {
+    fn drop(&mut self) {
+        if let Ok(mut active) = self.scope.lock() {
+            *active = false;
+        }
+        self.endpoint.close(0u32.into(), b"consent scope closed");
+    }
+}
+/// A channel cannot be adopted from an arbitrary external QUIC connection.
+/// ```compile_fail
+/// use seamless_transport::pairing_v2::provisional_tls::ProvisionalChannel;
+/// fn adopt(c: &quinn::Connection) {
+///     let _ = ProvisionalChannel::observe(c, 1, std::sync::Arc::default());
+/// }
+/// ```
+/// Replay ownership cannot be supplied or reset by a caller.
+/// ```compile_fail
+/// use seamless_transport::pairing_v2::operational_binding::TransportReplayRegistry;
+/// let _ = TransportReplayRegistry::default();
+/// ```
+/// ```compile_fail
+/// use seamless_transport::pairing_v2::provisional_tls::ProvisionalChannel;
+/// fn duplicate(c: ProvisionalChannel) { let _: ProvisionalChannel = c.clone(); }
+/// ```
 pub struct ProvisionalChannel {
     connection: quinn::Connection,
     leaf: Vec<u8>,
     id: String,
     generation: u64,
-    replay: Arc<TransportReplayRegistry>,
+    owner: &'static ProcessOwner,
+    scope: Arc<std::sync::Mutex<bool>>,
     attempted: bool,
 }
 impl ProvisionalChannel {
-    /// Generation is caller-owned local lifecycle state, never peer input or a
-    /// claim of a shared bilateral epoch. Use the strict configs above.
-    pub fn observe(
-        connection: &quinn::Connection,
+    // Only the strict endpoint can mint this capability. No raw public adoption.
+    fn observe(
+        connection: quinn::Connection,
         generation: u64,
-        replay: Arc<TransportReplayRegistry>,
+        owner: &'static ProcessOwner,
+        scope: Arc<std::sync::Mutex<bool>>,
     ) -> Result<Self, Invalid> {
         let observed = (|| {
             if connection.close_reason().is_some() {
@@ -231,11 +391,12 @@ impl ProvisionalChannel {
             }
         };
         Ok(Self {
-            connection: connection.clone(),
-            leaf,
             id: format!("quic-{}", connection.stable_id()),
+            connection,
+            leaf,
             generation,
-            replay,
+            owner,
+            scope,
             attempted: false,
         })
     }
@@ -244,7 +405,10 @@ impl ProvisionalChannel {
     }
     pub fn bind(&mut self, request: &[u8], hello: &[u8]) -> Result<LocalBinding, Invalid> {
         let result = (|| {
-            if self.attempted || self.connection.close_reason().is_some() {
+            // Linearize binding against scope revocation, independently of the
+            // asynchronous QUIC close notification. Poison is fail-closed.
+            let active = self.scope.lock().map_err(|_| Invalid)?;
+            if !*active || self.attempted || self.connection.close_reason().is_some() {
                 return Err(Invalid);
             }
             self.attempted = true;
@@ -255,7 +419,7 @@ impl ProvisionalChannel {
                 .export_keying_material(exporter.as_mut(), EXPORTER_LABEL, input.exporter_context())
                 .map_err(|_| Invalid)?;
             let binding = input.finish(exporter)?;
-            self.replay.consume(&binding)?;
+            self.owner.replay.consume(&binding)?;
             Ok(binding)
         })();
         if result.is_err() {

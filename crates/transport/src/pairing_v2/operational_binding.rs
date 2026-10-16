@@ -8,6 +8,9 @@ use super::{
     operational_wire::{ALPN, CandidateRequest},
 };
 use std::sync::Mutex;
+#[cfg(test)]
+#[path = "operational_binding_tests.rs"]
+mod tests;
 pub const EXPORTER_LABEL: &[u8] = b"EXPORTER-ControlShiftF12-Pairing-v2";
 pub struct BindingInput {
     context: Vec<u8>,
@@ -111,13 +114,13 @@ impl LocalBinding {
     }
 }
 #[derive(Default)]
-pub struct TransportReplayRegistry {
+pub(super) struct TransportReplayRegistry {
     used: Mutex<std::collections::HashSet<[u8; 32]>>,
 }
 impl TransportReplayRegistry {
     /// Shared across live provisional channels in one process. No eviction or
     /// durable recovery promise; restart requires entirely fresh pairing/SAS.
-    pub fn consume(&self, binding: &LocalBinding) -> Result<(), Invalid> {
+    pub(super) fn consume(&self, binding: &LocalBinding) -> Result<(), Invalid> {
         let mut used = self.used.lock().map_err(|_| Invalid)?;
         if used.len() >= 1024 || !used.insert(binding.replay) {
             return Err(Invalid);

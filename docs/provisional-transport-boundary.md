@@ -1,5 +1,10 @@
 # Experimental provisional transport boundary — phase5 restricted slice
 
+Historical c283e39 report: its caller-trusted observer and injectable replay APIs
+received security NO-GO and are replaced by the [sealed owner correction](provisional-transport-owner-boundary.md).
+The original green suite results below do not describe the correction's current
+host verification; see that report's explicit native-display failure.
+
 This is **not full operational pairing and not release approval**. It implements
 only the independently reviewed transport primitives and isolated real QUIC/TLS
 tests. The application still terminates selection at
