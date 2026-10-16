@@ -419,12 +419,10 @@ purges its prepared record, and makes commit impossible.
    retain the certificate/prepared evidence and disable a new V01 selection or
    new proposal at that base revision. A local CAS also fences immediately.
 5. `AbortLayout` after bilateral prepare is legal only on a durable bilateral
-   **zero-CAS abort certificate** for the same commit-certificate digest. It
-   contains both leaf identities, base/proposed revisions and two verified
-   Ed25519 statements, each asserting its local durable CAS state is exactly
-   `not_committed` for that certificate. It is persisted and verified on both
-   peers before either deletes a prepared record. A timeout, failed read or
-   missing remote record is not zero-CAS evidence.
+   **zero-CAS abort certificate V1** for the same commit-certificate digest.
+   It is persisted and verified on both peers before either deletes a prepared
+   record. A timeout, failed read or missing remote record is not zero-CAS
+   evidence.
 6. `FinalizeLayout` runs only after both peers durably recognize the same
    committed digest/revision. It deletes the commit certificate, prepared
    record, signatures, V01 attempt, approvals and all ephemeral bindings. It
@@ -449,6 +447,53 @@ per-peer local deadlines and how it proves/repairs the old revision without
 weakening the fence. A prepared record and certificate are internal recovery
 artifacts, retained only while fenced; they are not layout data a user can edit,
 export or restore from a shared backup.
+
+#### Zero-CAS abort certificate V1
+
+`zero-cas-abort-v1` is a distinct evidence object, not an inference made from a
+missing local CAS. Each canonical TLV record is exactly
+`tag:u8 || length:u16be || value`, with strictly ascending, unique tags and no
+unknown tags. `u64` values are exactly 8-byte big-endian; bytes32 values have
+length 32; fixed ASCII values have their listed byte length. The unsigned body
+is the direct concatenation of tags 1–11 in that order (no enclosing length,
+whitespace, JSON, text normalization or omitted empty field):
+
+| Tag | Field | Exact requirement |
+| ---: | --- | --- |
+| 1 | `abort_certificate_version` | `u64` exactly `1` |
+| 2 | `commit_certificate_digest` | bytes32 SHA-256 of the exact canonical commit-certificate bytes |
+| 3 | `role_a_leaf_hash` | bytes32 matching role A of that commit certificate |
+| 4 | `role_b_leaf_hash` | bytes32 matching role B of that commit certificate |
+| 5 | `receipt_epoch_a` | nonzero `u64`, matching A's active durable receipt epoch |
+| 6 | `receipt_epoch_b` | nonzero `u64`, matching B's active durable receipt epoch |
+| 7 | `base_layout_revision` | nonzero `u64`, exactly the certificate base revision |
+| 8 | `proposed_layout_revision` | `u64` exactly `base_layout_revision + 1` and the certificate proposal |
+| 9 | `role_a_local_cas_assertion` | ASCII exactly `not_committed` |
+| 10 | `role_b_local_cas_assertion` | ASCII exactly `not_committed` |
+| 11 | `signature_algorithm` | ASCII exactly `ed25519` |
+| 12 | `abort_a_signature` | exactly 64-byte Ed25519 signature by role A |
+| 13 | `abort_b_signature` | exactly 64-byte Ed25519 signature by role B |
+
+The exact signed message is the 31 ASCII bytes of domain separator
+`CSF12 layout zero-cas abort v1\0` followed directly by those unsigned bytes.
+`abort_a_signature` and `abort_b_signature` verify that exact message with the
+receipt-pinned role-A and role-B leaf public keys respectively;
+roles, leaf hashes, receipt epochs, digest, both revisions, assertions and
+algorithm are therefore signed. Each peer verifies the entire object, its own
+durable local CAS state is `not_committed`, and the inverse remote assertion is
+authenticated by the remote leaf. It then durably persists the same canonical
+bytes before acknowledging the other peer. Only after both durable
+acknowledgements may either delete its prepared record, certificate or
+signatures. A zero-CAS certificate cannot be minted by a reconnect merely
+because a prior V01 died; after that death it needs a separately reviewed
+resolution protocol with fresh authentication and approvals.
+
+The following named mutations must reject before any deletion: changed
+commit-certificate digest, swapped role A/B leaf fields, either receipt epoch,
+base or proposed revision, either `not_committed` assertion, either signature,
+an invalid signature length, unknown/duplicate tag, or an assertion when either
+peer already has a local CAS. These are evidence mutations, not display-only
+checks.
 
 ## Screen 5: bilateral preview and durable resolution
 
@@ -565,14 +610,16 @@ LAYOUT_COMMITTED
   -- separate capability gate only --> outside this specification
 ```
 
-`V01_PENDING` is terminal for its volatile values: every timeout, local Cancel,
-SAS mismatch, stream reset, peer disappearance or endpoint loss clears the
-attempt, session ID, nonces, preconfirm hash, confirmation choices and unsaved
-proposal. A **permission revoke** is local capability loss: it returns to the
-confirmed relationship and keeps remote control off, but does not erase a valid
-receipt. A **receipt/identity revoke** is trust loss: it triggers the peer-scoped
-purge and returns to `UNTRUSTED_CATALOGUE`. The UI must not show “Try again” as
-if it retained a confirmation; its action creates a fresh V01 connection from
+Before bilateral prepare, events are typed and not interchangeable.
+`V01_PENDING` is terminal for its volatile values: every V01 timeout, local
+Cancel, SAS mismatch, stream reset, peer disappearance or endpoint loss clears
+the attempt, session ID, nonces, preconfirm hash, confirmation choices and
+unsaved proposal, then returns to `CONFIRMED_RELATIONSHIP`. A **permission
+revoke** is local capability loss: it turns capability off and returns to the
+confirmed relationship, but does not erase a valid receipt. A
+**receipt/identity revoke** is trust loss: it triggers the peer-scoped purge and
+returns to `UNTRUSTED_CATALOGUE`. The UI must not show “Try again” as if it
+retained a confirmation; its action creates a fresh V01 connection from
 `CONFIRMED_RELATIONSHIP`.
 
 Every V01 preflight failure takes this same route: clear volatile V01 state,
@@ -664,15 +711,21 @@ its own encrypted, per-user, consented design; it is not implied here.
 
 On a successful bilateral commit recognition, `FinalizeLayout` verifies that
 both peers durably report the same committed digest/revision, then verifiably
-deletes the commit certificate, prepared record, both signature values, V01
-attempt, preconfirm binding, approvals and all volatile session material. It
-retains only the minimal committed record. A local finalization without the
-remote recognition acknowledgement is not success: it keeps the certificate
-bundle in the fenced outcome state. Certificate/prepared/signature/approval
-material is therefore retained only to support a fence, and is purged on
-receipt revoke, unpair or identity change. The deletion verifier must fail if
-any of those values remains in the local transaction record, UI cache,
-diagnostics or export after a recognized finalization/purge.
+deletes the commit certificate, zero-CAS certificate, prepared record, both
+signature values, V01 attempt, preconfirm binding, approvals and all volatile
+session material. It retains only the minimal committed record. A local
+finalization without the remote acknowledgement is an **asymmetric
+finalization**: both sides remain fenced/remote-outcome-unknown, capability
+stays off, and neither may present `LAYOUT_COMMITTED`, start V01, create a new
+proposal or reuse the base revision. Certificate/prepared/signature/approval
+material is retained only while fenced, in the current user's protected local
+storage; it must never be copied to logs, diagnostics, crash reports, exports,
+shared configuration or backups. Its maximum lifetime ends at recognized
+bilateral finalization, verified bilateral zero-CAS deletion, receipt revoke,
+unpair, identity change, or a future reviewed recovery protocol's terminal
+purge. The deletion verifier must fail if any of those values remains in the
+local transaction record, UI cache, diagnostics, export or backup after a
+recognized finalization/purge.
 
 ## Accessibility and platform behavior
 
@@ -710,8 +763,13 @@ a required design test matrix, not a claim that runtime tests exist today.
 | Base revision stale or proposed revision not `base + 1` | CAS/revision validation rejects before durable write |
 | Missing/mismatched certificate, wrong signature/role, one approval, receipt epoch or V01 binding | rejected before persistence and again atomically before each CAS |
 | Certificate inventory generation/revocation/V01 lease terminal before bilateral prepare | typed event: receipt/identity purge to catalogue; otherwise return confirmed relationship |
+| Permission revoke before bilateral prepare | capability off; retain valid receipt and return `CONFIRMED_RELATIONSHIP` |
+| Receipt/identity revoke before bilateral prepare | purge peer scope and return `UNTRUSTED_CATALOGUE` |
+| V01 timeout/reset/disappear before bilateral prepare | clear volatile attempt and return `CONFIRMED_RELATIONSHIP` |
 | Timeout/reset/crash/ack-loss after bilateral prepare, even with local no-CAS | `REMOTE_OUTCOME_UNKNOWN`; no new V01/proposal/base reuse without bilateral zero-CAS evidence |
 | Crash/restart after prepare A/B or between commit write 1 and write 2 | old V01 is terminal; no completion from certificate; local/remote outcome is fenced/capability-off |
+| Zero-CAS digest/role/epoch/base/proposed/assertion/signature mutation | reject certificate before either prepared record is deleted |
+| Crash/ack-loss after finalization on one peer | both remain fenced; neither reports ready or reuses the base until durable bilateral resolution |
 | One-sided acceptance, remote cancellation or acknowledgement loss | neither UI reports saved; no partial success |
 | Revocation, endpoint drop or inventory generation change during commit | pre-CAS purge or post-CAS fence; capability off, no replay on reconnect |
 | Revoke/unpair/identity change leaves layout/inventory cache or diagnostic copy | deletion check fails closed; relationship remains unusable |

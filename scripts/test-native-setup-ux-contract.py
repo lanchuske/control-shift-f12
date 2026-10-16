@@ -50,16 +50,48 @@ class Certificate:
 
 @dataclass(frozen=True)
 class ZeroCasAbort:
-    digest: str
-    signature_a: str
-    signature_b: str
+    version: int
+    commit_digest: str
+    role_a: str
+    role_b: str
+    receipt_a: int
+    receipt_b: int
+    base: int
+    proposed: int
+    assertion_a: str
+    assertion_b: str
+    algorithm: str
+    signature_a: str = ""
+    signature_b: str = ""
+
+    def unsigned(self) -> str:
+        return "|".join(map(str, (
+            self.version, self.commit_digest, self.role_a, self.role_b,
+            self.receipt_a, self.receipt_b, self.base, self.proposed,
+            self.assertion_a, self.assertion_b, self.algorithm)))
+
+    def message(self) -> str:
+        return "CSF12 layout zero-cas abort v1\\0" + self.unsigned()
 
     @classmethod
     def for_certificate(cls, cert: Certificate) -> "ZeroCasAbort":
-        return cls(cert.digest, "zero:A:" + cert.digest, "zero:B:" + cert.digest)
+        raw = cls(1, cert.digest, "leaf:A", "leaf:B", cert.receipt_a,
+                  cert.receipt_b, cert.base, cert.proposed, "not_committed",
+                  "not_committed", "ed25519")
+        return replace(raw, signature_a="zero:A:" + raw.message(),
+                       signature_b="zero:B:" + raw.message())
 
     def valid(self, cert: Certificate) -> bool:
-        return self.digest == cert.digest and self.signature_a == "zero:A:" + cert.digest and self.signature_b == "zero:B:" + cert.digest
+        return (
+            self.version == 1 and self.commit_digest == cert.digest
+            and self.role_a == "leaf:A" and self.role_b == "leaf:B"
+            and self.receipt_a == cert.receipt_a and self.receipt_b == cert.receipt_b
+            and self.base == cert.base and self.proposed == cert.proposed == cert.base + 1
+            and self.assertion_a == self.assertion_b == "not_committed"
+            and self.algorithm == "ed25519"
+            and self.signature_a == "zero:A:" + self.message()
+            and self.signature_b == "zero:B:" + self.message()
+        )
 
 
 class Store:
@@ -87,12 +119,18 @@ class Store:
         # Preserve artifacts because remote CAS outcome is unknown.
         self.remote_outcome_unknown = self.fenced = self.prepared is not None or self.committed is not None
 
-    def early_v01_terminal(self) -> str:
+    def preprepare_v01_terminal(self, event: str) -> str:
+        assert event in ("timeout", "reset", "disappear")
         self.v01_active = False
         if self.prepared is None:
             return "confirmed_relationship"
         self.remote_outcome_unknown = self.fenced = True
         return "remote_outcome_unknown"
+
+    def permission_revoke_preprepare(self) -> str:
+        self.v01_active = False
+        assert self.prepared is None
+        return "confirmed_relationship"
 
     def receipt_revoke(self) -> str:
         self.purge()
@@ -116,6 +154,11 @@ class Store:
         # Successful bilateral recognition deletes ephemeral certificate material.
         self.prepared = self.certificate = None
         self.finalized = True
+
+    def asymmetric_finalization(self) -> None:
+        # A local delete without the remote durable acknowledgement is not ready.
+        self.remote_outcome_unknown = self.fenced = True
+        self.finalized = False
 
     def purge(self) -> None:
         self.prepared = self.certificate = None
@@ -145,8 +188,11 @@ def abort_bilateral(a: Store, b: Store, evidence: ZeroCasAbort) -> None:
     cert = a.certificate
     assert cert is not None and cert == b.certificate and evidence.valid(cert)
     assert a.committed is None and b.committed is None
-    a.abort_zero_cas(evidence, b)
+    # Model both durable persists/verification before either delete.
+    assert evidence.valid(a.certificate) and evidence.valid(b.certificate)
+    a.prepared = a.certificate = None
     b.prepared = b.certificate = None
+    a.fenced = a.remote_outcome_unknown = False
     b.fenced = b.remote_outcome_unknown = False
 
 
@@ -167,6 +213,8 @@ def main() -> None:
         "no new V01, proposal or base-revision reuse",
         "FinalizeLayout", "both finalizations acknowledge deletion",
         "permission revocation only turns off", "Receipt/identity",
+        "CSF12 layout zero-cas abort v1\\0", "abort_certificate_version",
+        "asymmetric\nfinalization", "not_committed",
     ):
         assert phrase in text, "missing contract phrase: " + phrase
 
@@ -194,8 +242,11 @@ def main() -> None:
     abort_bilateral(a, b, evidence)
     assert a.certificate is b.certificate is None and a.can_start_v01() and b.can_start_v01()
 
-    # Early events are typed: timeout/reset vs receipt/identity revoke vs permission-equivalent inventory path.
-    a = Store(); assert a.early_v01_terminal() == "confirmed_relationship"
+    # Early events are typed: permission vs receipt/identity revoke vs V01 terminal.
+    for event in ("timeout", "reset", "disappear"):
+        a = Store(); assert a.preprepare_v01_terminal(event) == "confirmed_relationship"
+    rejects(lambda: Store().preprepare_v01_terminal("receipt_revoke"))
+    a = Store(); assert a.permission_revoke_preprepare() == "confirmed_relationship" and a.receipt == 1
     a = Store(); assert a.inventory_change_before_prepare() == "confirmed_relationship"
     a = Store(); assert a.receipt_revoke() == "untrusted_catalogue" and a.certificate is None
 
@@ -209,15 +260,37 @@ def main() -> None:
     rejects(lambda: a.prepare(certificate("preconfirm", preconfirm="old"), b))
     rejects(lambda: a.prepare(certificate("commitment", commitment="old"), b))
 
+    # Actual zero-CAS evidence fields all authenticate the same canonical bytes.
+    cert = certificate("zero")
+    evidence = ZeroCasAbort.for_certificate(cert)
+    rejects(lambda: replace(evidence, commit_digest="other").valid(cert) or (_ for _ in ()).throw(AssertionError()))
+    rejects(lambda: replace(evidence, role_a="leaf:B", role_b="leaf:A").valid(cert) or (_ for _ in ()).throw(AssertionError()))
+    rejects(lambda: replace(evidence, receipt_a=2).valid(cert) or (_ for _ in ()).throw(AssertionError()))
+    rejects(lambda: replace(evidence, receipt_b=2).valid(cert) or (_ for _ in ()).throw(AssertionError()))
+    rejects(lambda: replace(evidence, base=6).valid(cert) or (_ for _ in ()).throw(AssertionError()))
+    rejects(lambda: replace(evidence, proposed=9).valid(cert) or (_ for _ in ()).throw(AssertionError()))
+    rejects(lambda: replace(evidence, assertion_a="committed").valid(cert) or (_ for _ in ()).throw(AssertionError()))
+    rejects(lambda: replace(evidence, signature_a="bad").valid(cert) or (_ for _ in ()).throw(AssertionError()))
+    rejects(lambda: replace(evidence, signature_b="bad").valid(cert) or (_ for _ in ()).throw(AssertionError()))
+    rejects(lambda: replace(evidence, version=2).valid(cert) or (_ for _ in ()).throw(AssertionError()))
+    rejects(lambda: replace(evidence, algorithm="rsa").valid(cert) or (_ for _ in ()).throw(AssertionError()))
+
     # Revoke/inventory/V01 terminal after prepare fence rather than silently abort.
     a, b, cert = Store(), Store(), certificate("d4")
     a.prepare(cert, b); b.prepare(cert, a); a.receipt_revoke()
     assert a.certificate is None and a.fenced
-    a, b, cert = Store(), Store(), certificate("d5")
-    a.prepare(cert, b); b.prepare(cert, a); b.terminal_after_bilateral_prepare()
-    assert b.remote_outcome_unknown and not b.can_start_v01()
+    for event in ("timeout", "reset", "disappear"):
+        a, b, cert = Store(), Store(), certificate("d5-" + event)
+        a.prepare(cert, b); b.prepare(cert, a); b.terminal_after_bilateral_prepare()
+        assert b.remote_outcome_unknown and not b.can_start_v01()
 
-    print("PASS: native UX bilateral-outcome state-machine and 16 guard mutations")
+    # A crash/ack loss during finalization is fenced, never a local ready signal.
+    a, b, cert = Store(), Store(), certificate("d6")
+    a.prepare(cert, b); b.prepare(cert, a); a.commit(cert, b); b.commit(cert, a)
+    a.asymmetric_finalization(); b.asymmetric_finalization()
+    assert not a.finalized and not b.finalized and not a.can_start_v01() and not b.can_start_v01()
+
+    print("PASS: native UX bilateral-outcome state-machine and 28 guard mutations")
 
 
 if __name__ == "__main__":
