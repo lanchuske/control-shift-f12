@@ -34,6 +34,48 @@ an alternative socket, exporter, retry, pairing fallback, or capability path.
 Until the final commit is acknowledged by both peers, all input remains local,
 clipboard sharing remains off, and no cursor edge is active.
 
+### Two distinct bootstrap paths
+
+A LAN candidate is not a durable peer. There are therefore two intentionally
+separate journeys:
+
+1. **New relationship.** A person selects an untrusted LAN locator and enters
+   the separately reviewed *durable pairing bootstrap*. That protocol, not this
+   UI, is responsible for a fresh pairing SAS, mutual proof, pin creation and
+   an atomic durable receipt on both stores. It has no input, clipboard,
+   topology or operational V01 capability. If either receipt write fails,
+   neither side offers Arrange or starts V01. A discovery result never becomes
+   a V01 candidate merely because its display name, address or SAS looked right.
+2. **Existing relationship.** Only a locally verified, active durable receipt
+   can appear in the “confirmed computers” list. Selecting that receipt starts
+   a fresh V01 connection with its pinned leaves. The UI treats that gesture as
+   **V01 connection selection** and begins the single V01 deadline below.
+
+The two flows may share native components and visual language, but their
+attempts, short codes, confirmations and cancellation state are never reused
+or translated. In particular, a bootstrap pairing confirmation cannot satisfy
+an operational-session confirmation. A cancelled or failed bootstrap returns
+to the untrusted catalogue and leaves no partial receipt; a revoked durable
+receipt returns to the catalogue and requires the reviewed bootstrap again.
+
+### V01 deadline shown honestly
+
+The previous example countdown is replaced by the V01 absolute monotonic
+deadline: **at most 30 seconds from V01 connection selection**. There is one
+deadline shared by connection creation, TLS, preflight, SAS comparison and the
+two user-confirmation gestures. A UI refresh, network read, dialog pause or
+repaint cannot extend it. Both surfaces receive only the remaining duration
+from their own current V01 session state; they show “Less than a minute
+remaining” until it is 10 seconds or less, then a terse seconds countdown. The
+exact displayed second is advisory, never a clock-synchronization claim.
+
+At expiry, both local state machines terminally cancel: they clear the SAS and
+all confirmation affordances, discard the volatile attempt/session/nonces and
+return to the last safe screen. An implementation must not use the old
+`01:43`-style visual timer, keep waiting for the other person, or reconnect to
+extend the same attempt. A fresh attempt requires a new V01 connection and
+fresh V01 values as required by the reference.
+
 ## Native visual system
 
 The visual character is a **calm equipment panel**, not a web dashboard. The
@@ -78,7 +120,7 @@ select a state, set a button label, or render as a trusted device name.
 | --- | --- | --- | --- |
 | `not_started` | “Set up another computer” | “Find nearby computers” | confirmation, map save, remote control |
 | `browsing` | “Looking nearby” | “Stop looking” | confirmation, map save, remote control |
-| `candidate_selected` | “Check the code on both computers” | “Continue” | map save, remote control |
+| `candidate_selected` | “Secure this confirmed computer” | “Continue” | map save, remote control |
 | `sas_pending` | “Confirm the same code” | “This code matches” | map save, remote control |
 | `session_preflight` | “Securing this connection” | none, Cancel remains | map save, remote control |
 | `inventory_pending` | “Reading displays” | “Try again” when safe | map edit/save, remote control |
@@ -131,11 +173,11 @@ condition with a link to platform help; it is never bypassed or auto-elevated.
 ## Screen 2: same code, two confirmations
 
 After the reviewed operational session reaches its SAS stage, each application
-renders the same human-comparable short code, its expiration and an attempt
-identifier suffix in details. The SAS is supplied by the reviewed session
-contract; this document neither derives nor serializes it. Both people must
-compare it visually and choose an explicit local decision. Pressing Continue
-on one device cannot act for the other.
+renders the same human-comparable short code, the remaining V01 deadline and
+an attempt identifier suffix in details. The SAS is supplied by the reviewed
+session contract; this document neither derives nor serializes it. Both people
+must compare it visually and choose an explicit local decision. Pressing
+Continue on one device cannot act for the other.
 
 ```
 ┌ Check the code on both computers ─────────────────────────────────────┐
@@ -143,7 +185,7 @@ on one device cannot act for the other.
 │          42 71 68                                                      │
 │                                                                         │
 │ Does this match the code on the other computer?                         │
-│ This code expires in 01:43.                                            │
+│ Finish this check before the secure connection expires.                 │
 │                                                                         │
 │ [It does not match]                         [This code matches]        │
 │                                                                         │
@@ -153,10 +195,12 @@ on one device cannot act for the other.
 
 The code is deliberately short, grouped for verbal comparison and large enough
 to read at distance; its exact alphabet/length comes from security review.
-Never replace this with a QR-only flow. A code mismatch, expiry, candidate
-change, TLS/session reset, cancellation, suspend/reconnect, or revocation
-clears the code and both local confirmations. The next attempt starts at the
-nearby catalogue; there is no resume, code reuse or downgrade to legacy pairing.
+Never replace this with a QR-only flow. A code mismatch, V01 deadline expiry,
+candidate change, TLS/session reset, cancellation, suspend/reconnect, or
+revocation clears the code and both local confirmations. The next attempt
+starts from the confirmed durable relationship (or, if no receipt exists, the
+nearby catalogue); there is no resume, code reuse or downgrade to legacy
+pairing.
 
 ## Screen 3: display inventory with quality, not invented certainty
 
@@ -227,6 +271,70 @@ the base layout revision. It is then sent **through the admitted operational
 session**, not discovery or pairing. The sender locks the map read-only while
 waiting; any inventory or session change rejects it.
 
+### Frozen layout proposal contract (design input, not an enabled wire)
+
+The future application-payload addendum must use the following exact logical
+schema before the UI is implemented. It is a canonical `CSF12E01` TLV object
+named `control-shift-f12-layout-proposal-v1`; tags are ascending and unique,
+integers are unsigned big-endian, decimal coordinates are forbidden, and its
+SHA-256 digest is the `proposal_digest`. No currently shipped component may
+emit or accept it. This schema adds no cryptographic primitive: it is carried
+only by the separately reviewed application layer *after* V01 mutual confirm.
+
+| Tag | Field | Bound / source / rejection rule |
+| ---: | --- | --- |
+| 1 | `schema_version` | `u64`, exactly `1`; no fallback or negotiation. |
+| 2 | `v01_attempt` | exactly 32 volatile bytes from this live V01 attempt; never persisted, logged, displayed or put in discovery. |
+| 3 | `preconfirm_transcript_hash` | exactly 32 bytes from this same V01 preconfirm transcript. |
+| 4 | `authority_commitment_hash` | exactly 32 bytes from this same V01 bilateral durable commitment. |
+| 5 | `role_a_leaf_hash` | exactly 32 bytes; must match live V01 role A. |
+| 6 | `role_b_leaf_hash` | exactly 32 bytes; must match live V01 role B. |
+| 7 | `base_layout_revision` | nonzero `u64`, loaded atomically with both committed layout records. |
+| 8 | `proposed_layout_revision` | `base + 1`; any other value rejects. |
+| 9 | `inventory_a` | one canonical `layout-inventory-v1` object, at most 32 displays. |
+| 10 | `inventory_b` | one canonical `layout-inventory-v1` object, at most 32 displays. |
+| 11 | `placements` | one canonical array of 1–64 `layout-placement-v1` objects, sorted by display reference. |
+
+Each `layout-inventory-v1` has: owner leaf hash (tag 1, bytes32), inventory
+generation (tag 2, nonzero `u64`), descriptor array (tag 3, 1–32 entries) and
+the exact pre-measured inventory digest (tag 4, bytes32). A descriptor has a
+scoped display reference `(owner leaf hash, inventory generation, runtime
+index)` — never a global display ID — plus logical bounds in fixed-point
+1/1024 units, scale numerator/denominator (each 1–16, denominator nonzero),
+rotation in `{0,90,180,270}` or explicit `unknown`, physical-size quality enum,
+and only the optional fields that the measurement source actually supplied.
+Each dimension is positive and at most 100,000 logical units; coordinates are
+within ±1,000,000; unknown physical size/DPI/mirror state is encoded as
+`unavailable`, not a made-up value. The receiver rejects noncanonical ordering,
+duplicate runtime indexes within an inventory, unknown tags, fractional values,
+or a digest that is not an exact hash of the canonical descriptor sequence.
+
+Each `layout-placement-v1` is `(scoped display reference, x, y, width, height,
+rotation)`. It must correspond once and only once to the inventory descriptors,
+restate their measured size/rotation, stay within the geometry bounds, have no
+overlap, and touch at least one other display on a cardinal edge. The UI may
+show alignment offsets, but cannot rewrite measured size or rotation to make a
+proposal valid. Presentation labels and device names are never part of the
+canonical object or digest.
+
+Both peers independently recompute `proposal_digest = SHA-256(exact canonical
+proposal bytes)`. The later application-layer confirmation binds the full
+tuple `(v01_attempt, preconfirm_transcript_hash, authority_commitment_hash,
+proposal_digest, base_layout_revision, proposed_layout_revision,
+inventory_a.generation, inventory_b.generation)`. A proposal with values from
+different V01 attempts, different authority commitments, or any stale inventory
+generation is rejected before a preview or persistence write. This makes the
+two maps the same proposal rather than two similar-looking local drawings.
+
+Persisted layout records retain only `schema_version`, `proposal_digest`,
+`proposed_layout_revision`, both inventory digests/generations and placements.
+They never retain `v01_attempt`, SAS, nonces, exporter data or confirmation
+material. Both durable records use compare-and-swap from exactly
+`base_layout_revision` to exactly `proposed_layout_revision`; a failure,
+revocation or lost session commits neither side. A later recovery/reconnect
+loads the latest records and starts a new V01 attempt and a new proposal — it
+does not replay acceptance for a stored digest.
+
 ## Screen 5: bilateral preview and atomic commit
 
 The other computer sees the same proportional geometry and canonical revision,
@@ -260,6 +368,67 @@ permission before it enables input. The UI therefore separates “Layout saved�
 from any future “Start sharing” control and keeps that control unavailable
 unless the runtime reports a separately admitted, live capability.
 
+### Cancellation, revocation and reconnect state machine
+
+The implementation shall expose the following state machine as a single local
+source of truth. Remote bytes may report a terminal event, but cannot create a
+new local approval or advance a state without the local V01/session checks.
+
+```text
+UNTRUSTED_CATALOGUE
+  -- local select --> BOOTSTRAP_PENDING
+  -- local cancel/expiry --> UNTRUSTED_CATALOGUE
+
+BOOTSTRAP_PENDING
+  -- reviewed durable receipt on both stores --> CONFIRMED_RELATIONSHIP
+  -- decline/failure/revoke --> UNTRUSTED_CATALOGUE
+
+CONFIRMED_RELATIONSHIP
+  -- local V01 connection selection --> V01_PENDING (deadline <= 30s)
+  -- receipt revoke/change --> UNTRUSTED_CATALOGUE
+
+V01_PENDING
+  -- mutual V01 confirm --> INVENTORY_CURRENT
+  -- cancel/timeout/reset/disappear/revoke --> CONFIRMED_RELATIONSHIP
+
+INVENTORY_CURRENT
+  -- local edit --> PROPOSAL_LOCAL
+  -- inventory change/revoke/reset --> CONFIRMED_RELATIONSHIP
+
+PROPOSAL_LOCAL / PROPOSAL_REMOTE_REVIEW / COMMIT_PENDING
+  -- both valid approvals + bilateral CAS --> LAYOUT_COMMITTED
+  -- cancel/reject/timeout/reset/disappear/revoke/CAS failure --> INVENTORY_CURRENT
+
+LAYOUT_COMMITTED
+  -- inventory or receipt change --> CONFIRMED_RELATIONSHIP
+  -- separate capability gate only --> outside this specification
+```
+
+`V01_PENDING` is terminal for its volatile values: every timeout, local Cancel,
+SAS mismatch, stream reset, peer disappearance, endpoint loss, policy change,
+identity rotation or revocation clears the attempt, session ID, nonces,
+preconfirm hash, confirmation choices and unsaved proposal. The UI must not
+show “Try again” as if it retained a confirmation; its action creates a fresh
+V01 connection from `CONFIRMED_RELATIONSHIP`.
+
+`PROPOSAL_LOCAL`, `PROPOSAL_REMOTE_REVIEW` and `COMMIT_PENDING` hold no
+durable approval. A close-window event is Cancel. A remote Cancel/Reject is
+terminal for that proposal but preserves the last committed layout. If a peer
+disappears, the visible result is “The other computer is unavailable; this
+layout was not saved,” and the local editable draft is discarded rather than
+queued for later delivery. A reconnect always returns to
+`CONFIRMED_RELATIONSHIP`, reloads both receipt/layout revisions, and starts a
+new V01 attempt; it cannot restore a SAS or proposal acknowledgement.
+
+Only `LAYOUT_COMMITTED` persists. Its write is linearized with the bilateral
+CAS described above: the acknowledgement to both UIs is emitted only after both
+stores report the same proposal digest and proposed revision. If the process
+dies after one write or acknowledgement is lost, recovery reads both records;
+unequal revisions/digests are a blocked repair state, not a successful layout
+and not an opportunity to synthesize the missing approval. A future recovery
+protocol requires its own reviewed, atomic repair contract before it can alter
+either record.
+
 ## Error and recovery matrix
 
 | Condition | User-facing result | Recovery | Security rule |
@@ -288,6 +457,32 @@ unless the runtime reports a separately admitted, live capability.
   Closing the window is a cancel, clears volatile SAS/proposal state and leaves
   all capabilities off.
 
+## Documentary mutation matrix
+
+Before implementation, a future static contract verifier and its fixtures must
+exercise these mutations against canonical bytes and state transitions. This is
+a required design test matrix, not a claim that runtime tests exist today.
+
+| Mutation | Required result / stage |
+| --- | --- |
+| LAN advertisement substitutes a durable receipt or leaf | rejected in `UNTRUSTED_CATALOGUE`, before V01 selection |
+| Bootstrap confirmation reused as operational confirmation | rejected before `V01_PENDING` can reach `INVENTORY_CURRENT` |
+| V01 deadline altered to 31 seconds or a per-read timer | rejected at schedule validation; both sides cancel at deadline |
+| Old SAS/attempt/preconfirm hash substituted after reconnect | rejected before user confirmation or layout preview |
+| Layout schema version `0`/`2`, unknown tag or unsorted tag | canonical decode rejects before digest |
+| Mixed A inventory from one attempt and B inventory from another | binding tuple rejects before preview |
+| Runtime display index reused with another owner/generation | scoped-reference validation rejects before preview |
+| Descriptor size/rotation changed after its inventory digest | inventory digest mismatch rejects before preview |
+| Placement overlaps, omits a display, duplicates one, or loses cardinal touch | geometry validation rejects before approval |
+| Base revision stale or proposed revision not `base + 1` | CAS/revision validation rejects before durable write |
+| One-sided acceptance, remote cancellation or acknowledgement loss | neither UI reports saved; no partial success |
+| Revocation, endpoint drop or inventory generation change during commit | terminal cancellation before capability, no replay on reconnect |
+
+The static verifier must mutate the actual canonical proposal bytes and framed
+state fixture, recompute framing where necessary, and assert the named stage.
+Text-only grep or a generic early assertion is not evidence that a specific
+layout check executes.
+
 ## Acceptance evidence required before release
 
 This specification is not test evidence. A future implementation must add and
@@ -303,6 +498,8 @@ pass:
 5. physical Mac↔Windows QA showing the same SAS, mutual layout preview and
    commit, with input still disabled until its independent gate; and
 6. visual review at normal, high-contrast and 200% scaling states.
+7. the documentary mutation matrix above implemented as executable, independently
+   maintained fixture tests before the application protocol or UI is enabled.
 
 No check may call a green discovery test, a rendered map, or a local saved file
 proof that remote control is safe or enabled.
