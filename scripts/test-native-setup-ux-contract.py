@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Static/model verifier for the native setup UX transaction contract.
+"""Static/model verifier for the native setup certificate contract.
 
-It is documentation-only: no shipping protocol, persistence or UI code is
-shared. The state machine proves that a prepared record cannot become commit
-authority and a one-sided CAS remains fenced without its exact certificate.
+This is not cryptographic or shipping code. It models the documented guards and
+mutation stages, including the rule that V01 is terminal after restart and a
+unilateral CAS therefore remains fenced.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Optional
 
@@ -23,23 +23,43 @@ class Certificate:
     receipt_b: int
     inventory_a: int
     inventory_b: int
-    v01_active: bool = True
-    expires: int = 30
-    approvals: int = 2
+    attempt: str = "attempt-1"
+    preconfirm: str = "preconfirm-1"
+    commitment: str = "commitment-1"
+    signature_a: str = ""
+    signature_b: str = ""
 
-    def valid(self, now: int, receipt_a: int, receipt_b: int, inventory_a: int, inventory_b: int) -> bool:
+    def unsigned(self) -> str:
+        return "|".join(map(str, (
+            self.digest, self.base, self.proposed, self.receipt_a, self.receipt_b,
+            self.inventory_a, self.inventory_b, self.attempt, self.preconfirm,
+            self.commitment, "ed25519",
+        )))
+
+    def signed(self) -> "Certificate":
+        return replace(self, signature_a="sig:A:" + self.unsigned(), signature_b="sig:B:" + self.unsigned())
+
+    def valid(self, a: "Store", b: "Store") -> bool:
         return (
             self.proposed == self.base + 1
-            and self.receipt_a == receipt_a and self.receipt_b == receipt_b
-            and self.inventory_a == inventory_a and self.inventory_b == inventory_b
-            and self.v01_active and now < self.expires and self.approvals == 2
+            and self.receipt_a == a.receipt and self.receipt_b == b.receipt
+            and self.inventory_a == a.inventory and self.inventory_b == b.inventory
+            and a.v01_active and b.v01_active
+            and self.attempt == a.attempt and self.attempt == b.attempt
+            and self.preconfirm == a.preconfirm and self.preconfirm == b.preconfirm
+            and self.commitment == a.commitment and self.commitment == b.commitment
+            and self.signature_a == "sig:A:" + self.unsigned()
+            and self.signature_b == "sig:B:" + self.unsigned()
         )
 
 
 class Store:
     def __init__(self, receipt: int = 1, inventory: int = 1) -> None:
-        self.receipt = receipt
-        self.inventory = inventory
+        self.receipt, self.inventory = receipt, inventory
+        self.v01_active = True
+        self.attempt = "attempt-1"
+        self.preconfirm = "preconfirm-1"
+        self.commitment = "commitment-1"
         self.prepared: Optional[Certificate] = None
         self.certificate: Optional[Certificate] = None
         self.committed: Optional[tuple[str, int]] = None
@@ -47,46 +67,44 @@ class Store:
         self.inventory_cache = True
         self.diagnostics = True
 
-    def prepare(self, cert: Certificate, now: int, other: "Store") -> None:
-        assert cert.valid(now, self.receipt, other.receipt, self.inventory, other.inventory)
+    def prepare(self, cert: Certificate, other: "Store") -> None:
+        assert cert.valid(self, other)
         assert self.committed is None or self.committed[1] == cert.base
         assert self.prepared in (None, cert)
-        self.certificate = cert
-        self.prepared = cert
+        self.certificate = self.prepared = cert
 
-    def commit(self, cert: Certificate, now: int, other: "Store") -> None:
+    def commit(self, cert: Certificate, other: "Store") -> None:
         # Atomic local guard immediately before the local CAS.
         assert self.prepared == cert and self.certificate == cert and not self.fenced
-        assert cert.valid(now, self.receipt, other.receipt, self.inventory, other.inventory)
+        assert cert.valid(self, other)
         self.committed = (cert.digest, cert.proposed)
         self.prepared = None
 
-    def revoke_or_change(self) -> None:
-        self.receipt += 1
+    def v01_terminal(self) -> None:
+        self.v01_active = False
         self.prepared = None
         self.certificate = None
+        self.fenced = self.committed is not None
+
+    def receipt_revoked(self) -> None:
+        self.receipt += 1
+        self.prepared = self.certificate = None
         self.fenced = self.committed is not None
 
     def inventory_changed(self) -> None:
         self.inventory += 1
-        self.prepared = None
-        self.certificate = None
+        self.prepared = self.certificate = None
         self.fenced = self.committed is not None
 
-    def recover(self, cert: Optional[Certificate], now: int, other: "Store") -> str:
-        # Prepared data alone can never supply certificate or approval evidence.
-        if cert is None or self.certificate != cert or not cert.valid(
-            now, self.receipt, other.receipt, self.inventory, other.inventory
-        ):
-            self.fenced = self.committed is not None
-            return "fenced" if self.fenced else "abort"
-        if self.committed is not None and self.committed != (cert.digest, cert.proposed):
+    def recover(self, cert: Optional[Certificate], other: "Store") -> str:
+        # Restart makes V01 terminal. No old certificate may finish a CAS.
+        if self.committed is not None:
             self.fenced = True
             return "fenced"
-        if other.committed is not None and other.committed != (cert.digest, cert.proposed):
-            self.fenced = True
-            return "fenced"
-        return "finish"
+        if cert is None or self.certificate != cert or not cert.valid(self, other):
+            self.prepared = self.certificate = None
+            return "abort"
+        raise AssertionError("recovery must not complete a live V01 certificate")
 
     def purge(self) -> None:
         self.prepared = self.certificate = None
@@ -110,67 +128,70 @@ def rejects(action) -> None:
 def certificate(digest: str = "d1", **changes: object) -> Certificate:
     values = dict(digest=digest, base=7, proposed=8, receipt_a=1, receipt_b=1, inventory_a=1, inventory_b=1)
     values.update(changes)
-    return Certificate(**values)
+    return Certificate(**values).signed()
 
 
 def main() -> None:
     text = SPEC.read_text(encoding="utf-8")
     for phrase in (
-        "BOOTSTRAP_SAS_PENDING", "BOOTSTRAP_RECEIPT_PREPARED",
-        "at most 30 seconds from V01 connection selection",
-        "control-shift-f12-layout-proposal-v1",
         "control-shift-f12-layout-commit-certificate-v1",
-        "No `CommitLayout` CAS", "LAYOUT_RECOVERY_PENDING",
-        "Forget this computer and its layout", "After any unilateral CAS",
+        "There is deliberately **no cross-host `expires_at_monotonic_ms` field**",
+        "CSF12 layout commit certificate v1\\0",
+        "approval_a_signature", "approval_b_signature",
+        "revocation is inherently TOCTOU", "PURGE_TO_UNTRUSTED",
+        "new explicitly specified protocol", "per-peer local deadlines",
     ):
         require(text, phrase)
 
-    # Happy transaction: same durable certificate precedes both CAS operations.
+    # Positive live V01 transaction: signatures/certificate precede both CAS.
     a, b, cert = Store(), Store(), certificate()
-    a.prepare(cert, 1, b); b.prepare(cert, 1, a)
-    a.commit(cert, 2, b); b.commit(cert, 2, a)
+    a.prepare(cert, b); b.prepare(cert, a)
+    a.commit(cert, b); b.commit(cert, a)
     assert a.committed == b.committed == ("d1", 8)
 
-    # Crash/restart between writes: exact certificate can finish the other side.
+    # Crash/restart after unilateral CAS: V01 terminal; never finish old cert.
     a, b, cert = Store(), Store(), certificate("d2")
-    a.prepare(cert, 1, b); b.prepare(cert, 1, a); a.commit(cert, 2, b)
-    assert a.committed == ("d2", 8) and b.committed is None
-    assert a.recover(cert, 3, b) == "finish"
-    b.commit(cert, 3, a)
-    assert b.committed == ("d2", 8)
+    a.prepare(cert, b); b.prepare(cert, a); a.commit(cert, b)
+    a.v01_terminal(); b.v01_terminal()
+    assert a.recover(cert, b) == "fenced"
+    assert b.recover(cert, a) == "abort"
 
-    # Lost certificate after unilateral CAS is fenced, never inferred/aborted.
+    # Explicit post-CAS remote revoke is fenced; it can race the final guard.
     a, b, cert = Store(), Store(), certificate("d3")
-    a.prepare(cert, 1, b); b.prepare(cert, 1, a); a.commit(cert, 2, b)
-    a.certificate = None
-    assert a.recover(None, 3, b) == "fenced"
+    a.prepare(cert, b); b.prepare(cert, a); a.commit(cert, b); b.receipt_revoked()
+    assert a.recover(cert, b) == "fenced"
 
-    # Real named guard mutations at prepare, CAS and recovery stages.
-    rejects(lambda: Store().prepare(certificate("bad-revision", proposed=9), 1, Store()))
-    a, b = Store(), Store(); rejects(lambda: a.prepare(certificate("expired", expires=2), 2, b))
+    # Guard mutations: signatures, role swap, epoch, V01 bindings, terminal and inventory.
+    a, b = Store(), Store()
+    rejects(lambda: a.prepare(replace(certificate("sig-a"), signature_a="bad"), b))
+    rejects(lambda: a.prepare(replace(certificate("sig-b"), signature_b="bad"), b))
+    swapped = certificate("swap")
+    rejects(lambda: a.prepare(replace(swapped, signature_a=swapped.signature_b, signature_b=swapped.signature_a), b))
+    rejects(lambda: a.prepare(certificate("epoch", receipt_b=2), b))
+    rejects(lambda: a.prepare(certificate("attempt", attempt="old-attempt"), b))
+    rejects(lambda: a.prepare(certificate("preconfirm", preconfirm="old-preconfirm"), b))
+    rejects(lambda: a.prepare(certificate("commitment", commitment="old-commitment"), b))
     a, b, cert = Store(), Store(), certificate("d4")
-    a.prepare(cert, 1, b); b.prepare(cert, 1, a); b.inventory_changed()
-    rejects(lambda: a.commit(cert, 2, b))
+    a.prepare(cert, b); b.prepare(cert, a); b.inventory_changed()
+    rejects(lambda: a.commit(cert, b))
     a, b, cert = Store(), Store(), certificate("d5")
-    a.prepare(cert, 1, b); b.prepare(cert, 1, a); b.revoke_or_change()
-    rejects(lambda: a.commit(cert, 2, b))
-    a, b = Store(), Store(); rejects(lambda: a.prepare(certificate("d6", approvals=1), 1, b))
-    a, b = Store(), Store(); rejects(lambda: a.prepare(certificate("d7", v01_active=False), 1, b))
+    a.prepare(cert, b); b.prepare(cert, a); b.v01_terminal()
+    rejects(lambda: a.commit(cert, b))
 
-    # Pre-commit missing certificate aborts; post-commit missing certificate fences.
-    a, b, cert = Store(), Store(), certificate("d8")
-    a.prepare(cert, 1, b); b.prepare(cert, 1, a)
-    assert a.recover(None, 2, b) == "abort"
-    a, b, cert = Store(), Store(), certificate("d9")
-    a.prepare(cert, 1, b); b.prepare(cert, 1, a); a.commit(cert, 2, b)
-    assert a.recover(None, 3, b) == "fenced"
+    # Pre-CAS terminal abort/purge vs post-CAS fence.
+    a, b, cert = Store(), Store(), certificate("d6")
+    a.prepare(cert, b); b.prepare(cert, a); a.v01_terminal()
+    assert a.recover(cert, b) == "abort"
+    a, b, cert = Store(), Store(), certificate("d7")
+    a.prepare(cert, b); b.prepare(cert, a); a.commit(cert, b); a.inventory_changed()
+    assert a.recover(cert, b) == "fenced"
 
-    # Revoke/unpair purges correlatable local state rather than resurrecting it.
-    a = Store(); a.prepare(certificate("d10"), 1, Store()); a.purge()
+    # Unpair/revoke purge makes correlatable records unrecoverable.
+    a = Store(); a.prepare(certificate("d8"), Store()); a.purge()
     assert a.prepared is None and a.certificate is None and a.committed is None
     assert not a.inventory_cache and not a.diagnostics and a.fenced
 
-    print("PASS: native UX certificate state-machine and 10 guard mutations")
+    print("PASS: native UX certificate terminal-V01 state-machine and 14 guard mutations")
 
 
 if __name__ == "__main__":

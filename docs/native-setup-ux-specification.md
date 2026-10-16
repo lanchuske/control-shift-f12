@@ -373,18 +373,32 @@ are:
 | 11 | `proposed_layout_revision` | exactly `base + 1` |
 | 12 | `inventory_generation_a` | nonzero `u64`, exact proposal inventory A generation |
 | 13 | `inventory_generation_b` | nonzero `u64`, exact proposal inventory B generation |
-| 14 | `expires_at_monotonic_ms` | nonzero `u64`, no later than the active V01 deadline |
-| 15 | `approval_a` | canonical reviewed approval for this exact certificate bytes without approvals |
-| 16 | `approval_b` | canonical reviewed approval for this exact certificate bytes without approvals |
+| 14 | `signature_algorithm` | ASCII exactly `ed25519` |
+| 15 | `approval_a_signature` | exactly 64-byte Ed25519 signature by role A |
+| 16 | `approval_b_signature` | exactly 64-byte Ed25519 signature by role B |
 
-The certificate is valid only while its receipt epochs are active and equal to
-the current local receipt records, both inventory generations remain current,
-the final V01 lease is active, the V01 attempt/transcript/commitment bindings
-match, both approvals verify, and the monotonic expiry has not passed. This is
-checked atomically with the local state immediately before **both** prepare and
-commit CAS operations. Revocation, identity/receipt epoch change, inventory
-generation change, V01 terminal state or expiry fences the certificate, purges
-its prepared record, and makes commit impossible.
+The **unsigned certificate bytes** are the exact canonical object containing
+tags 1–14 only. Let `M` be the ASCII domain separator
+`CSF12 layout commit certificate v1\0` concatenated with those unsigned bytes.
+`approval_a_signature` is Ed25519 verification over `M` with the live role-A
+leaf public key; `approval_b_signature` is the same verification with the live
+role-B leaf public key. The leaf hashes, roles, signature algorithm and both
+signatures are all inside the certificate, so a role swap, a signature copied
+from another certificate, or a signature using the wrong leaf rejects. Ed25519
+and the strict leaf profile are existing project precedents; no new primitive is
+introduced. The verification keys are obtained from the authenticated V01
+connection and checked against the active receipt pins before persistence.
+
+There is deliberately **no cross-host `expires_at_monotonic_ms` field**. A
+monotonic clock is local and cannot make a meaningful durable distributed
+expiry. The certificate is valid only while its receipt epochs are active and
+equal to current local receipt records, both inventory generations remain
+current, the final V01 lease is active, the V01
+attempt/transcript/commitment bindings match, and both Ed25519 approvals verify.
+These guards are checked atomically with local state immediately before **both**
+prepare and commit CAS operations. Revocation, identity/receipt epoch change,
+inventory generation change or V01 terminal state fences the certificate,
+purges its prepared record, and makes commit impossible.
 
 1. `PrepareLayout` validates the proposal and all certificate preconditions,
    writes an immutable local **prepared** record containing the certificate
@@ -399,9 +413,13 @@ its prepared record, and makes commit impossible.
    certificate. It marks the exact uncommitted prepared record aborted and
    removes its placement payload. It cannot roll back a committed layout.
 4. `RecoverLayout` loads local records and a certificate digest only. It never
-   infers approval from a prepared record. Without a valid, unexpired exact
-   certificate, it may abort only if no commit occurred anywhere; otherwise it
-   remains fenced and reports `LAYOUT_RECOVERY_PENDING`.
+   infers approval from a prepared record. V01 is terminal after a crash or
+   restart, so recovery cannot use the old certificate to complete a remote
+   commit. If no local commit occurred, it may purge/abort the local prepared
+   record. If a local CAS occurred, it remains fenced and reports
+   `LAYOUT_RECOVERY_PENDING`; a new explicitly specified protocol with fresh
+   authentication, fresh bilateral approvals and per-peer local deadlines is
+   required before any later resolution.
 
 The sender and receiver each prepare locally first. Only then may the reviewed
 post-V01 application contract exchange prepared acknowledgements and create the
@@ -411,15 +429,16 @@ but before the other responds, the user-facing state is **“Layout saving was
 interrupted”**, never `LAYOUT_COMMITTED`. The local UI is read-only for that
 proposal and does not enable sharing.
 
-After any unilateral CAS, recovery has exactly two allowed outcomes: finish the
-same certificate on both peers after every guard is current and valid, or stay
-fenced indefinitely for operator/recovery handling. It may not create a newer
-proposal revision, reuse the revision, reinterpret prepared as approval, or
-abort a side that has already committed. A reconnect always loads the latest
+After any unilateral CAS, recovery is conservatively fenced. It cannot finish
+the old certificate because that V01 attempt is terminal; it cannot create a
+newer proposal revision, reuse the revision, reinterpret prepared as approval,
+or abort a side that has already committed. A reconnect always loads the latest
 receipts, layout revisions and fence state, creates a new V01 attempt and never
-carries SAS/approval/certificate authority into it. A prepared record and
-certificate are internal recovery artifacts, not layout data a user can edit,
-export or restore from a shared backup.
+carries SAS/approval/certificate authority into it. A future resolution protocol
+must define fresh authentication, two new local approvals, per-peer local
+deadlines and how it proves/repairs the old revision without weakening the
+fence. A prepared record and certificate are internal recovery artifacts, not
+layout data a user can edit, export or restore from a shared backup.
 
 ## Screen 5: bilateral preview and durable resolution
 
@@ -480,15 +499,22 @@ BOOTSTRAP_RECEIPT_PREPARED
 
 CONFIRMED_RELATIONSHIP
   -- local V01 connection selection --> V01_PENDING (deadline <= 30s)
-  -- receipt revoke/change --> UNTRUSTED_CATALOGUE
+  -- receipt/identity revoke or epoch change --> PURGE_TO_UNTRUSTED
+
+PURGE_TO_UNTRUSTED
+  -- peer-scoped receipt/layout/inventory purge complete --> UNTRUSTED_CATALOGUE
 
 V01_PENDING
   -- mutual V01 confirm --> INVENTORY_CURRENT
-  -- cancel/timeout/reset/disappear/revoke --> CONFIRMED_RELATIONSHIP
+  -- permission revoke --> CONFIRMED_RELATIONSHIP (capability remains off)
+  -- receipt/identity revoke --> PURGE_TO_UNTRUSTED
+  -- lease expiry/timeout/reset/disappear --> CONFIRMED_RELATIONSHIP
 
 INVENTORY_CURRENT
   -- local edit --> PROPOSAL_LOCAL
-  -- inventory change/revoke/reset --> CONFIRMED_RELATIONSHIP
+  -- permission revoke --> CONFIRMED_RELATIONSHIP (capability remains off)
+  -- receipt/identity revoke --> PURGE_TO_UNTRUSTED
+  -- inventory generation change / lease expiry / reset --> CONFIRMED_RELATIONSHIP
 
 PROPOSAL_LOCAL / PROPOSAL_REMOTE_REVIEW
   -- both valid approvals --> LAYOUT_PREPARE_PENDING
@@ -496,29 +522,37 @@ PROPOSAL_LOCAL / PROPOSAL_REMOTE_REVIEW
 
 LAYOUT_PREPARE_PENDING
   -- exact immutable prepares on both peers --> LAYOUT_COMMIT_PENDING
-  -- cancel/reject/timeout/reset/disappear/revoke/CAS failure --> INVENTORY_CURRENT
+  -- cancel/reject before CAS --> purge prepared, then INVENTORY_CURRENT
+  -- permission revoke / lease expiry / inventory change before CAS --> purge prepared, then CONFIRMED_RELATIONSHIP
+  -- receipt/identity revoke before CAS --> purge prepared and peer scope, then UNTRUSTED_CATALOGUE
+  -- remote revoke/identity/inventory race at CAS --> fence, capability off, LAYOUT_RECOVERY_PENDING
 
 LAYOUT_COMMIT_PENDING
   -- exact durable resolution on both peers --> LAYOUT_COMMITTED
-  -- crash/acknowledgement loss --> LAYOUT_RECOVERY_PENDING
+  -- crash/acknowledgement loss / remote TOCTOU revoke --> fence, capability off, LAYOUT_RECOVERY_PENDING
   -- abort only before any commit --> INVENTORY_CURRENT
 
 LAYOUT_RECOVERY_PENDING
-  -- valid same certificate + current guards resolves both sides --> LAYOUT_COMMITTED
-  -- no commit anywhere + abort-eligible certificate --> INVENTORY_CURRENT
-  -- unilateral commit / missing or fenced certificate --> LAYOUT_RECOVERY_PENDING
+  -- no local CAS --> purge local prepared/certificate, then CONFIRMED_RELATIONSHIP
+  -- local CAS / missing or fenced certificate --> remain fenced, capability off
+  -- new recovery protocol with fresh authentication + both approvals --> outside this specification
 
 LAYOUT_COMMITTED
-  -- inventory or receipt change --> CONFIRMED_RELATIONSHIP
+  -- permission revoke --> CONFIRMED_RELATIONSHIP (capability off; layout retained)
+  -- inventory/lease expiry --> CONFIRMED_RELATIONSHIP
+  -- receipt/identity revoke --> purge peer scope, then UNTRUSTED_CATALOGUE
   -- separate capability gate only --> outside this specification
 ```
 
 `V01_PENDING` is terminal for its volatile values: every timeout, local Cancel,
-SAS mismatch, stream reset, peer disappearance, endpoint loss, policy change,
-identity rotation or revocation clears the attempt, session ID, nonces,
-preconfirm hash, confirmation choices and unsaved proposal. The UI must not
-show “Try again” as if it retained a confirmation; its action creates a fresh
-V01 connection from `CONFIRMED_RELATIONSHIP`.
+SAS mismatch, stream reset, peer disappearance or endpoint loss clears the
+attempt, session ID, nonces, preconfirm hash, confirmation choices and unsaved
+proposal. A **permission revoke** is local capability loss: it returns to the
+confirmed relationship and keeps remote control off, but does not erase a valid
+receipt. A **receipt/identity revoke** is trust loss: it triggers the peer-scoped
+purge and returns to `UNTRUSTED_CATALOGUE`. The UI must not show “Try again” as
+if it retained a confirmation; its action creates a fresh V01 connection from
+`CONFIRMED_RELATIONSHIP`.
 
 Every V01 preflight failure takes this same route: clear volatile V01 state,
 retain the last locally verified durable receipt without changing it, and return
@@ -532,11 +566,14 @@ close-window event is Cancel. A remote Cancel/Reject is terminal for that
 proposal but preserves the last committed layout. If a peer disappears before
 prepare, the visible result is “The other computer is unavailable; this layout
 was not saved,” and the local editable draft is discarded rather than queued.
-If it disappears after a local prepare or commit, the result is
-`LAYOUT_RECOVERY_PENDING`; it cannot be silently presented as saved or silently
-aborted. A reconnect starts a fresh V01 attempt from `CONFIRMED_RELATIONSHIP`,
-but a fenced prior certificate stays fenced; the fresh attempt cannot reuse its
-revision or approvals.
+Before CAS, timeout, lease expiry, inventory change or local cancellation purges
+the prepared certificate and returns to the safe state shown above. A remote
+revocation is inherently TOCTOU: it can race the final local CAS even after the
+last guard check. Therefore any post-prepare uncertainty, including a remote
+revocation report, is `LAYOUT_RECOVERY_PENDING`, remote control stays off, and
+the prior layout cannot be presented as newly ready. A reconnect starts a fresh
+V01 attempt from `CONFIRMED_RELATIONSHIP`, but a fenced prior certificate stays
+fenced; the fresh attempt cannot reuse its revision or approvals.
 
 ## Error and recovery matrix
 
@@ -547,10 +584,12 @@ revision or approvals.
 | Code differs/expired | “Do not continue” | Start a fresh attempt | discard both approvals and SAS |
 | Session preflight fails | “Could not secure this connection” | Return to the confirmed relationship; start a fresh V01 attempt | no candidate switch, address/legacy/ALPN fallback |
 | Inventory incomplete | quality-specific explanation | retry measurement or cancel | do not invent orientation/size |
-| Inventory changes | “Displays changed” | read new inventory | reject proposal |
+| Inventory changes before CAS | “Displays changed” | purge prepared record; read new inventory | reject proposal |
+| Inventory/receipt change racing CAS | “Layout saving was interrupted” | fence, keep capability off | never report newly ready |
 | Layout conflict | “A newer layout was saved” | refresh and review | CAS/revision failure wins |
 | Remote rejects/cancels | “The other computer did not accept this layout” | keep current layout | no partial local commit |
-| Permission revoked | “Sharing is stopped” | follow OS permission guidance | release local control; no automatic re-enable |
+| Permission revoked | “Sharing is stopped” | follow OS permission guidance | release local control; retain valid receipt/layout; no automatic re-enable |
+| Receipt or identity revoked | “This computer is no longer confirmed” | peer-scope purge then catalogue | never retain/revive layout or trust |
 
 ## Data minimization, retention and deletion
 
@@ -626,11 +665,11 @@ a required design test matrix, not a claim that runtime tests exist today.
 | Descriptor size/rotation changed after its inventory digest | inventory digest mismatch rejects before preview |
 | Placement overlaps, omits a display, duplicates one, or loses cardinal touch | geometry validation rejects before approval |
 | Base revision stale or proposed revision not `base + 1` | CAS/revision validation rejects before durable write |
-| Missing/expired/mismatched certificate, one approval, receipt epoch or V01 binding | rejected before prepare and again atomically before each CAS |
-| Certificate inventory generation/revocation/V01 lease changes after prepare | certificate fenced, prepared payload purged, CAS rejected |
-| Crash after prepare A/B or between commit write 1 and write 2 | `LAYOUT_RECOVERY_PENDING`; after a unilateral CAS recovery can finish only the same valid certificate or remain fenced |
+| Missing/mismatched certificate, wrong signature/role, one approval, receipt epoch or V01 binding | rejected before persistence and again atomically before each CAS |
+| Certificate inventory generation/revocation/V01 lease terminal after prepare | certificate fenced, prepared payload purged, CAS rejected |
+| Crash/restart after prepare A/B or between commit write 1 and write 2 | old V01 is terminal; no completion from certificate; post-CAS state remains fenced/capability-off |
 | One-sided acceptance, remote cancellation or acknowledgement loss | neither UI reports saved; no partial success |
-| Revocation, endpoint drop or inventory generation change during commit | terminal cancellation before capability, no replay on reconnect |
+| Revocation, endpoint drop or inventory generation change during commit | pre-CAS purge or post-CAS fence; capability off, no replay on reconnect |
 | Revoke/unpair/identity change leaves layout/inventory cache or diagnostic copy | deletion check fails closed; relationship remains unusable |
 
 The static verifier must mutate the actual canonical proposal bytes and framed
