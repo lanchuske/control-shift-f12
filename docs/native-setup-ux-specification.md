@@ -342,43 +342,84 @@ nonces, exporter data or confirmation material. Their durable update is **not**
 described as an impossible cross-machine atomic write. It uses the reviewed
 prepare/commit/abort transaction below.
 
-### Durable layout transaction and crash recovery
+### Durable layout transaction, certificate and crash recovery
 
-The future layout authority implementation has three idempotent operations,
+The future layout authority implementation has four idempotent operations,
 all scoped by `(role-A leaf, role-B leaf, proposal_digest, base_layout_revision,
-proposed_layout_revision)` and guarded by the active V01 session binding:
+proposed_layout_revision)` and guarded by the active V01 session binding. It
+does **not** call a pair of independent writes “atomic.” No `CommitLayout` CAS
+is allowed before both sides verify and durably persist the same bilateral
+**commit certificate**.
 
-1. `PrepareLayout` validates the full canonical proposal, local current receipt,
-   inventory generation and base revision. It writes an immutable local
-   **prepared** record with the proposal digest and expires it when the V01
-   attempt terminals. Repeating the same valid prepare returns the same prepared
-   record; a different proposal for the same base revision rejects.
-2. `CommitLayout` is accepted only for that exact prepared record after the
-   reviewed bilateral commit evidence is present. It CASes the local committed
-   layout from base to proposed revision and marks its prepared record committed.
-   Repetition is idempotent only when the exact digest/revision is already
-   committed.
-3. `AbortLayout` marks only the exact uncommitted prepared record aborted and
-   removes its placement payload. It cannot roll back an already committed
-   layout.
+#### Commit certificate V1
+
+`control-shift-f12-layout-commit-certificate-v1` is a canonical, immutable
+`CSF12E01` TLV object. It is created only after both peers have locally approved
+the same proposal and each has prepared that exact digest. Its ordered fields
+are:
+
+| Tag | Field | Exact requirement |
+| ---: | --- | --- |
+| 1 | `certificate_version` | `u64` exactly `1` |
+| 2 | `proposal_digest` | bytes32 of the exact canonical proposal |
+| 3 | `role_a_leaf_hash` | bytes32, matches active V01 role A |
+| 4 | `role_b_leaf_hash` | bytes32, matches active V01 role B |
+| 5 | `receipt_epoch_a` | nonzero `u64`, current active durable receipt epoch for A |
+| 6 | `receipt_epoch_b` | nonzero `u64`, current active durable receipt epoch for B |
+| 7 | `v01_attempt` | bytes32 of this still-active V01 attempt; volatile, never exported to UI/logs/backups |
+| 8 | `preconfirm_transcript_hash` | bytes32 from this V01 attempt |
+| 9 | `authority_commitment_hash` | bytes32 from this V01 attempt |
+| 10 | `base_layout_revision` | nonzero `u64` |
+| 11 | `proposed_layout_revision` | exactly `base + 1` |
+| 12 | `inventory_generation_a` | nonzero `u64`, exact proposal inventory A generation |
+| 13 | `inventory_generation_b` | nonzero `u64`, exact proposal inventory B generation |
+| 14 | `expires_at_monotonic_ms` | nonzero `u64`, no later than the active V01 deadline |
+| 15 | `approval_a` | canonical reviewed approval for this exact certificate bytes without approvals |
+| 16 | `approval_b` | canonical reviewed approval for this exact certificate bytes without approvals |
+
+The certificate is valid only while its receipt epochs are active and equal to
+the current local receipt records, both inventory generations remain current,
+the final V01 lease is active, the V01 attempt/transcript/commitment bindings
+match, both approvals verify, and the monotonic expiry has not passed. This is
+checked atomically with the local state immediately before **both** prepare and
+commit CAS operations. Revocation, identity/receipt epoch change, inventory
+generation change, V01 terminal state or expiry fences the certificate, purges
+its prepared record, and makes commit impossible.
+
+1. `PrepareLayout` validates the proposal and all certificate preconditions,
+   writes an immutable local **prepared** record containing the certificate
+   digest, and persists the verified certificate. Repeating the same valid
+   prepare returns that record; a different proposal/certificate for the same
+   base revision rejects.
+2. `CommitLayout` re-runs every certificate guard in the same local durable
+   transaction as its CAS from base to proposed revision. It accepts only the
+   exact persisted valid certificate and marks the matching prepared record
+   committed. Repetition is idempotent only for the exact digest/revision.
+3. `AbortLayout` is legal only while neither local store has committed that
+   certificate. It marks the exact uncommitted prepared record aborted and
+   removes its placement payload. It cannot roll back a committed layout.
+4. `RecoverLayout` loads local records and a certificate digest only. It never
+   infers approval from a prepared record. Without a valid, unexpired exact
+   certificate, it may abort only if no commit occurred anywhere; otherwise it
+   remains fenced and reports `LAYOUT_RECOVERY_PENDING`.
 
 The sender and receiver each prepare locally first. Only then may the reviewed
-post-V01 application contract exchange durable prepared acknowledgements and
-commit evidence. If a crash happens after prepare on either side, or after the
-first peer commits but before the other responds, the user-facing state is
-**“Layout saving was interrupted”**, never `LAYOUT_COMMITTED`. The local UI is
-read-only for that proposal and does not enable sharing. On restart, recovery
-reads its prepared/committed records, expires a record that lacks the live V01
-attempt, and uses a separately reviewed recovery exchange to reach one of two
-outcomes: exact-digest commit on both peers, or abort/retain the last committed
-layout. It must not infer the other outcome from a timeout or synthesize an old
-approval. Until recovery finishes, the state is `LAYOUT_RECOVERY_PENDING`, not
-ready.
+post-V01 application contract exchange prepared acknowledgements and create the
+certificate. Both certificate copies are verified/persisted before either CAS.
+If a crash happens after prepare on either side, or after the first peer commits
+but before the other responds, the user-facing state is **“Layout saving was
+interrupted”**, never `LAYOUT_COMMITTED`. The local UI is read-only for that
+proposal and does not enable sharing.
 
-A reconnect always loads the latest receipts and layout revisions, creates a
-new V01 attempt and never carries a SAS, confirmation, prepared acknowledgement
-or commit evidence into that attempt. A prepared record is an internal recovery
-artifact, not a layout users can edit, export or restore from a shared backup.
+After any unilateral CAS, recovery has exactly two allowed outcomes: finish the
+same certificate on both peers after every guard is current and valid, or stay
+fenced indefinitely for operator/recovery handling. It may not create a newer
+proposal revision, reuse the revision, reinterpret prepared as approval, or
+abort a side that has already committed. A reconnect always loads the latest
+receipts, layout revisions and fence state, creates a new V01 attempt and never
+carries SAS/approval/certificate authority into it. A prepared record and
+certificate are internal recovery artifacts, not layout data a user can edit,
+export or restore from a shared backup.
 
 ## Screen 5: bilateral preview and durable resolution
 
@@ -460,11 +501,12 @@ LAYOUT_PREPARE_PENDING
 LAYOUT_COMMIT_PENDING
   -- exact durable resolution on both peers --> LAYOUT_COMMITTED
   -- crash/acknowledgement loss --> LAYOUT_RECOVERY_PENDING
-  -- abort before commit --> INVENTORY_CURRENT
+  -- abort only before any commit --> INVENTORY_CURRENT
 
 LAYOUT_RECOVERY_PENDING
-  -- reviewed recovery resolves exact digest --> LAYOUT_COMMITTED
-  -- reviewed recovery aborts --> INVENTORY_CURRENT
+  -- valid same certificate + current guards resolves both sides --> LAYOUT_COMMITTED
+  -- no commit anywhere + abort-eligible certificate --> INVENTORY_CURRENT
+  -- unilateral commit / missing or fenced certificate --> LAYOUT_RECOVERY_PENDING
 
 LAYOUT_COMMITTED
   -- inventory or receipt change --> CONFIRMED_RELATIONSHIP
@@ -492,8 +534,9 @@ prepare, the visible result is “The other computer is unavailable; this layout
 was not saved,” and the local editable draft is discarded rather than queued.
 If it disappears after a local prepare or commit, the result is
 `LAYOUT_RECOVERY_PENDING`; it cannot be silently presented as saved or silently
-aborted. A reconnect always starts from `CONFIRMED_RELATIONSHIP`, reloads
-receipt/layout state, and cannot restore a SAS or proposal acknowledgement.
+aborted. A reconnect starts a fresh V01 attempt from `CONFIRMED_RELATIONSHIP`,
+but a fenced prior certificate stays fenced; the fresh attempt cannot reuse its
+revision or approvals.
 
 ## Error and recovery matrix
 
@@ -583,7 +626,9 @@ a required design test matrix, not a claim that runtime tests exist today.
 | Descriptor size/rotation changed after its inventory digest | inventory digest mismatch rejects before preview |
 | Placement overlaps, omits a display, duplicates one, or loses cardinal touch | geometry validation rejects before approval |
 | Base revision stale or proposed revision not `base + 1` | CAS/revision validation rejects before durable write |
-| Crash after prepare A/B or between commit write 1 and write 2 | `LAYOUT_RECOVERY_PENDING`; no UI reports saved; recovery resolves exact digest or aborts |
+| Missing/expired/mismatched certificate, one approval, receipt epoch or V01 binding | rejected before prepare and again atomically before each CAS |
+| Certificate inventory generation/revocation/V01 lease changes after prepare | certificate fenced, prepared payload purged, CAS rejected |
+| Crash after prepare A/B or between commit write 1 and write 2 | `LAYOUT_RECOVERY_PENDING`; after a unilateral CAS recovery can finish only the same valid certificate or remain fenced |
 | One-sided acceptance, remote cancellation or acknowledgement loss | neither UI reports saved; no partial success |
 | Revocation, endpoint drop or inventory generation change during commit | terminal cancellation before capability, no replay on reconnect |
 | Revoke/unpair/identity change leaves layout/inventory cache or diagnostic copy | deletion check fails closed; relationship remains unusable |
