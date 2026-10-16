@@ -101,7 +101,11 @@ impl CapabilityReport {
             .unwrap_or("FAIL");
         let mut platform = NativePlatform::new();
         let input = access_label(platform.input_access());
-        let clipboard = access_label(platform.clipboard_access());
+        let clipboard = match platform.clipboard_access() {
+            AccessState::Granted => "PASS",
+            AccessState::Denied => "FAIL (clipboard unavailable or busy)",
+            AccessState::NotDetermined => "FAIL (clipboard access not determined)",
+        };
         let displays = match platform.displays() {
             Ok(displays) if !displays.is_empty() => format!("PASS ({})", displays.len()),
             Ok(_) => "FAIL (none found)".into(),

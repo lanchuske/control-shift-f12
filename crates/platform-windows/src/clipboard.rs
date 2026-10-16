@@ -112,8 +112,17 @@ impl PlatformClipboard for WindowsClipboard {
         if now_ms - since < DEBOUNCE_MS {
             return Ok(ClipboardOutcome::Pending);
         }
+        let content = match self.backend.read() {
+            // Another process may acquire the clipboard after available() succeeds.
+            // Keep this sequence pending so a later tick can retry it.
+            Err(ClipboardError::AccessUnavailable) => {
+                self.pending_since = Some(now_ms);
+                return Ok(ClipboardOutcome::Pending);
+            }
+            result => result?,
+        };
         self.pending_since = None;
-        let Some(content) = self.backend.read()? else {
+        let Some(content) = content else {
             return Ok(ClipboardOutcome::Unchanged);
         };
         Self::validate(&content)?;
@@ -142,7 +151,19 @@ mod native {
     use arboard::{Clipboard, ImageData};
     use image::{DynamicImage, ImageFormat, RgbaImage};
     use std::{borrow::Cow, io::Cursor, sync::Mutex};
-    use windows_sys::Win32::System::DataExchange::GetClipboardSequenceNumber;
+    use windows_sys::Win32::System::DataExchange::{
+        CloseClipboard, GetClipboardSequenceNumber, OpenClipboard,
+    };
+
+    fn backend_error(error: arboard::Error) -> ClipboardError {
+        match error {
+            arboard::Error::ClipboardOccupied | arboard::Error::ClipboardNotSupported => {
+                ClipboardError::AccessUnavailable
+            }
+            arboard::Error::ConversionFailure => ClipboardError::Conversion,
+            _ => ClipboardError::Backend,
+        }
+    }
 
     pub struct Win32Clipboard {
         clipboard: Mutex<Option<Clipboard>>,
@@ -163,10 +184,20 @@ mod native {
 
     impl ClipboardBackend for Win32Clipboard {
         fn available(&self) -> bool {
-            self.clipboard
-                .lock()
-                .map(|guard| guard.is_some())
-                .unwrap_or(false)
+            let Ok(guard) = self.clipboard.lock() else {
+                return false;
+            };
+            if guard.is_none() {
+                return false;
+            }
+            // arboard's Windows constructor does not open the clipboard. Probe
+            // actual current-session access without reading or changing content.
+            unsafe {
+                if OpenClipboard(std::ptr::null_mut()) == 0 {
+                    return false;
+                }
+                CloseClipboard() != 0
+            }
         }
         fn sequence_number(&self) -> Result<u64, ClipboardError> {
             Ok(u64::from(unsafe { GetClipboardSequenceNumber() }))
@@ -177,7 +208,7 @@ mod native {
             match clipboard.get_text() {
                 Ok(text) => return Ok(Some(ClipboardContent::Text(text))),
                 Err(arboard::Error::ContentNotAvailable) => {}
-                Err(_) => return Err(ClipboardError::Backend),
+                Err(error) => return Err(backend_error(error)),
             }
             match clipboard.get_image() {
                 Ok(image) => {
@@ -194,7 +225,7 @@ mod native {
                     Ok(Some(ClipboardContent::Png(encoded.into_inner())))
                 }
                 Err(arboard::Error::ContentNotAvailable) => Ok(None),
-                Err(_) => Err(ClipboardError::Backend),
+                Err(error) => Err(backend_error(error)),
             }
         }
         fn write(&mut self, content: &ClipboardContent) -> Result<(), ClipboardError> {
@@ -202,9 +233,7 @@ mod native {
             let mut guard = self.clipboard.lock().map_err(|_| ClipboardError::Backend)?;
             let clipboard = guard.as_mut().ok_or(ClipboardError::AccessUnavailable)?;
             match content {
-                ClipboardContent::Text(text) => clipboard
-                    .set_text(text)
-                    .map_err(|_| ClipboardError::Backend),
+                ClipboardContent::Text(text) => clipboard.set_text(text).map_err(backend_error),
                 ClipboardContent::Png(bytes) => {
                     let image = image::load_from_memory_with_format(bytes, ImageFormat::Png)
                         .map_err(|_| ClipboardError::Conversion)?
@@ -216,9 +245,32 @@ mod native {
                             height: height as usize,
                             bytes: Cow::Owned(image.into_raw()),
                         })
-                        .map_err(|_| ClipboardError::Backend)
+                        .map_err(backend_error)
                 }
             }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn native_busy_error_is_retryable_but_conversion_and_unknown_errors_are_not() {
+            assert_eq!(
+                backend_error(arboard::Error::ClipboardOccupied),
+                ClipboardError::AccessUnavailable
+            );
+            assert_eq!(
+                backend_error(arboard::Error::ConversionFailure),
+                ClipboardError::Conversion
+            );
+            assert_eq!(
+                backend_error(arboard::Error::Unknown {
+                    description: "must not expose native details".into(),
+                }),
+                ClipboardError::Backend
+            );
         }
     }
 }

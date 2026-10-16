@@ -395,6 +395,7 @@ struct FakeClipboardBackend {
     content: Rc<RefCell<Option<ClipboardContent>>>,
     writes: Rc<RefCell<Vec<ClipboardContent>>>,
     available: Rc<RefCell<bool>>,
+    read_error: Rc<RefCell<Option<clipboard::ClipboardError>>>,
 }
 
 impl clipboard::ClipboardBackend for FakeClipboardBackend {
@@ -405,6 +406,9 @@ impl clipboard::ClipboardBackend for FakeClipboardBackend {
         Ok(*self.sequence.borrow())
     }
     fn read(&mut self) -> Result<Option<ClipboardContent>, clipboard::ClipboardError> {
+        if let Some(error) = self.read_error.borrow().clone() {
+            return Err(error);
+        }
         Ok(self.content.borrow().clone())
     }
     fn write(&mut self, content: &ClipboardContent) -> Result<(), clipboard::ClipboardError> {
@@ -419,7 +423,101 @@ fn clipboard_backend(content: Option<ClipboardContent>) -> FakeClipboardBackend 
         content: Rc::new(RefCell::new(content)),
         writes: Rc::new(RefCell::new(Vec::new())),
         available: Rc::new(RefCell::new(true)),
+        read_error: Rc::new(RefCell::new(None)),
     }
+}
+
+#[test]
+fn clipboard_busy_after_availability_check_retries_the_same_sequence() {
+    let backend = clipboard_backend(Some(ClipboardContent::Text("recovered".into())));
+    let read_error = backend.read_error.clone();
+    let mut clipboard = clipboard::WindowsClipboard::with_backend(backend);
+    assert_eq!(clipboard.poll(0).unwrap(), ClipboardOutcome::Pending);
+    // Windows can lose access between the availability check and the read.
+    *read_error.borrow_mut() = Some(clipboard::ClipboardError::AccessUnavailable);
+    assert_eq!(clipboard.poll(200), Ok(ClipboardOutcome::Pending));
+    assert_eq!(clipboard.poll(400), Ok(ClipboardOutcome::Pending));
+    *read_error.borrow_mut() = None;
+    assert_eq!(
+        clipboard.poll(600),
+        Ok(ClipboardOutcome::Changed(ClipboardContent::Text(
+            "recovered".into()
+        )))
+    );
+    assert_eq!(clipboard.poll(800), Ok(ClipboardOutcome::Unchanged));
+}
+
+#[test]
+fn clipboard_backend_failures_and_invalid_content_remain_errors() {
+    let backend = clipboard_backend(Some(ClipboardContent::Png(vec![0; 32])));
+    let read_error = backend.read_error.clone();
+    let mut clipboard = clipboard::WindowsClipboard::with_backend(backend);
+    assert_eq!(clipboard.poll(0).unwrap(), ClipboardOutcome::Pending);
+    *read_error.borrow_mut() = Some(clipboard::ClipboardError::Backend);
+    assert_eq!(clipboard.poll(200), Err(clipboard::ClipboardError::Backend));
+    *read_error.borrow_mut() = None;
+    assert_eq!(
+        clipboard.poll(400),
+        Err(clipboard::ClipboardError::Conversion)
+    );
+}
+
+#[test]
+fn unavailable_clipboard_disables_only_sync_and_recovers_without_a_new_sequence() {
+    let backend = clipboard_backend(Some(ClipboardContent::Text("recovered".into())));
+    let available = backend.available.clone();
+    let writes = backend.writes.clone();
+    let mut clipboard = clipboard::WindowsClipboard::with_backend(backend);
+    assert_eq!(clipboard.poll(0).unwrap(), ClipboardOutcome::Pending);
+    *available.borrow_mut() = false;
+    assert_eq!(clipboard.access_state(), AccessState::Denied);
+    assert_eq!(clipboard.poll(200), Ok(ClipboardOutcome::Disabled));
+    assert_eq!(
+        clipboard.write_remote(&ClipboardContent::Text("blocked".into())),
+        Err(clipboard::ClipboardError::AccessUnavailable)
+    );
+    assert!(writes.borrow().is_empty());
+    *available.borrow_mut() = true;
+    assert_eq!(clipboard.access_state(), AccessState::Granted);
+    assert_eq!(
+        clipboard.poll(400),
+        Ok(ClipboardOutcome::Changed(ClipboardContent::Text(
+            "recovered".into()
+        )))
+    );
+}
+
+#[cfg(target_os = "windows")]
+#[test]
+fn native_clipboard_probe_detects_another_threads_open_clipboard_without_changing_it() {
+    use std::{sync::mpsc, thread, time::Duration};
+    use windows_sys::Win32::System::DataExchange::{CloseClipboard, OpenClipboard};
+
+    let (opened_tx, opened_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let holder = thread::spawn(move || {
+        let opened = (0..100).any(|_| {
+            if unsafe { OpenClipboard(std::ptr::null_mut()) } != 0 {
+                true
+            } else {
+                thread::sleep(Duration::from_millis(5));
+                false
+            }
+        });
+        opened_tx.send(opened).unwrap();
+        if opened {
+            // Dropping the sender also releases the lock if an assertion fails.
+            let _ = release_rx.recv_timeout(Duration::from_secs(5));
+            assert_ne!(unsafe { CloseClipboard() }, 0);
+        }
+    });
+    assert!(opened_rx.recv_timeout(Duration::from_secs(5)).unwrap());
+    let mut clipboard = clipboard::WindowsClipboard::new();
+    assert_eq!(clipboard.access_state(), AccessState::Denied);
+    assert_eq!(clipboard.poll(0), Ok(ClipboardOutcome::Disabled));
+    assert_eq!(clipboard.poll(200), Ok(ClipboardOutcome::Disabled));
+    release_tx.send(()).unwrap();
+    holder.join().unwrap();
 }
 
 #[test]
