@@ -80,6 +80,34 @@ pub struct CapabilityReport {
     pub identity: &'static str,
 }
 
+fn clipboard_diagnostic_label(
+    initial: AccessState,
+    probe_succeeded: bool,
+    probe_disabled: bool,
+    final_state: AccessState,
+) -> &'static str {
+    if initial == AccessState::Denied || probe_disabled {
+        "FAIL (clipboard unavailable or busy)"
+    } else if !probe_succeeded {
+        "FAIL (clipboard read failed)"
+    } else if final_state != AccessState::Granted {
+        "FAIL (clipboard content unavailable)"
+    } else {
+        "PASS"
+    }
+}
+
+fn clipboard_probe_unavailable<E>(
+    first: &Result<ClipboardOutcome, E>,
+    second: &Result<ClipboardOutcome, E>,
+) -> bool {
+    matches!(first, Ok(ClipboardOutcome::Disabled))
+        || matches!(
+            second,
+            Ok(ClipboardOutcome::Disabled | ClipboardOutcome::Pending)
+        )
+}
+
 impl CapabilityReport {
     pub fn measure(paths: &AppPaths) -> Self {
         let config = paths
@@ -101,10 +129,20 @@ impl CapabilityReport {
             .unwrap_or("FAIL");
         let mut platform = NativePlatform::new();
         let input = access_label(platform.input_access());
-        let clipboard = match platform.clipboard_access() {
-            AccessState::Granted => "PASS",
-            AccessState::Denied => "FAIL (clipboard unavailable or busy)",
-            AccessState::NotDetermined => "FAIL (clipboard access not determined)",
+        let clipboard_initial = platform.clipboard_access();
+        let first_probe = platform.poll_clipboard(0);
+        let second_probe = platform.poll_clipboard(200);
+        let probe_succeeded = first_probe.is_ok() && second_probe.is_ok();
+        let probe_disabled = clipboard_probe_unavailable(&first_probe, &second_probe);
+        let clipboard = if clipboard_initial == AccessState::NotDetermined {
+            "FAIL (clipboard access not determined)"
+        } else {
+            clipboard_diagnostic_label(
+                clipboard_initial,
+                probe_succeeded,
+                probe_disabled,
+                platform.clipboard_access(),
+            )
         };
         let displays = match platform.displays() {
             Ok(displays) if !displays.is_empty() => format!("PASS ({})", displays.len()),
@@ -1851,6 +1889,25 @@ mod fault_isolation_tests {
 mod tests {
     use super::*;
     use seamless_transport::PinnedPeer;
+
+    #[test]
+    fn clipboard_diagnostic_never_passes_without_a_real_read() {
+        let first_probe: Result<ClipboardOutcome, ()> = Ok(ClipboardOutcome::Pending);
+        let second_probe: Result<ClipboardOutcome, ()> = Ok(ClipboardOutcome::Pending);
+        assert!(clipboard_probe_unavailable(&first_probe, &second_probe));
+        assert_eq!(
+            clipboard_diagnostic_label(AccessState::Granted, true, false, AccessState::Denied,),
+            "FAIL (clipboard content unavailable)"
+        );
+        assert_eq!(
+            clipboard_diagnostic_label(AccessState::Denied, true, true, AccessState::Denied,),
+            "FAIL (clipboard unavailable or busy)"
+        );
+        assert_eq!(
+            clipboard_diagnostic_label(AccessState::Granted, true, false, AccessState::Granted,),
+            "PASS"
+        );
+    }
 
     fn test_paths(root: &Path, name: &str) -> AppPaths {
         let root = root.join(name);

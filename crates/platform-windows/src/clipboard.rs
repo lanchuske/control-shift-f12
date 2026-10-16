@@ -37,6 +37,7 @@ pub struct WindowsClipboard {
     last_now: u64,
     last_hash: Option<[u8; 32]>,
     pending_remote: Option<ClipboardContent>,
+    local_readable: bool,
 }
 
 impl WindowsClipboard {
@@ -48,6 +49,7 @@ impl WindowsClipboard {
             last_now: 0,
             last_hash: None,
             pending_remote: None,
+            local_readable: true,
         }
     }
 
@@ -89,7 +91,7 @@ impl PlatformClipboard for WindowsClipboard {
     type Error = ClipboardError;
 
     fn access_state(&self) -> AccessState {
-        if self.backend.available() {
+        if self.local_readable && self.backend.available() {
             AccessState::Granted
         } else {
             AccessState::Denied
@@ -133,13 +135,26 @@ impl PlatformClipboard for WindowsClipboard {
                 self.pending_since = Some(now_ms);
                 return Ok(ClipboardOutcome::Pending);
             }
+            Err(ClipboardError::Conversion) => {
+                self.pending_since = None;
+                self.local_readable = false;
+                return Ok(ClipboardOutcome::Unchanged);
+            }
             result => result?,
         };
         self.pending_since = None;
+        self.local_readable = true;
         let Some(content) = content else {
             return Ok(ClipboardOutcome::Unchanged);
         };
-        Self::validate(&content)?;
+        match Self::validate(&content) {
+            Ok(()) => {}
+            Err(ClipboardError::Conversion) => {
+                self.local_readable = false;
+                return Ok(ClipboardOutcome::Unchanged);
+            }
+            Err(error) => return Err(error),
+        }
         let hash = Self::hash(&content);
         if self.last_hash == Some(hash) {
             return Ok(ClipboardOutcome::Unchanged);

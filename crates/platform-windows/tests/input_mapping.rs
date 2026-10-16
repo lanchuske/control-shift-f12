@@ -453,16 +453,49 @@ fn clipboard_busy_after_availability_check_retries_the_same_sequence() {
 }
 
 #[test]
-fn clipboard_backend_failures_and_invalid_content_remain_errors() {
-    let backend = clipboard_backend(Some(ClipboardContent::Png(vec![0; 32])));
+fn clipboard_backend_failures_remain_errors() {
+    let backend = clipboard_backend(None);
     let read_error = backend.read_error.clone();
     let mut clipboard = clipboard::WindowsClipboard::with_backend(backend);
     assert_eq!(clipboard.poll(0).unwrap(), ClipboardOutcome::Pending);
     *read_error.borrow_mut() = Some(clipboard::ClipboardError::Backend);
     assert_eq!(clipboard.poll(200), Err(clipboard::ClipboardError::Backend));
+}
+
+#[test]
+fn local_conversion_failure_is_nonfatal_but_not_reported_as_accessible() {
+    let backend = clipboard_backend(Some(ClipboardContent::Text("recovered".into())));
+    let sequence = backend.sequence.clone();
+    let read_error = backend.read_error.clone();
+    let mut clipboard = clipboard::WindowsClipboard::with_backend(backend);
+
+    assert_eq!(clipboard.poll(0), Ok(ClipboardOutcome::Pending));
+    *read_error.borrow_mut() = Some(clipboard::ClipboardError::Conversion);
+    assert_eq!(clipboard.poll(200), Ok(ClipboardOutcome::Unchanged));
+    assert_eq!(clipboard.access_state(), AccessState::Denied);
+
     *read_error.borrow_mut() = None;
+    *sequence.borrow_mut() = 2;
+    assert_eq!(clipboard.poll(400), Ok(ClipboardOutcome::Pending));
     assert_eq!(
-        clipboard.poll(400),
+        clipboard.poll(600),
+        Ok(ClipboardOutcome::Changed(ClipboardContent::Text(
+            "recovered".into()
+        )))
+    );
+    assert_eq!(clipboard.access_state(), AccessState::Granted);
+}
+
+#[test]
+fn malformed_local_image_is_nonfatal_and_does_not_weaken_remote_validation() {
+    let backend = clipboard_backend(Some(ClipboardContent::Png(vec![0; 32])));
+    let mut clipboard = clipboard::WindowsClipboard::with_backend(backend);
+
+    assert_eq!(clipboard.poll(0), Ok(ClipboardOutcome::Pending));
+    assert_eq!(clipboard.poll(200), Ok(ClipboardOutcome::Unchanged));
+    assert_eq!(clipboard.access_state(), AccessState::Denied);
+    assert_eq!(
+        clipboard.write_remote(&ClipboardContent::Png(vec![0; 32])),
         Err(clipboard::ClipboardError::Conversion)
     );
 }
