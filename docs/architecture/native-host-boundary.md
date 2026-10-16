@@ -29,7 +29,7 @@ reserved native UI channel:
 | Channel | Argument vector | Rule |
 | --- | --- | --- |
 | Foundations control | `[absolute path to seamless-input, "control", "--stdio"]` | Preserves its existing control-engine behavior; it is not a native-host fallback. |
-| Native UI projection | `[absolute path to seamless-input, "control", "--ui-stdio"]` | Reserved for the reviewed typed UI adapter; it does not exist in the current CLI and cannot be launched until its entrypoint and platform tests are admitted. |
+| Native UI projection | `[absolute path to seamless-input, "control", "--ui-stdio"]` | The Rust-only adapter entrypoint is admitted; no native host source is admitted until its own target-platform owner/tests are admitted. |
 
 Written as documentation commands, those are `seamless-input control --stdio`
 and `seamless-input control --ui-stdio` respectively. The latter is a reserved

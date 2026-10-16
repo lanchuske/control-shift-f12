@@ -39,9 +39,9 @@ reserved native projection channel is:
 
 Written as a command for documentation only, that is
 `seamless-input control --ui-stdio`; the host must still use this exact
-argument vector, not a shell command. This option does not yet exist and no
-host may launch it until a separately reviewed entrypoint and platform tests
-are admitted.
+argument vector, not a shell command. Its Rust-only entrypoint is admitted;
+no native host source may launch it until platform-specific owner/tests are
+admitted.
 
 The native host must use its platform's argument-array process API. It must not
 invoke a shell, interpolate a command string, or accept a user-supplied binary

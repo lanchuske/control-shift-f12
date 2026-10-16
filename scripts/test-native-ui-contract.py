@@ -332,7 +332,7 @@ class NativeHostBoundaryTests(unittest.TestCase):
             "ui.confirm_v01",
             "terminal `sas_display_v1 current:false`",
             "Platform-specific reader cancellation is intentionally not unified",
-            "No implementation may use this document as authority to launch a process.",
+            "no native host source may use this",
             "no native host\nsource, build, launch, signing, packaging, or release is permitted",
         )
         for invariant in required:
@@ -398,6 +398,16 @@ class NativeHostBoundaryTests(unittest.TestCase):
             "Retry",
         ):
             self.assertIn(f"`{action}`", plan)
+
+    def test_ui_stdio_entrypoint_is_the_only_admitted_ui_child_vector(self):
+        """Rust may add the child mode without admitting native-host source."""
+        boundary = BOUNDARY_RECORD.read_text()
+        pipe_design = HOST_PIPE_DESIGN.read_text()
+        for text in (boundary, pipe_design):
+            self.assertIn("`seamless-input control --ui-stdio`", text)
+            self.assertIn("entrypoint is admitted", text)
+            self.assertIn("no native host source", text)
+        self.assertNotIn("`seamless-input control --stdio` is an alternate", boundary)
 
     def test_every_sas_field_and_literal_is_rejected_recursively_from_host_args(self):
         """A partial display shape is still an impermissible host re-export."""

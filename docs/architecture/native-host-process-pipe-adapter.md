@@ -2,21 +2,23 @@
 
 ## Status, scope, and admission gate
 
-This is a reviewed **design-only** record for Tasks 6 and 7. It does not add
-AppKit, WinForms, process, pipe, network, or product source. In particular, it
-does not make either manifest under `native/` shippable.
+This is a reviewed boundary record for Tasks 6 and 7. The admitted Rust child
+entrypoint does not add AppKit, WinForms, native-host process code, native pipe
+code, network, or product UI source. In particular, it does not make either
+manifest under `native/` shippable.
 
-The candidate contains a bounded Rust `UiStdioAdapter` and a
-`TimedRequestReader` abstraction. It does **not** yet contain an implementation
-of an inherited-pipe reader, an AppKit host, or a WinForms host. Moreover,
-`main.rs` currently routes `seamless-input control --stdio` to the foundations
-`control_engine::run_stdio`, not to `ui_stdio_adapter::run_stdio`. The reserved
-native UI vector is instead `seamless-input control --ui-stdio`; it does not
-exist yet. A native host remains blocked until a separately reviewed entrypoint
-adds that distinct routing while preserving foundations `--stdio` behavior.
+The candidate contains a bounded Rust `UiStdioAdapter`, a process-owned
+inherited-stdin reader for the Rust child, and a `TimedRequestReader`
+abstraction. It does **not** contain an AppKit host or a WinForms host. Moreover,
+`main.rs` routes `seamless-input control --stdio` to the foundations
+`control_engine::run_stdio`, not to `ui_stdio_adapter::run_stdio`. The separate
+`seamless-input control --ui-stdio` entrypoint is admitted for the Rust-only
+adapter while preserving foundations `--stdio` behavior. A native host remains
+blocked until its own target-platform owner/tests are admitted.
 
-No implementation may use this document as authority to launch a process.
-Native source is admitted only after all pre-enable tests in
+The Rust-only UI entrypoint is admitted. In particular, no native host source may use this
+document as authority to launch a process; native source is admitted only after
+all pre-enable tests in
 [Required evidence before native source](#required-evidence-before-native-source)
 are present and passing on the actual target operating system.
 
@@ -62,6 +64,12 @@ from the user session.
 The host owns the process and every parent pipe endpoint. It closes the parent
 end of stdin/stdout/stderr when it stops or faults; it never transfers those
 handles to a second host, helper, or restarted child.
+
+The Rust-only child entrypoint owns its inherited stdin reader. If a stdout
+write fails while that reader is blocked, the child terminates its own process
+rather than returning with a stranded reader. This process-local behavior does
+not substitute for the platform-specific host cancellation and reaping proof
+required below.
 
 ## Framing and direction
 

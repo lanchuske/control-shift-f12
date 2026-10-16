@@ -23,10 +23,9 @@ its current behavior. `seamless-input tui` remains a technical fallback. A
 desktop app must never fall back from `--ui-stdio` to `--stdio`, TUI, a shell,
 or a network endpoint.
 
-`--ui-stdio` is a reserved channel, not current implementation authority. It
-cannot be added until a separate entrypoint review admits adapter routing,
-bounded reading, child lifetime, and target-platform tests. The pipe/cancellation
-rules remain those in [the host-process design](native-host-process-pipe-adapter.md).
+`--ui-stdio` has a separately admitted Rust-only entrypoint. Native host source
+remains blocked until its platform-specific owner and tests are admitted. The
+pipe/cancellation rules remain those in [the host-process design](native-host-process-pipe-adapter.md).
 
 ## Functional parity surface
 
