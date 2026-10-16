@@ -99,6 +99,17 @@ current user. The boundary truthfully limits the product's own retention and
 secondary disclosure; it does not claim a secure-screen facility that macOS or
 Windows has not provided to this application.
 
+The existing framed JSON stdio boundary has one narrow exception to the word
+“non-serializable”: the reviewed engine may send the bounded, child-to-host-only
+`sas_display_v1` transient frame defined in the
+[native host boundary](native-host-boundary.md#child-to-host-transient-sas-frame).
+Its adapter-local `attempt_binding`, strictly increasing `generation`, and
+`current` invalidation bind a rendered code to one active screen without
+exposing the raw V01 attempt/session/transcript. This is transient pipe
+serialization, not a persistible/loggable/copyable value: the host cannot send
+the frame or any SAS-bearing argument back to the child, and cannot re-export
+it anywhere else.
+
 ## Design and adversarial test matrix
 
 | Area | Required invariant | Test / mutation evidence | Required failure result |
@@ -108,7 +119,7 @@ Windows has not provided to this application.
 | Discovery identity conflict | Advertisement never proves a durable peer | Substitute advertisement leaf/receipt for the active store tuple | Reject before bootstrap/V01; no trust promotion |
 | Bootstrap/V01 separation | Bootstrap SAS cannot satisfy V01 confirmation | Reuse bootstrap code/approval in a V01 state | Reject before `V01_PENDING -> INVENTORY_CURRENT` |
 | SAS provenance | V01 code is supplied only by an active reviewed V01 attempt | Feed code without matching live lease/attempt/transcript | Reject; clear volatile values |
-| SAS display boundary | `SasDisplayView` is current-only and cannot become host history | Attempt serialize/persist/log/copy/cache; inject it into title, notification, diagnostics, analytics, tooltip, accessibility cache/history or a stale screen | Reject/suppress; clear the display at the next terminal state or timeout |
+| SAS display boundary | `SasDisplayView` is current-only and cannot become host history | Mutate child->host frame direction/schema/bounds/generation; inject it into a host request, title, notification, diagnostics, analytics, tooltip, accessibility cache/history or a stale screen | Reject/suppress; terminal invalidation clears the display and a new attempt is required |
 | Both-screen visibility | Each display renders the same grouped code from its own V01 session | Mutate one code group, reorder groups, or present an old code | Local mismatch/cancel; no receipt, inventory or capability advance |
 | Double local confirmation | Each side needs its own explicit approval | Deliver remote approve before local approve; duplicate/replay approval | Remote fact alone cannot advance; duplicate rejects/fences |
 | Deadline | One monotonic deadline is <= 30 seconds | Change to 31 seconds; per-read timer; confirm at deadline; pause/repaint | Terminal cancel, clear SAS/approvals; fresh attempt required |

@@ -6,6 +6,7 @@ not launch a native host or turn the host boundary into a runtime path.
 """
 
 from pathlib import Path
+import json
 import subprocess
 import unittest
 
@@ -16,6 +17,7 @@ WINDOWS_MANIFEST = ROOT / "native/windows/ControlShiftF12App/ControlShiftF12App.
 NATIVE_README = ROOT / "native/README.md"
 BOUNDARY_RECORD = ROOT / "docs/architecture/native-host-boundary.md"
 SAS_MATRIX = ROOT / "docs/architecture/discovery-sas-security-matrix.md"
+SAS_FRAME_FIXTURE = ROOT / "docs/fixtures/sas-display-frame-v1.json"
 NONSHIPPING_NATIVE_PATHS = frozenset(
     {
         "native/README.md",
@@ -72,6 +74,91 @@ def tracked_native_paths():
         for path in result.stdout.split(b"\0")
         if path
     }
+
+
+def is_u64(value):
+    return isinstance(value, int) and not isinstance(value, bool) and 0 < value <= (2**64 - 1)
+
+
+def validate_sas_display_frame(frame):
+    """Structural oracle for the docs-only child-to-host transient frame."""
+    if not isinstance(frame, dict):
+        return False
+    common = {"v", "kind", "attempt_binding", "generation", "current"}
+    if not common.issubset(frame):
+        return False
+    if frame["v"] != 1 or frame["kind"] != "sas_display_v1":
+        return False
+    if not is_u64(frame["attempt_binding"]) or not is_u64(frame["generation"]):
+        return False
+    if not isinstance(frame["current"], bool):
+        return False
+    if frame["current"]:
+        allowed = common | {"remaining_ms", "code_groups", "details_suffix"}
+        if set(frame) - allowed or not {"remaining_ms", "code_groups"}.issubset(frame):
+            return False
+        if not isinstance(frame["remaining_ms"], int) or isinstance(frame["remaining_ms"], bool):
+            return False
+        if not 1 <= frame["remaining_ms"] <= 30_000:
+            return False
+        groups = frame["code_groups"]
+        if not isinstance(groups, list) or not 1 <= len(groups) <= 8:
+            return False
+        if any(
+            not isinstance(group, str)
+            or not 1 <= len(group) <= 32
+            or not group.isascii()
+            or not group.isprintable()
+            for group in groups
+        ):
+            return False
+        if "details_suffix" not in frame:
+            return True
+        suffix = frame["details_suffix"]
+        return (
+            isinstance(suffix, str)
+            and 1 <= len(suffix) <= 16
+            and suffix.isascii()
+            and suffix.isprintable()
+        )
+    return set(frame) == common
+
+
+def accepts_sas_display_sequence(frames):
+    active = {}
+    terminal = set()
+    for frame in frames:
+        if not validate_sas_display_frame(frame):
+            return False
+        binding = frame["attempt_binding"]
+        generation = frame["generation"]
+        if binding in terminal or generation <= active.get(binding, 0):
+            return False
+        if frame["current"]:
+            active[binding] = generation
+        else:
+            if binding not in active:
+                return False
+            del active[binding]
+            terminal.add(binding)
+    return not active
+
+
+def host_request_contains_sas(request):
+    if not isinstance(request, dict):
+        return True
+    if request.get("command") == "sas_display_v1":
+        return True
+    protected = {"kind", "attempt_binding", "generation", "current", "code_groups", "details_suffix"}
+
+    def contains(value):
+        if isinstance(value, dict):
+            return any(key in protected or contains(child) for key, child in value.items())
+        if isinstance(value, list):
+            return any(contains(child) for child in value)
+        return False
+
+    return contains(request.get("args"))
 
 
 class NativeHostBoundaryTests(unittest.TestCase):
@@ -200,6 +287,22 @@ class NativeHostBoundaryTests(unittest.TestCase):
 
         self.assertIn("accessibility cache/history", matrix)
         self.assertIn("details suffix", matrix)
+
+    def test_sas_display_fixture_is_one_way_bounded_and_terminal(self):
+        """The local JSON exception is structured, bounded, and never a request."""
+        fixture = json.loads(SAS_FRAME_FIXTURE.read_text())
+
+        self.assertTrue(accepts_sas_display_sequence(fixture["valid_child_to_host"]))
+        for frame in fixture["valid_child_to_host"]:
+            self.assertLessEqual(len(json.dumps(frame).encode("utf-8")), 256 * 1024)
+        for frame in fixture["invalid_child_to_host"]:
+            self.assertFalse(validate_sas_display_frame(frame), frame)
+        for sequence in fixture["invalid_sequences"]:
+            self.assertFalse(accepts_sas_display_sequence(sequence), sequence)
+        for request in fixture["valid_host_requests"]:
+            self.assertFalse(host_request_contains_sas(request), request)
+        for request in fixture["invalid_host_requests"]:
+            self.assertTrue(host_request_contains_sas(request), request)
 
 
 if __name__ == "__main__":

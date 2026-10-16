@@ -1,0 +1,150 @@
+{
+  "valid_child_to_host": [
+    {
+      "v": 1,
+      "kind": "sas_display_v1",
+      "attempt_binding": 41,
+      "generation": 7,
+      "current": true,
+      "remaining_ms": 30000,
+      "code_groups": ["42", "71", "68"],
+      "details_suffix": "3F7A"
+    },
+    {
+      "v": 1,
+      "kind": "sas_display_v1",
+      "attempt_binding": 41,
+      "generation": 8,
+      "current": false
+    }
+  ],
+  "invalid_child_to_host": [
+    {
+      "v": 2,
+      "kind": "sas_display_v1",
+      "attempt_binding": 41,
+      "generation": 7,
+      "current": true,
+      "remaining_ms": 10,
+      "code_groups": ["42"]
+    },
+    {
+      "v": 1,
+      "kind": "sas_display_v1",
+      "attempt_binding": 0,
+      "generation": 7,
+      "current": true,
+      "remaining_ms": 10,
+      "code_groups": ["42"]
+    },
+    {
+      "v": 1,
+      "kind": "sas_display_v1",
+      "attempt_binding": 41,
+      "generation": 7,
+      "current": true,
+      "remaining_ms": 30001,
+      "code_groups": ["42"]
+    },
+    {
+      "v": 1,
+      "kind": "sas_display_v1",
+      "attempt_binding": 41,
+      "generation": 7,
+      "current": true,
+      "remaining_ms": 10,
+      "code_groups": ["42"],
+      "details_suffix": null
+    },
+    {
+      "v": 1,
+      "kind": "sas_display_v1",
+      "attempt_binding": 41,
+      "generation": 7,
+      "current": false,
+      "code_groups": ["42"]
+    }
+  ],
+  "invalid_sequences": [
+    [
+      {
+        "v": 1,
+        "kind": "sas_display_v1",
+        "attempt_binding": 41,
+        "generation": 7,
+        "current": true,
+        "remaining_ms": 10,
+        "code_groups": ["42"]
+      },
+      {
+        "v": 1,
+        "kind": "sas_display_v1",
+        "attempt_binding": 41,
+        "generation": 7,
+        "current": false
+      }
+    ],
+    [
+      {
+        "v": 1,
+        "kind": "sas_display_v1",
+        "attempt_binding": 41,
+        "generation": 7,
+        "current": true,
+        "remaining_ms": 10,
+        "code_groups": ["42"]
+      },
+      {
+        "v": 1,
+        "kind": "sas_display_v1",
+        "attempt_binding": 41,
+        "generation": 8,
+        "current": false
+      },
+      {
+        "v": 1,
+        "kind": "sas_display_v1",
+        "attempt_binding": 41,
+        "generation": 9,
+        "current": true,
+        "remaining_ms": 10,
+        "code_groups": ["42"]
+      }
+    ],
+    [
+      {
+        "v": 1,
+        "kind": "sas_display_v1",
+        "attempt_binding": 41,
+        "generation": 7,
+        "current": false
+      }
+    ]
+  ],
+  "valid_host_requests": [
+    {
+      "v": 1,
+      "id": "host-0",
+      "command": "confirm",
+      "args": {
+        "matches": true
+      }
+    }
+  ],
+  "invalid_host_requests": [
+    {
+      "v": 1,
+      "id": "host-1",
+      "command": "sas_display_v1",
+      "args": {}
+    },
+    {
+      "v": 1,
+      "id": "host-2",
+      "command": "confirm",
+      "args": {
+        "code_groups": ["42", "71", "68"]
+      }
+    }
+  ]
+}

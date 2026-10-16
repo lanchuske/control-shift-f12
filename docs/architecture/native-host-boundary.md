@@ -61,6 +61,45 @@ No native host may parse human CLI output or create an alternative request
 framing format. Future typed UI requests retain the existing bounded framing
 and request-ID idempotence.
 
+### Child-to-host transient SAS frame
+
+The only permitted serialization of `SasDisplayView` is one bounded JSON value
+on the existing inherited **child stdout to host** pipe. It is not a V01 wire
+record and is not accepted by `read_request` on child stdin. A future reviewed
+adapter must reject it on every host-to-child request and must not re-export it
+to another process, pipe, log, cache or response.
+
+The value has exactly the following common fields; unknown fields reject:
+
+| Field | Requirement |
+| --- | --- |
+| `v` | JSON integer exactly `1` |
+| `kind` | ASCII exactly `sas_display_v1` |
+| `attempt_binding` | nonzero JSON `u64`; adapter-local, ephemeral and non-secret; it is **not** the raw V01 attempt/session/transcript value |
+| `generation` | nonzero JSON `u64`, strictly increasing for that `attempt_binding` |
+| `current` | JSON boolean |
+
+For `current: true`, the only additional fields are `remaining_ms`,
+`code_groups`, and optional `details_suffix`. `remaining_ms` is an integer in
+`1..=30000`. `code_groups` has `1..=8` printable-ASCII strings, each
+`1..=32` bytes; the reviewed SAS presentation contract, not the host, defines
+their exact alphabet and grouping. `details_suffix`, if present, is a
+printable-ASCII string of `1..=16` bytes and contains neither code nor locator.
+When no suffix is needed, the field is omitted; JSON `null` is not accepted.
+For `current: false`, there are no additional fields: it is a terminal
+invalidation, not a new status frame.
+
+The host renders a `current: true` frame only if its `(attempt_binding,
+generation)` is newer than the rendered one for that binding. It records no
+history: a `current: false` frame for an active binding must have a strictly
+higher generation, immediately clears the screen and makes that binding
+terminal. A later `current: true` frame for the terminal binding, a stale or
+duplicate generation, invalidation without an active view, an unknown field,
+or an out-of-bounds field is rejected and clears the visible view. This local
+framing serialization is permitted only as transient inherited-pipe bytes; it
+does not make the view serializable for persistence, logs, copying, caching,
+telemetry, host-to-child requests or any re-export.
+
 ## Lifecycle and capability boundary
 
 The host may render only a redacted typed projection supplied by a future
