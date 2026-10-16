@@ -101,6 +101,28 @@ impl Drop for OutboundWriter {
     }
 }
 
+fn spawn_deadlined_writer<F, Fut>(
+    capacity: usize,
+    peer: NodeId,
+    generation: u64,
+    failure_tx: mpsc::UnboundedSender<OutboundFailure>,
+    deadline: Duration,
+    mut deliver: F,
+) -> OutboundWriter
+where
+    F: FnMut(Vec<u8>) -> Fut + Send + 'static,
+    Fut: Future<Output = Result<(), String>> + Send + 'static,
+{
+    OutboundWriter::spawn(capacity, peer, generation, failure_tx, move |packet| {
+        let delivery = deliver(packet);
+        async move {
+            tokio::time::timeout(deadline, delivery)
+                .await
+                .map_err(|_| "peer send timed out".to_owned())?
+        }
+    })
+}
+
 fn rotating_batch<T: Clone>(items: &[T], cursor: usize, budget: usize) -> (Vec<T>, usize) {
     if items.is_empty() || budget == 0 {
         return (Vec::new(), 0);
@@ -674,17 +696,18 @@ impl NativeSupervisor {
         let generation = self.next_writer_generation;
         self.next_writer_generation = self.next_writer_generation.wrapping_add(1).max(1);
         let failure_tx = self.outbound_failure_tx.clone();
-        let writer = OutboundWriter::spawn(
+        let writer = spawn_deadlined_writer(
             OUTBOUND_QUEUE_CAPACITY,
             peer,
             generation,
             failure_tx,
+            OUTBOUND_SEND_DEADLINE,
             move |packet| {
                 let session = session.clone();
                 async move {
-                    tokio::time::timeout(OUTBOUND_SEND_DEADLINE, session.send_packet(&packet))
+                    session
+                        .send_packet(&packet)
                         .await
-                        .map_err(|_| "peer send timed out".to_owned())?
                         .map_err(|error| error.to_string())
                 }
             },
@@ -1339,7 +1362,7 @@ mod capture_buffer_tests {
     use std::{
         sync::{
             Arc,
-            atomic::{AtomicUsize, Ordering},
+            atomic::{AtomicBool, AtomicUsize, Ordering},
         },
         time::{Duration, Instant},
     };
@@ -1614,6 +1637,40 @@ mod capture_buffer_tests {
         tokio::task::yield_now().await;
         blocked.try_send(vec![2]).unwrap();
         assert_eq!(blocked.try_send(vec![3]), Err(OutboundEnqueueError::Full));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn dropping_writer_aborts_an_inflight_delivery_task() {
+        struct PendingGuard(Arc<AtomicBool>);
+        impl Drop for PendingGuard {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let observed = Arc::clone(&cancelled);
+        let (failure_tx, _) = tokio::sync::mpsc::unbounded_channel();
+        let writer = OutboundWriter::spawn(
+            1,
+            seamless_input_core::NodeId([10; 16]),
+            1,
+            failure_tx,
+            move |_| {
+                let guard = PendingGuard(Arc::clone(&observed));
+                async move {
+                    let _guard = guard;
+                    std::future::pending::<Result<(), String>>().await
+                }
+            },
+        );
+        writer.try_send(vec![1]).unwrap();
+        tokio::task::yield_now().await;
+        assert!(!cancelled.load(Ordering::SeqCst));
+
+        drop(writer);
+        tokio::task::yield_now().await;
+        assert!(cancelled.load(Ordering::SeqCst));
     }
 
     #[test]
@@ -2631,18 +2688,19 @@ mod tests {
 
         let generation = a.next_writer_generation;
         a.next_writer_generation += 1;
-        let timeout_writer = OutboundWriter::spawn(
+        let timeout_writer = spawn_deadlined_writer(
             1,
             b_id,
             generation,
             a.outbound_failure_tx.clone(),
-            |_| async { Err("simulated send timeout".to_owned()) },
+            Duration::from_millis(10),
+            |_| async { std::future::pending::<Result<(), String>>().await },
         );
         timeout_writer.try_send(vec![1]).unwrap();
         a.writers.insert(b_id, timeout_writer);
 
         for _ in 0..20 {
-            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(1)).await;
             a.drain_outbound_failures().unwrap();
             if !a.admitted.contains(&b_id) {
                 break;
