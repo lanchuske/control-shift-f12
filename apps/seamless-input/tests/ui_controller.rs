@@ -17,32 +17,45 @@ fn controller() -> UiController {
 
 fn confirmed_controller() -> UiController {
     let mut controller = controller();
-    controller.apply_local(UiCommand::StartDiscovery).unwrap();
-    controller.on_runtime(UiRuntimeEvent::Candidates(vec![CandidateView {
-        handle: candidate(),
-        compatibility: CandidateCompatibility::Compatible,
-        freshness: CandidateFreshness::Current,
-    }]));
     controller
-        .apply_local(UiCommand::SelectCandidate {
+        .apply_local_at(0, UiCommand::StartDiscovery)
+        .unwrap();
+    controller.on_runtime_at(
+        0,
+        UiRuntimeEvent::Candidates(vec![CandidateView {
             handle: candidate(),
-        })
-        .unwrap();
-    controller.apply_local(UiCommand::BeginBootstrap).unwrap();
-    controller.on_runtime(UiRuntimeEvent::BootstrapSasReady);
+            compatibility: CandidateCompatibility::Compatible,
+            freshness: CandidateFreshness::Current,
+        }]),
+    );
     controller
-        .apply_local(UiCommand::ConfirmBootstrap { matches: true })
+        .apply_local_at(
+            0,
+            UiCommand::SelectCandidate {
+                handle: candidate(),
+            },
+        )
         .unwrap();
-    controller.on_runtime(UiRuntimeEvent::BootstrapReceiptVerified);
+    controller
+        .apply_local_at(0, UiCommand::BeginBootstrap)
+        .unwrap();
+    controller.on_runtime_at(0, UiRuntimeEvent::BootstrapSasReady);
+    controller
+        .apply_local_at(0, UiCommand::ConfirmBootstrap { matches: true })
+        .unwrap();
+    controller.on_runtime_at(0, UiRuntimeEvent::BootstrapReceiptVerified);
     controller
 }
 
 fn enter_v01(controller: &mut UiController) {
-    controller.apply_local(UiCommand::BeginV01).unwrap();
-    controller.on_runtime(UiRuntimeEvent::V01SasReady(V01View {
-        code: SasCode::try_from(vec!["42".to_owned(), "71".to_owned()]).unwrap(),
-        remaining: RemainingDuration::MoreThanTenSeconds,
-    }));
+    controller.apply_local_at(0, UiCommand::BeginV01).unwrap();
+    controller.on_runtime_at(
+        0,
+        UiRuntimeEvent::V01SasReady(V01View {
+            code: SasCode::try_from(vec!["42".to_owned(), "71".to_owned()]).unwrap(),
+            remaining: RemainingDuration::MoreThanTenSeconds,
+        }),
+    );
 }
 
 fn runtime_pass() -> DiagnosticRow {
@@ -70,23 +83,33 @@ fn inventory_controller() -> UiController {
 #[test]
 fn legal_local_route_keeps_capabilities_off() {
     let mut controller = controller();
-    controller.apply_local(UiCommand::StartDiscovery).unwrap();
-    controller.on_runtime(UiRuntimeEvent::Candidates(vec![CandidateView {
-        handle: candidate(),
-        compatibility: CandidateCompatibility::Compatible,
-        freshness: CandidateFreshness::Current,
-    }]));
     controller
-        .apply_local(UiCommand::SelectCandidate {
+        .apply_local_at(0, UiCommand::StartDiscovery)
+        .unwrap();
+    controller.on_runtime_at(
+        0,
+        UiRuntimeEvent::Candidates(vec![CandidateView {
             handle: candidate(),
-        })
-        .unwrap();
-    controller.apply_local(UiCommand::BeginBootstrap).unwrap();
-    controller.on_runtime(UiRuntimeEvent::BootstrapSasReady);
+            compatibility: CandidateCompatibility::Compatible,
+            freshness: CandidateFreshness::Current,
+        }]),
+    );
     controller
-        .apply_local(UiCommand::ConfirmBootstrap { matches: true })
+        .apply_local_at(
+            0,
+            UiCommand::SelectCandidate {
+                handle: candidate(),
+            },
+        )
         .unwrap();
-    controller.on_runtime(UiRuntimeEvent::BootstrapReceiptVerified);
+    controller
+        .apply_local_at(0, UiCommand::BeginBootstrap)
+        .unwrap();
+    controller.on_runtime_at(0, UiRuntimeEvent::BootstrapSasReady);
+    controller
+        .apply_local_at(0, UiCommand::ConfirmBootstrap { matches: true })
+        .unwrap();
+    controller.on_runtime_at(0, UiRuntimeEvent::BootstrapReceiptVerified);
     enter_v01(&mut controller);
 
     assert_eq!(controller.snapshot().state, UiState::V01Pending);
@@ -98,7 +121,7 @@ fn legal_local_route_keeps_capabilities_off() {
 fn remote_confirm_cannot_advance_v01_without_local_confirm() {
     let mut controller = confirmed_controller();
     enter_v01(&mut controller);
-    controller.on_runtime(UiRuntimeEvent::PeerConfirmed);
+    controller.on_runtime_at(0, UiRuntimeEvent::PeerConfirmed);
     assert_eq!(controller.snapshot().state, UiState::V01Pending);
 }
 
@@ -106,24 +129,35 @@ fn remote_confirm_cannot_advance_v01_without_local_confirm() {
 fn invalid_candidate_switch_and_layout_before_inventory_are_rejected_locally() {
     let mut controller = controller();
     assert_eq!(
-        controller.apply_local(UiCommand::SubmitLayout),
+        controller.apply_local_at(0, UiCommand::SubmitLayout),
         Err(UiError::InvalidState)
     );
-    controller.apply_local(UiCommand::StartDiscovery).unwrap();
-    controller.on_runtime(UiRuntimeEvent::Candidates(vec![CandidateView {
-        handle: candidate(),
-        compatibility: CandidateCompatibility::Compatible,
-        freshness: CandidateFreshness::Current,
-    }]));
     controller
-        .apply_local(UiCommand::SelectCandidate {
+        .apply_local_at(0, UiCommand::StartDiscovery)
+        .unwrap();
+    controller.on_runtime_at(
+        0,
+        UiRuntimeEvent::Candidates(vec![CandidateView {
             handle: candidate(),
-        })
+            compatibility: CandidateCompatibility::Compatible,
+            freshness: CandidateFreshness::Current,
+        }]),
+    );
+    controller
+        .apply_local_at(
+            0,
+            UiCommand::SelectCandidate {
+                handle: candidate(),
+            },
+        )
         .unwrap();
     assert_eq!(
-        controller.apply_local(UiCommand::SelectCandidate {
-            handle: candidate()
-        }),
+        controller.apply_local_at(
+            0,
+            UiCommand::SelectCandidate {
+                handle: candidate()
+            }
+        ),
         Err(UiError::InvalidState)
     );
 }
@@ -132,12 +166,14 @@ fn invalid_candidate_switch_and_layout_before_inventory_are_rejected_locally() {
 fn v01_deadline_and_cancel_clear_volatile_state_without_extending_it() {
     let mut controller = confirmed_controller();
     enter_v01(&mut controller);
-    controller.advance_to(30_001);
+    controller.on_runtime_at(30_001, UiRuntimeEvent::Diagnostics(vec![]));
     assert_eq!(controller.snapshot().state, UiState::ConfirmedRelationship);
     assert!(controller.snapshot().v01.is_none());
 
     enter_v01(&mut controller);
-    controller.apply_local(UiCommand::Cancel).unwrap();
+    controller
+        .apply_local_at(30_001, UiCommand::Cancel)
+        .unwrap();
     assert_eq!(controller.snapshot().state, UiState::ConfirmedRelationship);
     assert!(controller.snapshot().v01.is_none());
 }
@@ -172,11 +208,14 @@ fn decisive_commands_and_runtime_events_expire_v01_at_exact_deadline_without_a_t
 #[test]
 fn invalid_v01_runtime_fact_is_rejected_before_snapshot_storage() {
     let mut controller = confirmed_controller();
-    controller.apply_local(UiCommand::BeginV01).unwrap();
-    controller.on_runtime(UiRuntimeEvent::V01SasReady(V01View {
-        code: SasCode::try_from(vec!["42".to_owned(), "71".to_owned()]).unwrap(),
-        remaining: RemainingDuration::Seconds(0),
-    }));
+    controller.apply_local_at(0, UiCommand::BeginV01).unwrap();
+    controller.on_runtime_at(
+        0,
+        UiRuntimeEvent::V01SasReady(V01View {
+            code: SasCode::try_from(vec!["42".to_owned(), "71".to_owned()]).unwrap(),
+            remaining: RemainingDuration::Seconds(0),
+        }),
+    );
 
     assert_eq!(controller.snapshot().state, UiState::ConfirmedRelationship);
     assert!(controller.snapshot().v01.is_none());
@@ -200,7 +239,7 @@ fn projection_requires_one_current_runtime_pass_before_any_actions() {
 
     for rows in cases {
         let mut controller = inventory_controller();
-        controller.on_runtime(UiRuntimeEvent::Diagnostics(rows));
+        controller.on_runtime_at(29_999, UiRuntimeEvent::Diagnostics(rows));
         let view = controller.view();
         assert!(view.runtime_not_running);
         assert!(!view.can_start_sharing);
@@ -209,16 +248,30 @@ fn projection_requires_one_current_runtime_pass_before_any_actions() {
 }
 
 #[test]
+fn public_controller_surface_exposes_only_timestamped_decisive_paths() {
+    let source = include_str!("../src/ui_controller.rs");
+
+    assert!(source.contains("pub fn apply_local_at"));
+    assert!(source.contains("pub fn on_runtime_at"));
+    assert!(!source.contains("pub fn apply_local("));
+    assert!(!source.contains("pub fn on_runtime("));
+    assert!(!source.contains("pub fn advance_to("));
+}
+
+#[test]
 fn stale_diagnostics_project_as_not_running_and_do_not_enable_actions() {
     let mut controller = controller();
-    controller.on_runtime(UiRuntimeEvent::Diagnostics(vec![DiagnosticRow {
-        id: DiagnosticId::Runtime,
-        label: DiagnosticLabel::Runtime,
-        state: DiagnosticState::Unknown,
-        detail: DiagnosticDetail::Stale,
-        action: None,
-        failure_code: None,
-    }]));
+    controller.on_runtime_at(
+        0,
+        UiRuntimeEvent::Diagnostics(vec![DiagnosticRow {
+            id: DiagnosticId::Runtime,
+            label: DiagnosticLabel::Runtime,
+            state: DiagnosticState::Unknown,
+            detail: DiagnosticDetail::Stale,
+            action: None,
+            failure_code: None,
+        }]),
+    );
     let view = controller.view();
     assert!(view.runtime_not_running);
     assert!(!view.can_start_sharing);
@@ -233,15 +286,15 @@ fn stale_diagnostics_project_as_not_running_and_do_not_enable_actions() {
 #[test]
 fn fenced_remote_outcome_refuses_new_v01_or_layout_edits() {
     let mut controller = confirmed_controller();
-    controller.on_runtime(UiRuntimeEvent::RemoteOutcomeUnknown);
+    controller.on_runtime_at(0, UiRuntimeEvent::RemoteOutcomeUnknown);
 
     assert_eq!(controller.snapshot().state, UiState::RemoteOutcomeUnknown);
     assert_eq!(
-        controller.apply_local(UiCommand::BeginV01),
+        controller.apply_local_at(0, UiCommand::BeginV01),
         Err(UiError::Blocked)
     );
     assert_eq!(
-        controller.apply_local(UiCommand::ResetLayout),
+        controller.apply_local_at(0, UiCommand::ResetLayout),
         Err(UiError::Blocked)
     );
     assert!(!controller.snapshot().capabilities.input_enabled());

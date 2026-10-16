@@ -64,7 +64,7 @@ impl UiController {
         project(&self.snapshot)
     }
 
-    pub fn advance_to(&mut self, now_ms: u64) {
+    fn advance_to(&mut self, now_ms: u64) {
         // The injected clock is monotonic: a delayed event may not rewind a
         // deadline that was already observed by a later command.
         self.now_ms = self.now_ms.max(now_ms);
@@ -74,10 +74,6 @@ impl UiController {
         {
             self.clear_v01_to_confirmed();
         }
-    }
-
-    pub fn apply_local(&mut self, command: UiCommand) -> Result<(), UiError> {
-        self.apply_local_at(self.now_ms, command)
     }
 
     /// Applies a local command at an injected monotonic clock reading.
@@ -187,10 +183,6 @@ impl UiController {
                 },
             ),
         }
-    }
-
-    pub fn on_runtime(&mut self, event: UiRuntimeEvent) {
-        self.on_runtime_at(self.now_ms, event);
     }
 
     /// Records adapter-owned facts at an injected monotonic clock reading.
