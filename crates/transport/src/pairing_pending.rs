@@ -78,20 +78,13 @@ pub(crate) struct AdmissionRevoker {
 
 #[cfg(feature = "pairing-v2-experimental")]
 impl AdmissionRevoker {
-    pub(crate) fn arm(&mut self) -> Result<(), StoreError> {
-        active_revocation_guards()
-            .lock()
-            .map_err(|_| StoreError::Invalid)?
-            .insert(self.token);
+    pub(crate) fn arm(&mut self) {
+        active_revocation_guard_tokens().insert(self.token);
         self.armed = true;
-        Ok(())
     }
 
     pub(crate) fn revoke(&mut self) -> Result<(), StoreError> {
-        active_revocation_guards()
-            .lock()
-            .map_err(|_| StoreError::Invalid)?
-            .remove(&self.token);
+        active_revocation_guard_tokens().remove(&self.token);
         self.store.revoke_current(self.peer)?;
         self.store.clear_admission_guard(self.attempt)?;
         self.armed = false;
@@ -103,9 +96,7 @@ impl AdmissionRevoker {
 impl Drop for AdmissionRevoker {
     fn drop(&mut self) {
         if self.armed {
-            if let Ok(mut active) = active_revocation_guards().lock() {
-                active.remove(&self.token);
-            }
+            active_revocation_guard_tokens().remove(&self.token);
         } else {
             let _ = self.store.clear_admission_guard(self.attempt);
         }
@@ -116,6 +107,13 @@ impl Drop for AdmissionRevoker {
 fn active_revocation_guards() -> &'static Mutex<BTreeSet<[u8; 32]>> {
     static ACTIVE: OnceLock<Mutex<BTreeSet<[u8; 32]>>> = OnceLock::new();
     ACTIVE.get_or_init(|| Mutex::new(BTreeSet::new()))
+}
+
+#[cfg(feature = "pairing-v2-experimental")]
+fn active_revocation_guard_tokens() -> std::sync::MutexGuard<'static, BTreeSet<[u8; 32]>> {
+    active_revocation_guards()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 #[cfg(feature = "pairing-v2-experimental")]
@@ -139,6 +137,7 @@ impl PendingStore {
 mod unix {
     use super::*;
     use crate::private_fs::PrivateDir;
+    #[cfg(feature = "pairing-v2-experimental")]
     use rand::RngCore;
     use sha2::{Digest, Sha256};
     use std::collections::BTreeSet;
@@ -483,11 +482,7 @@ mod unix {
             if guard.attempt != attempt || guard.peer == [0; 32] || guard.token == [0; 32] {
                 return Err(StoreError::Invalid);
             }
-            if active_revocation_guards()
-                .lock()
-                .map_err(|_| StoreError::Invalid)?
-                .contains(&guard.token)
-            {
+            if active_revocation_guard_tokens().contains(&guard.token) {
                 return Ok(());
             }
             let mut revoker = AdmissionRevoker {

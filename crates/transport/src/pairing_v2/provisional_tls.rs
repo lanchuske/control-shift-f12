@@ -312,7 +312,7 @@ impl ConsentScope {
         if state.phase != ConsentPhase::Active {
             return Err(Invalid);
         }
-        revoker.arm().map_err(|_| Invalid)?;
+        revoker.arm();
         state.phase = ConsentPhase::Frozen;
         state.revoker = Some(revoker);
         Ok(())
