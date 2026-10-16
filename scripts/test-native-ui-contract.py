@@ -44,6 +44,7 @@ ADMITTED_WINDOWS_CONTRACT_PATHS = frozenset(
         "native/windows/ControlShiftF12App.Core/DesktopJourneyState.cs",
         "native/windows/ControlShiftF12App.Core/DesktopShellPresentation.cs",
         "native/windows/ControlShiftF12App.Core/DesktopSnapshotProjection.cs",
+        "native/windows/ControlShiftF12App.Core/UiChildSession.cs",
         "native/windows/ControlShiftF12App.Core/FramedPayloadReader.cs",
         "native/windows/ControlShiftF12App.Core/DiagnosticsProjection.cs",
         "native/windows/ControlShiftF12App.Tests/ControlShiftF12App.Tests.csproj",
@@ -54,6 +55,7 @@ ADMITTED_WINDOWS_CONTRACT_PATHS = frozenset(
         "native/windows/ControlShiftF12App.Tests/DesktopSnapshotProjectionTests.cs",
         "native/windows/ControlShiftF12App.Tests/FramedPayloadReaderTests.cs",
         "native/windows/ControlShiftF12App.Tests/UiStdioChildProbeTests.cs",
+        "native/windows/ControlShiftF12App.Tests/UiChildSessionTests.cs",
         "native/windows/ControlShiftF12App.Tests/WindowsDiagnosticsProjectionTests.cs",
     }
 )

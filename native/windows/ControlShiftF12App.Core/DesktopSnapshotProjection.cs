@@ -4,6 +4,7 @@ using System.Text.Json;
 namespace ControlShiftF12App.Core;
 
 public sealed record DesktopSnapshotProjection(
+    ulong Generation,
     string State,
     IReadOnlyList<string> Nearby,
     bool InputEnabled,
@@ -65,6 +66,7 @@ public sealed record DesktopSnapshotProjection(
             }
 
             projection = new DesktopSnapshotProjection(
+                Generation: snapshot.GetProperty("generation").GetUInt64(),
                 State: state,
                 Nearby: nearby,
                 InputEnabled: false,

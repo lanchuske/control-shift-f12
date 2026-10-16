@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.Text;
 using System.Text.Json;
+using ControlShiftF12App.Core;
 using Xunit;
 
 namespace ControlShiftF12App.Tests;
@@ -37,12 +38,16 @@ public sealed class UiStdioChildProbeTests
         await child.StandardInput.BaseStream.FlushAsync(timeout.Token);
 
         var payload = await ReadFrameAsync(child.StandardOutput.BaseStream, timeout.Token);
-        using var document = JsonDocument.Parse(payload);
-        Assert.Equal("ui_snapshot_v1", document.RootElement.GetProperty("kind").GetString());
+        var session = new UiChildSession();
+        session.ReceiveOutput(Frame(payload));
+        Assert.Equal(ChildSessionPhase.Running, session.State.Phase);
+        Assert.NotNull(session.Snapshot);
 
         child.StandardInput.Close();
         await child.WaitForExitAsync(timeout.Token);
         Assert.True(child.HasExited);
+        session.CompleteOutput();
+        Assert.Equal(ChildSessionPhase.Terminal, session.State.Phase);
     }
 
     private static byte[] Frame(byte[] payload)
