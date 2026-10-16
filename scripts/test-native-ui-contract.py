@@ -18,6 +18,7 @@ NATIVE_README = ROOT / "native/README.md"
 BOUNDARY_RECORD = ROOT / "docs/architecture/native-host-boundary.md"
 SAS_MATRIX = ROOT / "docs/architecture/discovery-sas-security-matrix.md"
 HOST_PIPE_DESIGN = ROOT / "docs/architecture/native-host-process-pipe-adapter.md"
+DESKTOP_PARITY_GATE = ROOT / "docs/architecture/desktop-functional-parity-gate.md"
 SAS_FRAME_FIXTURE = ROOT / "docs/fixtures/sas-display-frame-v1.json"
 NONSHIPPING_NATIVE_PATHS = frozenset(
     {
@@ -274,6 +275,7 @@ class NativeHostBoundaryTests(unittest.TestCase):
 
         for text in (native_readme, boundary_record):
             self.assertIn("seamless-input control --stdio", text)
+            self.assertIn("seamless-input control --ui-stdio", text)
             self.assertIn("argument vector", text)
             self.assertIn("anonymous inherited", text)
             self.assertIn("MAX_FRAME_BYTES", text)
@@ -322,7 +324,9 @@ class NativeHostBoundaryTests(unittest.TestCase):
         required = (
             "control_engine::run_stdio",
             "ui_stdio_adapter::run_stdio",
-            "[absolute path to seamless-input, \"control\", \"--stdio\"]",
+            "[absolute path to seamless-input, \"control\", \"--ui-stdio\"]",
+            "seamless-input control --stdio",
+            "seamless-input control --ui-stdio",
             "MAX_FRAME_BYTES = 256 KiB",
             "ui.refresh",
             "ui.confirm_v01",
@@ -350,6 +354,20 @@ class NativeHostBoundaryTests(unittest.TestCase):
         self.assertIn("no foundations shutdown command", design)
         self.assertIn("no shutdown command on the host-to-child path", boundary)
         self.assertIn("sends no\nfoundations shutdown command", native_readme)
+
+    def test_desktop_parity_plan_reserves_a_separate_ui_stdio_channel(self):
+        """Native UX must not repurpose the foundations control channel or TUI."""
+        plan = DESKTOP_PARITY_GATE.read_text()
+        for invariant in (
+            "`seamless-input control --ui-stdio`",
+            "`seamless-input control --stdio`",
+            "TUI is a technical fallback",
+            "AppKit",
+            "WinForms",
+            "separate authenticated application-session lifecycle",
+            "not a saved topology",
+        ):
+            self.assertIn(invariant, plan)
 
     def test_every_sas_field_and_literal_is_rejected_recursively_from_host_args(self):
         """A partial display shape is still an impermissible host re-export."""

@@ -10,9 +10,10 @@ The candidate contains a bounded Rust `UiStdioAdapter` and a
 `TimedRequestReader` abstraction. It does **not** yet contain an implementation
 of an inherited-pipe reader, an AppKit host, or a WinForms host. Moreover,
 `main.rs` currently routes `seamless-input control --stdio` to the foundations
-`control_engine::run_stdio`, not to `ui_stdio_adapter::run_stdio`. A native
-host must therefore remain blocked until a separately reviewed engine-routing
-change selects the typed adapter without changing the process argument vector.
+`control_engine::run_stdio`, not to `ui_stdio_adapter::run_stdio`. The reserved
+native UI vector is instead `seamless-input control --ui-stdio`; it does not
+exist yet. A native host remains blocked until a separately reviewed entrypoint
+adds that distinct routing while preserving foundations `--stdio` behavior.
 
 No implementation may use this document as authority to launch a process.
 Native source is admitted only after all pre-enable tests in
@@ -30,7 +31,7 @@ session. Its only launch target is the signed package resource selected by the
 host, with this exact argument array:
 
 ```text
-[absolute path to seamless-input, "control", "--stdio"]
+[absolute path to seamless-input, "control", "--ui-stdio"]
 ```
 
 The host must use its native argument-array process API. It must not invoke a
@@ -39,6 +40,10 @@ path, environment-selected executable, browser view, URL scheme, socket, or
 named/public pipe. The fixed executable path is resolved inside the installed
 package before launching; a missing, non-regular, or out-of-package target is
 a local failure and does not fall back to another executable.
+
+`control --stdio` is not an alternate host launch vector: it remains the
+foundations channel. The TUI is likewise a technical fallback, not a host
+substitute.
 
 The child gets only these three inherited standard streams:
 

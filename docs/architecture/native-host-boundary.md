@@ -23,17 +23,30 @@ with a required `--stdio` flag. There is no `--control-stdio` flag.
 
 ## Parent-created child process
 
-Each future AppKit or WinForms host starts exactly one engine child using a
-platform-native argument vector:
+The existing foundations control channel is deliberately separate from the
+reserved native UI channel:
+
+| Channel | Argument vector | Rule |
+| --- | --- | --- |
+| Foundations control | `[absolute path to seamless-input, "control", "--stdio"]` | Preserves its existing control-engine behavior; it is not a native-host fallback. |
+| Native UI projection | `[absolute path to seamless-input, "control", "--ui-stdio"]` | Reserved for the reviewed typed UI adapter; it does not exist in the current CLI and cannot be launched until its entrypoint and platform tests are admitted. |
+
+Written as documentation commands, those are `seamless-input control --stdio`
+and `seamless-input control --ui-stdio` respectively. The latter is a reserved
+future channel, not a currently executable host interface.
+
+When the native UI channel is admitted, each future AppKit or WinForms host
+starts exactly one child using this platform-native argument vector:
 
 ```text
-[absolute path to seamless-input, "control", "--stdio"]
+[absolute path to seamless-input, "control", "--ui-stdio"]
 ```
 
 The path comes from signed-package resources selected by the local host, not
 from a UI field, discovery record, environment variable, or remote message.
 The host does not use a shell, command string, terminal parser, browser view,
-or secondary launcher.
+or secondary launcher. It cannot fall back to `--stdio`, the TUI, or any other
+argument vector.
 
 The host creates anonymous inherited standard-input and standard-output pipes
 before spawn. It gives the child no inherited listening socket, no named or

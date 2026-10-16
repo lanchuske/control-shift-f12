@@ -1,0 +1,174 @@
+# Desktop functional-parity plan and admission gate
+
+## Decision and status
+
+Control Shift F12 is a desktop product. Its primary experience must be a
+functional macOS AppKit application and a functional Windows WinForms
+application. The TUI is a technical fallback for development and support; it
+is not the primary user flow or evidence that either desktop application is
+ready.
+
+This document is a docs-only admission plan. It adds no host source, GUI,
+child process, network, pairing endpoint, layout save, runtime capability, CI,
+or release. The non-shipping manifest guard remains active.
+
+## Chosen control-channel separation
+
+The eventual native child mode is `seamless-input control --ui-stdio`, launched
+through a native argument array, never a shell. It is the dedicated inherited
+stdio projection channel for the reviewed typed `UiStdioAdapter`.
+
+`seamless-input control --stdio` remains the foundations control channel with
+its current behavior. `seamless-input tui` remains a technical fallback. A
+desktop app must never fall back from `--ui-stdio` to `--stdio`, TUI, a shell,
+or a network endpoint.
+
+`--ui-stdio` is a reserved channel, not current implementation authority. It
+cannot be added until a separate entrypoint review admits adapter routing,
+bounded reading, child lifetime, and target-platform tests. The pipe/cancellation
+rules remain those in [the host-process design](native-host-process-pipe-adapter.md).
+
+## Functional parity surface
+
+Both desktop apps expose the same human workflow. “Expose” means the person
+can see current state, understand why an action is unavailable, act locally
+where a reviewed contract permits it, and recover without a terminal. It never
+means the UI invents protocol facts or bypasses permissions/firewall policy.
+
+| Stage | Native desktop capability | Required honest boundary |
+| --- | --- | --- |
+| Nearby | Explicit find/stop action and neutral compatible/fresh handles | Discovery is untrusted. Stale, incompatible, missing, or policy-blocked entries return to the catalogue; no silent substitution or manual-address fallback. |
+| New relationship | Bootstrap progress and visible double local confirmation | Bootstrap SAS is separate from V01; a locally verified durable receipt is required before confirmed state. No sharing follows bootstrap. |
+| Confirmed relationship | Current confirmed-computers list and explicit selection | Only active local receipt/pin state is selectable; missing/prepared/revoked is not presented as confirmed. |
+| V01 compare | Same grouped code on both screens, remaining-time state, explicit local match/mismatch | `SasDisplayView` is current-only and child-to-host-only. One machine cannot approve the other; expiry/reset/revoke clears it. |
+| Device/session | Stable header and details for runtime, permissions, discovery, sessions, capability | Missing, duplicate, stale, malformed, non-PASS, or terminal facts never render as ready/running and disable dependent actions. |
+| Displays | Measured inventory, quality markers, proportional map, drag and keyboard cardinal placement | A map is a local draft. Inventory generation changes invalidate it; no cursor/input/clipboard capability follows map editing. |
+| Layout review | Native review, accept/reject, and clear waiting/blocked state | A proposal is **not a saved topology**. V01 closes before payloads: save requires a separate authenticated application-session lifecycle. |
+| Permission/firewall | macOS Accessibility guidance; Windows private-network guidance | Never collect a password, silently elevate, create a rule, enable public networks, or treat consent as trust. |
+| Runtime/recovery | Start/stop/retry state and current diagnostics | Pipe/process/session failure clears projection, SAS, pending approval and actions. A retry is a fresh session. |
+| Diagnostics | Compact semantic result and selectable redacted detail | PASS/FAIL/NOT MEASURED is current and structured; diagnostics grant no authority or stale success. |
+
+The detailed interaction contract is [the native setup UX specification](../native-setup-ux-specification.md).
+
+## Two native design systems
+
+The common character is a calm equipment panel: one quiet vertical workflow
+and one memorable visual element, the proportional display topology. It is not
+a browser dashboard, a terminal transcription, or a field of rounded SaaS
+cards. System colors, conventional controls, and disciplined whitespace carry
+the rest.
+
+| Token | AppKit | WinForms | Shared meaning |
+| --- | --- | --- | --- |
+| Surface | `windowBackgroundColor` | `SystemColors.Window` | Plain working surface, not a tinted dashboard. |
+| Topology field | `underPageBackgroundColor` | `ControlLightLight` | Quiet canvas behind measured monitor rectangles. |
+| Ready | system green | `Color.ForestGreen` | A locally verified completed fact only. |
+| Attention | system orange | `Color.DarkOrange` | Human confirmation or retryable interruption. |
+| Blocked | system red | `Color.Firebrick` | A condition that prevents progress. |
+| Selection | current accent color | user accent / `Highlight` | Keyboard and pointer selection, never decoration. |
+| Type | SF Pro/San Francisco system font | Segoe UI system font | Semibold title; normal body; monospaced only in a selectable details disclosure. |
+
+### AppKit: composed equipment panel
+
+Use an `NSWindow` with a stable header, `NSOutlineView` or `NSTableView` for
+nearby/confirmed devices, `NSButton` actions, native sheets for interruption,
+and an `NSView` topology canvas. Align all prose and controls to one left
+edge; the lower action row stays fixed while the topology receives remaining
+height. The map has thin measured rectangles, quiet fills, and a single
+connection thread only when the underlying state permits its meaning.
+
+```text
+┌ Control Shift F12 ───────────────────────────────────────────────────┐
+│ Arrange the screens                                                    │
+│ Geometry measured on both computers · layout not saved                 │
+│                                                                        │
+│              ┌──────── Mac ────────┐                                  │
+│              │ 1512 × 982 · 2×     │                                  │
+│              └─────────────────────┘                                  │
+│                         ┌──── Windows 1 ────┬── Windows 2 ──┐          │
+│                         │ 1920 × 1080 ·100% │ 2560×1440·125%│          │
+│                         └───────────────────┴───────────────┘          │
+│                                                                        │
+│ Displays must touch by an edge.                    [Review layout]    │
+└──────────────────────────────────────────────────────────────────────┘
+```
+
+### WinForms: direct desktop control surface
+
+Use a standard `Form`, `ListView`/`DataGridView`, `Button`, `StatusStrip`,
+`ErrorProvider`, and a double-buffered custom `Control` only for the topology
+canvas. Preserve the same vertical hierarchy but use WinForms' familiar action
+alignment and error presentation rather than imitating macOS sheets or
+spacing. The map remains the visual anchor; ordinary state is plain text,
+status strip, and native focus.
+
+```text
++-----------------------------------------------------------------------+
+| Control Shift F12                                                     |
+| Find and confirm another computer on this private network             |
+| [Find nearby computers]                                               |
+|                                                                       |
+| Nearby computers                              Seen        Action     |
+|   Nearby computer 1                           now         [Continue] |
+|                                                                       |
+| Discovery does not confirm who owns a computer.                      |
+| [Cancel]                                                   [Refresh]  |
++-----------------------------------------------------------------------+
+```
+
+### Accessibility, focus, and motion
+
+Both systems expose sentence-case accessible names and help text, visible
+focus, predictable tab order, keyboard equivalents for map cardinal movement,
+and plain error copy. Focus enters the main task, never a hidden diagnostic.
+The focused local SAS confirmation control may expose its grouped code to local
+assistive technology; code/suffix never appears in a title, notification,
+global announcement, history, clipboard, or accessibility cache. Respect
+reduced motion: only an explicit state transition may animate, for 120–180 ms.
+
+### Anti-generic critique
+
+No gradient, web-card grid, pill metric, all-caps eyebrow, ornamental
+monospace label, or repeated soft shadow is admitted. Those patterns would
+make state look like marketing telemetry and obscure the safety difference
+between “nearby”, “confirmed”, “proposal”, and “saved”. The topology is the
+single expressive visual because it represents measured geometry; everything
+else should look like an intentional native control surface.
+
+## Admission sequence
+
+| Gate | Deliverable | Proof before advance | Failure result |
+| --- | --- | --- | --- |
+| G0 | This channel decision in boundary docs and guard | `control --stdio` remains covered; `--ui-stdio` is reserved; no native source tracked | Keep manifests non-shipping. |
+| G1 | Rust-only `control --ui-stdio` entrypoint | Bounded frames, strict direction, stdout closure with stdin held open exits boundedly, no listener/socket/process-spawn authority | Exit/clear; no fallback. |
+| G2 | AppKit and WinForms pipe owners | Per-OS cancellation/join/reap, timeout, stderr redaction, restart, main-thread handoff, no extra inherited/public handles | Failed platform remains disabled. |
+| G3 | Native projection, SAS, state, permissions, recovery, diagnostics | Visual/accessibility plus stale/malformed/terminal adversarial tests on each OS | Render blocked, never optimistic success. |
+| G4 | Discovery/bootstrap and V01 screens | Privacy, candidate replacement, expiry, replay, downgrade, receipt, and bilateral-local-consent proof | Return safely to catalogue. |
+| G5 | Inventory/map draft and review | Measured geometry, canonical draft, cardinal validation, generation invalidation, keyboard tests | Keep proposal local and unsaved. |
+| G6 | Durable layout | Separately reviewed authenticated application-session lifecycle and bilateral durable commit/recovery proof | No map-save control or saved status. |
+| G7 | Sharing and release | Real target permissions, lifecycle, emergency recovery, install/uninstall, resource, and bidirectional physical QA | Input/clipboard stay local/off; preview or hold. |
+
+## Acceptance record
+
+Record PASS, FAIL, or NOT MEASURED for each platform independently: first
+launch/lifecycle; discovery privacy; bootstrap/V01 double confirmation; SAS
+clearing; current device/session/diagnostic truth; accessibility; permission
+and firewall guidance; inventory/map draft; durable map save; and bidirectional
+input/clipboard. A harness green result is not proof of both target systems.
+
+## Open protocol boundaries
+
+1. V01 terminates its sole stream and excludes application payloads. Layout
+   proposal, durable save certificate, zero-CAS evidence, and acknowledgement
+   require a separate authenticated application-session lifecycle before G6.
+2. The bootstrap SAS/receipt transition lacks a frozen interoperability record
+   in this worktree. Its code format, deadline, durable transition, and wire
+   evidence must be fixed before G4 claims conformance.
+3. The guided desktop flow has no manual-address fallback. If a technical flow
+   remains, it must not be reachable as a fallback from the native journey.
+
+## Non-goals
+
+This plan does not implement AppKit, WinForms, `control --ui-stdio`, a pipe
+reader, networking, pairing, layout persistence, sharing, CI, signing,
+publication, or physical QA. It does not lift the non-shipping guard.

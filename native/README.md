@@ -23,15 +23,25 @@ promise. A shipping support matrix requires host builds and platform QA.
 
 ## Boundary that future hosts must implement
 
-The only permitted engine child is launched with this exact argument vector:
+The existing foundations channel remains:
 
 ```text
 [absolute path to seamless-input, "control", "--stdio"]
 ```
 
 Written as a command for documentation only, that is
-`seamless-input control --stdio`; the host must still use an argument array,
-not a shell command.
+`seamless-input control --stdio`. It is not a native-host fallback. The
+reserved native projection channel is:
+
+```text
+[absolute path to seamless-input, "control", "--ui-stdio"]
+```
+
+Written as a command for documentation only, that is
+`seamless-input control --ui-stdio`; the host must still use this exact
+argument vector, not a shell command. This option does not yet exist and no
+host may launch it until a separately reviewed entrypoint and platform tests
+are admitted.
 
 The native host must use its platform's argument-array process API. It must not
 invoke a shell, interpolate a command string, or accept a user-supplied binary
