@@ -33,6 +33,37 @@ public sealed class UiChildSessionTests
     }
 
     [Fact]
+    public void Discovery_response_is_accepted_only_after_a_current_projection()
+    {
+        var session = new UiChildSession();
+
+        session.ReceiveOutput(Frame("""
+        {"v":1,"kind":"ui_snapshot_v1","snapshot":{
+          "schema_version":1,"generation":2,"state":"browsing",
+          "diagnostics":[],"candidates":[],"confirmed":[],"inventory":null,
+          "layout":{"state":"not_configured"},
+          "capabilities":{"input_enabled":false,"clipboard_enabled":false}
+        }}
+        """));
+        session.ReceiveOutput(Frame("""{"v":1,"kind":"ui_response_v1","id":"windows-start-discovery","ok":true}"""));
+
+        Assert.Equal(ChildSessionPhase.Running, session.State.Phase);
+        Assert.Equal("browsing", session.Snapshot!.State);
+        Assert.False(session.Snapshot.InputEnabled);
+        Assert.False(session.Snapshot.ClipboardEnabled);
+    }
+
+    [Fact]
+    public void Unknown_response_id_terminates_the_session()
+    {
+        var session = new UiChildSession();
+
+        session.ReceiveOutput(Frame("""{"v":1,"kind":"ui_response_v1","id":"anything-else","ok":true}"""));
+
+        Assert.Equal(ChildSessionPhase.Terminal, session.State.Phase);
+    }
+
+    [Fact]
     public void Current_snapshot_advances_then_eof_clears_every_projection()
     {
         var session = new UiChildSession();
