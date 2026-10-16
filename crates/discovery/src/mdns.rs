@@ -6,6 +6,45 @@ use std::{
 
 pub const SERVICE_TYPE: &str = "_seamless-input._udp.local.";
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PollBudget {
+    max_events: usize,
+    max_elapsed: Duration,
+}
+
+impl PollBudget {
+    pub fn new(max_events: usize, max_elapsed: Duration) -> Result<Self, String> {
+        if max_events == 0 || max_elapsed.is_zero() {
+            return Err("discovery poll budget must be non-zero".into());
+        }
+        Ok(Self {
+            max_events,
+            max_elapsed,
+        })
+    }
+}
+
+struct PollAllowance {
+    remaining: usize,
+    deadline: Instant,
+}
+
+impl PollAllowance {
+    fn new(budget: PollBudget, started: Instant) -> Self {
+        Self {
+            remaining: budget.max_events,
+            deadline: started.checked_add(budget.max_elapsed).unwrap_or(started),
+        }
+    }
+    fn take(&mut self, now: Instant) -> bool {
+        if self.remaining == 0 || now >= self.deadline {
+            return false;
+        }
+        self.remaining -= 1;
+        true
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Advertisement {
     pub instance: String,
@@ -231,8 +270,18 @@ impl Discovery {
     /// Drain only mDNS events that are already available. This method never
     /// waits for network traffic and is suitable for latency-sensitive loops.
     pub fn poll(&mut self) -> Result<Vec<DiscoveredPeer>, String> {
+        self.poll_with_budget(PollBudget::new(64, Duration::from_millis(2))?)
+    }
+
+    /// Drain ready events within both a count and wall-clock budget so a
+    /// continuously replenished daemon backlog cannot monopolize its caller.
+    pub fn poll_with_budget(&mut self, budget: PollBudget) -> Result<Vec<DiscoveredPeer>, String> {
         let receiver = self.ensure_browser()?;
-        while let Ok(event) = receiver.try_recv() {
+        let mut allowance = PollAllowance::new(budget, Instant::now());
+        while allowance.take(Instant::now()) {
+            let Ok(event) = receiver.try_recv() else {
+                break;
+            };
             self.observe_event(event);
         }
         if receiver.is_disconnected() {
@@ -290,6 +339,22 @@ impl Drop for Discovery {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn polling_allowance_stops_on_count_or_elapsed_budget() {
+        let started = Instant::now();
+        let mut count =
+            PollAllowance::new(PollBudget::new(2, Duration::from_secs(1)).unwrap(), started);
+        assert!(count.take(started));
+        assert!(count.take(started));
+        assert!(!count.take(started));
+
+        let mut elapsed = PollAllowance::new(
+            PollBudget::new(10, Duration::from_millis(1)).unwrap(),
+            started,
+        );
+        assert!(!elapsed.take(started + Duration::from_millis(2)));
+    }
 
     #[test]
     fn browse_rejects_broadcast_and_keeps_valid_unicast_from_resolved_service() {

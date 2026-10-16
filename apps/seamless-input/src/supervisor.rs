@@ -32,6 +32,73 @@ use tokio::{sync::mpsc, task::JoinHandle};
 
 pub const INPUT_SERVICE_INTERVAL: Duration = Duration::from_millis(5);
 const CAPTURE_DRAIN_BUDGET: usize = 64;
+const OUTBOUND_QUEUE_CAPACITY: usize = 256;
+const OUTBOUND_SEND_DEADLINE: Duration = Duration::from_millis(250);
+const DIAL_ATTEMPTS_PER_TICK: usize = 1;
+const DIAL_ATTEMPT_DEADLINE: Duration = Duration::from_millis(250);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OutboundEnqueueError {
+    Full,
+    Closed,
+}
+
+struct OutboundWriter {
+    sender: mpsc::Sender<Vec<u8>>,
+    task: JoinHandle<()>,
+}
+
+impl OutboundWriter {
+    /// Own the only network sender for a peer. The supervisor remains the
+    /// single runtime authority and can only enqueue in FIFO order; a full or
+    /// failed queue is therefore an explicit peer-isolation boundary rather
+    /// than a place where critical transitions can be dropped silently.
+    fn spawn<F, Fut>(
+        capacity: usize,
+        peer: NodeId,
+        failure_tx: mpsc::UnboundedSender<NodeId>,
+        mut deliver: F,
+    ) -> Self
+    where
+        F: FnMut(Vec<u8>) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<(), String>> + Send + 'static,
+    {
+        let (sender, mut receiver) = mpsc::channel(capacity);
+        let task = tokio::spawn(async move {
+            while let Some(packet) = receiver.recv().await {
+                if deliver(packet).await.is_err() {
+                    let _ = failure_tx.send(peer);
+                    break;
+                }
+            }
+        });
+        Self { sender, task }
+    }
+
+    fn try_send(&self, packet: Vec<u8>) -> Result<(), OutboundEnqueueError> {
+        self.sender.try_send(packet).map_err(|error| match error {
+            mpsc::error::TrySendError::Full(_) => OutboundEnqueueError::Full,
+            mpsc::error::TrySendError::Closed(_) => OutboundEnqueueError::Closed,
+        })
+    }
+}
+
+impl Drop for OutboundWriter {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+fn rotating_batch<T: Clone>(items: &[T], cursor: usize, budget: usize) -> (Vec<T>, usize) {
+    if items.is_empty() || budget == 0 {
+        return (Vec::new(), 0);
+    }
+    let count = budget.min(items.len());
+    let batch = (0..count)
+        .map(|offset| items[(cursor + offset) % items.len()].clone())
+        .collect();
+    (batch, (cursor + count) % items.len())
+}
 
 async fn interleave_maintenance<T, E, F, S>(
     maintenance: F,
@@ -250,6 +317,9 @@ pub struct NativeSupervisor {
     links: Vec<PeerLink>,
     sessions: BTreeMap<NodeId, PeerSession>,
     readers: BTreeMap<NodeId, JoinHandle<()>>,
+    writers: BTreeMap<NodeId, OutboundWriter>,
+    outbound_failure_tx: mpsc::UnboundedSender<NodeId>,
+    outbound_failure_rx: mpsc::UnboundedReceiver<NodeId>,
     inbound_tx: mpsc::UnboundedSender<InboundPacket>,
     inbound_rx: mpsc::UnboundedReceiver<InboundPacket>,
     runtime: Runtime,
@@ -257,6 +327,7 @@ pub struct NativeSupervisor {
     admitted: BTreeSet<NodeId>,
     started: Instant,
     last_heartbeat_ms: u64,
+    dial_cursor: usize,
     local_displays: Vec<LogicalDisplay>,
     remote_displays: BTreeMap<NodeId, Vec<RemoteDisplay>>,
     cursor: CursorContinuity,
@@ -306,6 +377,7 @@ impl NativeSupervisor {
             links.push(create_peer_link(&identity, &mut discovery, peer)?);
         }
         let (inbound_tx, inbound_rx) = mpsc::unbounded_channel();
+        let (outbound_failure_tx, outbound_failure_rx) = mpsc::unbounded_channel();
         let capture = NativeCapture::install()
             .map_err(|error| SupervisorError::Capture(error.to_string()))?;
 
@@ -317,6 +389,9 @@ impl NativeSupervisor {
             links,
             sessions: BTreeMap::new(),
             readers: BTreeMap::new(),
+            writers: BTreeMap::new(),
+            outbound_failure_tx,
+            outbound_failure_rx,
             inbound_tx,
             inbound_rx,
             runtime,
@@ -324,6 +399,7 @@ impl NativeSupervisor {
             admitted: BTreeSet::new(),
             started: Instant::now(),
             last_heartbeat_ms: 0,
+            dial_cursor: 0,
             local_displays: displays,
             remote_displays,
             cursor,
@@ -336,6 +412,7 @@ impl NativeSupervisor {
     }
 
     pub async fn tick(&mut self) -> Result<SupervisorStatus, SupervisorError> {
+        self.drain_outbound_failures()?;
         self.refresh_peer_membership().await?;
         if let Ok(Some(config)) = self.live_config.poll() {
             let displays = self.platform.displays()?;
@@ -424,6 +501,7 @@ impl NativeSupervisor {
                 })?;
             self.admitted.insert(session.peer());
             self.sessions.insert(session.peer(), session.clone());
+            self.spawn_writer(session.clone());
             newly_admitted.push(session.peer());
             self.spawn_reader(session);
         }
@@ -473,6 +551,7 @@ impl NativeSupervisor {
     }
 
     pub async fn service_input(&mut self) -> Result<(), SupervisorError> {
+        self.drain_outbound_failures()?;
         let now_ms = self.started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
         self.drain_capture(now_ms, CAPTURE_DRAIN_BUDGET).await?;
         self.capture
@@ -493,6 +572,7 @@ impl NativeSupervisor {
                 link.endpoint.revoke(peer);
             }
             self.sessions.remove(&peer);
+            self.writers.remove(&peer);
             self.admitted.remove(&peer);
             if let Some(task) = self.readers.remove(&peer) {
                 task.abort();
@@ -530,6 +610,7 @@ impl NativeSupervisor {
             .iter()
             .map(|link| (link.peer, Arc::clone(&link.endpoint)))
             .collect::<Vec<_>>();
+        let mut candidates = Vec::new();
         for (peer_id, endpoint) in links {
             if self
                 .sessions
@@ -538,39 +619,89 @@ impl NativeSupervisor {
             {
                 continue;
             }
-            'candidate: for peer in discovered
+            for peer in discovered
                 .iter()
                 .filter(|peer| peer.compatible && !peer.advertisement.pairable)
             {
                 for address in &peer.advertisement.addresses {
-                    let endpoint = Arc::clone(&endpoint);
-                    let address = *address;
-                    let reconnect = async move {
-                        let policy = ReconnectPolicy {
-                            initial_delay: Duration::from_millis(50),
-                            max_delay: Duration::from_millis(50),
-                            max_attempts: 1,
-                        };
-                        tokio::time::timeout(
-                            Duration::from_millis(250),
-                            endpoint.reconnect(
-                                address,
-                                "seamless-input.local",
-                                Some(peer_id),
-                                &policy,
-                            ),
-                        )
-                        .await
-                    };
-                    let attempt =
-                        interleave_maintenance(reconnect, INPUT_SERVICE_INTERVAL, async || {
-                            self.service_input().await
-                        })
-                        .await?;
-                    if let Ok(Ok(_)) = attempt {
-                        break 'candidate;
-                    }
+                    candidates.push((peer_id, Arc::clone(&endpoint), *address));
                 }
+            }
+        }
+        let (batch, next_cursor) =
+            rotating_batch(&candidates, self.dial_cursor, DIAL_ATTEMPTS_PER_TICK);
+        // One bounded dial per supervisor tick prevents the Cartesian product
+        // of links, advertisements and addresses from consuming the runtime's
+        // five-second heartbeat freshness window. Rotation preserves fairness.
+        self.dial_cursor = next_cursor;
+        for (peer_id, endpoint, address) in batch {
+            let reconnect = async move {
+                let policy = ReconnectPolicy {
+                    initial_delay: Duration::from_millis(50),
+                    max_delay: Duration::from_millis(50),
+                    max_attempts: 1,
+                };
+                tokio::time::timeout(
+                    DIAL_ATTEMPT_DEADLINE,
+                    endpoint.reconnect(address, "seamless-input.local", Some(peer_id), &policy),
+                )
+                .await
+            };
+            let attempt = interleave_maintenance(reconnect, INPUT_SERVICE_INTERVAL, async || {
+                self.service_input().await
+            })
+            .await?;
+            let _ = attempt;
+        }
+        Ok(())
+    }
+
+    fn spawn_writer(&mut self, session: PeerSession) {
+        let peer = session.peer();
+        let failure_tx = self.outbound_failure_tx.clone();
+        let writer =
+            OutboundWriter::spawn(OUTBOUND_QUEUE_CAPACITY, peer, failure_tx, move |packet| {
+                let session = session.clone();
+                async move {
+                    tokio::time::timeout(OUTBOUND_SEND_DEADLINE, session.send_packet(&packet))
+                        .await
+                        .map_err(|_| "peer send timed out".to_owned())?
+                        .map_err(|error| error.to_string())
+                }
+            });
+        self.writers.insert(peer, writer);
+    }
+
+    fn drain_outbound_failures(&mut self) -> Result<(), SupervisorError> {
+        let mut failed = BTreeSet::new();
+        while let Ok(peer) = self.outbound_failure_rx.try_recv() {
+            failed.insert(peer);
+        }
+        for peer in failed {
+            self.isolate_peer(peer)?;
+        }
+        Ok(())
+    }
+
+    fn isolate_peer(&mut self, peer: NodeId) -> Result<(), SupervisorError> {
+        self.sessions.remove(&peer);
+        self.writers.remove(&peer);
+        self.admitted.remove(&peer);
+        if let Some(task) = self.readers.remove(&peer) {
+            task.abort();
+        }
+        for recovery in self.runtime.disconnect(peer) {
+            match recovery {
+                RuntimeEffect::ReleaseLocal => self
+                    .platform
+                    .input
+                    .release_all()
+                    .map_err(|e| SupervisorError::DataPlane(e.to_string()))?,
+                RuntimeEffect::WarpLocal { point, .. } => self
+                    .platform
+                    .warp_local(point)
+                    .map_err(SupervisorError::DataPlane)?,
+                RuntimeEffect::Local(_) | RuntimeEffect::Send { .. } => {}
             }
         }
         Ok(())
@@ -775,11 +906,14 @@ impl NativeSupervisor {
                 RuntimeEffect::WarpLocal { point, .. } => self.platform.warp_local(point),
                 RuntimeEffect::Send { peer, message } => {
                     let packet = encode_peer_message(&message);
-                    let result = match (self.sessions.get(&peer), packet) {
-                        (Some(session), Ok(packet)) => session
-                            .send_packet(&packet)
-                            .await
-                            .map_err(|error| error.to_string()),
+                    let result = match (self.writers.get(&peer), packet) {
+                        (Some(writer), Ok(packet)) => writer.try_send(packet).map_err(|error| {
+                            match error {
+                                OutboundEnqueueError::Full => "peer outbound queue is full",
+                                OutboundEnqueueError::Closed => "peer outbound writer is closed",
+                            }
+                            .to_owned()
+                        }),
                         (None, _) => Err("peer session is unavailable".into()),
                         (_, Err(error)) => Err(error),
                     };
@@ -797,25 +931,7 @@ impl NativeSupervisor {
             return Err(SupervisorError::DataPlane(error));
         }
         for peer in failed_peers {
-            self.sessions.remove(&peer);
-            self.admitted.remove(&peer);
-            if let Some(task) = self.readers.remove(&peer) {
-                task.abort();
-            }
-            for recovery in self.runtime.disconnect(peer) {
-                match recovery {
-                    RuntimeEffect::ReleaseLocal => self
-                        .platform
-                        .input
-                        .release_all()
-                        .map_err(|error| SupervisorError::DataPlane(error.to_string()))?,
-                    RuntimeEffect::WarpLocal { point, .. } => self
-                        .platform
-                        .warp_local(point)
-                        .map_err(SupervisorError::DataPlane)?,
-                    RuntimeEffect::Local(_) | RuntimeEffect::Send { .. } => {}
-                }
-            }
+            self.isolate_peer(peer)?;
         }
         Ok(())
     }
@@ -1185,7 +1301,9 @@ impl CaptureBuffer {
 mod capture_buffer_tests {
     use super::{
         CAPTURE_DRAIN_BUDGET, CaptureBuffer, CaptureEnqueueAction, CapturedInput,
-        INPUT_SERVICE_INTERVAL, acknowledge_recovery_after, interleave_maintenance,
+        DIAL_ATTEMPT_DEADLINE, DIAL_ATTEMPTS_PER_TICK, INPUT_SERVICE_INTERVAL,
+        OutboundEnqueueError, OutboundWriter, acknowledge_recovery_after, interleave_maintenance,
+        rotating_batch,
     };
     use seamless_input_protocol::{Button, InputEvent, Modifier};
     use std::{
@@ -1390,6 +1508,91 @@ mod capture_buffer_tests {
             serviced.load(Ordering::SeqCst) >= 6,
             "input service did not interleave with slow maintenance"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pending_network_send_does_not_block_input_heartbeat_or_shutdown() {
+        let (failure_tx, mut failure_rx) = tokio::sync::mpsc::unbounded_channel();
+        let writer = OutboundWriter::spawn(
+            2,
+            seamless_input_core::NodeId([7; 16]),
+            failure_tx,
+            |_| async { std::future::pending::<Result<(), String>>().await },
+        );
+        writer.try_send(vec![1]).unwrap();
+        tokio::task::yield_now().await;
+
+        let mut input = tokio::time::interval(Duration::from_millis(5));
+        let mut heartbeat = tokio::time::interval(Duration::from_millis(10));
+        input.reset();
+        heartbeat.reset();
+        let shutdown = tokio::time::sleep(Duration::from_millis(35));
+        tokio::pin!(shutdown);
+        let mut inputs = 0;
+        let mut heartbeats = 0;
+        loop {
+            tokio::select! {
+                _ = input.tick() => inputs += 1,
+                _ = heartbeat.tick() => heartbeats += 1,
+                _ = &mut shutdown => break,
+            }
+        }
+        assert!(inputs >= 5, "input cadence stalled behind a pending send");
+        assert!(heartbeats >= 2, "heartbeat stalled behind a pending send");
+        assert!(failure_rx.try_recv().is_err());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn outbound_queue_is_fifo_and_backpressure_is_explicit() {
+        let delivered = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed = Arc::clone(&delivered);
+        let (failure_tx, _) = tokio::sync::mpsc::unbounded_channel();
+        let writer = OutboundWriter::spawn(
+            4,
+            seamless_input_core::NodeId([8; 16]),
+            failure_tx,
+            move |packet| {
+                let observed = Arc::clone(&observed);
+                async move {
+                    observed.lock().unwrap().push(packet);
+                    Ok(())
+                }
+            },
+        );
+        for packet in [vec![1], vec![2], vec![3]] {
+            writer.try_send(packet).unwrap();
+        }
+        for _ in 0..20 {
+            if delivered.lock().unwrap().len() == 3 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(*delivered.lock().unwrap(), vec![vec![1], vec![2], vec![3]]);
+
+        let (failure_tx, _) = tokio::sync::mpsc::unbounded_channel();
+        let blocked = OutboundWriter::spawn(
+            1,
+            seamless_input_core::NodeId([9; 16]),
+            failure_tx,
+            |_| async { std::future::pending::<Result<(), String>>().await },
+        );
+        blocked.try_send(vec![1]).unwrap();
+        tokio::task::yield_now().await;
+        blocked.try_send(vec![2]).unwrap();
+        assert_eq!(blocked.try_send(vec![3]), Err(OutboundEnqueueError::Full));
+    }
+
+    #[test]
+    fn dial_batch_is_bounded_and_rotates_across_the_whole_matrix() {
+        let candidates: Vec<_> = (0..128).collect();
+        let (first, cursor) = rotating_batch(&candidates, 0, 1);
+        let (second, cursor) = rotating_batch(&candidates, cursor, 1);
+        assert_eq!(first, vec![0]);
+        assert_eq!(second, vec![1]);
+        assert_eq!(cursor, 2);
+        assert_eq!(DIAL_ATTEMPTS_PER_TICK, 1);
+        assert!(DIAL_ATTEMPT_DEADLINE < Duration::from_secs(5));
     }
 
     #[test]
