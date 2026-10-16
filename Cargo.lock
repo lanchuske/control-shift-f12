@@ -1745,6 +1745,7 @@ dependencies = [
  "seamless-input-protocol",
  "seamless-transport",
  "serde",
+ "serde_json",
  "tempfile",
  "thiserror",
  "tokio",
@@ -1761,6 +1762,7 @@ dependencies = [
  "proptest",
  "seamless-input-protocol",
  "serde",
+ "serde_json",
  "sha2",
 ]
 
@@ -1812,6 +1814,7 @@ dependencies = [
  "base64 0.22.1",
  "bip39",
  "hmac",
+ "libc",
  "quinn",
  "rand 0.8.8",
  "rcgen",

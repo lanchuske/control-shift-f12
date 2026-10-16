@@ -8,6 +8,7 @@
 
 pub mod clipboard;
 pub mod control;
+pub mod display_inventory;
 pub mod platform;
 pub mod topology;
 pub use control::{Action, ControlError, Controller};

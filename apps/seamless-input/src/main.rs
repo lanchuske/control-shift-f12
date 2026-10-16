@@ -31,6 +31,11 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
+    /// Internal setup foundations; input, clipboard and pairing remain disabled.
+    Control {
+        #[arg(long, required = true)]
+        stdio: bool,
+    },
     /// Start this machine as a Control Shift F12 peer.
     Start,
     /// Report the currently running peer and authenticated session count.
@@ -113,6 +118,12 @@ impl<E: std::error::Error> From<E> for OperationalError {
 async fn run(cli: Cli) -> Result<(), OperationalError> {
     let paths = AppPaths::discover()?;
     match cli.command {
+        Commands::Control { stdio: _ } => {
+            let _instance =
+                seamless_transport::setup_lock::SetupInstanceLock::acquire(&paths.root)?;
+            seamless_input::control_engine::run_stdio(io::stdin().lock(), io::stdout().lock())?;
+            Ok(())
+        }
         Commands::Start => start(&paths).await,
         Commands::Status(args) => status(&paths, args),
         Commands::Pair(args) => pair(&paths, &args.code, args.address.as_deref()).await,
