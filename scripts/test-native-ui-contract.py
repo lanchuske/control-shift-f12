@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Static boundary checks for the admitted macOS diagnostics host.
+"""Static boundary checks for admitted non-shipping diagnostics contracts.
 
-The checks admit one reviewable AppKit source tree and its XCTest target. They
-do not admit Windows source, bundles, build output, a network endpoint, or any
-host capability beyond the fixed local child projection pipe.
+The checks admit one reviewable AppKit source tree and a Windows-only parser
+plus tests. They do not admit a Windows host, bundles, build output, a network
+endpoint, or any host capability beyond the fixed local child projection pipe.
 """
 
 from pathlib import Path
@@ -34,6 +34,14 @@ ADMITTED_MACOS_HOST_PATHS = frozenset(
     {
         "native/macos/ControlShiftF12App/Sources/ControlShiftF12App/main.swift",
         "native/macos/ControlShiftF12App/Tests/ControlShiftF12AppTests/ControlShiftF12AppTests.swift",
+    }
+)
+ADMITTED_WINDOWS_CONTRACT_PATHS = frozenset(
+    {
+        "native/windows/ControlShiftF12App.Core/ControlShiftF12App.Core.csproj",
+        "native/windows/ControlShiftF12App.Core/DiagnosticsProjection.cs",
+        "native/windows/ControlShiftF12App.Tests/ControlShiftF12App.Tests.csproj",
+        "native/windows/ControlShiftF12App.Tests/WindowsDiagnosticsProjectionTests.cs",
     }
 )
 HOST_SOURCE_SUFFIXES = (".swift", ".cs", ".m", ".mm", ".h")
@@ -70,8 +78,12 @@ SAS_HOST_REQUEST_RESERVED_FIELDS = frozenset(
 
 
 def is_nonshipping_native_path(path):
-    """Only the reviewed macOS diagnostics host may extend declarations."""
-    return path in NONSHIPPING_NATIVE_PATHS | ADMITTED_MACOS_HOST_PATHS
+    """Only reviewed diagnostics contracts may extend native declarations."""
+    return path in (
+        NONSHIPPING_NATIVE_PATHS
+        | ADMITTED_MACOS_HOST_PATHS
+        | ADMITTED_WINDOWS_CONTRACT_PATHS
+    )
 
 
 def is_blocked_native_artifact(path):
@@ -83,7 +95,7 @@ def is_blocked_native_artifact(path):
     if (
         path.endswith(HOST_SOURCE_SUFFIXES)
         and not path.endswith("Package.swift")
-        and path not in ADMITTED_MACOS_HOST_PATHS
+        and not is_nonshipping_native_path(path)
     ):
         return True
     return path.endswith(BUILD_OUTPUT_SUFFIXES)
@@ -186,15 +198,20 @@ def host_request_contains_sas(request):
 
 
 class NativeHostBoundaryTests(unittest.TestCase):
-    def test_native_tree_has_only_reviewed_manifests_docs_and_macos_diagnostics_host(self):
+    def test_native_tree_has_only_reviewed_manifests_docs_and_diagnostics_contracts(self):
         tracked = tracked_native_paths()
-        unexpected = sorted(tracked - (NONSHIPPING_NATIVE_PATHS | ADMITTED_MACOS_HOST_PATHS))
+        admitted = (
+            NONSHIPPING_NATIVE_PATHS
+            | ADMITTED_MACOS_HOST_PATHS
+            | ADMITTED_WINDOWS_CONTRACT_PATHS
+        )
+        unexpected = sorted(tracked - admitted)
         self.assertEqual(
             unexpected,
             [],
-            "only the approved macOS diagnostics host may be tracked",
+            "only approved diagnostics contracts may be tracked",
         )
-        self.assertEqual(tracked, NONSHIPPING_NATIVE_PATHS | ADMITTED_MACOS_HOST_PATHS)
+        self.assertEqual(tracked, admitted)
         blocked = sorted(path for path in tracked if is_blocked_native_artifact(path))
         self.assertEqual(blocked, [], "tracked host source or build output is forbidden")
 
@@ -211,6 +228,22 @@ class NativeHostBoundaryTests(unittest.TestCase):
         for path in prohibited:
             self.assertFalse(is_nonshipping_native_path(path), path)
             self.assertTrue(is_blocked_native_artifact(path), path)
+
+    def test_windows_contract_is_parser_and_tests_only(self):
+        parser = (ROOT / "native/windows/ControlShiftF12App.Core/DiagnosticsProjection.cs").read_text()
+        tests = (ROOT / "native/windows/ControlShiftF12App.Tests/WindowsDiagnosticsProjectionTests.cs").read_text()
+        for required in ("Encoding.UTF8.GetByteCount", "TryGetUInt64", "EnumerateObject"):
+            self.assertIn(required, parser)
+        for forbidden in (
+            "ProcessStartInfo", "Process.Start", "System.Net", "Pipe", "Socket",
+            "ui.confirm", "ui.refresh", "Windows.Forms",
+        ):
+            self.assertNotIn(forbidden, parser, forbidden)
+        for expected in (
+            "Duplicate_frame_field_is_rejected", "Frame_larger_than_the_engine_limit",
+            "Negative_generation_is_rejected",
+        ):
+            self.assertIn(expected, tests)
 
     def test_macos_diagnostics_host_is_structurally_limited_to_the_fixed_child_pipe(self):
         """The sole admitted host cannot grow a shell, listener, or control surface."""

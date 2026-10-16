@@ -4,6 +4,7 @@ namespace ControlShiftF12App.Core;
 
 public sealed record DiagnosticsProjection(ulong Generation, IReadOnlyList<DiagnosticRow> Rows)
 {
+    private const int MaxFrameBytes = 256 * 1024;
     private static readonly HashSet<string> FrameProperties = ["v", "kind", "generation", "rows"];
     private static readonly HashSet<string> RowProperties = ["id", "label", "state", "detail", "action", "failure_code"];
     private static readonly HashSet<string> DiagnosticIds = ["runtime", "input", "clipboard", "displays", "relationship", "session", "layout", "policy"];
@@ -18,6 +19,7 @@ public sealed record DiagnosticsProjection(ulong Generation, IReadOnlyList<Diagn
     public static bool TryParse(string json, out DiagnosticsProjection? projection)
     {
         projection = null;
+        if (System.Text.Encoding.UTF8.GetByteCount(json) > MaxFrameBytes) return false;
         try
         {
             using var document = JsonDocument.Parse(json);
@@ -68,8 +70,15 @@ public sealed record DiagnosticsProjection(ulong Generation, IReadOnlyList<Diagn
         return true;
     }
 
-    private static bool HasExactly(JsonElement value, HashSet<string> expected) =>
-        value.EnumerateObject().Select(property => property.Name).ToHashSet().SetEquals(expected);
+    private static bool HasExactly(JsonElement value, HashSet<string> expected)
+    {
+        var seen = new HashSet<string>();
+        foreach (var property in value.EnumerateObject())
+        {
+            if (!expected.Contains(property.Name) || !seen.Add(property.Name)) return false;
+        }
+        return seen.SetEquals(expected);
+    }
 
     private static bool HasString(JsonElement value, string name, string expected) =>
         value.TryGetProperty(name, out var child) && child.ValueKind == JsonValueKind.String && child.GetString() == expected;

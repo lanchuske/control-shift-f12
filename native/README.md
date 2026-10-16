@@ -2,12 +2,12 @@
 
 ## Status
 
-This directory records non-shipping host admission material. It admits exactly
-one reviewable macOS AppKit **diagnostics projection** source and its XCTest
-target. It does not contain a product bundle or build output, a Windows host,
-a socket, pairing path, display map, or sharing controls. The Rust executable
-remains the only owner of runtime, pairing, operational-session, inventory,
-layout, input and clipboard state.
+This directory records non-shipping host admission material. It admits one
+reviewable macOS AppKit **diagnostics projection** source and its XCTest target,
+plus a Windows-only diagnostics parser and its tests. It does not contain a
+product bundle or build output, a Windows host, a socket, pairing path, display
+map, or sharing controls. The Rust executable remains the only owner of runtime,
+pairing, operational-session, inventory, layout, input and clipboard state.
 
 The detailed parent/child boundary is
 [the architecture record](../docs/architecture/native-host-boundary.md).
@@ -17,7 +17,7 @@ The detailed parent/child boundary is
 | Host | Required build environment | Current evidence | Decision when unavailable |
 | --- | --- | --- | --- |
 | macOS AppKit | macOS 27.0.1 with Xcode 27.0 (build 27A266a), capable of evaluating the Swift 5.9 package manifest | Verified on the local planning Mac on 2026-10-16; no host was built or launched | Block the native-host build. Do not substitute a terminal, web, or CLI surface. |
-| Windows WinForms | .NET 8 WindowsDesktop SDK (`net8.0-windows`), MSVC Build Tools, and a matching Windows SDK for the Rust engine | **Not verified.** No Windows host/toolchain probe or build has been performed. | Block the native-host build. Do not substitute a terminal, web, or CLI surface. |
+| Windows WinForms | .NET 8 WindowsDesktop SDK (`net8.0-windows`), MSVC Build Tools, and a matching Windows SDK for the Rust engine | Rust engine contracts and the Windows diagnostics parser were built and tested on the target Windows machine on 2026-10-16; no WinForms host has been built or launched. | Block the native-host build until its pipe owner and target tests are admitted. Do not substitute a terminal, web, or CLI surface. |
 
 The macOS observation is a development-host fact, not a released compatibility
 promise. A shipping support matrix requires host builds and platform QA.
@@ -78,7 +78,9 @@ licenses leaving a child process running.
 
 ## Deliberate non-goals in this change
 
-- No Windows host source has been added.
+- No Windows host source has been added; the admitted Windows source is only a
+  pure diagnostics parser plus its tests, with no process, pipe, network, or UI
+  capability.
 - No host product has been launched, signed, installed, or shipped.
 - No local or remote network endpoint has been added.
 - No pairing, SAS, inventory, topology, input, clipboard, runtime capability,
