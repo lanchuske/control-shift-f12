@@ -159,7 +159,7 @@ mod native {
         snapshot_count: AtomicU64,
     }
 
-    struct NativePasteboardChangeToken(objc2::rc::Retained<NSPasteboard>);
+    pub(crate) struct NativePasteboardChangeToken(pub(crate) objc2::rc::Retained<NSPasteboard>);
 
     impl PasteboardChangeToken for NativePasteboardChangeToken {
         fn current(&self) -> Result<u64, ClipboardError> {
@@ -280,6 +280,8 @@ mod native {
     }
 }
 
+#[cfg(all(test, target_os = "macos"))]
+use native::NativePasteboardChangeToken;
 #[cfg(target_os = "macos")]
 pub use native::PasteboardBackend;
 
@@ -299,7 +301,12 @@ impl Default for MacClipboard {
 
 #[cfg(all(test, target_os = "macos"))]
 mod native_change_token_tests {
-    use super::{ClipboardBackend, ClipboardError, PasteboardBackend, PasteboardChangeToken};
+    use super::{
+        ClipboardBackend, ClipboardError, NativePasteboardChangeToken, PasteboardBackend,
+        PasteboardChangeToken,
+    };
+    use objc2_app_kit::{NSPasteboard, NSPasteboardTypeString};
+    use objc2_foundation::NSString;
     use std::{cell::RefCell, collections::VecDeque, rc::Rc};
 
     type TokenExpectations = Rc<RefCell<VecDeque<Result<u64, ClipboardError>>>>;
@@ -348,5 +355,28 @@ mod native_change_token_tests {
         assert_eq!(backend.change_count(), Ok(8));
         assert_eq!(backend.change_count(), Err(ClipboardError::Backend));
         assert!(expected.borrow().is_empty());
+    }
+
+    #[test]
+    fn native_unique_pasteboard_reports_real_change_count_increments_without_snapshots() {
+        let pasteboard = NSPasteboard::pasteboardWithUniqueName();
+        let backend = PasteboardBackend::with_change_token_for_test(NativePasteboardChangeToken(
+            pasteboard.clone(),
+        ));
+        let initial = backend.change_count().unwrap();
+        assert_eq!(initial, pasteboard.changeCount().max(0) as u64);
+
+        pasteboard.clearContents();
+        let cleared = backend.change_count().unwrap();
+        assert!(cleared > initial);
+
+        let value = NSString::from_str("control-shift-f12-change-token-test");
+        assert!(pasteboard.setString_forType(&value, unsafe { NSPasteboardTypeString }));
+        let written = backend.change_count().unwrap();
+        assert!(written >= cleared);
+        pasteboard.clearContents();
+        let cleared_again = backend.change_count().unwrap();
+        assert!(cleared_again > written);
+        assert_eq!(backend.snapshot_count_for_test(), 0);
     }
 }

@@ -1774,6 +1774,7 @@ dependencies = [
  "image",
  "objc2",
  "objc2-app-kit",
+ "objc2-foundation",
  "seamless-input-core",
  "seamless-input-protocol",
  "sha2",

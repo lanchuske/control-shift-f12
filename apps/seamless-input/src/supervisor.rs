@@ -1006,8 +1006,7 @@ enum CaptureEnqueueAction {
 
 struct CaptureBufferState {
     emergency: bool,
-    critical: VecDeque<CapturedInput>,
-    pointer: Option<CapturedInput>,
+    ordered: VecDeque<CapturedInput>,
 }
 
 #[derive(Clone)]
@@ -1023,8 +1022,7 @@ impl CaptureBuffer {
             capacity,
             state: Arc::new(Mutex::new(CaptureBufferState {
                 emergency: false,
-                critical: VecDeque::with_capacity(capacity),
-                pointer: None,
+                ordered: VecDeque::with_capacity(capacity),
             })),
         }
     }
@@ -1035,25 +1033,30 @@ impl CaptureBuffer {
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
         if captured.emergency {
-            state.critical.clear();
-            state.pointer = None;
+            state.ordered.clear();
             state.emergency = true;
             return CaptureEnqueueAction::RecoverLocal;
         }
-        if matches!(
+        let pointer = matches!(
             captured.event,
             Some(seamless_input_protocol::InputEvent::Pointer { .. })
-        ) {
-            state.pointer = Some(captured);
+        );
+        if pointer
+            && let Some(last) = state.ordered.back_mut()
+            && matches!(
+                last.event,
+                Some(seamless_input_protocol::InputEvent::Pointer { .. })
+            )
+        {
+            *last = captured;
             return CaptureEnqueueAction::Continue;
         }
-        if state.critical.len() == self.capacity {
-            state.critical.clear();
-            state.pointer = None;
+        if state.ordered.len() == self.capacity {
+            state.ordered.clear();
             state.emergency = true;
             return CaptureEnqueueAction::RecoverLocal;
         }
-        state.critical.push_back(captured);
+        state.ordered.push_back(captured);
         CaptureEnqueueAction::Continue
     }
 
@@ -1065,7 +1068,7 @@ impl CaptureBuffer {
             .state
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
-        let mut drained = Vec::with_capacity(budget.min(state.critical.len() + 1));
+        let mut drained = Vec::with_capacity(budget.min(state.ordered.len() + 1));
         if std::mem::take(&mut state.emergency) {
             drained.push(CapturedInput {
                 event: None,
@@ -1074,15 +1077,10 @@ impl CaptureBuffer {
             return drained;
         }
         while drained.len() < budget {
-            let Some(captured) = state.critical.pop_front() else {
+            let Some(captured) = state.ordered.pop_front() else {
                 break;
             };
             drained.push(captured);
-        }
-        if drained.len() < budget
-            && let Some(pointer) = state.pointer.take()
-        {
-            drained.push(pointer);
         }
         drained
     }
@@ -1126,6 +1124,54 @@ mod capture_buffer_tests {
             })
         );
         assert!(queue.drain(1).is_empty());
+    }
+
+    #[test]
+    fn critical_transition_is_a_barrier_after_pointer_motion() {
+        let queue = CaptureBuffer::new(4);
+        let pointer = InputEvent::Pointer { x: 10.0, y: 20.0 };
+        let down = InputEvent::Button {
+            button: Button::Left,
+            pressed: true,
+        };
+        queue.push(captured(pointer.clone()));
+        queue.push(captured(down.clone()));
+
+        assert_eq!(
+            queue
+                .drain(4)
+                .into_iter()
+                .map(|captured| captured.event.unwrap())
+                .collect::<Vec<_>>(),
+            vec![pointer, down]
+        );
+    }
+
+    #[test]
+    fn pointers_coalesce_only_inside_segments_between_critical_transitions() {
+        let queue = CaptureBuffer::new(8);
+        let first = InputEvent::Pointer { x: 10.0, y: 20.0 };
+        let down = InputEvent::Button {
+            button: Button::Left,
+            pressed: true,
+        };
+        let second = InputEvent::Pointer { x: 30.0, y: 40.0 };
+        let up = InputEvent::Button {
+            button: Button::Left,
+            pressed: false,
+        };
+        for event in [first.clone(), down.clone(), second.clone(), up.clone()] {
+            queue.push(captured(event));
+        }
+
+        assert_eq!(
+            queue
+                .drain(8)
+                .into_iter()
+                .map(|captured| captured.event.unwrap())
+                .collect::<Vec<_>>(),
+            vec![first, down, second, up]
+        );
     }
 
     #[test]
