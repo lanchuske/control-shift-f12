@@ -1,5 +1,10 @@
+#nullable enable
+
 using System;
 using System.Drawing;
+using System.IO;
+using System.Linq;
+using System.Threading.Tasks;
 using System.Windows.Forms;
 using ControlShiftF12App.Core;
 
@@ -12,6 +17,9 @@ namespace ControlShiftF12App;
 internal sealed class DesktopShellForm : Form
 {
     private static readonly Color Accent = Color.FromArgb(0, 103, 192);
+    private WindowsUiChildOwner? childOwner;
+    private Button? findNearbyButton;
+    private Label? engineStatus;
 
     public DesktopShellForm()
     {
@@ -44,9 +52,10 @@ internal sealed class DesktopShellForm : Form
         root.Controls.Add(BuildFooter(presentation), 0, 2);
         root.SetColumnSpan(root.GetControlFromPosition(0, 2)!, 2);
         Controls.Add(root);
+        Shown += async (_, _) => await ConnectLocalEngineAsync();
     }
 
-    private static Control BuildHeader(DesktopShellPresentation presentation)
+    private Control BuildHeader(DesktopShellPresentation presentation)
     {
         var panel = new Panel { Dock = DockStyle.Fill, Height = 94, Margin = new Padding(0, 0, 0, 24) };
         panel.Controls.Add(new Label
@@ -63,17 +72,18 @@ internal sealed class DesktopShellForm : Form
             AutoSize = true,
             Location = new Point(2, 43),
         });
-        panel.Controls.Add(new Label
+        engineStatus = new Label
         {
             Text = "Connection health: Not connected",
             ForeColor = Color.FromArgb(122, 79, 0),
             AutoSize = true,
             Location = new Point(2, 68),
-        });
+        };
+        panel.Controls.Add(engineStatus);
         return panel;
     }
 
-    private static Control BuildSetupPanel(DesktopShellPresentation presentation)
+    private Control BuildSetupPanel(DesktopShellPresentation presentation)
     {
         var group = CreateGroup("1. Pair computers");
         var content = new FlowLayoutPanel
@@ -98,7 +108,9 @@ internal sealed class DesktopShellForm : Form
             ForeColor = Color.DimGray,
             Margin = new Padding(0, 0, 0, 16),
         });
-        content.Controls.Add(CreateDisabledButton("Find nearby computers"));
+        findNearbyButton = CreateDisabledButton("Find nearby computers");
+        findNearbyButton.Click += async (_, _) => await StartLocalDiscoveryAsync();
+        content.Controls.Add(findNearbyButton);
         content.Controls.Add(CreateDisabledButton("Confirm code on both computers"));
         content.Controls.Add(new Label
         {
@@ -219,4 +231,82 @@ internal sealed class DesktopShellForm : Form
         AutoSize = true,
         Margin = new Padding(0, 0, 24, 0),
     };
+
+    private async Task ConnectLocalEngineAsync()
+    {
+        var packageRoot = AppContext.BaseDirectory;
+        var enginePath = Path.Combine(packageRoot, "Resources", "seamless-input.exe");
+        if (!File.Exists(enginePath))
+        {
+            SetEngineStatus("Local engine unavailable — pairing is safely disabled.", Color.FromArgb(122, 79, 0));
+            return;
+        }
+
+        try
+        {
+            var environment = Environment.GetEnvironmentVariables()
+                .Keys.Cast<object>()
+                .ToDictionary(key => key.ToString()!, key => Environment.GetEnvironmentVariable(key.ToString()!));
+            var spec = ChildLaunchSpec.Create(packageRoot, enginePath, environment);
+            childOwner = await WindowsUiChildOwner.StartAsync(spec);
+            var session = await childOwner.ReadInitialProjectionAsync(TimeSpan.FromSeconds(3));
+            if (session.State.Phase != ChildSessionPhase.Running || session.Snapshot is null)
+            {
+                await childOwner.DisposeAsync();
+                childOwner = null;
+                SetEngineStatus("Local engine did not provide a valid state — pairing is disabled.", Color.Firebrick);
+                return;
+            }
+
+            findNearbyButton!.Enabled = session.Snapshot.State == "not_started";
+            SetEngineStatus("Local engine ready — no computers paired.", Color.FromArgb(0, 103, 80));
+        }
+        catch (Exception)
+        {
+            if (childOwner is not null)
+            {
+                await childOwner.DisposeAsync();
+                childOwner = null;
+            }
+            SetEngineStatus("Local engine could not start — pairing is disabled.", Color.Firebrick);
+        }
+    }
+
+    private async Task StartLocalDiscoveryAsync()
+    {
+        if (childOwner is null || findNearbyButton is null) return;
+
+        findNearbyButton.Enabled = false;
+        try
+        {
+            var session = await childOwner.StartDiscoveryAsync(TimeSpan.FromSeconds(3));
+            if (session.Snapshot is { State: "browsing" } snapshot)
+            {
+                SetEngineStatus(snapshot.Nearby.Count == 0
+                    ? "Looking for nearby computers — none found yet."
+                    : "Nearby computers found — confirm the same code on both computers.", Color.FromArgb(0, 103, 80));
+                return;
+            }
+        }
+        catch (Exception)
+        {
+            // The safe fallback below intentionally exposes no technical child detail.
+        }
+
+        SetEngineStatus("Discovery stopped safely — try again after the local engine is ready.", Color.Firebrick);
+    }
+
+    private void SetEngineStatus(string text, Color color)
+    {
+        if (engineStatus is null) return;
+        engineStatus.Text = text;
+        engineStatus.ForeColor = color;
+    }
+
+    protected override void OnFormClosed(FormClosedEventArgs e)
+    {
+        childOwner?.DisposeAsync().AsTask().GetAwaiter().GetResult();
+        childOwner = null;
+        base.OnFormClosed(e);
+    }
 }
