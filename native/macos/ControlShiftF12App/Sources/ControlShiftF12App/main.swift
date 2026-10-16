@@ -62,6 +62,28 @@ struct MacDesktopShellPresentation: Equatable {
         automaticUpdatesEnabled: false,
         saveLayoutEnabled: false
     )
+
+    static let readyToDiscover = Self(
+        title: "Set up another computer",
+        connectionStatus: "Not connected",
+        findNearbyEnabled: true,
+        confirmCodeEnabled: false,
+        inputSharingEnabled: false,
+        clipboardSharingEnabled: false,
+        automaticUpdatesEnabled: false,
+        saveLayoutEnabled: false
+    )
+
+    static let browsing = Self(
+        title: "Looking for nearby computers",
+        connectionStatus: "Not connected",
+        findNearbyEnabled: false,
+        confirmCodeEnabled: false,
+        inputSharingEnabled: false,
+        clipboardSharingEnabled: false,
+        automaticUpdatesEnabled: false,
+        saveLayoutEnabled: false
+    )
 }
 
 struct DiagnosticSourceRow: Equatable {
@@ -139,6 +161,7 @@ private struct SnapshotGeneration: Decodable {
 /// on the AppKit main thread after a complete frame has been decoded.
 final class DiagnosticsFrameController {
     private(set) var presentation = DiagnosticsPresentation(runtime: .unknown, rows: [])
+    private(set) var shell = MacDesktopShellPresentation.initial
     private var highestGeneration: UInt64 = 0
     private var isClosed = false
 
@@ -175,6 +198,7 @@ final class DiagnosticsFrameController {
     func invalidate() {
         isClosed = true
         presentation = DiagnosticsPresentation(runtime: .unknown, rows: [], refreshEnabled: false)
+        shell = .initial
     }
 
     private func completePayload(from frame: Data) throws -> Data {
@@ -222,7 +246,7 @@ final class DiagnosticsFrameController {
               let schemaVersion = snapshot["schema_version"] as? Int,
               schemaVersion == 1,
               let state = snapshot["state"] as? String,
-              state == "not_started",
+              ["not_started", "browsing"].contains(state),
               let diagnostics = snapshot["diagnostics"] as? [Any], diagnostics.isEmpty,
               let candidates = snapshot["candidates"] as? [Any], candidates.isEmpty,
               let confirmed = snapshot["confirmed"] as? [Any], confirmed.isEmpty,
@@ -235,6 +259,7 @@ final class DiagnosticsFrameController {
               capabilities["input_enabled"] as? Bool == false,
               capabilities["clipboard_enabled"] as? Bool == false
         else { throw HostError.invalidFrame }
+        shell = state == "not_started" ? .readyToDiscover : .browsing
     }
 
     private func validateIgnoredSuccessResponse(_ object: [String: Any]) throws {
@@ -242,7 +267,7 @@ final class DiagnosticsFrameController {
               let version = object["v"] as? Int,
               version == 1,
               let id = object["id"] as? String,
-              id == "mac-refresh",
+              ["mac-refresh", "mac-start-discovery"].contains(id),
               let ok = object["ok"] as? Bool,
               ok
         else { throw HostError.invalidFrame }
@@ -276,6 +301,7 @@ private func bigEndianLength(_ bytes: Data.SubSequence) -> UInt32 {
 
 protocol ChildLifecycleChild: AnyObject {
     func sendRefresh() throws
+    func sendStartDiscovery() throws
     func closeInput()
     func closeOutput()
     func closeError()
@@ -305,6 +331,11 @@ final class ChildLifecycle {
     func refresh() {
         guard !isClosed else { return }
         try? child.sendRefresh()
+    }
+
+    func startDiscovery() {
+        guard !isClosed else { return }
+        try? child.sendStartDiscovery()
     }
 
     func close() {
@@ -404,10 +435,18 @@ final class BundledChild: ChildLifecycleChild {
     }
 
     func sendRefresh() throws {
+        try sendFixedRequest(id: "mac-refresh", command: "ui.refresh")
+    }
+
+    func sendStartDiscovery() throws {
+        try sendFixedRequest(id: "mac-start-discovery", command: "ui.start_discovery")
+    }
+
+    private func sendFixedRequest(id: String, command: String) throws {
         let request: [String: Any] = [
             "v": 1,
-            "id": "mac-refresh",
-            "command": "ui.refresh",
+            "id": id,
+            "command": command,
             "args": [:],
         ]
         let payload = try JSONSerialization.data(withJSONObject: request)
@@ -478,6 +517,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     private let statusLabel = NSTextField(labelWithString: "Not running")
     private let table = NSTableView()
     private let refreshButton = NSButton(title: "Refresh", target: nil, action: nil)
+    private weak var journeyHeading: NSTextField?
+    private weak var journeyStatus: NSTextField?
+    private weak var pairingButton: NSButton?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         let window = NSWindow(
@@ -549,17 +591,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         lifecycle?.refresh()
     }
 
+    @objc private func startDiscovery() {
+        guard diagnostics.shell.findNearbyEnabled else { return }
+        lifecycle?.startDiscovery()
+    }
+
+    private func updateJourney() {
+        let shell = diagnostics.shell
+        journeyHeading?.stringValue = shell.title
+        journeyStatus?.stringValue = shell.connectionStatus
+        pairingButton?.isEnabled = shell.findNearbyEnabled
+    }
+
     private func desktopJourneyView() -> NSView {
         let presentation = MacDesktopShellPresentation.initial
         let heading = NSTextField(labelWithString: presentation.title)
         heading.font = .systemFont(ofSize: 15, weight: .semibold)
+        journeyHeading = heading
 
         let status = NSTextField(labelWithString: presentation.connectionStatus)
         status.textColor = .secondaryLabelColor
+        journeyStatus = status
 
-        let pairing = NSButton(title: "Find nearby computers", target: nil, action: nil)
+        let pairing = NSButton(title: "Find nearby computers", target: self, action: #selector(startDiscovery))
         pairing.isEnabled = presentation.findNearbyEnabled
         pairing.setAccessibilityLabel("Find nearby computers")
+        pairingButton = pairing
 
         let confirm = NSButton(title: "Confirm code on both computers", target: nil, action: nil)
         confirm.isEnabled = presentation.confirmCodeEnabled
@@ -605,6 +662,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
                 try? session.receive(event)
                 self.statusLabel.stringValue = self.diagnostics.presentation.statusText
                 self.refreshButton.isEnabled = self.diagnostics.presentation.refreshEnabled
+                self.updateJourney()
                 self.table.reloadData()
             }
         }

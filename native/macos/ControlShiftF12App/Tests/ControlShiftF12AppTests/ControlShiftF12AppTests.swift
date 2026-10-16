@@ -15,6 +15,51 @@ final class ControlShiftF12AppTests: XCTestCase {
         XCTAssertFalse(shell.saveLayoutEnabled)
     }
 
+    func testInitial_snapshot_enables_only_the_local_discovery_gesture() throws {
+        let controller = DiagnosticsFrameController()
+        let snapshot = """
+        {"v":1,"kind":"ui_snapshot_v1","snapshot":{
+          "schema_version":1,"generation":1,"state":"not_started",
+          "candidates":[],"confirmed":[],"inventory":null,
+          "layout":{"state":"not_configured"},
+          "capabilities":{"input_enabled":false,"clipboard_enabled":false},
+          "diagnostics":[]
+        }}
+        """.data(using: .utf8)!
+
+        try controller.consume(lengthPrefixed: frame(snapshot))
+
+        XCTAssertTrue(controller.shell.findNearbyEnabled)
+        XCTAssertFalse(controller.shell.confirmCodeEnabled)
+        XCTAssertFalse(controller.shell.inputSharingEnabled)
+        XCTAssertFalse(controller.shell.clipboardSharingEnabled)
+        XCTAssertFalse(controller.shell.saveLayoutEnabled)
+    }
+
+    func testStartDiscoverySendsOnlyTheDedicatedTypedRequestWhileOpen() {
+        let child = RecordingChild()
+        let lifecycle = ChildLifecycle(child: child)
+
+        lifecycle.startDiscovery()
+        lifecycle.close()
+        lifecycle.startDiscovery()
+
+        XCTAssertEqual(child.startDiscoveryCalls, 1)
+    }
+
+    func testStartDiscoveryAcknowledgementIsAcceptedWithoutEnablingSharing() throws {
+        let child = RecordingChild()
+        let session = DiagnosticsSession(lifecycle: ChildLifecycle(child: child))
+        let response = """
+        {"v":1,"kind":"ui_response_v1","id":"mac-start-discovery","ok":true}
+        """.data(using: .utf8)!
+
+        try session.receive(.data(frame(response)))
+
+        XCTAssertFalse(session.isTerminal)
+        XCTAssertEqual(child.terminateCalls, 0)
+    }
+
     func testStaleOrUnknownRuntimeProjectsNotRunningAndDisablesActions() {
         for runtime in [RuntimeStatus.stale, .unknown] {
             let presentation = DiagnosticsPresentation(
@@ -249,8 +294,10 @@ private class RecordingChild: ChildLifecycleChild {
     var reaped = false
     var terminateCalls = 0
     var reapCalls = 0
+    var startDiscoveryCalls = 0
 
     func sendRefresh() throws {}
+    func sendStartDiscovery() throws { startDiscoveryCalls += 1 }
     func closeInput() { inputClosed = true }
     func closeOutput() { outputClosed = true }
     func closeError() { errorClosed = true }
