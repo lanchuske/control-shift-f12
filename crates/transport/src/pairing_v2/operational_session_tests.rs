@@ -1,7 +1,8 @@
 use super::admission_authority::AdmissionAuthorityStore;
 use super::operational_session::{
-    AuthorityView, OperationalEndpoint, OperationalRecord, RecordType, Role,
-    derive_and_verify_confirmation_key, validate_v01_schedule,
+    AttemptGuard, AuthorityView, ExtraStreamMonitor, OperationalEndpoint, OperationalRecord,
+    RecordType, Role, derive_and_verify_confirmation_key, validate_confirmation,
+    validate_v01_schedule,
 };
 use rustls::pki_types::PrivatePkcs8KeyDer;
 use sha2::{Digest, Sha256};
@@ -181,6 +182,57 @@ fn fixture_exporter_derives_the_only_key_that_accepts_both_confirms() {
     let mut changed_exporter = exporter;
     changed_exporter[0] ^= 1;
     assert!(derive_and_verify_confirmation_key(&records, changed_exporter).is_err());
+}
+
+#[test]
+fn confirm_a_hmac_mutation_is_rejected_before_confirm_b_can_be_constructed() {
+    let key = [17; 32];
+    let attempt = [18; 32];
+    let session = [19; 16];
+    let prior = [20; 32];
+    let authentic =
+        super::operational_session::confirmation(&key, Role::A, attempt, session, prior).unwrap();
+    assert!(validate_confirmation(&key, Role::A, attempt, session, prior, authentic).is_ok());
+
+    let mut altered = authentic;
+    altered[0] ^= 1;
+    assert!(validate_confirmation(&key, Role::A, attempt, session, prior, altered).is_err());
+}
+
+#[tokio::test]
+async fn absolute_attempt_deadline_rejects_work_without_a_per_operation_extension() {
+    let guard = AttemptGuard::test_only_expired();
+    let result = guard.within(async { Ok::<(), super::Invalid>(()) }).await;
+    assert!(result.is_err());
+}
+
+#[tokio::test]
+async fn monitor_rejects_a_stream_opened_after_the_primary_window() {
+    let (a_der, a_key) = identity();
+    let (b_der, b_key) = identity();
+    let a =
+        OperationalEndpoint::bind("127.0.0.1:0".parse().unwrap(), a_der.clone(), a_key).unwrap();
+    let b =
+        OperationalEndpoint::bind("127.0.0.1:0".parse().unwrap(), b_der.clone(), b_key).unwrap();
+    let (a_channel, b_channel) = tokio::join!(
+        a.connect(b.local_addr().unwrap(), Sha256::digest(&b_der).into()),
+        b.accept(Sha256::digest(&a_der).into())
+    );
+    let mut monitor = ExtraStreamMonitor::new(a_channel.unwrap().test_only_connection(), Role::A);
+    let b_connection = b_channel.unwrap().test_only_connection();
+    let (mut late, _late_recv) =
+        tokio::time::timeout(Duration::from_secs(1), b_connection.open_bi())
+            .await
+            .expect("late stream must open")
+            .unwrap();
+    late.write_all(b"late").await.unwrap();
+    late.finish().unwrap();
+    tokio::task::yield_now().await;
+    tokio::task::yield_now().await;
+    assert!(monitor.assert_clear().is_err());
+    drop(late);
+    drop(b_connection);
+    drop(monitor);
 }
 
 #[tokio::test]

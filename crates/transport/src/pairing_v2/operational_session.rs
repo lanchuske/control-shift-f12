@@ -13,7 +13,7 @@ use rand::RngCore;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use sha2::{Digest, Sha256};
 use std::{net::SocketAddr, time::Duration};
-use tokio::sync::oneshot;
+use tokio::{sync::oneshot, time::Instant};
 
 pub(crate) const ALPN: &[u8] = b"csf12-operational/1";
 pub(crate) const APPLICATION_ERROR: u32 = 0x4353_4612;
@@ -23,6 +23,7 @@ const MAGIC: &[u8; 8] = b"CSF12S1\0";
 const VERSION: u16 = 1;
 const HEADER_LEN: usize = 20;
 const SUITE: &str = "x25519-hkdf-sha256-ed25519-v1";
+const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Role {
@@ -690,6 +691,77 @@ fn bounded_bytes(value: &Value, limit: usize) -> Result<Vec<u8>, Invalid> {
 /// A sealed endpoint for the distinct V01 operational ALPN.  It is crate-private,
 /// owns its strict TLS configuration, and does not expose an arbitrary QUIC
 /// connection for adoption or application I/O.
+/// One absolute, monotonic attempt budget.  It is intentionally created
+/// before the durable snapshot and TLS selection, so neither a slow connect
+/// nor a slow local-consent callback can extend the V01 30-second window.
+pub(crate) struct AttemptGuard {
+    deadline: Instant,
+    connection: Option<quinn::Connection>,
+    complete: bool,
+}
+
+impl AttemptGuard {
+    fn new() -> Self {
+        Self {
+            deadline: Instant::now() + ATTEMPT_TIMEOUT,
+            connection: None,
+            complete: false,
+        }
+    }
+
+    pub(crate) async fn within<T>(
+        &self,
+        operation: impl std::future::Future<Output = Result<T, Invalid>>,
+    ) -> Result<T, Invalid> {
+        if Instant::now() >= self.deadline {
+            return Err(Invalid);
+        }
+        tokio::time::timeout_at(self.deadline, operation)
+            .await
+            .map_err(|_| Invalid)?
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_only_expired() -> Self {
+        Self {
+            deadline: Instant::now() - Duration::from_millis(1),
+            connection: None,
+            complete: false,
+        }
+    }
+
+    fn assert_lease(
+        &self,
+        lease: Option<&crate::pairing_pending::OperationalFinalLease>,
+    ) -> Result<(), Invalid> {
+        if Instant::now() >= self.deadline {
+            return Err(Invalid);
+        }
+        if let Some(lease) = lease {
+            lease.assert_current().map_err(|_| Invalid)?;
+        }
+        Ok(())
+    }
+
+    fn attach(&mut self, connection: quinn::Connection) {
+        self.connection = Some(connection);
+    }
+
+    fn succeed(&mut self) {
+        self.complete = true;
+    }
+}
+
+impl Drop for AttemptGuard {
+    fn drop(&mut self) {
+        if !self.complete
+            && let Some(connection) = &self.connection
+        {
+            connection.close(APPLICATION_ERROR.into(), b"operational session aborted");
+        }
+    }
+}
+
 pub(crate) struct OperationalEndpoint {
     endpoint: quinn::Endpoint,
     client: super::provisional_tls::StrictClient,
@@ -722,15 +794,24 @@ impl OperationalEndpoint {
         peer: SocketAddr,
         expected_peer_pin: [u8; 32],
     ) -> Result<OperationalChannel, Invalid> {
+        let guard = AttemptGuard::new();
+        self.connect_until(peer, expected_peer_pin, &guard).await
+    }
+
+    async fn connect_until(
+        &self,
+        peer: SocketAddr,
+        expected_peer_pin: [u8; 32],
+        guard: &AttemptGuard,
+    ) -> Result<OperationalChannel, Invalid> {
         let (client, auth) = self.client.fresh()?;
         let connecting = self
             .endpoint
             .connect_with(client, peer, "operational.local")
             .map_err(|_| Invalid)?;
-        let connection = tokio::time::timeout(Duration::from_secs(30), connecting)
-            .await
-            .map_err(|_| Invalid)?
-            .map_err(|_| Invalid)?;
+        let connection = guard
+            .within(async { connecting.await.map_err(|_| Invalid) })
+            .await?;
         if !auth.was_requested() {
             connection.close(APPLICATION_ERROR.into(), b"mutual authentication required");
             return Err(Invalid);
@@ -742,16 +823,25 @@ impl OperationalEndpoint {
         &self,
         expected_peer_pin: [u8; 32],
     ) -> Result<OperationalChannel, Invalid> {
-        let connection = tokio::time::timeout(Duration::from_secs(30), async {
-            self.endpoint
-                .accept()
-                .await
-                .ok_or(Invalid)?
-                .await
-                .map_err(|_| Invalid)
-        })
-        .await
-        .map_err(|_| Invalid)??;
+        let guard = AttemptGuard::new();
+        self.accept_until(expected_peer_pin, &guard).await
+    }
+
+    async fn accept_until(
+        &self,
+        expected_peer_pin: [u8; 32],
+        guard: &AttemptGuard,
+    ) -> Result<OperationalChannel, Invalid> {
+        let connection = guard
+            .within(async {
+                self.endpoint
+                    .accept()
+                    .await
+                    .ok_or(Invalid)?
+                    .await
+                    .map_err(|_| Invalid)
+            })
+            .await?;
         OperationalChannel::observe(connection, expected_peer_pin)
     }
 
@@ -761,6 +851,7 @@ impl OperationalEndpoint {
         authority: &super::admission_authority::AdmissionAuthorityStore,
         durable_attempt: [u8; 32],
     ) -> Result<OperationalAttempt, Invalid> {
+        let guard = AttemptGuard::new();
         let snapshot = authority
             .operational_admission_snapshot(durable_attempt)
             .map_err(|_| Invalid)?;
@@ -768,8 +859,11 @@ impl OperationalEndpoint {
         if view.self_fingerprint >= view.peer_fingerprint {
             return Err(Invalid);
         }
-        let channel = self.connect(peer, view.peer_fingerprint).await?;
-        OperationalAttempt::new(channel, Role::A, authority, durable_attempt, view).await
+        guard.assert_lease(None)?;
+        let channel = self
+            .connect_until(peer, view.peer_fingerprint, &guard)
+            .await?;
+        OperationalAttempt::new(channel, Role::A, authority, durable_attempt, view, guard).await
     }
 
     pub(crate) async fn accept_admitted(
@@ -777,6 +871,7 @@ impl OperationalEndpoint {
         authority: &super::admission_authority::AdmissionAuthorityStore,
         durable_attempt: [u8; 32],
     ) -> Result<OperationalAttempt, Invalid> {
+        let guard = AttemptGuard::new();
         let snapshot = authority
             .operational_admission_snapshot(durable_attempt)
             .map_err(|_| Invalid)?;
@@ -784,8 +879,9 @@ impl OperationalEndpoint {
         if view.self_fingerprint <= view.peer_fingerprint {
             return Err(Invalid);
         }
-        let channel = self.accept(view.peer_fingerprint).await?;
-        OperationalAttempt::new(channel, Role::B, authority, durable_attempt, view).await
+        guard.assert_lease(None)?;
+        let channel = self.accept_until(view.peer_fingerprint, &guard).await?;
+        OperationalAttempt::new(channel, Role::B, authority, durable_attempt, view, guard).await
     }
 }
 
@@ -863,6 +959,11 @@ impl OperationalChannel {
         ALPN
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_only_connection(&self) -> quinn::Connection {
+        self.connection.clone()
+    }
+
     pub(crate) async fn exchange_frozen_schedule(
         &self,
         role: Role,
@@ -927,7 +1028,8 @@ pub(crate) struct OperationalAttempt {
     channel: OperationalChannel,
     role: Role,
     view: AuthorityView,
-    preflight: crate::pairing_pending::OperationalPreflightLease,
+    preflight: Option<crate::pairing_pending::OperationalPreflightLease>,
+    guard: AttemptGuard,
 }
 
 /// A one-use local approval bound to exactly one V01 preconfirm transcript and
@@ -954,39 +1056,129 @@ impl LocalOperationalConsent {
 
 /// Watches only for protocol-violating streams after the single V01 stream has
 /// been selected.  It never exposes either the connection or a stream handle.
-struct ExtraStreamMonitor {
+pub(crate) struct ExtraStreamMonitor {
     notified: oneshot::Receiver<()>,
+    primary: Option<oneshot::Receiver<(quinn::SendStream, quinn::RecvStream)>>,
     task: tokio::task::JoinHandle<()>,
 }
 
 impl ExtraStreamMonitor {
-    fn new(connection: quinn::Connection) -> Self {
+    /// Starts before the selected V01 stream.  B's monitor owns the first
+    /// incoming bidi stream and hands it to the driver exactly once; every
+    /// later bidi/uni stream is a protocol violation from the outset.
+    pub(crate) fn new(connection: quinn::Connection, role: Role) -> Self {
         let (send, notified) = oneshot::channel();
+        let (primary_send, primary) = oneshot::channel();
         let task = tokio::spawn(async move {
-            tokio::select! {
-                result = connection.accept_bi() => {
-                    if let Ok((send, recv)) = result { drop(send); drop(recv); }
-                }
-                result = connection.accept_uni() => {
-                    if let Ok(mut recv) = result { let _ = recv.stop(APPLICATION_ERROR.into()); }
+            if role == Role::B {
+                let primary_stream = tokio::select! {
+                    result = connection.accept_bi() => result.ok(),
+                    result = connection.accept_uni() => {
+                        if let Ok(mut recv) = result { let _ = recv.stop(APPLICATION_ERROR.into()); }
+                        None
+                    }
+                };
+                let Some(primary_stream) = primary_stream else {
+                    let _ = send.send(());
+                    return;
+                };
+                if primary_send.send(primary_stream).is_err() {
+                    let _ = send.send(());
+                    return;
                 }
             }
-            let _ = send.send(());
+            tokio::select! {
+                result = connection.accept_bi() => {
+                    if let Ok((mut stream_send, mut recv)) = result {
+                        let _ = stream_send.reset(APPLICATION_ERROR.into());
+                        let _ = recv.stop(APPLICATION_ERROR.into());
+                        let _ = send.send(());
+                    }
+                }
+                result = connection.accept_uni() => {
+                    if let Ok(mut recv) = result {
+                        let _ = recv.stop(APPLICATION_ERROR.into());
+                        let _ = send.send(());
+                    }
+                }
+            }
         });
-        Self { notified, task }
+        Self {
+            notified,
+            primary: (role == Role::B).then_some(primary),
+            task,
+        }
     }
 
-    fn assert_clear(&mut self) -> Result<(), Invalid> {
+    async fn take_primary(
+        &mut self,
+        guard: &AttemptGuard,
+    ) -> Result<(quinn::SendStream, quinn::RecvStream), Invalid> {
+        let primary = self.primary.take().ok_or(Invalid)?;
+        guard
+            .within(async { primary.await.map_err(|_| Invalid) })
+            .await
+    }
+
+    pub(crate) fn assert_clear(&mut self) -> Result<(), Invalid> {
         match self.notified.try_recv() {
             Err(oneshot::error::TryRecvError::Empty) => Ok(()),
-            Ok(()) | Err(oneshot::error::TryRecvError::Closed) => Err(Invalid),
+            Ok(()) => Err(Invalid),
+            // A connection that has cleanly reached EOF makes accept_* return
+            // and drops the monitor sender. No additional stream was ever
+            // observed, so that is not a protocol violation.
+            Err(oneshot::error::TryRecvError::Closed) => Ok(()),
         }
+    }
+
+    async fn finish_and_assert_clear(&mut self, guard: &AttemptGuard) -> Result<(), Invalid> {
+        // Let a concurrently opened late stream become observable before
+        // declaring the FIN boundary clean, without extending the absolute
+        // attempt deadline.
+        guard
+            .within(async {
+                tokio::task::yield_now().await;
+                self.assert_clear()
+            })
+            .await
     }
 }
 
 impl Drop for ExtraStreamMonitor {
     fn drop(&mut self) {
         self.task.abort();
+    }
+}
+
+/// Owns the selected stream until the complete V01 transcript and reciprocal
+/// EOF have succeeded. Any early return resets both directions, including
+/// timeout, consent mismatch, lease revocation and parser rejection.
+struct AttemptStream {
+    send: quinn::SendStream,
+    recv: quinn::RecvStream,
+    clean: bool,
+}
+
+impl AttemptStream {
+    fn new(pair: (quinn::SendStream, quinn::RecvStream)) -> Self {
+        Self {
+            send: pair.0,
+            recv: pair.1,
+            clean: false,
+        }
+    }
+
+    fn succeed(&mut self) {
+        self.clean = true;
+    }
+}
+
+impl Drop for AttemptStream {
+    fn drop(&mut self) {
+        if !self.clean {
+            let _ = self.send.reset(APPLICATION_ERROR.into());
+            let _ = self.recv.stop(APPLICATION_ERROR.into());
+        }
     }
 }
 
@@ -997,7 +1189,12 @@ impl OperationalAttempt {
         authority: &super::admission_authority::AdmissionAuthorityStore,
         durable_attempt: [u8; 32],
         view: AuthorityView,
+        mut guard: AttemptGuard,
     ) -> Result<Self, Invalid> {
+        // From this point every failure has an authenticated connection to
+        // close with the operational application error, even a lease-acquire
+        // failure before the selected stream exists.
+        guard.attach(channel.connection.clone());
         let encoded_view = view.encode()?;
         let view_hash = hash(&encoded_view);
         let (a, b) = match role {
@@ -1046,22 +1243,25 @@ impl OperationalAttempt {
             channel,
             role,
             view,
-            preflight,
+            preflight: Some(preflight),
+            guard,
         })
     }
 
     /// Runs the dynamic V01 transcript. The only values constructed here are
     /// fresh opaque attempt/session/nonces and the exact durable/TLS bindings.
-    pub(crate) async fn complete_with_local_consent<F>(self, confirm: F) -> Result<(), Invalid>
+    pub(crate) async fn complete_with_local_consent<F>(mut self, confirm: F) -> Result<(), Invalid>
     where
         F: FnOnce([u8; 32], [u8; 32]) -> Result<LocalOperationalConsent, Invalid>,
     {
-        tokio::time::timeout(Duration::from_secs(30), self.complete_inner(confirm))
-            .await
-            .map_err(|_| Invalid)?
+        let result = self.complete_inner(confirm).await;
+        if result.is_ok() {
+            self.guard.succeed();
+        }
+        result
     }
 
-    async fn complete_inner<F>(self, confirm: F) -> Result<(), Invalid>
+    async fn complete_inner<F>(&mut self, confirm: F) -> Result<(), Invalid>
     where
         F: FnOnce([u8; 32], [u8; 32]) -> Result<LocalOperationalConsent, Invalid>,
     {
@@ -1073,21 +1273,19 @@ impl OperationalAttempt {
             rand::rngs::OsRng.fill_bytes(&mut session);
             rand::rngs::OsRng.fill_bytes(&mut nonce_a);
         }
-        let (mut send, mut recv) = match self.role {
-            Role::A => self
-                .channel
-                .connection
-                .open_bi()
-                .await
-                .map_err(|_| Invalid)?,
-            Role::B => self
-                .channel
-                .connection
-                .accept_bi()
-                .await
-                .map_err(|_| Invalid)?,
+        // Start stream surveillance before opening/accepting the sole V01
+        // stream. For B the monitor transfers exactly the first bidi stream;
+        // a second one is already a failure even if it races the first record.
+        let mut extra_streams = ExtraStreamMonitor::new(self.channel.connection.clone(), self.role);
+        let pair = match self.role {
+            Role::A => {
+                self.guard
+                    .within(async { self.channel.connection.open_bi().await.map_err(|_| Invalid) })
+                    .await?
+            }
+            Role::B => extra_streams.take_primary(&self.guard).await?,
         };
-        let mut extra_streams = ExtraStreamMonitor::new(self.channel.connection.clone());
+        let mut stream = AttemptStream::new(pair);
         let first = if self.role == Role::A {
             record(
                 0,
@@ -1103,12 +1301,17 @@ impl OperationalAttempt {
                 ],
             )?
         } else {
-            read_one_record(&mut recv).await?
+            receive_validate(&self.guard, None, &mut extra_streams, &mut stream.recv).await?
         };
         if self.role == Role::A {
-            send.write_all(&first.encode()?)
-                .await
-                .map_err(|_| Invalid)?;
+            send_checked(
+                &self.guard,
+                None,
+                &mut extra_streams,
+                &mut stream.send,
+                &first,
+            )
+            .await?;
         }
         extra_streams.assert_clear()?;
         let a = preflight_open(&first)?;
@@ -1140,12 +1343,17 @@ impl OperationalAttempt {
                 ],
             )?
         } else {
-            read_one_record(&mut recv).await?
+            receive_validate(&self.guard, None, &mut extra_streams, &mut stream.recv).await?
         };
         if self.role == Role::B {
-            send.write_all(&second.encode()?)
-                .await
-                .map_err(|_| Invalid)?;
+            send_checked(
+                &self.guard,
+                None,
+                &mut extra_streams,
+                &mut stream.send,
+                &second,
+            )
+            .await?;
         }
         extra_streams.assert_clear()?;
         let b = preflight_accept(&second)?;
@@ -1157,15 +1365,20 @@ impl OperationalAttempt {
         }
         let commitment = authority_commitment(&a.a_view, &b.b_view)?;
         let ch = hash(&commitment);
-        let final_lease = self.preflight.promote(ch).map_err(|_| Invalid)?;
-        final_lease.assert_current().map_err(|_| Invalid)?;
+        let final_lease = self
+            .preflight
+            .take()
+            .ok_or(Invalid)?
+            .promote(ch)
+            .map_err(|_| Invalid)?;
+        self.guard.assert_lease(Some(&final_lease))?;
         let context = exporter_context(a.a_leaf, a.b_leaf, ch, nonce_a, nonce_b)?;
         let cx = hash(&context);
         let exporter = self
             .channel
             .exporter(b"EXPORTER-ControlShiftF12-OperationalSession-v1", &context)?;
         let key = confirm_key(exporter, cx)?;
-        final_lease.assert_current().map_err(|_| Invalid)?;
+        self.guard.assert_lease(Some(&final_lease))?;
         let open = if self.role == Role::A {
             record(
                 2,
@@ -1179,13 +1392,26 @@ impl OperationalAttempt {
                 ],
             )?
         } else {
-            read_one_record(&mut recv).await?
+            receive_validate(
+                &self.guard,
+                Some(&final_lease),
+                &mut extra_streams,
+                &mut stream.recv,
+            )
+            .await?
         };
         if self.role == Role::A {
-            send.write_all(&open.encode()?).await.map_err(|_| Invalid)?;
+            send_checked(
+                &self.guard,
+                Some(&final_lease),
+                &mut extra_streams,
+                &mut stream.send,
+                &open,
+            )
+            .await?;
         }
         extra_streams.assert_clear()?;
-        final_lease.assert_current().map_err(|_| Invalid)?;
+        self.guard.assert_lease(Some(&final_lease))?;
         let checked_open = open_record(&open)?;
         if checked_open.attempt != attempt
             || checked_open.session_id != session
@@ -1208,15 +1434,26 @@ impl OperationalAttempt {
                 ],
             )?
         } else {
-            read_one_record(&mut recv).await?
+            receive_validate(
+                &self.guard,
+                Some(&final_lease),
+                &mut extra_streams,
+                &mut stream.recv,
+            )
+            .await?
         };
         if self.role == Role::B {
-            send.write_all(&accept.encode()?)
-                .await
-                .map_err(|_| Invalid)?;
+            send_checked(
+                &self.guard,
+                Some(&final_lease),
+                &mut extra_streams,
+                &mut stream.send,
+                &accept,
+            )
+            .await?;
         }
         extra_streams.assert_clear()?;
-        final_lease.assert_current().map_err(|_| Invalid)?;
+        self.guard.assert_lease(Some(&final_lease))?;
         let checked_accept = accept_record(&accept)?;
         if checked_accept.attempt != attempt
             || checked_accept.session_id != session
@@ -1231,7 +1468,7 @@ impl OperationalAttempt {
         if !consent.matches(preconfirm, ch) {
             return Err(Invalid);
         }
-        final_lease.assert_current().map_err(|_| Invalid)?;
+        self.guard.assert_lease(Some(&final_lease))?;
         let prior = hash(accept.payload());
         let ca = confirmation(&key, Role::A, attempt, session, prior)?;
         let confirm_a = if self.role == Role::A {
@@ -1247,15 +1484,44 @@ impl OperationalAttempt {
                 ],
             )?
         } else {
-            read_one_record(&mut recv).await?
+            receive_validate(
+                &self.guard,
+                Some(&final_lease),
+                &mut extra_streams,
+                &mut stream.recv,
+            )
+            .await?
         };
         if self.role == Role::A {
-            send.write_all(&confirm_a.encode()?)
-                .await
-                .map_err(|_| Invalid)?;
+            send_checked(
+                &self.guard,
+                Some(&final_lease),
+                &mut extra_streams,
+                &mut stream.send,
+                &confirm_a,
+            )
+            .await?;
         }
         extra_streams.assert_clear()?;
-        final_lease.assert_current().map_err(|_| Invalid)?;
+        self.guard.assert_lease(Some(&final_lease))?;
+        let checked_confirm_a = confirm_record(&confirm_a, Role::A)?;
+        if checked_confirm_a.attempt != attempt
+            || checked_confirm_a.session_id != session
+            || checked_confirm_a.prior_hash != hash(accept.payload())
+        {
+            return Err(Invalid);
+        }
+        validate_confirmation(
+            &key,
+            Role::A,
+            attempt,
+            session,
+            checked_confirm_a.prior_hash,
+            checked_confirm_a.confirmation,
+        )?;
+        // Confirm B is not even constructed until the received Confirm A is
+        // parse-valid and exporter-HMAC-valid.
+        self.guard.assert_lease(Some(&final_lease))?;
         let prior_b = hash(confirm_a.payload());
         let cb = confirmation(&key, Role::B, attempt, session, prior_b)?;
         let confirm_b = if self.role == Role::B {
@@ -1271,35 +1537,64 @@ impl OperationalAttempt {
                 ],
             )?
         } else {
-            read_one_record(&mut recv).await?
+            receive_validate(
+                &self.guard,
+                Some(&final_lease),
+                &mut extra_streams,
+                &mut stream.recv,
+            )
+            .await?
         };
         if self.role == Role::B {
-            send.write_all(&confirm_b.encode()?)
-                .await
-                .map_err(|_| Invalid)?;
+            send_checked(
+                &self.guard,
+                Some(&final_lease),
+                &mut extra_streams,
+                &mut stream.send,
+                &confirm_b,
+            )
+            .await?;
         }
         extra_streams.assert_clear()?;
-        final_lease.assert_current().map_err(|_| Invalid)?;
+        self.guard.assert_lease(Some(&final_lease))?;
         let records = vec![first, second, open, accept, confirm_a, confirm_b];
         derive_and_verify_confirmation_key(&records, exporter)?;
-        final_lease.assert_current().map_err(|_| Invalid)?;
-        send.finish().map_err(|_| Invalid)?;
+        self.guard.assert_lease(Some(&final_lease))?;
+        self.guard
+            .within(async { stream.send.finish().map_err(|_| Invalid) })
+            .await?;
         // A sender must not drop the sealed channel until the peer has also
         // finished its sending half.  Otherwise the final confirmation can be
         // discarded by `OperationalChannel::drop` before the other side reads
         // it.  Any trailing byte is still an immediate protocol violation.
         let mut trailing = [0; 1];
-        match recv.read(&mut trailing).await {
-            Ok(None) => {}
+        match self
+            .guard
+            .within(async {
+                match stream.recv.read(&mut trailing).await {
+                    Ok(value) => Ok(value),
+                    // At this point both exporter-HMAC confirmations have
+                    // already been read and verified. Quinn may surface the
+                    // peer's normal last-handle close instead of EOF.
+                    Err(quinn::ReadError::ConnectionLost(
+                        quinn::ConnectionError::ApplicationClosed(_),
+                    )) => Ok(None),
+                    Err(_) => Err(Invalid),
+                }
+            })
+            .await?
+        {
+            None => {}
             // Quinn can surface the peer's final normal application close
             // instead of EOF after it has already consumed both exporter-HMAC
             // confirmations. The transcript check above is therefore the
             // linear evidence that neither confirm was lost; any delivered
             // trailing byte remains a hard failure below.
-            Err(quinn::ReadError::ConnectionLost(quinn::ConnectionError::ApplicationClosed(_))) => {
-            }
-            Ok(Some(_)) | Err(_) => return Err(Invalid),
+            Some(_) => return Err(Invalid),
         }
+        extra_streams.finish_and_assert_clear(&self.guard).await?;
+        self.guard.assert_lease(Some(&final_lease))?;
+        stream.succeed();
         Ok(())
     }
 }
@@ -1317,7 +1612,7 @@ fn confirm_key(exporter: [u8; 32], context: [u8; 32]) -> Result<[u8; 32], Invali
     y.update(&[1]);
     Ok(y.finalize().into_bytes().into())
 }
-fn confirmation(
+pub(crate) fn confirmation(
     key: &[u8; 32],
     role: Role,
     attempt: [u8; 32],
@@ -1336,6 +1631,20 @@ fn confirmation(
     Ok(m.finalize().into_bytes().into())
 }
 
+/// Verifies a received confirmation before the reciprocal confirmation is even
+/// constructed.  Keeping this separate from transcript derivation prevents a
+/// peer-controlled Confirm A from becoming input to Confirm B.
+pub(crate) fn validate_confirmation(
+    key: &[u8; 32],
+    sender: Role,
+    attempt: [u8; 32],
+    session: [u8; 16],
+    prior: [u8; 32],
+    received: [u8; 32],
+) -> Result<(), Invalid> {
+    verify_confirmation(key, sender, attempt, session, prior, received)
+}
+
 async fn read_one_record(recv: &mut quinn::RecvStream) -> Result<OperationalRecord, Invalid> {
     let mut header = [0; HEADER_LEN];
     recv.read_exact(&mut header).await.map_err(|_| Invalid)?;
@@ -1351,6 +1660,39 @@ async fn read_one_record(recv: &mut quinn::RecvStream) -> Result<OperationalReco
     recv.read_exact(&mut payload).await.map_err(|_| Invalid)?;
     raw.extend(payload);
     OperationalRecord::decode(&raw)
+}
+
+async fn receive_validate(
+    guard: &AttemptGuard,
+    lease: Option<&crate::pairing_pending::OperationalFinalLease>,
+    monitor: &mut ExtraStreamMonitor,
+    recv: &mut quinn::RecvStream,
+) -> Result<OperationalRecord, Invalid> {
+    guard.assert_lease(lease)?;
+    monitor.assert_clear()?;
+    let record = guard.within(read_one_record(recv)).await?;
+    guard.assert_lease(lease)?;
+    monitor.assert_clear()?;
+    Ok(record)
+}
+
+async fn send_checked(
+    guard: &AttemptGuard,
+    lease: Option<&crate::pairing_pending::OperationalFinalLease>,
+    monitor: &mut ExtraStreamMonitor,
+    send: &mut quinn::SendStream,
+    record: &OperationalRecord,
+) -> Result<(), Invalid> {
+    // This is deliberately immediately adjacent to write_all: revocation wins
+    // before every emitted record, not merely between transcript stages.
+    guard.assert_lease(lease)?;
+    monitor.assert_clear()?;
+    let encoded = record.encode()?;
+    guard
+        .within(async { send.write_all(&encoded).await.map_err(|_| Invalid) })
+        .await?;
+    guard.assert_lease(lease)?;
+    monitor.assert_clear()
 }
 
 impl Drop for OperationalChannel {
