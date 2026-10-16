@@ -1,0 +1,38 @@
+{
+  "cases": [
+    {
+      "digest_hex": "0000000000000000000000000000000000000000000000000000000000000000",
+      "words": [
+        "abandon",
+        "abandon",
+        "abandon",
+        "abandon"
+      ]
+    },
+    {
+      "digest_hex": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "words": [
+        "zoo",
+        "zoo",
+        "zoo",
+        "zoo"
+      ]
+    },
+    {
+      "digest_hex": "0000040100300000000000000000000000000000000000000000000000000000",
+      "indexes": [
+        0,
+        1,
+        2,
+        3
+      ],
+      "words": [
+        "abandon",
+        "ability",
+        "able",
+        "about"
+      ]
+    }
+  ],
+  "id": "V03"
+}

@@ -1,0 +1,27 @@
+{
+  "candidate_hello": {
+    "canonical_hex": "43534631324530310f63616e6469646174652d68656c6c6f00080001020000001020202020202020202020202020202020000202000000105050505050505050505050505050505000030200000010606060606060606060606060606060600004030000000a4d616320766563746f72000503000000056d61636f73000602000000210001001d7832353531392d686b64662d7368613235362d656432353531392d7631000702000000205e6d8f8ba20d7c2a0b28ce0de50574ea3e8eb51cdbadb30d23356c0e6ec1f28f000801000000080000000000007530",
+    "claimed_certificate_sha256_hex": "5e6d8f8ba20d7c2a0b28ce0de50574ea3e8eb51cdbadb30d23356c0e6ec1f28f",
+    "schema": {
+      "1": "rendezvous_id:bytes16",
+      "2": "request_nonce:bytes16",
+      "3": "server_nonce:bytes16",
+      "4": "claimed_name:utf8-nfc",
+      "5": "os_family:ascii-enum",
+      "6": "supported_suites:bytes(count-u16be, repeated length-u16be+ascii-id)",
+      "7": "claimed_certificate_sha256:bytes32",
+      "8": "expires_in_ms:u64-nonbool"
+    },
+    "sha256_hex": "24638fa45070a47328a6b9d3df2a57b43cd63f711e8bfef20672be1d879646ad"
+  },
+  "digest_types": {
+    "attempt_id": "bytes32",
+    "fc_hash": "bytes32",
+    "json_representation": "lowercase-hex-64"
+  },
+  "id": "INTEROP-V01",
+  "migration": {
+    "v01_candidate_hello_hash": "synthetic placeholder; do not treat as CandidateHello evidence",
+    "v11": "string fields replaced by bytes32; JSON keys renamed attempt_id_hex/fc_hash_hex"
+  }
+}

@@ -513,6 +513,7 @@ dependencies = [
  "rand_core 0.6.4",
  "rustc_version",
  "subtle",
+ "zeroize",
 ]
 
 [[package]]
@@ -1811,13 +1812,18 @@ dependencies = [
 name = "seamless-transport"
 version = "0.1.1"
 dependencies = [
+ "asn1-rs",
  "base64 0.22.1",
  "bip39",
+ "curve25519-dalek",
+ "der-parser",
  "hmac",
  "libc",
  "quinn",
  "rand 0.8.8",
  "rcgen",
+ "regex-syntax",
+ "ring",
  "rustls",
  "seamless-discovery",
  "seamless-input-protocol",
@@ -1828,7 +1834,9 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tokio",
+ "unicode-normalization",
  "windows-sys 0.61.2",
+ "x509-parser",
  "zeroize",
 ]
 

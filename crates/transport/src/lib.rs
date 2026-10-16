@@ -2,6 +2,8 @@
 pub mod identity;
 pub mod pairing;
 pub mod pairing_pending;
+#[cfg(feature = "pairing-v2-experimental")]
+pub mod pairing_v2;
 #[cfg(unix)]
 mod private_fs;
 pub mod quic;
