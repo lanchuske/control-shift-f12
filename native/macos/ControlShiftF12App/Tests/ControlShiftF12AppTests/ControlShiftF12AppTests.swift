@@ -71,6 +71,40 @@ final class ControlShiftF12AppTests: XCTestCase {
         XCTAssertEqual(child.terminateCalls, 0)
     }
 
+    func testSnapshotWithUnexpectedOrSensitiveStateTerminatesTheChildSession() throws {
+        let child = RecordingChild()
+        let session = DiagnosticsSession(lifecycle: ChildLifecycle(child: child))
+        let snapshot = """
+        {"v":1,"kind":"ui_snapshot_v1","snapshot":{
+          "schema_version":1,"generation":1,"state":"not_started",
+          "candidates":[],"confirmed":[],"inventory":null,
+          "layout":{"state":"not_configured"},
+          "capabilities":{"input_enabled":false,"clipboard_enabled":false},
+          "diagnostics":[],"v01":{"code_groups":["secret"]}
+        }}
+        """.data(using: .utf8)!
+
+        try session.receive(.data(frame(snapshot)))
+
+        XCTAssertTrue(session.isTerminal)
+        XCTAssertEqual(session.presentation.statusText, "Not running")
+        XCTAssertEqual(child.terminateCalls, 1)
+    }
+
+    func testResponseForAnyRequestOtherThanTheLocalRefreshTerminatesTheChildSession() throws {
+        let child = RecordingChild()
+        let session = DiagnosticsSession(lifecycle: ChildLifecycle(child: child))
+        let response = """
+        {"v":1,"kind":"ui_response_v1","id":"unexpected-response","ok":true}
+        """.data(using: .utf8)!
+
+        try session.receive(.data(frame(response)))
+
+        XCTAssertTrue(session.isTerminal)
+        XCTAssertEqual(session.presentation.statusText, "Not running")
+        XCTAssertEqual(child.terminateCalls, 1)
+    }
+
     func testStaleGenerationAndClosedSessionNeverUpdateTheMainThreadPresentation() throws {
         let controller = DiagnosticsFrameController()
         try controller.consume(lengthPrefixed: frame(diagnosticsPayload(generation: 4)))

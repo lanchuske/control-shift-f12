@@ -120,15 +120,13 @@ final class DiagnosticsFrameController {
 
         switch kind {
         case "ui_snapshot_v1":
-            // The adapter always publishes a snapshot before its separately
-            // typed diagnostics frame. This host does not render snapshots,
-            // but accepts their bounded, typed envelope so the following
-            // diagnostics frame can remain current.
+            // The adapter publishes its baseline snapshot before the separate
+            // diagnostics projection. This diagnostics-only host accepts only
+            // that inert baseline, never identities, relationships, or SAS.
             try validateIgnoredSnapshot(object)
         case "ui_response_v1":
-            // A successful response acknowledges the preceding bounded local
-            // request. It carries no presentation state for this diagnostics
-            // host, so it is validated and deliberately not rendered.
+            // A successful response can only acknowledge this host's single,
+            // fixed local refresh request. It carries no presentation state.
             try validateIgnoredSuccessResponse(object)
         case "ui_diagnostics_v1":
             try consumeDiagnostics(payload: payload, object: object)
@@ -177,10 +175,31 @@ final class DiagnosticsFrameController {
     }
 
     private func validateIgnoredSnapshot(_ object: [String: Any]) throws {
+        let snapshotKeys: Set<String> = [
+            "schema_version", "generation", "state", "diagnostics", "candidates",
+            "confirmed", "inventory", "layout", "capabilities",
+        ]
         guard Set(object.keys) == ["v", "kind", "snapshot"],
               let version = object["v"] as? Int,
               version == 1,
-              object["snapshot"] is [String: Any]
+              let snapshot = object["snapshot"] as? [String: Any],
+              Set(snapshot.keys) == snapshotKeys,
+              let schemaVersion = snapshot["schema_version"] as? Int,
+              schemaVersion == 1,
+              snapshot["generation"] is UInt64 || snapshot["generation"] is Int,
+              let state = snapshot["state"] as? String,
+              state == "not_started",
+              let diagnostics = snapshot["diagnostics"] as? [Any], diagnostics.isEmpty,
+              let candidates = snapshot["candidates"] as? [Any], candidates.isEmpty,
+              let confirmed = snapshot["confirmed"] as? [Any], confirmed.isEmpty,
+              snapshot["inventory"] is NSNull,
+              let layout = snapshot["layout"] as? [String: Any],
+              Set(layout.keys) == ["state"],
+              layout["state"] as? String == "not_configured",
+              let capabilities = snapshot["capabilities"] as? [String: Any],
+              Set(capabilities.keys) == ["input_enabled", "clipboard_enabled"],
+              capabilities["input_enabled"] as? Bool == false,
+              capabilities["clipboard_enabled"] as? Bool == false
         else { throw HostError.invalidFrame }
     }
 
@@ -189,7 +208,7 @@ final class DiagnosticsFrameController {
               let version = object["v"] as? Int,
               version == 1,
               let id = object["id"] as? String,
-              !id.isEmpty,
+              id == "mac-refresh",
               let ok = object["ok"] as? Bool,
               ok
         else { throw HostError.invalidFrame }
