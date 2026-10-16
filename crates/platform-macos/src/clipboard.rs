@@ -137,6 +137,7 @@ mod native {
     use super::*;
     use arboard::{Clipboard, ImageData};
     use image::{DynamicImage, ImageFormat, RgbaImage};
+    use objc2_app_kit::NSPasteboard;
     use std::{
         borrow::Cow,
         io::Cursor,
@@ -149,8 +150,8 @@ mod native {
     pub struct PasteboardBackend {
         clipboard: Mutex<Option<Clipboard>>,
         access: AccessState,
-        count: AtomicU64,
-        observed_hash: Mutex<Option<[u8; 32]>>,
+        pasteboard: Option<objc2::rc::Retained<NSPasteboard>>,
+        snapshot_count: AtomicU64,
     }
 
     impl PasteboardBackend {
@@ -159,19 +160,20 @@ mod native {
                 Ok(clipboard) => Self {
                     clipboard: Mutex::new(Some(clipboard)),
                     access: AccessState::Granted,
-                    count: AtomicU64::new(0),
-                    observed_hash: Mutex::new(None),
+                    pasteboard: Some(NSPasteboard::generalPasteboard()),
+                    snapshot_count: AtomicU64::new(0),
                 },
                 Err(_) => Self {
                     clipboard: Mutex::new(None),
                     access: AccessState::Denied,
-                    count: AtomicU64::new(0),
-                    observed_hash: Mutex::new(None),
+                    pasteboard: None,
+                    snapshot_count: AtomicU64::new(0),
                 },
             }
         }
 
         fn snapshot(&self) -> Result<Option<ClipboardContent>, ClipboardError> {
+            self.snapshot_count.fetch_add(1, Ordering::Relaxed);
             let mut guard = self.clipboard.lock().map_err(|_| ClipboardError::Backend)?;
             let clipboard = guard.as_mut().ok_or(ClipboardError::AccessUnavailable)?;
             match clipboard.get_text() {
@@ -197,6 +199,11 @@ mod native {
                 Err(_) => Err(ClipboardError::Backend),
             }
         }
+
+        #[cfg(test)]
+        pub(crate) fn snapshot_count_for_test(&self) -> u64 {
+            self.snapshot_count.load(Ordering::Relaxed)
+        }
     }
 
     impl Default for PasteboardBackend {
@@ -213,17 +220,11 @@ mod native {
             if self.access != AccessState::Granted {
                 return Err(ClipboardError::AccessUnavailable);
             }
-            let content = self.snapshot()?;
-            let hash = content.as_ref().map(MacClipboard::hash);
-            let mut observed = self
-                .observed_hash
-                .lock()
-                .map_err(|_| ClipboardError::Backend)?;
-            if *observed != hash {
-                *observed = hash;
-                self.count.fetch_add(1, Ordering::Relaxed);
-            }
-            Ok(self.count.load(Ordering::Relaxed))
+            let pasteboard = self
+                .pasteboard
+                .as_ref()
+                .ok_or(ClipboardError::AccessUnavailable)?;
+            Ok(pasteboard.changeCount().max(0) as u64)
         }
         fn read(&mut self) -> Result<Option<ClipboardContent>, ClipboardError> {
             self.snapshot()
@@ -268,5 +269,22 @@ impl MacClipboard {
 impl Default for MacClipboard {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod native_change_token_tests {
+    use super::{ClipboardBackend, PasteboardBackend};
+
+    #[test]
+    fn unchanged_native_change_checks_do_not_read_or_encode_clipboard_contents() {
+        let backend = PasteboardBackend::new();
+        let before = backend.snapshot_count_for_test();
+
+        for _ in 0..100 {
+            let _ = backend.change_count();
+        }
+
+        assert_eq!(backend.snapshot_count_for_test(), before);
     }
 }

@@ -1772,6 +1772,8 @@ dependencies = [
  "core-graphics",
  "crc32fast",
  "image",
+ "objc2",
+ "objc2-app-kit",
  "seamless-input-core",
  "seamless-input-protocol",
  "sha2",

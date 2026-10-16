@@ -1008,7 +1008,6 @@ impl NativeCapture {
         Ok(Self { tap, receiver })
     }
     fn drain(&self) -> Vec<CapturedInput> {
-        self.tap.poll();
         self.receiver
             .try_iter()
             .map(|outcome| CapturedInput {

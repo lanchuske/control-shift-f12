@@ -3,6 +3,16 @@ use seamless_input_core::platform::{AccessState, CaptureMode, EventDisposition, 
 use seamless_input_protocol::Button;
 use seamless_input_protocol::{InputEvent, Modifier};
 use std::collections::BTreeSet;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
+
+fn service_event_tap_until_stopped(stop: &AtomicBool, mut service_once: impl FnMut()) {
+    while !stop.load(Ordering::Acquire) {
+        service_once();
+    }
+}
 
 /// USB HID usage for F12. The public recovery shortcut is Control+Shift+F12.
 pub const EMERGENCY_HID_USAGE: u16 = 0x45;
@@ -160,10 +170,7 @@ mod native {
     };
     use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
     use core_graphics::geometry::CGPoint;
-    use std::sync::{
-        Arc,
-        atomic::{AtomicU8, Ordering},
-    };
+    use std::sync::atomic::AtomicU8;
 
     const INJECTED_EVENT_MARKER: i64 = 0x0053_494d_4143_4f53;
 
@@ -289,8 +296,9 @@ mod native {
     }
 
     pub struct MacEventTap {
-        _tap: CGEventTap<'static>,
         mode: Arc<AtomicU8>,
+        stop: Arc<AtomicBool>,
+        worker: Option<std::thread::JoinHandle<()>>,
     }
     impl MacEventTap {
         pub fn install(
@@ -301,105 +309,135 @@ mod native {
             let callback = Arc::new(callback);
             let callback_mode = Arc::clone(&mode_value);
             let emergency_mode = Arc::clone(&mode_value);
-            let held = std::sync::Mutex::new(BTreeSet::new());
-            let tap = CGEventTap::new(
-                CGEventTapLocation::Session,
-                CGEventTapPlacement::HeadInsertEventTap,
-                CGEventTapOptions::Default,
-                vec![
-                    CGEventType::MouseMoved,
-                    CGEventType::LeftMouseDragged,
-                    CGEventType::RightMouseDragged,
-                    CGEventType::LeftMouseDown,
-                    CGEventType::LeftMouseUp,
-                    CGEventType::RightMouseDown,
-                    CGEventType::RightMouseUp,
-                    CGEventType::OtherMouseDown,
-                    CGEventType::OtherMouseUp,
-                    CGEventType::ScrollWheel,
-                    CGEventType::KeyDown,
-                    CGEventType::KeyUp,
-                    CGEventType::FlagsChanged,
-                ],
-                move |_proxy, event_type, event| {
-                    if event.get_integer_value_field(EventField::EVENT_SOURCE_USER_DATA)
-                        == INJECTED_EVENT_MARKER
-                    {
-                        return CallbackResult::Keep;
-                    }
-                    let input = normalize_event(event_type, event);
-                    if let Ok(mut held) = held.lock() {
-                        if let Some(InputEvent::Modifier { modifier, pressed }) = input.as_ref() {
-                            if *pressed {
-                                held.insert(*modifier);
-                            } else {
-                                held.remove(modifier);
+            let stop = Arc::new(AtomicBool::new(false));
+            let worker_stop = Arc::clone(&stop);
+            let (ready_sender, ready_receiver) = std::sync::mpsc::sync_channel(1);
+            let worker = std::thread::Builder::new()
+                .name("control-shift-f12-macos-event-tap".into())
+                .spawn(move || {
+                    let held = std::sync::Mutex::new(BTreeSet::new());
+                    let tap = CGEventTap::new(
+                        CGEventTapLocation::Session,
+                        CGEventTapPlacement::HeadInsertEventTap,
+                        CGEventTapOptions::Default,
+                        vec![
+                            CGEventType::MouseMoved,
+                            CGEventType::LeftMouseDragged,
+                            CGEventType::RightMouseDragged,
+                            CGEventType::LeftMouseDown,
+                            CGEventType::LeftMouseUp,
+                            CGEventType::RightMouseDown,
+                            CGEventType::RightMouseUp,
+                            CGEventType::OtherMouseDown,
+                            CGEventType::OtherMouseUp,
+                            CGEventType::ScrollWheel,
+                            CGEventType::KeyDown,
+                            CGEventType::KeyUp,
+                            CGEventType::FlagsChanged,
+                        ],
+                        move |_proxy, event_type, event| {
+                            if event.get_integer_value_field(EventField::EVENT_SOURCE_USER_DATA)
+                                == INJECTED_EVENT_MARKER
+                            {
+                                return CallbackResult::Keep;
                             }
-                        }
-                        if matches!(
-                            input.as_ref(),
-                            Some(InputEvent::Key {
-                                code: EMERGENCY_HID_USAGE,
-                                pressed: true
-                            })
-                        ) && [Modifier::Control, Modifier::Shift]
-                            .iter()
-                            .all(|modifier| held.contains(modifier))
-                        {
-                            held.clear();
-                            emergency_mode.store(CaptureMode::Local as u8, Ordering::Relaxed);
-                            callback(CaptureOutcome {
-                                disposition: EventDisposition::PassThrough,
-                                event: None,
-                                emergency: true,
-                            });
-                            return CallbackResult::Keep;
-                        }
-                    }
-                    let remote = callback_mode.load(Ordering::Relaxed) == CaptureMode::Remote as u8;
-                    if let Some(input) = input {
-                        callback(CaptureOutcome {
-                            disposition: if remote {
-                                EventDisposition::Suppress
+                            let input = normalize_event(event_type, event);
+                            if let Ok(mut held) = held.lock() {
+                                if let Some(InputEvent::Modifier { modifier, pressed }) =
+                                    input.as_ref()
+                                {
+                                    if *pressed {
+                                        held.insert(*modifier);
+                                    } else {
+                                        held.remove(modifier);
+                                    }
+                                }
+                                if matches!(
+                                    input.as_ref(),
+                                    Some(InputEvent::Key {
+                                        code: EMERGENCY_HID_USAGE,
+                                        pressed: true
+                                    })
+                                ) && [Modifier::Control, Modifier::Shift]
+                                    .iter()
+                                    .all(|modifier| held.contains(modifier))
+                                {
+                                    held.clear();
+                                    emergency_mode
+                                        .store(CaptureMode::Local as u8, Ordering::Relaxed);
+                                    callback(CaptureOutcome {
+                                        disposition: EventDisposition::PassThrough,
+                                        event: None,
+                                        emergency: true,
+                                    });
+                                    return CallbackResult::Keep;
+                                }
+                            }
+                            let remote =
+                                callback_mode.load(Ordering::Relaxed) == CaptureMode::Remote as u8;
+                            if let Some(input) = input {
+                                callback(CaptureOutcome {
+                                    disposition: if remote {
+                                        EventDisposition::Suppress
+                                    } else {
+                                        EventDisposition::PassThrough
+                                    },
+                                    event: Some(input),
+                                    emergency: false,
+                                });
+                            }
+                            if remote {
+                                CallbackResult::Drop
                             } else {
-                                EventDisposition::PassThrough
-                            },
-                            event: Some(input),
-                            emergency: false,
+                                CallbackResult::Keep
+                            }
+                        },
+                    );
+                    let Ok(tap) = tap else {
+                        let _ = ready_sender.send(Err(InputError::AccessibilityUnavailable));
+                        return;
+                    };
+                    let Ok(source) = tap.mach_port().create_runloop_source(0) else {
+                        let _ = ready_sender.send(Err(InputError::CoreGraphics));
+                        return;
+                    };
+                    core_foundation::runloop::CFRunLoop::get_current()
+                        .add_source(&source, unsafe {
+                            core_foundation::runloop::kCFRunLoopCommonModes
                         });
+                    tap.enable();
+                    if ready_sender.send(Ok(())).is_err() {
+                        return;
                     }
-                    if remote {
-                        CallbackResult::Drop
-                    } else {
-                        CallbackResult::Keep
-                    }
-                },
-            )
-            .map_err(|_| InputError::AccessibilityUnavailable)?;
-            let source = tap
-                .mach_port()
-                .create_runloop_source(0)
+                    service_event_tap_until_stopped(&worker_stop, || {
+                        let _ = core_foundation::runloop::CFRunLoop::run_in_mode(
+                            unsafe { core_foundation::runloop::kCFRunLoopDefaultMode },
+                            std::time::Duration::from_millis(5),
+                            false,
+                        );
+                    });
+                })
                 .map_err(|_| InputError::CoreGraphics)?;
-            core_foundation::runloop::CFRunLoop::get_current().add_source(&source, unsafe {
-                core_foundation::runloop::kCFRunLoopCommonModes
-            });
-            tap.enable();
+            ready_receiver
+                .recv()
+                .map_err(|_| InputError::CoreGraphics)??;
             Ok(Self {
-                _tap: tap,
                 mode: mode_value,
+                stop,
+                worker: Some(worker),
             })
         }
         pub fn set_mode(&self, mode: CaptureMode) {
             self.mode.store(mode as u8, Ordering::Relaxed);
         }
-        /// Service pending tap callbacks without taking ownership of the
-        /// application's main loop. The supervisor calls this on every tick.
-        pub fn poll(&self) {
-            let _ = core_foundation::runloop::CFRunLoop::run_in_mode(
-                unsafe { core_foundation::runloop::kCFRunLoopDefaultMode },
-                std::time::Duration::ZERO,
-                true,
-            );
+    }
+
+    impl Drop for MacEventTap {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Release);
+            if let Some(worker) = self.worker.take() {
+                let _ = worker.join();
+            }
         }
     }
 
@@ -540,5 +578,31 @@ impl MacInput {
 impl Default for MacInput {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tap_service_tests {
+    use super::service_event_tap_until_stopped;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    };
+
+    #[test]
+    fn event_tap_service_runs_independently_of_housekeeping() {
+        let stop = Arc::new(AtomicBool::new(false));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let callback_stop = Arc::clone(&stop);
+        let callback_calls = Arc::clone(&calls);
+
+        service_event_tap_until_stopped(&stop, || {
+            let observed = callback_calls.fetch_add(1, Ordering::SeqCst) + 1;
+            if observed == 3 {
+                callback_stop.store(true, Ordering::SeqCst);
+            }
+        });
+
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
     }
 }
