@@ -60,7 +60,10 @@ fn snapshot_is_inert_and_contract_never_claims_identity_or_admission() {
     assert_eq!(starts.get(), 0);
     assert_eq!(s.authenticated_sessions, 0);
     assert!(!s.input_enabled && !s.clipboard_enabled && !s.promotion_enabled);
-    assert_eq!(s.pairing_transport, TransportStatus::ContractPending);
+    assert_eq!(
+        serde_json::to_value(s.pairing_transport).unwrap(),
+        "handshake_envelope_pending"
+    );
     assert!(s.candidates.is_empty());
     assert_eq!(
         c.execute(SetupCommand::CompareMatch {}),
@@ -98,12 +101,19 @@ fn explicit_open_refresh_select_stops_at_closed_transport_and_retry_revokes_hand
     let s = c.execute(SetupCommand::Refresh {}).unwrap();
     let h = s.candidates[0].handle.clone();
     assert_eq!(
-        c.execute(SetupCommand::Select { handle: h.clone() }),
-        Err(SetupError::OperationalContractPending)
+        serde_json::to_value(
+            c.execute(SetupCommand::Select { handle: h.clone() })
+                .unwrap_err()
+        )
+        .unwrap(),
+        "handshake_envelope_pending"
     );
     assert_eq!(drops.get(), 1);
     let s = c.execute(SetupCommand::Snapshot {}).unwrap();
-    assert_eq!(s.status, SetupStatus::ContractPending);
+    assert_eq!(
+        serde_json::to_value(s.status).unwrap(),
+        "handshake_envelope_pending"
+    );
     assert_eq!(s.authenticated_sessions, 0);
     assert!(s.candidates.is_empty());
     c.execute(SetupCommand::OpenDiscovery {}).unwrap();

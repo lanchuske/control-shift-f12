@@ -18,7 +18,7 @@ pub enum SetupError {
     StaleCandidate,
     Incompatible,
     InvalidArguments,
-    OperationalContractPending,
+    HandshakeEnvelopePending,
 }
 impl From<DiscoveryError> for SetupError {
     fn from(value: DiscoveryError) -> Self {
@@ -76,12 +76,12 @@ pub enum SetupCommand {
 pub enum SetupStatus {
     Closed,
     Browsing,
-    ContractPending,
+    HandshakeEnvelopePending,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TransportStatus {
-    ContractPending,
+    HandshakeEnvelopePending,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CandidateView {
@@ -237,8 +237,8 @@ impl<C: SetupClock> SetupController<C> {
                     now,
                 )?;
                 self.stop(now);
-                self.status = SetupStatus::ContractPending;
-                // Typed composition endpoint: no wire contract exists yet.
+                self.status = SetupStatus::HandshakeEnvelopePending;
+                // Typed composition endpoint: bilateral envelope integration is disabled.
                 // Consuming a locator cannot call legacy pairing or PeerEndpoint.
                 return closed_provisional_transport(selected);
             }
@@ -264,7 +264,7 @@ impl<C: SetupClock> SetupController<C> {
         Ok(SetupSnapshot {
             schema_version: 1,
             status: self.status,
-            pairing_transport: TransportStatus::ContractPending,
+            pairing_transport: TransportStatus::HandshakeEnvelopePending,
             candidates,
             authenticated_sessions: 0,
             promotion_enabled: false,
@@ -276,5 +276,5 @@ impl<C: SetupClock> SetupController<C> {
 fn closed_provisional_transport(
     _: seamless_discovery::guided::SelectedLocator,
 ) -> Result<SetupSnapshot, SetupError> {
-    Err(SetupError::OperationalContractPending)
+    Err(SetupError::HandshakeEnvelopePending)
 }

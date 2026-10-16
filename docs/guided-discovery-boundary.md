@@ -1,5 +1,9 @@
 # Experimental guided-discovery boundary (phase 4 narrowed slice)
 
+Historical phase4 report. The later [provisional transport slice](provisional-transport-boundary.md)
+supersedes the typed pending status with `handshake_envelope_pending`; it does
+not connect the controller to a live transport. Evidence below describes phase4.
+
 This is **not operational pairing or release approval**. It composes a real,
 consent-gated browse-only mDNS adapter, an OS monotonic clock, and a typed private
 control/UI contract. It does not implement a candidate TLS connection, emit a

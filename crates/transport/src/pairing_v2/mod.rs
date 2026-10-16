@@ -1,8 +1,11 @@
-//! Experimental offline pairing components: verification, phase ordering,
+//! Experimental pairing primitives, isolated provisional TLS, phase ordering,
 //! injected-clock limits and quarantined durable evidence. No application
-//! adapter, network, trust-store signer, production emitter or admission.
+//! handshake emitter, trust-store signer or admission; type3 remains opaque.
 pub mod codec;
 mod evidence;
+pub mod operational_binding;
+pub mod operational_wire;
+pub mod provisional_tls;
 pub use evidence::*;
 mod primitives;
 pub use primitives::*;

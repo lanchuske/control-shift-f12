@@ -140,7 +140,7 @@ impl ControlEngine {
             Err(reason) => {
                 if matches!(
                     reason,
-                    SetupError::OperationalContractPending
+                    SetupError::HandshakeEnvelopePending
                         | SetupError::Expired
                         | SetupError::Unavailable
                 ) && let Ok(snapshot) = self.guided.execute(SetupCommand::Snapshot {})

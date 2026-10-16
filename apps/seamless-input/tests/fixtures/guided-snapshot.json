@@ -1,1 +1,1 @@
-{"schema_version":1,"status":"closed","pairing_transport":"contract_pending","candidates":[],"authenticated_sessions":0,"promotion_enabled":false,"input_enabled":false,"clipboard_enabled":false}
+{"schema_version":1,"status":"closed","pairing_transport":"handshake_envelope_pending","candidates":[],"authenticated_sessions":0,"promotion_enabled":false,"input_enabled":false,"clipboard_enabled":false}
