@@ -102,6 +102,14 @@ private struct WireDiagnosticRow: Decodable {
     }
 }
 
+private struct SnapshotGenerationEnvelope: Decodable {
+    let snapshot: SnapshotGeneration
+}
+
+private struct SnapshotGeneration: Decodable {
+    let generation: UInt64
+}
+
 /// Owns the redacted diagnostics view state. Calls to `consume` must be made
 /// on the AppKit main thread after a complete frame has been decoded.
 final class DiagnosticsFrameController {
@@ -180,13 +188,14 @@ final class DiagnosticsFrameController {
             "confirmed", "inventory", "layout", "capabilities",
         ]
         guard Set(object.keys) == ["v", "kind", "snapshot"],
+              let encoded = try? JSONSerialization.data(withJSONObject: object),
+              (try? JSONDecoder().decode(SnapshotGenerationEnvelope.self, from: encoded)) != nil,
               let version = object["v"] as? Int,
               version == 1,
               let snapshot = object["snapshot"] as? [String: Any],
               Set(snapshot.keys) == snapshotKeys,
               let schemaVersion = snapshot["schema_version"] as? Int,
               schemaVersion == 1,
-              snapshot["generation"] is UInt64 || snapshot["generation"] is Int,
               let state = snapshot["state"] as? String,
               state == "not_started",
               let diagnostics = snapshot["diagnostics"] as? [Any], diagnostics.isEmpty,
