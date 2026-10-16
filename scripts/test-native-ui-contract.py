@@ -334,6 +334,23 @@ class NativeHostBoundaryTests(unittest.TestCase):
         for invariant in required:
             self.assertIn(invariant, design)
 
+    def test_native_host_pipe_design_never_adds_a_close_command(self):
+        """Normal close is pipe/process ownership, not a foundations command."""
+        design = HOST_PIPE_DESIGN.read_text()
+        boundary = BOUNDARY_RECORD.read_text()
+        native_readme = NATIVE_README.read_text()
+        host_to_child = design.split("| Host → child |", 1)[1].split("\n", 1)[0]
+        self.assertEqual(
+            host_to_child,
+            " `ui.refresh` and `ui.confirm_v01` only, using the existing request envelope and idempotent request IDs |",
+        )
+        for text in (design, boundary, native_readme):
+            self.assertNotIn("send the existing typed shutdown request", text)
+            self.assertNotIn("shutdown request when the pipe is usable", text)
+        self.assertIn("no foundations shutdown command", design)
+        self.assertIn("no shutdown command on the host-to-child path", boundary)
+        self.assertIn("sends no\nfoundations shutdown command", native_readme)
+
     def test_every_sas_field_and_literal_is_rejected_recursively_from_host_args(self):
         """A partial display shape is still an impermissible host re-export."""
         for field in SAS_HOST_REQUEST_RESERVED_FIELDS:

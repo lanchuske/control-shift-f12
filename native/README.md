@@ -58,10 +58,11 @@ big-endian length followed by JSON, with each frame bounded by
 requests accepted by that engine. They must not create a second parser or a
 network route.
 
-On normal window termination, process exit, or pipe failure, the host sends
-the existing typed shutdown request when the pipe is usable, closes both pipe
-ends, then terminates/reaps the child. Failure to send shutdown never licenses
-leaving a child process running.
+On normal window termination, process exit, or pipe failure, the host sends no
+foundations shutdown command. It stops accepting UI actions, clears its
+projection, cancels the platform reader, closes its owned standard-stream
+endpoints, then waits/reaps or terminates/reaps the child. Pipe closure never
+licenses leaving a child process running.
 
 ## Deliberate non-goals in this change
 

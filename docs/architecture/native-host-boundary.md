@@ -145,10 +145,13 @@ capture, or trusted assistive technology from observing content visibly shown
 on that user's screen; it prohibits only product-controlled retention and
 secondary disclosure.
 
-Closing a GUI sends the existing shutdown request while the inherited pipe is
-healthy, closes the pipes, and reaps the child. If shutdown fails, the host
-still terminates and reaps its child. A host cannot leave a detached engine or
-claim a running engine after its pipe closes.
+Closing a GUI has no shutdown command on the host-to-child path. It stops
+accepting local actions, clears the visible projection, cancels its
+platform-specific reader, closes the owned standard-stream endpoints, waits a
+bounded interval, and then terminates/reaps its owned child if necessary. A
+host cannot leave a detached engine or claim a running engine after its pipe
+closes. Its exact host-to-child request allowlist remains the separately
+reviewed typed UI commands; it does not use the foundations `shutdown` command.
 
 This boundary does not create a relationship, session, layout, cursor crossing,
 input, clipboard operation, or diagnostic success state. Those require their

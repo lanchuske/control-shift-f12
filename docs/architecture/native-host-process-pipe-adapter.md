@@ -97,17 +97,19 @@ clipboard, discovery locators, receipts, or layout state.
 
 Normal close is ordered as follows:
 
-1. If stdin is still healthy, send the existing typed shutdown request once.
-2. Stop accepting UI actions and clear the visible SAS immediately.
-3. Cancel the platform reader, close every parent pipe endpoint, and wait a
+1. Stop accepting UI actions and clear the visible SAS immediately.
+2. Cancel the platform reader, close every parent pipe endpoint, and wait a
    bounded platform-native interval for the child to exit.
-4. If it has not exited, terminate only that owned child, wait/reap it, then
+3. If it has not exited, terminate only that owned child, wait/reap it, then
    discard the `PipeSession`.
 
 A write failure, read failure, malformed frame, EOF, child exit, application
 termination, app deactivation that ends the session, or timeout follows the
-same clear-and-reap path. A failed shutdown request never permits a detached
-child, background reader, or a UI that still claims the engine is running.
+same clear-and-reap path. There is no foundations shutdown command on the
+host-to-child path: its exact allowlist remains `ui.refresh` and
+`ui.confirm_v01`. Closing pipes and owning/reaping the child never permits a
+detached child, background reader, or a UI that still claims the engine is
+running.
 
 The engine adapter owns the authoritative monotonic deadline and emits the
 terminal `sas_display_v1 current:false` frame. The host additionally has a
