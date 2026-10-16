@@ -35,9 +35,7 @@ public sealed record DesktopSnapshotProjection(
                 ])
                 || !HasInteger(snapshot, "schema_version", 1)
                 || !HasNonzeroUInt64(snapshot, "generation")
-                || !HasString(snapshot, "state", "not_started")
                 || !EmptyArray(snapshot, "diagnostics")
-                || !EmptyArray(snapshot, "candidates")
                 || !EmptyArray(snapshot, "confirmed")
                 || !IsNull(snapshot, "inventory")
                 || !HasExactlyObject(snapshot, "layout", ["state"], "state", "not_configured")
@@ -46,9 +44,29 @@ public sealed record DesktopSnapshotProjection(
                 return false;
             }
 
+            if (!snapshot.TryGetProperty("state", out var stateValue)
+                || stateValue.ValueKind != JsonValueKind.String
+                || stateValue.GetString() is not { } state)
+            {
+                return false;
+            }
+
+            IReadOnlyList<string> nearby;
+            switch (state)
+            {
+                case "not_started" when EmptyArray(snapshot, "candidates"):
+                    nearby = [];
+                    break;
+                case "browsing" when TryParseCurrentCandidates(snapshot, out var currentCandidates):
+                    nearby = currentCandidates;
+                    break;
+                default:
+                    return false;
+            }
+
             projection = new DesktopSnapshotProjection(
-                State: "not_started",
-                Nearby: [],
+                State: state,
+                Nearby: nearby,
                 InputEnabled: false,
                 ClipboardEnabled: false,
                 ConnectionHealth: "Not measured"
@@ -72,6 +90,46 @@ public sealed record DesktopSnapshotProjection(
             && input.ValueKind == JsonValueKind.False
             && capabilities.TryGetProperty("clipboard_enabled", out var clipboard)
             && clipboard.ValueKind == JsonValueKind.False;
+    }
+
+    private static bool TryParseCurrentCandidates(
+        JsonElement snapshot,
+        out IReadOnlyList<string> candidates
+    )
+    {
+        candidates = [];
+        if (!snapshot.TryGetProperty("candidates", out var values)
+            || values.ValueKind != JsonValueKind.Array
+            || values.GetArrayLength() > 32)
+        {
+            return false;
+        }
+
+        var handles = new List<string>();
+        var uniqueHandles = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var candidate in values.EnumerateArray())
+        {
+            if (!HasExactly(candidate, ["handle", "compatibility", "freshness"])
+                || !candidate.TryGetProperty("handle", out var handle)
+                || handle.ValueKind != JsonValueKind.String
+                || string.IsNullOrEmpty(handle.GetString())
+                || handle.GetString()!.Length > 64
+                || !handle.GetString()!.All(character =>
+                    char.IsAsciiLetterOrDigit(character) || character is '-' or '_')
+                || !HasString(candidate, "compatibility", "compatible")
+                || !HasString(candidate, "freshness", "current"))
+            {
+                return false;
+            }
+            if (!uniqueHandles.Add(handle.GetString()!))
+            {
+                return false;
+            }
+            handles.Add(handle.GetString()!);
+        }
+
+        candidates = handles;
+        return true;
     }
 
     private static bool HasExactlyObject(

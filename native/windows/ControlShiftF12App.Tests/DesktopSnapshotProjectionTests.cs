@@ -25,4 +25,44 @@ public sealed class DesktopSnapshotProjectionTests
         Assert.False(projection.ClipboardEnabled);
         Assert.Equal("Not measured", projection.ConnectionHealth);
     }
+
+    [Fact]
+    public void Browsing_snapshot_projects_only_a_neutral_current_candidate()
+    {
+        const string snapshot = """
+        {"v":1,"kind":"ui_snapshot_v1","snapshot":{
+          "schema_version":1,"generation":2,"state":"browsing",
+          "diagnostics":[],"candidates":[
+            {"handle":"nearby_1","compatibility":"compatible","freshness":"current"}
+          ],"confirmed":[],"inventory":null,
+          "layout":{"state":"not_configured"},
+          "capabilities":{"input_enabled":false,"clipboard_enabled":false}
+        }}
+        """;
+
+        Assert.True(DesktopSnapshotProjection.TryParse(snapshot, out var projection));
+        Assert.NotNull(projection);
+        Assert.Equal("browsing", projection.State);
+        Assert.Equal(["nearby_1"], projection.Nearby);
+        Assert.False(projection.InputEnabled);
+        Assert.False(projection.ClipboardEnabled);
+    }
+
+    [Fact]
+    public void Browsing_snapshot_with_duplicate_candidate_handle_is_rejected()
+    {
+        const string snapshot = """
+        {"v":1,"kind":"ui_snapshot_v1","snapshot":{
+          "schema_version":1,"generation":2,"state":"browsing",
+          "diagnostics":[],"candidates":[
+            {"handle":"nearby_1","compatibility":"compatible","freshness":"current"},
+            {"handle":"nearby_1","compatibility":"compatible","freshness":"current"}
+          ],"confirmed":[],"inventory":null,
+          "layout":{"state":"not_configured"},
+          "capabilities":{"input_enabled":false,"clipboard_enabled":false}
+        }}
+        """;
+
+        Assert.False(DesktopSnapshotProjection.TryParse(snapshot, out _));
+    }
 }
