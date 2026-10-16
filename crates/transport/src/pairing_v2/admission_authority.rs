@@ -116,6 +116,14 @@ impl AdmissionAuthorityStore {
             .acquire_operational_preflight_lease(attempt, view_hash, connection_binding)
     }
 
+    #[allow(dead_code)] // Sealed default-off V01 boundary.
+    pub(crate) fn operational_admission_snapshot(
+        &self,
+        attempt: [u8; 32],
+    ) -> Result<crate::pairing_pending::OperationalAdmissionSnapshot, StoreError> {
+        self.store.operational_admission_snapshot(attempt)
+    }
+
     /// Test-only synthetic entry point. Production can commit only a live sealed
     /// handshake witness through `commit_sealed_foundation`.
     #[cfg(test)]
@@ -508,6 +516,24 @@ mod tests {
             store.reconcile(record.attempt_id).unwrap(),
             ReconcileAdmission::Promoted
         );
+    }
+
+    #[test]
+    fn operational_snapshot_copies_the_active_pairing_receipt_v2_exactly() {
+        let root = tempfile::tempdir().unwrap();
+        let store = AdmissionAuthorityStore::open(root.path()).unwrap();
+        let record = store
+            .prepare(store.version().unwrap(), [79; 32], [78; 32])
+            .unwrap();
+        store
+            .commit_metadata(store.version().unwrap(), 0, &record, evidence(&record))
+            .unwrap();
+        let snapshot = store
+            .operational_admission_snapshot(record.attempt_id)
+            .unwrap();
+        assert_eq!(snapshot.receipt.attempt, record.attempt_id);
+        assert_eq!(snapshot.receipt.protocol_version, PROTOCOL_VERSION);
+        assert_eq!(snapshot.receipt.protocol_version, 2);
     }
 
     #[test]

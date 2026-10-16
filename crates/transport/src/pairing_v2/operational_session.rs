@@ -113,6 +113,27 @@ pub(crate) struct AuthorityView {
 }
 
 impl AuthorityView {
+    pub(crate) fn from_snapshot(
+        local_leaf: [u8; 32],
+        snapshot: &crate::pairing_pending::OperationalAdmissionSnapshot,
+    ) -> Result<Self, Invalid> {
+        let receipt = &snapshot.receipt;
+        let view = Self {
+            self_fingerprint: local_leaf,
+            peer_fingerprint: receipt.peer_pin,
+            suite: receipt.suite.clone(),
+            protocol_version: u64::from(receipt.protocol_version),
+            policy_revision: receipt.policy_revision,
+            identity_generation: receipt.identity_generation,
+            revocation_generation: receipt.revocation_generation,
+            receipt_revision: receipt.revision,
+            admission_attempt: receipt.attempt,
+        };
+        (view.is_v01() && view.self_fingerprint != view.peer_fingerprint)
+            .then_some(view)
+            .ok_or(Invalid)
+    }
+
     pub(crate) fn decode(raw: &[u8]) -> Result<Self, Invalid> {
         if raw.is_empty() || raw.len() > 512 {
             return Err(Invalid);
@@ -188,7 +209,11 @@ impl AuthorityView {
     }
 
     pub(crate) fn is_v01(&self) -> bool {
-        self.suite == SUITE && self.protocol_version == 1
+        // V01 has two independent version domains: the operational framing is
+        // VERSION=1 above, while this copied durable pairing receipt field is
+        // exact protocol version 2.  They must never be used as a fallback for
+        // one another.
+        self.suite == SUITE && self.protocol_version == 2
     }
 
     fn inverse_of(&self, other: &Self) -> bool {
@@ -200,6 +225,14 @@ impl AuthorityView {
 }
 
 impl OperationalRecord {
+    fn new(sequence: u32, payload: Vec<u8>) -> Result<Self, Invalid> {
+        Ok(Self {
+            kind: RecordType::for_sequence(sequence)?,
+            sender: Role::for_sequence(sequence)?,
+            sequence,
+            payload,
+        })
+    }
     pub(crate) fn decode(raw: &[u8]) -> Result<Self, Invalid> {
         if raw.len() < HEADER_LEN || raw[..8] != *MAGIC || raw[8..10] != VERSION.to_be_bytes() {
             return Err(Invalid);
@@ -759,6 +792,72 @@ impl OperationalChannel {
     pub(crate) fn negotiated_alpn(&self) -> &'static [u8] {
         ALPN
     }
+
+    pub(crate) async fn exchange_frozen_schedule(
+        &self,
+        role: Role,
+        records: &[OperationalRecord],
+    ) -> Result<(), Invalid> {
+        validate_v01_schedule(records)?;
+        let connection = self.connection.clone();
+        let (mut send, mut recv) = tokio::time::timeout(Duration::from_secs(30), async {
+            match role {
+                Role::A => connection.open_bi().await.map_err(|_| Invalid),
+                Role::B => connection.accept_bi().await.map_err(|_| Invalid),
+            }
+        })
+        .await
+        .map_err(|_| Invalid)??;
+        let expected = records.to_vec();
+        let protocol = async {
+            for record in &expected {
+                if record.sender == role {
+                    send.write_all(&record.encode()?)
+                        .await
+                        .map_err(|_| Invalid)?;
+                } else if read_one_record(&mut recv).await? != *record {
+                    return Err(Invalid);
+                }
+            }
+            send.finish().map_err(|_| Invalid)?;
+            let mut trailing = [0; 1];
+            (recv
+                .read(&mut trailing)
+                .await
+                .map_err(|_| Invalid)?
+                .is_none())
+            .then_some(())
+            .ok_or(Invalid)
+        };
+        tokio::select! {
+            result = protocol => result,
+            extra = self.connection.accept_bi() => {
+                if let Ok((send, recv)) = extra { drop(send); drop(recv); }
+                Err(Invalid)
+            }
+            extra = self.connection.accept_uni() => {
+                if let Ok(mut recv) = extra { let _ = recv.stop(APPLICATION_ERROR.into()); }
+                Err(Invalid)
+            }
+        }
+    }
+}
+
+async fn read_one_record(recv: &mut quinn::RecvStream) -> Result<OperationalRecord, Invalid> {
+    let mut header = [0; HEADER_LEN];
+    recv.read_exact(&mut header).await.map_err(|_| Invalid)?;
+    if header[..8] != *MAGIC || header[8..10] != VERSION.to_be_bytes() {
+        return Err(Invalid);
+    }
+    let length = u32::from_be_bytes(header[16..20].try_into().map_err(|_| Invalid)?) as usize;
+    if length == 0 || length > RECORD_LIMIT {
+        return Err(Invalid);
+    }
+    let mut raw = header.to_vec();
+    let mut payload = vec![0; length];
+    recv.read_exact(&mut payload).await.map_err(|_| Invalid)?;
+    raw.extend(payload);
+    OperationalRecord::decode(&raw)
 }
 
 impl Drop for OperationalChannel {

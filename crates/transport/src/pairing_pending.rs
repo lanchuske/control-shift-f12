@@ -636,6 +636,14 @@ mod unix {
         }
 
         #[cfg(feature = "pairing-v2-experimental")]
+        pub(crate) fn operational_admission_snapshot(
+            &self,
+            attempt: [u8; 32],
+        ) -> Result<OperationalAdmissionSnapshot, StoreError> {
+            self.current_operational_snapshot(attempt)
+        }
+
+        #[cfg(feature = "pairing-v2-experimental")]
         #[allow(dead_code)] // Used by the sealed final lease once the V01 driver is wired.
         fn operational_snapshot_still_current(
             &self,

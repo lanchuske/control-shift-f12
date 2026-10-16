@@ -90,6 +90,31 @@ fn authority_views_decode_exactly_and_preserve_each_revision_byte() {
 }
 
 #[test]
+fn authority_view_keeps_pairing_receipt_v2_distinct_from_wire_v1() {
+    let fixture: serde_json::Value = serde_json::from_slice(include_bytes!(
+        "../../tests/fixtures/pairing-v2/operational-session-v01.json"
+    ))
+    .unwrap();
+    let valid = raw_a(&fixture);
+    assert!(AuthorityView::decode(&valid).unwrap().is_v01());
+
+    // The V01 authority view's fourth field is pairing receipt protocol 2.
+    // Altering it to either the framing version (1) or an unknown version (3)
+    // must never be accepted as the V01 durable tuple.
+    let marker = [0, 4, 1, 0, 0, 0, 8];
+    let offset = valid
+        .windows(marker.len())
+        .position(|w| w == marker)
+        .unwrap();
+    for replacement in [1, 3] {
+        let mut changed = valid.clone();
+        changed[offset + marker.len() + 7] = replacement;
+        let parsed = AuthorityView::decode(&changed).unwrap();
+        assert!(!parsed.is_v01());
+    }
+}
+
+#[test]
 fn frozen_v01_payloads_form_one_bound_bilateral_schedule() {
     let fixture: serde_json::Value = serde_json::from_slice(include_bytes!(
         "../../tests/fixtures/pairing-v2/operational-session-v01.json"
@@ -169,6 +194,38 @@ async fn v01_uses_a_fresh_mutual_tls_connection_with_the_operational_alpn() {
     );
     assert_eq!(a_channel.negotiated_alpn(), b"csf12-operational/1");
     assert_eq!(b_channel.negotiated_alpn(), b"csf12-operational/1");
+}
+
+#[tokio::test]
+async fn v01_exchanges_exactly_six_records_on_one_bidirectional_stream() {
+    let fixture: serde_json::Value = serde_json::from_slice(include_bytes!(
+        "../../tests/fixtures/pairing-v2/operational-session-v01.json"
+    ))
+    .unwrap();
+    let records = fixture["records_hex"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|record| OperationalRecord::decode(&hex(record.as_str().unwrap())).unwrap())
+        .collect::<Vec<_>>();
+    let (a_der, a_key) = identity();
+    let (b_der, b_key) = identity();
+    let a =
+        OperationalEndpoint::bind("127.0.0.1:0".parse().unwrap(), a_der.clone(), a_key).unwrap();
+    let b =
+        OperationalEndpoint::bind("127.0.0.1:0".parse().unwrap(), b_der.clone(), b_key).unwrap();
+    let a_pin: [u8; 32] = Sha256::digest(&a_der).into();
+    let b_pin: [u8; 32] = Sha256::digest(&b_der).into();
+    let (a_channel, b_channel) =
+        tokio::join!(a.connect(b.local_addr().unwrap(), b_pin), b.accept(a_pin));
+    let a_channel = a_channel.unwrap();
+    let b_channel = b_channel.unwrap();
+    let (a_result, b_result) = tokio::join!(
+        a_channel.exchange_frozen_schedule(Role::A, &records),
+        b_channel.exchange_frozen_schedule(Role::B, &records)
+    );
+    assert!(a_result.is_ok(), "{a_result:?}");
+    assert!(b_result.is_ok(), "{b_result:?}");
 }
 
 #[tokio::test]
