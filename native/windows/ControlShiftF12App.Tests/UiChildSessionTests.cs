@@ -33,6 +33,18 @@ public sealed class UiChildSessionTests
     }
 
     [Fact]
+    public void Stop_discovery_request_is_a_fixed_empty_command()
+    {
+        var request = UiChildSession.StopDiscoveryFrame();
+        var length = (request[0] << 24) | (request[1] << 16) | (request[2] << 8) | request[3];
+        using var document = JsonDocument.Parse(request.Skip(4).Take(length).ToArray());
+
+        Assert.Equal("ui.stop_discovery", document.RootElement.GetProperty("command").GetString());
+        Assert.Equal("windows-stop-discovery", document.RootElement.GetProperty("id").GetString());
+        Assert.False(document.RootElement.GetProperty("args").EnumerateObject().Any());
+    }
+
+    [Fact]
     public void Discovery_response_is_accepted_only_after_a_current_projection()
     {
         var session = new UiChildSession();

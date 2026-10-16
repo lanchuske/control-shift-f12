@@ -23,6 +23,9 @@ public sealed class UiChildSession
     public static byte[] StartDiscoveryFrame()
         => CreateFixedRequest("windows-start-discovery", "ui.start_discovery");
 
+    public static byte[] StopDiscoveryFrame()
+        => CreateFixedRequest("windows-stop-discovery", "ui.stop_discovery");
+
     private static byte[] CreateFixedRequest(string id, string command)
     {
         var payload = Encoding.UTF8.GetBytes($"{{\"v\":1,\"id\":\"{id}\",\"command\":\"{command}\",\"args\":{{}}}}");
@@ -140,7 +143,7 @@ public sealed class UiChildSession
         && root.TryGetProperty("v", out var version) && version.TryGetInt32(out var v) && v == 1
         && root.TryGetProperty("kind", out var kind) && kind.GetString() == "ui_response_v1"
         && root.TryGetProperty("id", out var id)
-        && id.GetString() is "windows-refresh" or "windows-start-discovery"
+        && id.GetString() is "windows-refresh" or "windows-start-discovery" or "windows-stop-discovery"
         && root.TryGetProperty("ok", out var ok) && ok.ValueKind == JsonValueKind.True;
 
     private void Fault()

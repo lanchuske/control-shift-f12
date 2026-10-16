@@ -79,6 +79,19 @@ public sealed class WindowsUiChildOwner : IAsyncDisposable
         return await ReadUntilProjectionAsync(previous.Generation, timeout);
     }
 
+    public async Task<UiChildSession> StopDiscoveryAsync(TimeSpan timeout)
+    {
+        ThrowIfClosed();
+        if (Session.State.Phase != ChildSessionPhase.Running
+            || Session.Snapshot is not { State: "browsing" } previous)
+        {
+            throw new InvalidOperationException("Discovery is not active.");
+        }
+
+        await WriteFixedRequestAsync(UiChildSession.StopDiscoveryFrame(), timeout);
+        return await ReadUntilProjectionAsync(previous.Generation, timeout);
+    }
+
     private async Task WriteFixedRequestAsync(byte[] request, TimeSpan timeout)
     {
         using var cancellation = new CancellationTokenSource(timeout);

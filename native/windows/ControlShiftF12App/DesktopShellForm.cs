@@ -279,9 +279,23 @@ internal sealed class DesktopShellForm : Form
         findNearbyButton.Enabled = false;
         try
         {
+            if (childOwner.Session.Snapshot is { State: "browsing" })
+            {
+                var stopped = await childOwner.StopDiscoveryAsync(TimeSpan.FromSeconds(3));
+                if (stopped.Snapshot is { State: "not_started" })
+                {
+                    findNearbyButton.Text = "Find nearby computers";
+                    findNearbyButton.Enabled = true;
+                    SetEngineStatus("Local engine ready — no computers paired.", Color.FromArgb(0, 103, 80));
+                    return;
+                }
+            }
+
             var session = await childOwner.StartDiscoveryAsync(TimeSpan.FromSeconds(3));
             if (session.Snapshot is { State: "browsing" } snapshot)
             {
+                findNearbyButton.Text = "Stop searching";
+                findNearbyButton.Enabled = true;
                 SetEngineStatus(snapshot.Nearby.Count == 0
                     ? "Looking for nearby computers — none found yet."
                     : "Nearby computers found — confirm the same code on both computers.", Color.FromArgb(0, 103, 80));
