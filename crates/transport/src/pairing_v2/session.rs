@@ -7,6 +7,7 @@ use super::{
     evidence::{b, hash, t},
     sas_words, validate_identity,
 };
+use std::sync::Arc;
 use zeroize::Zeroizing;
 
 pub struct BoundHello {
@@ -89,7 +90,7 @@ pub struct SasSession {
     context_hash: [u8; 32],
     transcript: Option<[u8; 32]>,
     context: Option<EvidenceContext>,
-    keys: Option<DerivedKeys>,
+    keys: Option<Arc<DerivedKeys>>,
     private: Option<Zeroizing<[u8; 32]>>,
     ui: u64,
     local_confirmed: bool,
@@ -104,6 +105,49 @@ pub struct SasSession {
     aborted: bool,
 }
 impl SasSession {
+    pub(super) fn live_evidence(&self) -> Result<super::handshake_evidence::LiveEvidence, Invalid> {
+        if self.aborted {
+            return Err(Invalid);
+        }
+        Ok(super::handshake_evidence::LiveEvidence {
+            context: self.context.as_ref().ok_or(Invalid)?.clone(),
+            keys: self.keys.as_ref().ok_or(Invalid)?.clone(),
+        })
+    }
+    pub(super) fn local_commit(&self, blind: &[u8; 32]) -> Result<Vec<u8>, Invalid> {
+        if self.aborted || self.reveals.iter().any(Option::is_some) {
+            return Err(Invalid);
+        }
+        let public = curve25519_dalek::constants::X25519_BASEPOINT
+            .mul_clamped(**self.private.as_ref().ok_or(Invalid)?)
+            .to_bytes();
+        let commitment = hash(&encode(
+            "commit-body",
+            &[
+                t(DOMAIN),
+                b(&self.context_hash),
+                t(self.local.text()),
+                b(&public),
+                b(blind),
+            ],
+        )?);
+        encode(
+            "commit",
+            &[b(&self.attempt), t(self.local.text()), b(&commitment)],
+        )
+    }
+    pub(super) fn local_reveal(&self, blind: &[u8; 32]) -> Result<Vec<u8>, Invalid> {
+        if self.aborted || self.commits.iter().any(Option::is_none) {
+            return Err(Invalid);
+        }
+        let public = curve25519_dalek::constants::X25519_BASEPOINT
+            .mul_clamped(**self.private.as_ref().ok_or(Invalid)?)
+            .to_bytes();
+        encode(
+            "reveal",
+            &[b(&self.attempt), t(self.local.text()), b(&public), b(blind)],
+        )
+    }
     /// Explicit local cancel is terminal; retry requires a new attempt and keys.
     pub fn cancel(&mut self) {
         self.abort();
@@ -321,11 +365,11 @@ impl SasSession {
                     let Value::Bytes(peer) = &peer[2] else {
                         return Err(Invalid);
                     };
-                    self.keys = Some(derive_keys(
+                    self.keys = Some(Arc::new(derive_keys(
                         self.private.take().ok_or(Invalid)?,
                         peer.as_slice().try_into().map_err(|_| Invalid)?,
                         transcript,
-                    )?);
+                    )?));
                     self.context = Some(EvidenceContext::new(
                         [
                             self.hellos[0].identity.clone(),

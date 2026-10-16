@@ -51,6 +51,7 @@ impl SignedEvidence {
         })
     }
 }
+#[derive(Clone)]
 pub struct EvidenceContext {
     pub(super) identities: [Identity; 2],
     pub(super) attempt: [u8; 32],

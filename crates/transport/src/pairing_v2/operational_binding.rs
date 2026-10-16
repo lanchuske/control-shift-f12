@@ -118,6 +118,13 @@ pub(super) struct TransportReplayRegistry {
     used: Mutex<std::collections::HashSet<[u8; 32]>>,
 }
 impl TransportReplayRegistry {
+    pub(super) fn consume_input(&self, input: &BindingInput) -> Result<(), Invalid> {
+        let mut used = self.used.lock().map_err(|_| Invalid)?;
+        if used.len() >= 1024 || !used.insert(input.replay) {
+            return Err(Invalid);
+        }
+        Ok(())
+    }
     /// Shared across live provisional channels in one process. No eviction or
     /// durable recovery promise; restart requires entirely fresh pairing/SAS.
     pub(super) fn consume(&self, binding: &LocalBinding) -> Result<(), Invalid> {

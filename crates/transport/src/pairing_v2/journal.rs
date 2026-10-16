@@ -161,7 +161,7 @@ impl PublicJournal {
 
 pub struct Finalizer {
     context: EvidenceContext,
-    keys: Option<DerivedKeys>,
+    keys: Option<std::sync::Arc<DerivedKeys>>,
     journal: PublicJournal,
     records: [Option<SignedEvidence>; 5],
     own_durable: bool,
@@ -173,9 +173,41 @@ pub struct Finalizer {
     fc: Option<[u8; 32]>,
 }
 impl Finalizer {
+    pub(super) fn durable_fc_bytes(&self) -> Result<Vec<u8>, Invalid> {
+        if self.durable_fc_hash().is_none() {
+            return Err(Invalid);
+        }
+        let fps = [
+            self.context.identities[0].fingerprint().as_slice(),
+            self.context.identities[1].fingerprint().as_slice(),
+        ]
+        .concat();
+        let mut fields = vec![
+            t(PROTOCOL),
+            t(SUITE),
+            b(&WORDLIST_HASH),
+            b(&self.context.attempt),
+            b(&self.context.transcript),
+            t(ROLE_MAP),
+            b(&fps),
+        ];
+        for record in self
+            .journal
+            .approvals
+            .iter()
+            .chain(self.journal.messages.iter())
+        {
+            fields.push(b(&record.encode()?));
+        }
+        let bytes = encode("finalization-certificate", &fields)?;
+        if Some(*self.context.verify_fc(&bytes)?.hash()) != self.durable_fc_hash() {
+            return Err(Invalid);
+        }
+        Ok(bytes)
+    }
     pub(super) fn start(
         context: EvidenceContext,
-        keys: DerivedKeys,
+        keys: std::sync::Arc<DerivedKeys>,
         journal: PublicJournal,
         deadline: u64,
     ) -> Result<Self, Invalid> {

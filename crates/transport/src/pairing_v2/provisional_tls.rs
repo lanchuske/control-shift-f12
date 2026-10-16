@@ -19,8 +19,13 @@ use std::sync::{
     Arc, OnceLock,
     atomic::{AtomicBool, AtomicU64, Ordering},
 };
+mod handshake_io;
 #[cfg(test)]
 mod tests;
+pub use handshake_io::{
+    HandshakeCompletePendingAuthority, HandshakeConfig, HandshakeError, VerificationDecision,
+    VerificationPrompt,
+};
 fn utc() -> Result<i64, Invalid> {
     i64::try_from(
         std::time::SystemTime::now()
@@ -168,10 +173,13 @@ fn configs(
     client.resumption = rustls::client::Resumption::disabled();
     let mut limits = quinn::TransportConfig::default();
     limits
-        .max_concurrent_bidi_streams(1u32.into())
+        // A retains its candidate request half while opening the control stream.
+        // The application rejects every extra stream beyond this exact schedule.
+        .max_concurrent_bidi_streams(2u32.into())
         .max_concurrent_uni_streams(1u32.into())
         .stream_receive_window(16_399u32.into())
         .receive_window(65_536u32.into())
+        .keep_alive_interval(Some(std::time::Duration::from_secs(10)))
         .max_idle_timeout(Some(
             std::time::Duration::from_secs(30)
                 .try_into()
@@ -216,6 +224,12 @@ impl rustls::client::ResolvesClientCert for ClientAuthEvidence {
     }
 }
 impl StrictClient {
+    fn identity(&self) -> Result<Arc<rustls::sign::CertifiedKey>, Invalid> {
+        self.config
+            .client_auth_cert_resolver
+            .resolve(&[], &[rustls::SignatureScheme::ED25519])
+            .ok_or(Invalid)
+    }
     fn fresh(&self) -> Result<(quinn::ClientConfig, Arc<ClientAuthEvidence>), Invalid> {
         let mut config = self.config.clone();
         let evidence = Arc::new(ClientAuthEvidence {
@@ -251,7 +265,8 @@ impl ProcessOwner {
     }
 }
 /// A consent-scoped endpoint owns strict configs and all connect/accept paths.
-/// The app does not instantiate it while HandshakeEnvelopePending is active.
+/// The app/controller gate remains closed pending independent review; the
+/// experimental handshake API can reach only PendingAuthority, never admission.
 /// No raw endpoint, connection, config, registry or channel constructor is exposed.
 /// Dropping the endpoint revokes all its channels. The process replay owner is
 /// never reset by dropping/recreating an endpoint.
@@ -301,7 +316,13 @@ impl ProvisionalEndpoint {
             connection.close(2u32.into(), b"mutual authentication required");
             return Err(Invalid);
         }
-        ProvisionalChannel::observe(connection, generation, self.owner, self.scope.clone())
+        ProvisionalChannel::observe(
+            connection,
+            generation,
+            self.owner,
+            self.scope.clone(),
+            self.client.identity()?,
+        )
     }
     pub async fn accept(&self) -> Result<ProvisionalChannel, Invalid> {
         let generation = self.owner.generation()?;
@@ -315,7 +336,13 @@ impl ProvisionalEndpoint {
         })
         .await
         .map_err(|_| Invalid)??;
-        ProvisionalChannel::observe(connection, generation, self.owner, self.scope.clone())
+        ProvisionalChannel::observe(
+            connection,
+            generation,
+            self.owner,
+            self.scope.clone(),
+            self.client.identity()?,
+        )
     }
 }
 impl Drop for ProvisionalEndpoint {
@@ -343,6 +370,9 @@ impl Drop for ProvisionalEndpoint {
 /// fn duplicate(c: ProvisionalChannel) { let _: ProvisionalChannel = c.clone(); }
 /// ```
 pub struct ProvisionalChannel {
+    #[cfg(test)]
+    fault: Option<handshake_io::WireFault>,
+    local_identity: Arc<rustls::sign::CertifiedKey>,
     connection: quinn::Connection,
     leaf: Vec<u8>,
     id: String,
@@ -358,6 +388,7 @@ impl ProvisionalChannel {
         generation: u64,
         owner: &'static ProcessOwner,
         scope: Arc<std::sync::Mutex<bool>>,
+        local_identity: Arc<rustls::sign::CertifiedKey>,
     ) -> Result<Self, Invalid> {
         let observed = (|| {
             if connection.close_reason().is_some() {
@@ -391,6 +422,9 @@ impl ProvisionalChannel {
             }
         };
         Ok(Self {
+            local_identity,
+            #[cfg(test)]
+            fault: None,
             id: format!("quic-{}", connection.stable_id()),
             connection,
             leaf,

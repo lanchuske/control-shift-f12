@@ -111,6 +111,20 @@ pub fn derive_keys(
     })
 }
 impl DerivedKeys {
+    pub(super) fn confirm_tag(&self, role: Role, bytes: &[u8]) -> Result<[u8; 32], Invalid> {
+        mac(self.confirm[role.index()].as_ref(), bytes)
+    }
+    pub(super) fn verify_confirm_tag(
+        &self,
+        role: Role,
+        bytes: &[u8],
+        tag: &[u8],
+    ) -> Result<(), Invalid> {
+        let mut m = Hmac::<Sha256>::new_from_slice(self.confirm[role.index()].as_ref())
+            .map_err(|_| Invalid)?;
+        m.update(bytes);
+        m.verify_slice(tag).map_err(|_| Invalid)
+    }
     pub(super) fn verify_finalization(
         &self,
         context: &EvidenceContext,

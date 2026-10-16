@@ -1,8 +1,13 @@
 //! Experimental pairing primitives, isolated provisional TLS, phase ordering,
-//! injected-clock limits and quarantined durable evidence. No application
-//! handshake emitter, trust-store signer or admission; type3 remains opaque.
+//! injected-clock limits and quarantined durable evidence. The sealed bilateral
+//! handshake emits only the reviewed control wire. No application I/O,
+//! RecoveryAuthority provider, active trust, promotion or admission.
 pub mod codec;
 mod evidence;
+mod handshake_binding;
+mod handshake_evidence;
+mod handshake_machine;
+mod handshake_wire;
 pub mod operational_binding;
 pub mod operational_wire;
 pub mod provisional_tls;

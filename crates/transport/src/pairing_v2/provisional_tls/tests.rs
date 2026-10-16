@@ -25,6 +25,454 @@ fn identity(usage: bool) -> (Vec<u8>, rustls::pki_types::PrivateKeyDer<'static>)
         PrivatePkcs8KeyDer::from(key.serialize_der()).into(),
     )
 }
+
+fn handshake_config(local: u8, remote: u8) -> super::HandshakeConfig {
+    super::HandshakeConfig {
+        device_name: format!("Peer {local}"),
+        os: "macos".into(),
+        local_rendezvous: [local; 16],
+        selected_rendezvous: [remote; 16],
+    }
+}
+#[tokio::test]
+async fn bilateral_rejects_substituted_tls_connection_before_candidate_io() {
+    let (_ea, _eb, mut a, _b, _) = pair().await;
+    let (_ec, _ed, foreign, _peer, _) = pair().await;
+    let original = a.connection.clone();
+    let mut original_exporter = [0; 32];
+    let mut foreign_exporter = [0; 32];
+    original
+        .export_keying_material(
+            &mut original_exporter,
+            b"EXPORTER-ControlShiftF12-Handshake-v2",
+            b"test-context",
+        )
+        .unwrap();
+    foreign
+        .connection
+        .export_keying_material(
+            &mut foreign_exporter,
+            b"EXPORTER-ControlShiftF12-Handshake-v2",
+            b"test-context",
+        )
+        .unwrap();
+    assert_ne!(original_exporter, foreign_exporter);
+    // Test-only access models a broken owner retaining old metadata with a second TLS.
+    a.connection = foreign.connection.clone();
+    let temp = tempfile::tempdir().unwrap();
+    let store = crate::pairing_pending::PendingStore::open(temp.path()).unwrap();
+    let before = store.version().unwrap();
+    let result = tokio::time::timeout(
+        Duration::from_millis(200),
+        a.handshake(handshake_config(1, 2), &store, |_| async {
+            panic!("substituted TLS reached SAS")
+        }),
+    )
+    .await;
+    assert!(
+        matches!(result, Ok(Err(super::HandshakeError::Rejected))),
+        "substituted TLS must reject before candidate I/O"
+    );
+    assert_eq!(store.version().unwrap(), before);
+}
+#[tokio::test]
+async fn bilateral_completed_capability_is_invalidated_by_late_extra_stream() {
+    let (_ea, _eb, a, b, _) = pair().await;
+    let ta = tempfile::tempdir().unwrap();
+    let tb = tempfile::tempdir().unwrap();
+    let sa = crate::pairing_pending::PendingStore::open(ta.path()).unwrap();
+    let sb = crate::pairing_pending::PendingStore::open(tb.path()).unwrap();
+    let (a, b) = tokio::join!(
+        a.handshake(
+            handshake_config(1, 2),
+            &sa,
+            |p| async move { p.decision(true) }
+        ),
+        b.handshake(
+            handshake_config(2, 1),
+            &sb,
+            |p| async move { p.decision(true) }
+        )
+    );
+    let a = a.unwrap();
+    let b = b.unwrap();
+    assert!(a.is_protocol_valid());
+    b.test_late_extra().await;
+    let deadline = std::time::Instant::now() + Duration::from_secs(1);
+    while a.is_protocol_valid() && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(!a.is_protocol_valid());
+}
+#[tokio::test]
+async fn bilateral_completed_capability_rejects_late_candidate_data() {
+    let (_ea, _eb, a, b, _) = pair().await;
+    let ta = tempfile::tempdir().unwrap();
+    let tb = tempfile::tempdir().unwrap();
+    let sa = crate::pairing_pending::PendingStore::open(ta.path()).unwrap();
+    let sb = crate::pairing_pending::PendingStore::open(tb.path()).unwrap();
+    let (a, b) = tokio::join!(
+        a.handshake(
+            handshake_config(1, 2),
+            &sa,
+            |p| async move { p.decision(true) }
+        ),
+        b.handshake(
+            handshake_config(2, 1),
+            &sb,
+            |p| async move { p.decision(true) }
+        )
+    );
+    let a = a.unwrap();
+    let mut b = b.unwrap();
+    assert!(a.durable_fc_hash().is_some());
+    b.test_late_candidate().await;
+    let deadline = std::time::Instant::now() + Duration::from_secs(1);
+    while a.is_protocol_valid() && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(!a.is_protocol_valid());
+    assert!(a.durable_fc_hash().is_none());
+}
+#[tokio::test]
+async fn bilateral_rejection_issues_real_reset_and_stop_independently_of_connection_close() {
+    let (_ea, _eb, a, b, _) = pair().await;
+    let (mut tx, mut rx) = a.connection.open_bi().await.unwrap();
+    tx.write_all(&[1]).await.unwrap();
+    let (mut bs, br) = b.connection.accept_bi().await.unwrap();
+    bs.write_all(&[2]).await.unwrap();
+    let mut one = [0];
+    rx.read_exact(&mut one).await.unwrap();
+    super::handshake_io::reject_test_stream((bs, br));
+    assert!(
+        matches!(tokio::time::timeout(Duration::from_secs(2),rx.read(&mut one)).await.unwrap(),Err(quinn::ReadError::Reset(code)) if code==super::super::handshake_wire::APPLICATION_ERROR.into())
+    );
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(2), tx.stopped())
+            .await
+            .unwrap()
+            .unwrap(),
+        Some(super::super::handshake_wire::APPLICATION_ERROR.into())
+    );
+    assert!(a.connection.close_reason().is_none());
+    assert!(b.connection.close_reason().is_none());
+}
+
+#[tokio::test]
+async fn bilateral_control_fragmentation_and_adversarial_phase_matrix() {
+    for mutation in 0..7 {
+        for sequence in [0, 2, 4, 6, 8, 10, 12, 14, 15, 16] {
+            let (_ea, _eb, mut a, mut b, _) = pair().await;
+            let a_role = if super::hash(a.local_identity.cert[0].as_ref()) < super::hash(&a.leaf) {
+                1
+            } else {
+                2
+            };
+            if super::super::handshake_wire::SCHEDULE[sequence].1 == a_role {
+                a.fault = Some(super::handshake_io::WireFault { sequence, mutation });
+            } else {
+                b.fault = Some(super::handshake_io::WireFault { sequence, mutation });
+            }
+            let ta = tempfile::tempdir().unwrap();
+            let tb = tempfile::tempdir().unwrap();
+            let sa = crate::pairing_pending::PendingStore::open(ta.path()).unwrap();
+            let sb = crate::pairing_pending::PendingStore::open(tb.path()).unwrap();
+            let test = async {
+                tokio::join!(
+                    a.handshake(
+                        handshake_config(1, 2),
+                        &sa,
+                        |p| async move { p.decision(true) }
+                    ),
+                    b.handshake(
+                        handshake_config(2, 1),
+                        &sb,
+                        |p| async move { p.decision(true) }
+                    )
+                )
+            };
+            let (a, b) = tokio::time::timeout(Duration::from_secs(5), test)
+                .await
+                .expect("fault must not stall");
+            if mutation == 0 {
+                assert!(a.is_ok() && b.is_ok(), "fragment seq {sequence}");
+            } else {
+                assert!(
+                    a.is_err() && b.is_err(),
+                    "mutation {mutation} seq {sequence}"
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn bilateral_wrong_ui_binding_and_user_reject_never_create_pending_evidence() {
+    for mode in 0..4 {
+        let (_ea, _eb, a, b, _) = pair().await;
+        let ta = tempfile::tempdir().unwrap();
+        let tb = tempfile::tempdir().unwrap();
+        let sa = crate::pairing_pending::PendingStore::open(ta.path()).unwrap();
+        let sb = crate::pairing_pending::PendingStore::open(tb.path()).unwrap();
+        let (a, b) = tokio::join!(
+            a.handshake(handshake_config(1, 2), &sa, |p| async move {
+                let mut d = p.decision(mode != 0);
+                match mode {
+                    1 => d.attempt[0] ^= 1,
+                    2 => d.transcript[0] ^= 1,
+                    3 => d.ui_generation += 1,
+                    _ => {}
+                }
+                d
+            }),
+            b.handshake(
+                handshake_config(2, 1),
+                &sb,
+                |p| async move { p.decision(true) }
+            )
+        );
+        assert!(a.is_err() && b.is_err());
+        assert_eq!(sa.version().unwrap().revision, 0);
+        assert_eq!(sb.version().unwrap().revision, 0);
+    }
+}
+
+#[tokio::test]
+async fn bilateral_candidate_raw_trailing_duplicate_downgrade_oversize_early_close_fail_closed() {
+    for mode in 0..6 {
+        let (_ea, _eb, x, y, _) = pair().await;
+        let (attacker, honest) =
+            if super::hash(x.local_identity.cert[0].as_ref()) < super::hash(&x.leaf) {
+                (x, y)
+            } else {
+                (y, x)
+            };
+        let tmp = tempfile::tempdir().unwrap();
+        let store = crate::pairing_pending::PendingStore::open(tmp.path()).unwrap();
+        let exercise = async {
+            let (mut send, mut recv) = attacker.connection.open_bi().await.unwrap();
+            let mut raw = TransportFrame {
+                kind: FrameKind::CandidateRequest,
+                payload: CandidateRequest::new([1; 16], [2; 16], [3; 16])
+                    .encode()
+                    .unwrap(),
+            }
+            .encode()
+            .unwrap();
+            match mode {
+                0 => raw.push(1),
+                1 => raw.extend(raw.clone()),
+                2 => raw[9] = 1,
+                3 => raw[11..15].copy_from_slice(&1025u32.to_be_bytes()),
+                4 => raw.truncate(8),
+                _ => {
+                    raw[10] = 2;
+                }
+            }
+            let _ = send.write_all(&raw).await;
+            if mode == 4 {
+                send.finish().unwrap();
+            }
+            let error = tokio::time::timeout(Duration::from_secs(5), attacker.connection.closed())
+                .await
+                .unwrap();
+            assert!(
+                matches!(error,quinn::ConnectionError::ApplicationClosed(ref closed) if closed.error_code==super::super::handshake_wire::APPLICATION_ERROR.into()),
+                "mode {mode}: {error:?}"
+            );
+            let _ = recv.stop(0u32.into());
+        };
+        let (result, ()) = tokio::join!(
+            honest.handshake(handshake_config(2, 1), &store, |_| async {
+                panic!("invalid candidate reached SAS")
+            }),
+            exercise
+        );
+        assert!(
+            matches!(result, Err(super::HandshakeError::Rejected)),
+            "mode {mode}"
+        );
+        assert_eq!(store.version().unwrap().revision, 0);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bilateral_two_process_real_tls_sas_and_durable_fc_pending_only() {
+    let (der, key) = identity(true);
+    let endpoint = ProvisionalEndpoint::bind("127.0.0.1:0".parse().unwrap(), der, key).unwrap();
+    let child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--ignored",
+            "--exact",
+            "pairing_v2::provisional_tls::tests::bilateral_process_worker",
+            "--nocapture",
+        ])
+        .env(
+            "CSF12_BILATERAL_TEST_PEER",
+            endpoint.local_addr().unwrap().to_string(),
+        )
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut child = ProcessGuard(Some(child));
+    let temp = tempfile::tempdir().unwrap();
+    let store = crate::pairing_pending::PendingStore::open(temp.path()).unwrap();
+    let channel = endpoint.accept().await.unwrap();
+    let done = channel
+        .handshake(handshake_config(2, 1), &store, |p| async move {
+            p.decision(true)
+        })
+        .await
+        .unwrap();
+    std::io::Write::write_all(child.0.as_mut().unwrap().stdin.as_mut().unwrap(), b"done\n")
+        .unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while child.0.as_mut().unwrap().try_wait().unwrap().is_none() {
+        assert!(std::time::Instant::now() < deadline);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let output = child.0.take().unwrap().wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let expected = done
+        .durable_fc_hash
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains(&format!("BILATERAL_PENDING:{expected}"))
+    );
+    assert_eq!(store.version().unwrap().revision, 3);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bilateral_process_death_before_and_after_real_finalization_emit_keeps_quarantine() {
+    for point in ["before", "after"] {
+        let (der, key) = identity(true);
+        let endpoint = ProvisionalEndpoint::bind("127.0.0.1:0".parse().unwrap(), der, key).unwrap();
+        let child_root = tempfile::tempdir().unwrap();
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "pairing_v2::provisional_tls::tests::bilateral_process_worker",
+                "--nocapture",
+            ])
+            .env(
+                "CSF12_BILATERAL_TEST_PEER",
+                endpoint.local_addr().unwrap().to_string(),
+            )
+            .env("CSF12_BILATERAL_WORKER_STORE", child_root.path())
+            .env("CSF12_BILATERAL_EMIT_CRASH", point)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut child = ProcessGuard(Some(child));
+        let temp = tempfile::tempdir().unwrap();
+        let store = crate::pairing_pending::PendingStore::open(temp.path()).unwrap();
+        let channel = endpoint.accept().await.unwrap();
+        let result = channel
+            .handshake(handshake_config(2, 1), &store, |p| async move {
+                p.decision(true)
+            })
+            .await;
+        assert!(result.is_err(), "point {point}");
+        let output = child.0.take().unwrap().wait_with_output().unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(91),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let reopened = crate::pairing_pending::PendingStore::open(child_root.path()).unwrap();
+        assert_eq!(
+            reopened.version().unwrap().revision,
+            2,
+            "prepare and local decision durable before either crash"
+        );
+        assert!(reopened.promote([1; 32]).is_err());
+    }
+}
+#[test]
+#[ignore = "subprocess helper"]
+fn bilateral_process_worker() {
+    let peer = std::env::var("CSF12_BILATERAL_TEST_PEER")
+        .unwrap()
+        .parse()
+        .unwrap();
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let (der, key) = identity(true);
+            let endpoint =
+                ProvisionalEndpoint::bind("127.0.0.1:0".parse().unwrap(), der, key).unwrap();
+            let tmp = tempfile::tempdir().unwrap();
+            let worker_root = std::env::var_os("CSF12_BILATERAL_WORKER_STORE")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| tmp.path().to_owned());
+            let store = crate::pairing_pending::PendingStore::open(worker_root).unwrap();
+            let channel = endpoint.connect(peer).await.unwrap();
+            let done = channel
+                .handshake(handshake_config(1, 2), &store, |p| async move {
+                    p.decision(true)
+                })
+                .await
+                .unwrap();
+            assert_eq!(store.version().unwrap().revision, 3);
+            let hash = done
+                .durable_fc_hash
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>();
+            println!("BILATERAL_PENDING:{hash}");
+            // Out-of-band harness lifetime acknowledgement, not pairing wire.
+            tokio::task::spawn_blocking(|| {
+                let mut line = String::new();
+                std::io::stdin().read_line(&mut line).unwrap();
+                assert_eq!(line, "done\n");
+            })
+            .await
+            .unwrap();
+        });
+}
+#[tokio::test]
+async fn bilateral_real_quic_one_connection_two_requester_streams_and_durable_fc() {
+    let (_a, _b, a, b, _) = pair().await;
+    let ta = tempfile::tempdir().unwrap();
+    let tb = tempfile::tempdir().unwrap();
+    let sa = crate::pairing_pending::PendingStore::open(ta.path()).unwrap();
+    let sb = crate::pairing_pending::PendingStore::open(tb.path()).unwrap();
+    let prompts = std::sync::Mutex::new(Vec::new());
+    let confirm = |p: super::VerificationPrompt| {
+        prompts.lock().unwrap().push(p.clone());
+        async move { p.decision(true) }
+    };
+    let (a, b) = tokio::join!(
+        a.handshake(handshake_config(1, 2), &sa, confirm),
+        b.handshake(handshake_config(2, 1), &sb, confirm)
+    );
+    let a = a.unwrap();
+    let b = b.unwrap();
+    assert_ne!(a.role, b.role);
+    assert_eq!(a.durable_fc_hash, b.durable_fc_hash);
+    assert_ne!(a.local_binding, b.local_binding);
+    let prompts = prompts.into_inner().unwrap();
+    assert_eq!(prompts.len(), 2);
+    assert_eq!(prompts[0].attempt, prompts[1].attempt);
+    assert_eq!(prompts[0].transcript, prompts[1].transcript);
+    assert_eq!(prompts[0].words, prompts[1].words);
+    assert_eq!(sa.version().unwrap().revision, 3);
+    assert_eq!(sb.version().unwrap().revision, 3);
+}
 fn hello(der: &[u8]) -> Vec<u8> {
     let mut suites = vec![0, 1, 0, SUITE.len() as u8];
     suites.extend(SUITE.as_bytes());
