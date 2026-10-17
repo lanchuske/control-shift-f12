@@ -787,7 +787,11 @@ async fn stale_endpoint_drop_after_cancel_keeps_replacement_promoted() {
             )
     );
     let replacement_a_authority = replacement_a_authority.unwrap();
-    drop(replacement_b_authority.unwrap());
+    // Keep B's sealed authority alive until A's promotion has frozen ingress
+    // and published its durable record. Dropping B first is an intentional
+    // peer shutdown, which the fail-closed ingress watcher must reject rather
+    // than race with the promotion this test is meant to exercise.
+    let replacement_b_authority = replacement_b_authority.unwrap();
     let replacement_attempt = replacement_a_authority.test_attempt();
     let replacement = store
         .commit_sealed_foundation(store.version().unwrap(), replacement_a_authority)
@@ -801,10 +805,19 @@ async fn stale_endpoint_drop_after_cancel_keeps_replacement_promoted() {
         <[u8; 32]>::from(Sha256::digest(&b_identity))
     );
 
+    // Only after the replacement has reached durable promotion may either
+    // endpoint close. A's old endpoint must not revoke B's exact ownership.
+    drop(replacement_b_authority);
     drop(ea);
     assert_eq!(
         store.reconcile(replacement_attempt).unwrap(),
         crate::pairing_v2::admission_authority::ReconcileAdmission::Promoted
+    );
+    let (_, receipt, active) = sa.admission_state(replacement_attempt).unwrap();
+    assert!(active);
+    assert_eq!(
+        receipt.unwrap().peer_pin,
+        <[u8; 32]>::from(Sha256::digest(&b_identity))
     );
     drop(replacement_a);
     drop(replacement_b);
