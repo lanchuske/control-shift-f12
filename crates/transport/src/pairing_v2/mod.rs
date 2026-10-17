@@ -46,7 +46,11 @@ pub const WORDLIST_HASH: [u8; 32] = [
     0x90, 0xe5, 0x85, 0x03, 0x64, 0x6d, 0x9f, 0xf8, 0xef, 0xf3, 0xa2, 0xed, 0x3b, 0x24, 0xdb, 0xda,
 ];
 pub fn sas_words(digest: &[u8; 32]) -> Result<[String; 4], Invalid> {
-    let raw = validated_wordlist(include_bytes!("bip39-english.txt"))?;
+    sas_words_for_wordlist(digest, include_bytes!("bip39-english.txt"))
+}
+
+fn sas_words_for_wordlist(digest: &[u8; 32], wordlist: &[u8]) -> Result<[String; 4], Invalid> {
+    let raw = validated_wordlist(wordlist)?;
     let words: Vec<_> = std::str::from_utf8(raw.as_ref())
         .map_err(|_| Invalid)?
         .lines()
@@ -169,7 +173,7 @@ mod wordlist_tests {
     }
 
     #[test]
-    fn sas_vectors_are_stable_when_the_embedded_wordlist_is_crlf() {
+    fn sas_vectors_for_the_embedded_wordlist_are_stable() {
         assert_eq!(
             sas_words(&[0; 32]).unwrap(),
             ["abandon", "abandon", "abandon", "abandon"]
@@ -181,6 +185,26 @@ mod wordlist_tests {
                 0x00, 0x00, 0x00, 0x00,
             ])
             .unwrap(),
+            ["ability", "able", "about", "above"]
+        );
+    }
+
+    #[test]
+    fn sas_mapping_uses_the_same_words_for_canonical_crlf() {
+        let digest = [
+            0x00, 0x20, 0x08, 0x01, 0x80, 0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+        ];
+        let lf = include_bytes!("bip39-english.txt");
+        let crlf = crlf_wordlist();
+
+        assert_eq!(
+            sas_words_for_wordlist(&digest, lf).unwrap(),
+            sas_words_for_wordlist(&digest, &crlf).unwrap()
+        );
+        assert_eq!(
+            sas_words_for_wordlist(&digest, &crlf).unwrap(),
             ["ability", "able", "about", "above"]
         );
     }
