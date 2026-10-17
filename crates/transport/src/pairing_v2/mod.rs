@@ -29,6 +29,9 @@ mod identity;
 pub use coordinator_limits::*;
 mod recovery_authority;
 pub use recovery_authority::*;
+#[cfg(feature = "pairing-v2-experimental")]
+#[allow(dead_code)] // The sealed grammar precedes the future authenticated transport.
+pub(crate) mod recovery;
 mod session;
 pub use identity::{Identity, validate_identity};
 pub use session::*;
