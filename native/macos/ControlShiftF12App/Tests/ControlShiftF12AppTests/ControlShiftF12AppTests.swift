@@ -90,6 +90,14 @@ final class ControlShiftF12AppTests: XCTestCase {
         """.data(using: .utf8)!
 
         XCTAssertNoThrow(try controller.consume(lengthPrefixed: frame(snapshot)))
+        XCTAssertEqual(
+            controller.nearbyCandidates,
+            [NearbyCandidatePresentation(
+                handle: "windows-studio",
+                compatibility: "compatible",
+                freshness: "current"
+            )]
+        )
         XCTAssertFalse(controller.shell.inputSharingEnabled)
         XCTAssertFalse(controller.shell.clipboardSharingEnabled)
     }

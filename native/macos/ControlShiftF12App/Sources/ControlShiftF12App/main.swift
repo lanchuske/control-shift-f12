@@ -86,6 +86,18 @@ struct MacDesktopShellPresentation: Equatable {
     )
 }
 
+/// A deliberately minimal candidate summary. The native host may render this
+/// while browsing, but it never contains an address, account, or session key.
+struct NearbyCandidatePresentation: Equatable {
+    let handle: String
+    let compatibility: String
+    let freshness: String
+
+    var displayText: String {
+        "\(handle) — \(compatibility.replacingOccurrences(of: "_", with: " ")), \(freshness)"
+    }
+}
+
 /// Presentation-only bilateral pairing state. The transport supplies an
 /// opaque candidate and a transient verification phrase; this state cannot
 /// expose addresses or make durable admission happen on its own.
@@ -218,6 +230,7 @@ final class DiagnosticsFrameController {
     private(set) var presentation = DiagnosticsPresentation(runtime: .unknown, rows: [])
     private(set) var shell = MacDesktopShellPresentation.initial
     private(set) var pairing: MacPairingBridgeState?
+    private(set) var nearbyCandidates: [NearbyCandidatePresentation] = []
     private var highestGeneration: UInt64 = 0
     private var isClosed = false
 
@@ -258,6 +271,7 @@ final class DiagnosticsFrameController {
         presentation = DiagnosticsPresentation(runtime: .unknown, rows: [], refreshEnabled: false)
         shell = .initial
         pairing = nil
+        nearbyCandidates = []
     }
 
     private func completePayload(from frame: Data) throws -> Data {
@@ -307,8 +321,8 @@ final class DiagnosticsFrameController {
               let state = snapshot["state"] as? String,
               ["not_started", "browsing"].contains(state),
               let diagnostics = snapshot["diagnostics"] as? [Any], diagnostics.isEmpty,
-              let candidates = snapshot["candidates"] as? [[String: Any]],
-              validCandidates(candidates, while: state),
+              let rawCandidates = snapshot["candidates"] as? [[String: Any]],
+              let candidates = validatedCandidates(rawCandidates, while: state),
               let confirmed = snapshot["confirmed"] as? [Any], confirmed.isEmpty,
               snapshot["inventory"] is NSNull,
               let layout = snapshot["layout"] as? [String: Any],
@@ -319,13 +333,15 @@ final class DiagnosticsFrameController {
               capabilities["input_enabled"] as? Bool == false,
               capabilities["clipboard_enabled"] as? Bool == false
         else { throw HostError.invalidFrame }
+        nearbyCandidates = candidates
         shell = state == "not_started" ? .readyToDiscover : .browsing
     }
 
-    private func validCandidates(_ candidates: [[String: Any]], while state: String) -> Bool {
-        guard candidates.count <= 32 else { return false }
-        if state == "not_started" && !candidates.isEmpty { return false }
+    private func validatedCandidates(_ candidates: [[String: Any]], while state: String) -> [NearbyCandidatePresentation]? {
+        guard candidates.count <= 32 else { return nil }
+        if state == "not_started" && !candidates.isEmpty { return nil }
         var handles = Set<String>()
+        var validated: [NearbyCandidatePresentation] = []
         for candidate in candidates {
             guard Set(candidate.keys) == ["handle", "compatibility", "freshness"],
                   let handle = candidate["handle"] as? String,
@@ -336,9 +352,14 @@ final class DiagnosticsFrameController {
                   ["compatible", "needs_update", "incompatible"].contains(compatibility),
                   let freshness = candidate["freshness"] as? String,
                   ["current", "stale", "gone"].contains(freshness)
-            else { return false }
+            else { return nil }
+            validated.append(NearbyCandidatePresentation(
+                handle: handle,
+                compatibility: compatibility,
+                freshness: freshness
+            ))
         }
-        return true
+        return validated
     }
 
     private func validateIgnoredSuccessResponse(_ object: [String: Any]) throws {
@@ -633,6 +654,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     private weak var journeyHeading: NSTextField?
     private weak var journeyStatus: NSTextField?
     private weak var pairingButton: NSButton?
+    private weak var nearbyCandidatesLabel: NSTextField?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         let window = NSWindow(
@@ -718,6 +740,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         journeyStatus?.stringValue = shell.connectionStatus
         pairingButton?.isEnabled = shell.findNearbyEnabled || shell == .browsing
         pairingButton?.title = shell == .browsing ? "Stop searching" : "Find nearby computers"
+        if diagnostics.nearbyCandidates.isEmpty {
+            nearbyCandidatesLabel?.stringValue = shell == .browsing
+                ? "Searching for nearby computers…"
+                : "No nearby computers found yet."
+        } else {
+            nearbyCandidatesLabel?.stringValue = diagnostics.nearbyCandidates
+                .map(\.displayText)
+                .joined(separator: "\n")
+        }
     }
 
     private func desktopJourneyView() -> NSView {
@@ -734,6 +765,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         pairing.isEnabled = presentation.findNearbyEnabled
         pairing.setAccessibilityLabel("Find nearby computers")
         pairingButton = pairing
+
+        let candidates = NSTextField(wrappingLabelWithString: "No nearby computers found yet.")
+        candidates.textColor = .secondaryLabelColor
+        candidates.setAccessibilityLabel("Nearby computers")
+        nearbyCandidatesLabel = candidates
 
         let confirm = NSButton(title: "Confirm code on both computers", target: nil, action: nil)
         confirm.isEnabled = presentation.confirmCodeEnabled
@@ -752,7 +788,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         options.orientation = .horizontal
         options.spacing = 14
 
-        let content = NSStackView(views: [heading, status, pairing, confirm, map, options])
+        let content = NSStackView(views: [heading, status, pairing, candidates, confirm, map, options])
         content.orientation = .vertical
         content.alignment = .leading
         content.spacing = 8
