@@ -43,6 +43,18 @@ final class ControlShiftF12AppTests: XCTestCase {
         XCTAssertEqual(invalid.phase, .browsing)
     }
 
+    func testPairingProjectionAcceptsOnlyRedactedFourWordDisplay() throws {
+        let controller = DiagnosticsFrameController()
+        let payload = """
+        {"v":1,"kind":"ui_pairing_v1","generation":2,"phase":"awaiting_local_confirmation","candidate_handle":"windows-studio","verification_words":["ember","ocean","violet","copper"]}
+        """.data(using: .utf8)!
+
+        try controller.consume(lengthPrefixed: frame(payload))
+
+        XCTAssertEqual(controller.pairing?.phase, .awaitingLocalConfirmation)
+        XCTAssertEqual(controller.pairing?.verificationWords, ["ember", "ocean", "violet", "copper"])
+    }
+
     func testInitial_snapshot_enables_only_the_local_discovery_gesture() throws {
         let controller = DiagnosticsFrameController()
         let snapshot = """

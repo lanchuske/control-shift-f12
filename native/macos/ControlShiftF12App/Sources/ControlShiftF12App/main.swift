@@ -217,6 +217,7 @@ private struct SnapshotGeneration: Decodable {
 final class DiagnosticsFrameController {
     private(set) var presentation = DiagnosticsPresentation(runtime: .unknown, rows: [])
     private(set) var shell = MacDesktopShellPresentation.initial
+    private(set) var pairing: MacPairingBridgeState?
     private var highestGeneration: UInt64 = 0
     private var isClosed = false
 
@@ -241,6 +242,8 @@ final class DiagnosticsFrameController {
             try validateIgnoredSuccessResponse(object)
         case "ui_diagnostics_v1":
             try consumeDiagnostics(payload: payload, object: object)
+        case "ui_pairing_v1":
+            try consumePairing(object)
         default:
             throw HostError.invalidFrame
         }
@@ -254,6 +257,7 @@ final class DiagnosticsFrameController {
         isClosed = true
         presentation = DiagnosticsPresentation(runtime: .unknown, rows: [], refreshEnabled: false)
         shell = .initial
+        pairing = nil
     }
 
     private func completePayload(from frame: Data) throws -> Data {
@@ -326,6 +330,30 @@ final class DiagnosticsFrameController {
               let ok = object["ok"] as? Bool,
               ok
         else { throw HostError.invalidFrame }
+    }
+
+    private func consumePairing(_ object: [String: Any]) throws {
+        guard Set(object.keys) == ["v", "kind", "generation", "phase", "candidate_handle", "verification_words"],
+              object["v"] as? Int == 1,
+              object["kind"] as? String == "ui_pairing_v1",
+              let generation = object["generation"] as? UInt64, generation > highestGeneration,
+              let candidate = object["candidate_handle"] as? String,
+              let words = object["verification_words"] as? [String],
+              let phase = object["phase"] as? String
+        else { throw HostError.invalidFrame }
+        var state = MacPairingBridgeState()
+        state.beginVerification(candidate: candidate, words: words)
+        guard state.phase == .awaitingLocalConfirmation else { throw HostError.invalidFrame }
+        switch phase {
+        case "awaiting_local_confirmation": break
+        case "awaiting_remote_confirmation": state.approveLocalDisplay(matches: true)
+        case "ready_for_durable_admission":
+            state.approveLocalDisplay(matches: true)
+            state.acceptRemoteDisplay()
+        default: throw HostError.invalidFrame
+        }
+        highestGeneration = generation
+        pairing = state
     }
 
     private func isValid(_ row: WireDiagnosticRow) -> Bool {
