@@ -11,7 +11,7 @@ FileDescription = "Control Shift F12"
 OriginalFilename = "seamless-input.exe"
 
 [features]
-pairing-v2-experimental = ["seamless-discovery/pairing-v2-experimental", "seamless-transport/pairing-v2-experimental"]
+pairing-v2-experimental = ["seamless-discovery/pairing-v2-experimental", "seamless-transport/pairing-v2-experimental", "dep:mdns-sd", "dep:rustls"]
 
 [dependencies]
 clap.workspace = true
@@ -29,6 +29,8 @@ seamless-transport = { path = "../../crates/transport" }
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
 tokio.workspace = true
 thiserror = "2"
+mdns-sd = { version = "0.21", optional = true }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"], optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 seamless-input-platform-macos = { path = "../../crates/platform-macos" }
@@ -40,6 +42,7 @@ seamless-input-platform-windows = { path = "../../crates/platform-windows" }
 [dev-dependencies]
 insta = "1.42"
 tempfile = "3.14"
+rcgen = "0.14"
 
 [build-dependencies]
 winresource = "0.1.34"
