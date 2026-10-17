@@ -132,9 +132,30 @@ async fn pinned_recovery_connection_for_identities(
     quinn::Connection,
     quinn::Connection,
 ) {
+    pinned_recovery_connection_with_alpn(
+        a_certificate,
+        a_key,
+        b_certificate,
+        b_key,
+        b"control-shift-f12-recovery/1",
+    )
+    .await
+}
+
+async fn pinned_recovery_connection_with_alpn(
+    a_certificate: Vec<u8>,
+    a_key: rustls::pki_types::PrivateKeyDer<'static>,
+    b_certificate: Vec<u8>,
+    b_key: rustls::pki_types::PrivateKeyDer<'static>,
+    alpn: &[u8],
+) -> (
+    quinn::Endpoint,
+    quinn::Endpoint,
+    quinn::Connection,
+    quinn::Connection,
+) {
     let a_fingerprint: [u8; 32] = Sha256::digest(&a_certificate).into();
     let b_fingerprint: [u8; 32] = Sha256::digest(&b_certificate).into();
-    let alpn = b"control-shift-f12-recovery/1";
     let (server_config, _) =
         super::strict_pinned_configs(b_certificate, b_key, a_fingerprint, alpn, 1, 0).unwrap();
     let server = quinn::Endpoint::server(server_config, "127.0.0.1:0".parse().unwrap()).unwrap();
@@ -150,6 +171,47 @@ async fn pinned_recovery_connection_for_identities(
         server.accept().await.unwrap().await.unwrap()
     });
     (server, client, left_connection.unwrap(), right_connection)
+}
+
+fn observed_recovery_peer_pin(connection: &quinn::Connection) -> [u8; 32] {
+    let certs = connection
+        .peer_identity()
+        .unwrap()
+        .downcast::<Vec<rustls::pki_types::CertificateDer<'static>>>()
+        .unwrap();
+    Sha256::digest(certs[0].as_ref()).into()
+}
+
+#[tokio::test]
+async fn exact_peer_recovery_mint_rejects_wrong_alpn_or_expected_durable_pin() {
+    use crate::pairing_v2::recovery::{ExactPeerRecovery, exchange_exact_pair};
+    for wrong_alpn in [true, false] {
+        let (a, ak) = identity(true);
+        let (b, bk) = identity(true);
+        let a_pin = Sha256::digest(&a).into();
+        let b_pin = Sha256::digest(&b).into();
+        let alpn: &[u8] = if wrong_alpn {
+            b"different-control-channel/1"
+        } else {
+            b"control-shift-f12-recovery/1"
+        };
+        let (_server, _client, left, right) =
+            pinned_recovery_connection_with_alpn(a, ak, b, bk, alpn).await;
+        let left_evidence =
+            ExactPeerRecovery::new([1; 32], [2; 32], Some([3; 32]), 7, 11, 0).unwrap();
+        let right_evidence =
+            ExactPeerRecovery::new([1; 32], [3; 32], Some([2; 32]), 7, 11, 0).unwrap();
+        let expected = if wrong_alpn { b_pin } else { [9; 32] };
+        let (left_result, right_result) = tokio::join!(
+            exchange_exact_pair(&left, true, left_evidence, expected),
+            exchange_exact_pair(&right, false, right_evidence, a_pin),
+        );
+        assert!(
+            left_result.is_err(),
+            "the wrapper factory must reject wrong channel authentication"
+        );
+        assert!(right_result.is_err());
+    }
 }
 
 #[tokio::test]
@@ -174,8 +236,18 @@ async fn exact_peer_recovery_exchanges_one_complementary_record_over_pinned_tls(
     )
     .unwrap();
     let (left_peer, right_peer) = tokio::join!(
-        crate::pairing_v2::recovery::exchange_exact_pair(&left_connection, true, left.clone(),),
-        crate::pairing_v2::recovery::exchange_exact_pair(&right_connection, false, right.clone()),
+        crate::pairing_v2::recovery::exchange_exact_pair(
+            &left_connection,
+            true,
+            left.clone(),
+            observed_recovery_peer_pin(&left_connection)
+        ),
+        crate::pairing_v2::recovery::exchange_exact_pair(
+            &right_connection,
+            false,
+            right.clone(),
+            observed_recovery_peer_pin(&right_connection)
+        ),
     );
     assert_eq!(left_peer.unwrap().evidence(), &right);
     assert_eq!(right_peer.unwrap().evidence(), &left);
@@ -203,8 +275,18 @@ async fn exact_peer_recovery_rejects_a_changed_binding_over_pinned_tls() {
     )
     .unwrap();
     let (left_result, right_result) = tokio::join!(
-        crate::pairing_v2::recovery::exchange_exact_pair(&left_connection, true, left),
-        crate::pairing_v2::recovery::exchange_exact_pair(&right_connection, false, changed),
+        crate::pairing_v2::recovery::exchange_exact_pair(
+            &left_connection,
+            true,
+            left,
+            observed_recovery_peer_pin(&left_connection)
+        ),
+        crate::pairing_v2::recovery::exchange_exact_pair(
+            &right_connection,
+            false,
+            changed,
+            observed_recovery_peer_pin(&right_connection)
+        ),
     );
     assert!(left_result.is_err());
     assert!(right_result.is_err());

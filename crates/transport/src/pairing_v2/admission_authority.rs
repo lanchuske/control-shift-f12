@@ -503,19 +503,20 @@ pub(crate) async fn recover_bilateral_foundation(
 ) -> Result<(), StoreError> {
     // Reconcile stale guards before capturing receipts. A staged dead owner is
     // independently exact-aborted by the existing sidecar resolver.
-    let left_guard = left.store.resolve_admission_guard(left_attempt);
-    let right_guard = right.store.resolve_admission_guard(right_attempt);
-    if left_guard?.is_some() || right_guard?.is_some() {
-        return Err(StoreError::Conflict);
-    }
-    let left_receipt = left.store.admission_state(left_attempt)?.1;
-    let right_receipt = right.store.admission_state(right_attempt)?.1;
+    let left_receipt = capture_recovery_receipt(left, left_attempt);
+    let right_receipt = capture_recovery_receipt(right, right_attempt);
     let outcome = async {
-        let local_left = left_receipt.as_ref().ok_or(StoreError::Invalid)?;
-        let local_right = right_receipt.as_ref().ok_or(StoreError::Invalid)?;
+        let local_left = left_receipt
+            .as_ref()
+            .map_err(Clone::clone)?
+            .as_ref()
+            .ok_or(StoreError::Invalid)?;
+        let local_right = right_receipt
+            .as_ref()
+            .map_err(Clone::clone)?
+            .as_ref()
+            .ok_or(StoreError::Invalid)?;
         let (left_channel, right_channel) = channels.ok_or(StoreError::Unavailable)?;
-        validate_recovery_channel(left_channel, local_left.peer_pin)?;
-        validate_recovery_channel(right_channel, local_right.peer_pin)?;
         if local_left.bilateral.transaction_id != local_right.bilateral.transaction_id
             || local_left.bilateral.fields.peer_attempt != right_attempt
             || local_right.bilateral.fields.peer_attempt != left_attempt
@@ -527,8 +528,18 @@ pub(crate) async fn recover_bilateral_foundation(
         let left_evidence = left.store.recovery_evidence(left_attempt)?;
         let right_evidence = right.store.recovery_evidence(right_attempt)?;
         let (left_peer, right_peer) = tokio::join!(
-            super::recovery::exchange_exact_pair(left_channel, true, left_evidence.clone()),
-            super::recovery::exchange_exact_pair(right_channel, false, right_evidence.clone()),
+            super::recovery::exchange_exact_pair(
+                left_channel,
+                true,
+                left_evidence.clone(),
+                local_left.peer_pin
+            ),
+            super::recovery::exchange_exact_pair(
+                right_channel,
+                false,
+                right_evidence.clone(),
+                local_right.peer_pin
+            ),
         );
         let left_peer = left_peer.map_err(|_| StoreError::Invalid)?;
         let right_peer = right_peer.map_err(|_| StoreError::Invalid)?;
@@ -550,12 +561,26 @@ pub(crate) async fn recover_bilateral_foundation(
         }
         // Both cleanups run even when the first fails. Retain captured immutable
         // tuples across the await: never replace them with a newer peer receipt.
-        let left_abort = abort_recovery_receipt(left, left_receipt.as_ref());
-        let right_abort = abort_recovery_receipt(right, right_receipt.as_ref());
+        let left_abort =
+            abort_recovery_receipt(left, left_receipt.as_ref().ok().and_then(Option::as_ref));
+        let right_abort =
+            abort_recovery_receipt(right, right_receipt.as_ref().ok().and_then(Option::as_ref));
         left_abort?;
         right_abort?;
     }
     outcome
+}
+
+fn capture_recovery_receipt(
+    store: &AdmissionAuthorityStore,
+    attempt: [u8; 32],
+) -> Result<Option<AdmissionReceiptRecord>, StoreError> {
+    if store.store.resolve_admission_guard(attempt)?.is_some() {
+        // An active owner must never become a compensation target. The peer
+        // capture is independent, so its interrupted tuple can still abort.
+        return Err(StoreError::Conflict);
+    }
+    Ok(store.store.admission_state(attempt)?.1)
 }
 
 fn abort_recovery_receipt(
@@ -574,30 +599,6 @@ fn abort_recovery_receipt(
     store
         .store
         .clear_admission_guard_exact(receipt.attempt, receipt.bilateral.guard_token)
-}
-
-fn validate_recovery_channel(
-    connection: &quinn::Connection,
-    pin: [u8; 32],
-) -> Result<(), StoreError> {
-    let handshake = connection
-        .handshake_data()
-        .ok_or(StoreError::Invalid)?
-        .downcast::<quinn::crypto::rustls::HandshakeData>()
-        .map_err(|_| StoreError::Invalid)?;
-    let certificates = connection
-        .peer_identity()
-        .ok_or(StoreError::Invalid)?
-        .downcast::<Vec<rustls::pki_types::CertificateDer<'static>>>()
-        .map_err(|_| StoreError::Invalid)?;
-    if connection.close_reason().is_some()
-        || handshake.protocol.as_deref() != Some(b"control-shift-f12-recovery/1")
-        || certificates.len() != 1
-        || super::evidence::hash(certificates[0].as_ref()) != pin
-    {
-        return Err(StoreError::Invalid);
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -1273,6 +1274,102 @@ mod tests {
             transcript: [23; 32],
             binding: [24; 32],
         }
+    }
+
+    #[tokio::test]
+    async fn recovery_malformed_sidecar_still_exact_aborts_the_other_store() {
+        for malformed_left in [true, false] {
+            let left_root = tempfile::tempdir().unwrap();
+            let right_root = tempfile::tempdir().unwrap();
+            let left = AdmissionAuthorityStore::open(left_root.path()).unwrap();
+            let right = AdmissionAuthorityStore::open(right_root.path()).unwrap();
+            let a = left
+                .prepare(left.version().unwrap(), [191; 32], [192; 32])
+                .unwrap();
+            let b = right
+                .prepare(right.version().unwrap(), [193; 32], [194; 32])
+                .unwrap();
+            left.commit_operational_test_receipt(&a, [195; 32]).unwrap();
+            right
+                .commit_operational_test_receipt(&b, [196; 32])
+                .unwrap();
+            let (bad_root, bad_attempt, valid, valid_record) = if malformed_left {
+                (left_root.path(), a.attempt_id, &right, &b)
+            } else {
+                (right_root.path(), b.attempt_id, &left, &a)
+            };
+            let hex: String = bad_attempt
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect();
+            std::fs::write(
+                bad_root
+                    .join("pairing-tombstones")
+                    .join(format!("admission-revocation-{hex}.json")),
+                b"malformed sidecar",
+            )
+            .unwrap();
+            assert!(
+                recover_bilateral_foundation(&left, a.attempt_id, &right, b.attempt_id, None)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(
+                valid.reconcile(valid_record.attempt_id).unwrap(),
+                ReconcileAdmission::Absent,
+                "one malformed sidecar must not skip the other immutable transaction's cleanup"
+            );
+            assert!(
+                valid
+                    .operational_admission_snapshot(valid_record.attempt_id)
+                    .is_err()
+            );
+            valid
+                .prepare(
+                    valid.version().unwrap(),
+                    [197; 32],
+                    valid_record.peer_fingerprint,
+                )
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn recovery_active_owner_is_preserved_while_the_other_store_exact_aborts() {
+        let left_root = tempfile::tempdir().unwrap();
+        let right_root = tempfile::tempdir().unwrap();
+        let left = AdmissionAuthorityStore::open(left_root.path()).unwrap();
+        let right = AdmissionAuthorityStore::open(right_root.path()).unwrap();
+        let a = left
+            .prepare(left.version().unwrap(), [201; 32], [202; 32])
+            .unwrap();
+        let b = right
+            .prepare(right.version().unwrap(), [203; 32], [204; 32])
+            .unwrap();
+        left.commit_operational_test_receipt(&a, [205; 32]).unwrap();
+        right
+            .commit_operational_test_receipt(&b, [206; 32])
+            .unwrap();
+        let mut live = left
+            .store
+            .admission_revoker(a.peer_fingerprint, a.attempt_id)
+            .unwrap();
+        live.arm();
+        let before = left.test_bilateral_receipt(a.attempt_id).unwrap();
+        assert!(
+            recover_bilateral_foundation(&left, a.attempt_id, &right, b.attempt_id, None)
+                .await
+                .is_err()
+        );
+        assert_eq!(left.test_bilateral_receipt(a.attempt_id).unwrap(), before);
+        assert!(left.test_has_admission_guard(a.attempt_id).unwrap());
+        assert_eq!(
+            right.reconcile(b.attempt_id).unwrap(),
+            ReconcileAdmission::Absent
+        );
+        right
+            .prepare(right.version().unwrap(), [207; 32], b.peer_fingerprint)
+            .unwrap();
     }
 
     #[tokio::test]

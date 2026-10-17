@@ -386,6 +386,41 @@ mod bilateral_admission_state_tests {
     }
 
     #[test]
+    fn authenticated_peer_recovery_rejects_evidence_authenticated_to_another_pin() {
+        let root = tempfile::tempdir().unwrap();
+        let store = PendingStore::open(root.path()).unwrap();
+        let record = store
+            .prepare(store.version().unwrap(), [141; 32], [142; 32])
+            .unwrap();
+        let receipt = store
+            .publish_local_bilateral_receipt(
+                store.version().unwrap(),
+                &record,
+                prepared_store_owned_receipt(&record, store.version().unwrap()),
+            )
+            .unwrap();
+        let peer = crate::pairing_v2::recovery::ExactPeerRecovery::new(
+            receipt.bilateral.transaction_id.as_bytes(),
+            [143; 32],
+            Some(receipt.bilateral.local_receipt_hash),
+            receipt.identity_generation,
+            receipt.revocation_generation,
+            receipt.policy_revision,
+        )
+        .unwrap();
+        let peer =
+            crate::pairing_v2::recovery::AuthenticatedExactPeerRecovery::test_only(peer, [144; 32]);
+        assert_eq!(
+            store.confirm_authenticated_peer_recovery(record.attempt_id, peer),
+            Err(StoreError::Invalid)
+        );
+        assert_eq!(
+            store.admission_state(record.attempt_id).unwrap().1,
+            Some(receipt)
+        );
+    }
+
+    #[test]
     fn authenticated_peer_recovery_confirms_only_the_exact_store_owned_receipt() {
         let root = tempfile::tempdir().unwrap();
         let store = PendingStore::open(root.path()).unwrap();
@@ -408,7 +443,10 @@ mod bilateral_admission_state_tests {
             receipt.policy_revision,
         )
         .unwrap();
-        let peer = crate::pairing_v2::recovery::AuthenticatedExactPeerRecovery::test_only(peer);
+        let peer = crate::pairing_v2::recovery::AuthenticatedExactPeerRecovery::test_only(
+            peer,
+            receipt.peer_pin,
+        );
 
         let confirmed = store
             .confirm_authenticated_peer_recovery(record.attempt_id, peer)
@@ -2992,6 +3030,9 @@ mod unix {
             }
             let (_, receipt, active) = self.admission_state(attempt)?;
             let receipt = receipt.filter(|_| active).ok_or(StoreError::Invalid)?;
+            if peer.authenticated_peer_pin() != receipt.peer_pin {
+                return Err(StoreError::Invalid);
+            }
             match receipt.bilateral.state {
                 BilateralAdmissionState::StoreOwnedAwaitingPeer => self.confirm_bilateral_receipt(
                     self.version()?,

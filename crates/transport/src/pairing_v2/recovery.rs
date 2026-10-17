@@ -135,18 +135,26 @@ impl ExactPeerRecovery {
 /// Evidence returned only after the fresh pinned mutual-TLS exchange has
 /// compared the two descriptors. Its payload remains crate-private so raw
 /// serialized recovery data cannot be mistaken for transport-authenticated
-/// evidence by the durable store.
+/// evidence by the durable store. The observed TLS pin travels with the proof
+/// and must match the consuming receipt's durable peer pin.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct AuthenticatedExactPeerRecovery(ExactPeerRecovery);
+pub(crate) struct AuthenticatedExactPeerRecovery {
+    evidence: ExactPeerRecovery,
+    peer_pin: [u8; 32],
+}
 
 impl AuthenticatedExactPeerRecovery {
     pub(crate) fn evidence(&self) -> &ExactPeerRecovery {
-        &self.0
+        &self.evidence
+    }
+
+    pub(crate) fn authenticated_peer_pin(&self) -> [u8; 32] {
+        self.peer_pin
     }
 
     #[cfg(test)]
-    pub(crate) fn test_only(evidence: ExactPeerRecovery) -> Self {
-        Self(evidence)
+    pub(crate) fn test_only(evidence: ExactPeerRecovery, peer_pin: [u8; 32]) -> Self {
+        Self { evidence, peer_pin }
     }
 }
 
@@ -157,12 +165,16 @@ impl AuthenticatedExactPeerRecovery {
 /// The caller retains the connection for the duration of the exchange so a
 /// successful responder cannot tear it down before the initiator observes its
 /// clean stream finish.
+/// Authentication is checked here, before any record exchange: callers cannot
+/// mint this wrapper through another ALPN or by supplying a different pin.
 pub(crate) async fn exchange_exact_pair(
     connection: &quinn::Connection,
     initiator: bool,
     local: ExactPeerRecovery,
+    expected_peer_pin: [u8; 32],
 ) -> Result<AuthenticatedExactPeerRecovery, Invalid> {
     let result = tokio::time::timeout(RECOVERY_DEADLINE, async {
+        validate_recovery_channel(connection, expected_peer_pin)?;
         let protocol = async {
             if initiator {
                 let (mut send, mut recv) = connection.open_bi().await.map_err(|_| Invalid)?;
@@ -174,7 +186,10 @@ pub(crate) async fn exchange_exact_pair(
                 send.write_all(&[RECOVERY_ACK]).await.map_err(|_| Invalid)?;
                 send.finish().map_err(|_| Invalid)?;
                 recovery_eof(&mut recv).await?;
-                Ok(AuthenticatedExactPeerRecovery(peer))
+                Ok(AuthenticatedExactPeerRecovery {
+                    evidence: peer,
+                    peer_pin: expected_peer_pin,
+                })
             } else {
                 let (mut send, mut recv) = connection.accept_bi().await.map_err(|_| Invalid)?;
                 let peer = read_recovery_record(&mut recv).await?;
@@ -189,7 +204,10 @@ pub(crate) async fn exchange_exact_pair(
                 }
                 recovery_eof(&mut recv).await?;
                 send.finish().map_err(|_| Invalid)?;
-                Ok(AuthenticatedExactPeerRecovery(peer))
+                Ok(AuthenticatedExactPeerRecovery {
+                    evidence: peer,
+                    peer_pin: expected_peer_pin,
+                })
             }
         };
         tokio::select! { biased;
@@ -213,6 +231,38 @@ pub(crate) async fn exchange_exact_pair(
             Err(Invalid)
         }
     }
+}
+
+fn validate_recovery_channel(connection: &quinn::Connection, pin: [u8; 32]) -> Result<(), Invalid> {
+    let handshake = connection
+        .handshake_data()
+        .ok_or(Invalid)?
+        .downcast::<quinn::crypto::rustls::HandshakeData>()
+        .map_err(|_| Invalid)?;
+    let certificates = connection
+        .peer_identity()
+        .ok_or(Invalid)?
+        .downcast::<Vec<rustls::pki_types::CertificateDer<'static>>>()
+        .map_err(|_| Invalid)?;
+    if connection.close_reason().is_some() {
+        return Err(Invalid);
+    }
+    validate_recovery_identity(handshake.protocol.as_deref(), certificates.as_slice(), pin)
+}
+
+fn validate_recovery_identity(
+    protocol: Option<&[u8]>,
+    certificates: &[rustls::pki_types::CertificateDer<'_>],
+    pin: [u8; 32],
+) -> Result<(), Invalid> {
+    if pin == [0; 32]
+        || protocol != Some(b"control-shift-f12-recovery/1")
+        || certificates.len() != 1
+        || super::evidence::hash(certificates[0].as_ref()) != pin
+    {
+        return Err(Invalid);
+    }
+    Ok(())
 }
 
 async fn write_recovery_record(
@@ -253,6 +303,55 @@ async fn recovery_eof(recv: &mut quinn::RecvStream) -> Result<(), Invalid> {
 #[cfg(test)]
 mod tests {
     use super::ExactPeerRecovery;
+
+    #[test]
+    fn exact_peer_recovery_identity_gate_requires_recovery_alpn_and_durable_pin() {
+        use rustls::pki_types::CertificateDer;
+        use sha2::{Digest, Sha256};
+        let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap();
+        let cert = rcgen::CertificateParams::default()
+            .self_signed(&key)
+            .unwrap();
+        let chain = [CertificateDer::from(cert.der().to_vec())];
+        let pin: [u8; 32] = Sha256::digest(chain[0].as_ref()).into();
+        assert!(
+            super::validate_recovery_identity(Some(b"control-shift-f12-recovery/1"), &chain, pin)
+                .is_ok()
+        );
+        for protocol in [None, Some(&b"different-control-channel/1"[..])] {
+            assert!(super::validate_recovery_identity(protocol, &chain, pin).is_err());
+        }
+        let mut other_pin = pin;
+        other_pin[0] ^= 1;
+        assert!(
+            super::validate_recovery_identity(
+                Some(b"control-shift-f12-recovery/1"),
+                &chain,
+                other_pin
+            )
+            .is_err()
+        );
+        assert!(
+            super::validate_recovery_identity(
+                Some(b"control-shift-f12-recovery/1"),
+                &chain,
+                [0; 32]
+            )
+            .is_err()
+        );
+        assert!(
+            super::validate_recovery_identity(Some(b"control-shift-f12-recovery/1"), &[], pin)
+                .is_err()
+        );
+        assert!(
+            super::validate_recovery_identity(
+                Some(b"control-shift-f12-recovery/1"),
+                &[chain[0].clone(), chain[0].clone()],
+                pin
+            )
+            .is_err()
+        );
+    }
 
     fn left() -> ExactPeerRecovery {
         ExactPeerRecovery::new([1; 32], [2; 32], Some([3; 32]), 7, 11, 0).unwrap()
