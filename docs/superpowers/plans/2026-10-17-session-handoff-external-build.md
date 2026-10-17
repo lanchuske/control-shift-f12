@@ -70,8 +70,10 @@ test is ignored. The staged crash recovery bug was that a restart returned
 `AwaitingHandoff` receipt and exact-aborts it, rather than using the legacy
 ambiguous revocation fallback.
 
-Windows is **NOT MEASURED** for this fix. The isolated Windows checkout built
-and began the test run, but no completed result was captured. Resume with:
+Windows verification completed on the isolated checkout on 2026-10-17:
+Prepared, Staged, and the ambiguous legacy recovery case passed (3 passed, 0
+failed, 1 intentional subprocess helper ignored). Re-run the same command if
+the pending Task 5 changes change:
 
 ```sh
 ssh windows 'powershell -NoProfile -Command "Set-Location C:\\Users\\lanch\\csf12-task5-staged; cargo test -p seamless-transport --features pairing-v2-experimental task4_ -- --nocapture"'
@@ -81,8 +83,7 @@ Do not treat a compilation or partial output as a Windows pass.
 
 ## Next work in order
 
-1. Capture the full Windows result for the existing Task 5 test.
-2. Finish actual subprocess kill/restart coverage for `ProofVerified`, `Frozen`,
+1. Finish actual subprocess kill/restart coverage for `ProofVerified`, `Frozen`,
    `StoreOwned`, one-finalize, and one-confirm boundaries.
 3. Require each recovery case to leave no snapshot, pin, unilateral relation, or
    durable admission; the same peer must be able to retry cleanly.
