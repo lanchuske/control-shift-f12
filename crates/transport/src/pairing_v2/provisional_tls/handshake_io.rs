@@ -104,6 +104,11 @@ impl LocalFinalizationReceipt {
     pub(super) fn test_fault(&mut self, fault: FinalizationTestFault) {
         self.test_fault = Some(fault);
     }
+
+    #[cfg(test)]
+    pub(in crate::pairing_v2) fn test_fault_wrong_transaction_on_wire(&mut self) {
+        self.test_fault = Some(FinalizationTestFault::WrongTransactionOnWire);
+    }
 }
 
 /// Authenticated observation of the peer's finalization publication.  This is
@@ -226,12 +231,19 @@ impl PreparedHandshakeAuthority {
             .map_err(|_| HandshakeError::Rejected)
     }
 
+    pub(in crate::pairing_v2) fn abort_exact(self) -> Result<(), HandshakeError> {
+        self.reservation
+            .abort_exact()
+            .map_err(|_| HandshakeError::Rejected)
+    }
+
     pub(in crate::pairing_v2) fn local_receipt(
         &self,
         peer_attempt: [u8; 32],
         receipt_hash: [u8; 32],
     ) -> Result<LocalFinalizationReceipt, HandshakeError> {
-        self.authority.local_finalization_receipt(peer_attempt, receipt_hash)
+        self.authority
+            .local_finalization_receipt(peer_attempt, receipt_hash)
     }
 
     pub(in crate::pairing_v2) async fn exchange(
@@ -247,7 +259,10 @@ impl PreparedHandshakeAuthority {
         if !self.authority.is_protocol_valid() {
             return Err(HandshakeError::Rejected);
         }
-        let handoff = self.reservation.freeze().map_err(|_| HandshakeError::Rejected)?;
+        let handoff = self
+            .reservation
+            .freeze()
+            .map_err(|_| HandshakeError::Rejected)?;
         self.authority
             ._channel
             .connection
@@ -896,6 +911,12 @@ impl FrozenPromotionEvidence {
     ) -> (SealedPromotionFields, super::FrozenAdmissionHandoff) {
         let fields = self.fields();
         (fields, self.handoff)
+    }
+
+    pub(in crate::pairing_v2) fn abort_exact(self) -> Result<(), HandshakeError> {
+        self.handoff
+            .abort_exact()
+            .map_err(|_| HandshakeError::Rejected)
     }
 
     #[cfg(test)]

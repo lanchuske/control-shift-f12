@@ -369,6 +369,12 @@ impl PreparedAdmissionHandoff {
         self.scope.mark_staged(self.token)
     }
 
+    pub(in crate::pairing_v2) fn abort_exact(
+        self,
+    ) -> Result<(), crate::pairing_pending::StoreError> {
+        self.scope.abort_live(self.token)
+    }
+
     #[cfg(test)]
     pub(in crate::pairing_v2) fn test_matches_ownership(
         &self,
@@ -404,6 +410,12 @@ impl FrozenAdmissionHandoff {
         }
         state.phase = ConsentPhase::TransferredToStore;
         Ok(revoker)
+    }
+
+    pub(in crate::pairing_v2) fn abort_exact(
+        self,
+    ) -> Result<(), crate::pairing_pending::StoreError> {
+        self.scope.abort_frozen(self.token)
     }
 
     pub(in crate::pairing_v2) fn awaiting_handoff_ownership(
@@ -490,6 +502,73 @@ impl ConsentScope {
         }
         state.phase = ConsentPhase::Staged;
         Ok(())
+    }
+
+    fn abort_live(&self, token: [u8; 32]) -> Result<(), crate::pairing_pending::StoreError> {
+        let (revoker, phase) = self.take_live_revoker_for_abort(token)?;
+        let mut revoker = revoker;
+        match phase {
+            ConsentPhase::Reserved => revoker.cancel_exact(),
+            ConsentPhase::Staged => revoker.abort_staged_exact(),
+            _ => Err(crate::pairing_pending::StoreError::Invalid),
+        }
+    }
+
+    fn abort_frozen(&self, token: [u8; 32]) -> Result<(), crate::pairing_pending::StoreError> {
+        let revoker = self.take_revoker_for_abort(token, ConsentPhase::Frozen)?;
+        let mut revoker = revoker;
+        revoker.abort_staged_exact()
+    }
+
+    fn take_live_revoker_for_abort(
+        &self,
+        token: [u8; 32],
+    ) -> Result<
+        (crate::pairing_pending::AdmissionRevoker, ConsentPhase),
+        crate::pairing_pending::StoreError,
+    > {
+        let mut state = self
+            .0
+            .lock()
+            .map_err(|_| crate::pairing_pending::StoreError::Invalid)?;
+        if !matches!(state.phase, ConsentPhase::Reserved | ConsentPhase::Staged) {
+            return Err(crate::pairing_pending::StoreError::Invalid);
+        }
+        let phase = state.phase;
+        let revoker = state
+            .revoker
+            .take()
+            .ok_or(crate::pairing_pending::StoreError::Invalid)?;
+        if !revoker.matches_handoff_token(token) {
+            state.revoker = Some(revoker);
+            return Err(crate::pairing_pending::StoreError::Invalid);
+        }
+        state.phase = ConsentPhase::Revoked;
+        Ok((revoker, phase))
+    }
+
+    fn take_revoker_for_abort(
+        &self,
+        token: [u8; 32],
+        expected_phase: ConsentPhase,
+    ) -> Result<crate::pairing_pending::AdmissionRevoker, crate::pairing_pending::StoreError> {
+        let mut state = self
+            .0
+            .lock()
+            .map_err(|_| crate::pairing_pending::StoreError::Invalid)?;
+        if state.phase != expected_phase {
+            return Err(crate::pairing_pending::StoreError::Invalid);
+        }
+        let revoker = state
+            .revoker
+            .take()
+            .ok_or(crate::pairing_pending::StoreError::Invalid)?;
+        if !revoker.matches_handoff_token(token) {
+            state.revoker = Some(revoker);
+            return Err(crate::pairing_pending::StoreError::Invalid);
+        }
+        state.phase = ConsentPhase::Revoked;
+        Ok(revoker)
     }
     fn revoke(&self) -> Option<(crate::pairing_pending::AdmissionRevoker, ConsentPhase)> {
         let Ok(mut state) = self.0.lock() else {
@@ -610,8 +689,11 @@ impl Drop for ProvisionalEndpoint {
                 // Once staged, endpoint loss aborts only the exact
                 // transaction/guard; the legacy peer-wide revoker is not
                 // permitted on the Task 4 path.
-                ConsentPhase::Staged => revoker.abort_staged_exact(),
-                ConsentPhase::Active | ConsentPhase::Frozen => revoker.revoke(),
+                ConsentPhase::Staged | ConsentPhase::Frozen => revoker.abort_staged_exact(),
+                // Only an unreserved legacy endpoint may revoke the current
+                // peer. Once Task 4 owns an exact reservation, even a frozen
+                // endpoint loss must be confined to that attempt/token.
+                ConsentPhase::Active => revoker.revoke(),
                 ConsentPhase::TransferredToStore | ConsentPhase::Revoked => Ok(()),
             };
         }

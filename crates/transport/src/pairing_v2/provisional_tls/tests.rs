@@ -259,10 +259,10 @@ async fn bilateral_commit_requires_both_stores_confirmed_before_any_snapshot() {
     let b = b.unwrap();
     let a_attempt = a.test_attempt();
     let b_attempt = b.test_attempt();
-    let left = crate::pairing_v2::admission_authority::AdmissionAuthorityStore::open(ta.path())
-        .unwrap();
-    let right = crate::pairing_v2::admission_authority::AdmissionAuthorityStore::open(tb.path())
-        .unwrap();
+    let left =
+        crate::pairing_v2::admission_authority::AdmissionAuthorityStore::open(ta.path()).unwrap();
+    let right =
+        crate::pairing_v2::admission_authority::AdmissionAuthorityStore::open(tb.path()).unwrap();
     let hook = crate::pairing_v2::admission_authority::BilateralCommitTestHook::recording();
 
     crate::pairing_v2::admission_authority::commit_bilateral_foundation_with_test_hook(
@@ -278,6 +278,7 @@ async fn bilateral_commit_requires_both_stores_confirmed_before_any_snapshot() {
             Checkpoint::PreflightComplete,
             Checkpoint::LeftStaged,
             Checkpoint::RightStaged,
+            Checkpoint::Task3ProofsAttempted,
             Checkpoint::Task3ProofsVerified,
             Checkpoint::LeftFrozen,
             Checkpoint::RightFrozen,
@@ -304,15 +305,26 @@ async fn bilateral_commit_requires_both_stores_confirmed_before_any_snapshot() {
         right_receipt.bilateral.state,
         crate::pairing_pending::BilateralAdmissionState::BilateralConfirmed
     );
-    assert_eq!(left_receipt.bilateral.transaction_id, right_receipt.bilateral.transaction_id);
-    assert_eq!(left_receipt.bilateral.local_receipt_hash, right_receipt.bilateral.peer_receipt_hash.unwrap());
-    assert_eq!(right_receipt.bilateral.local_receipt_hash, left_receipt.bilateral.peer_receipt_hash.unwrap());
+    assert_eq!(
+        left_receipt.bilateral.transaction_id,
+        right_receipt.bilateral.transaction_id
+    );
+    assert_eq!(
+        left_receipt.bilateral.local_receipt_hash,
+        right_receipt.bilateral.peer_receipt_hash.unwrap()
+    );
+    assert_eq!(
+        right_receipt.bilateral.local_receipt_hash,
+        left_receipt.bilateral.peer_receipt_hash.unwrap()
+    );
     assert!(left.operational_admission_snapshot(a_attempt).is_err());
     assert!(right.operational_admission_snapshot(b_attempt).is_err());
 }
 
 async fn bilateral_commit_failure_aborts_exact_transactions_on_both_stores(
-    make_hook: impl FnOnce(ProvisionalEndpoint) -> crate::pairing_v2::admission_authority::BilateralCommitTestHook,
+    make_hook: impl FnOnce(
+        ProvisionalEndpoint,
+    ) -> crate::pairing_v2::admission_authority::BilateralCommitTestHook,
     expected_checkpoints: &[crate::pairing_v2::admission_authority::BilateralCommitCheckpoint],
 ) {
     let (ea, _eb, a, b, _) = pair().await;
@@ -332,10 +344,10 @@ async fn bilateral_commit_failure_aborts_exact_transactions_on_both_stores(
     let b = b.unwrap();
     let a_attempt = a.test_attempt();
     let b_attempt = b.test_attempt();
-    let left = crate::pairing_v2::admission_authority::AdmissionAuthorityStore::open(ta.path())
-        .unwrap();
-    let right = crate::pairing_v2::admission_authority::AdmissionAuthorityStore::open(tb.path())
-        .unwrap();
+    let left =
+        crate::pairing_v2::admission_authority::AdmissionAuthorityStore::open(ta.path()).unwrap();
+    let right =
+        crate::pairing_v2::admission_authority::AdmissionAuthorityStore::open(tb.path()).unwrap();
 
     let a_peer = sa.pending(a_attempt).unwrap().unwrap().peer_fingerprint;
     let b_peer = sb.pending(b_attempt).unwrap().unwrap().peer_fingerprint;
@@ -343,10 +355,11 @@ async fn bilateral_commit_failure_aborts_exact_transactions_on_both_stores(
     // chooses to drop it at a named transition. This rules out a fake
     // store-only endpoint failure seam.
     let hook = make_hook(ea);
-    let result = crate::pairing_v2::admission_authority::commit_bilateral_foundation_with_test_hook(
-        &left, a, &right, b, &hook,
-    )
-    .await;
+    let result =
+        crate::pairing_v2::admission_authority::commit_bilateral_foundation_with_test_hook(
+            &left, a, &right, b, &hook,
+        )
+        .await;
     assert!(result.is_err());
     assert!(left.operational_admission_snapshot(a_attempt).is_err());
     assert!(right.operational_admission_snapshot(b_attempt).is_err());
@@ -358,13 +371,38 @@ async fn bilateral_commit_failure_aborts_exact_transactions_on_both_stores(
         right.reconcile(b_attempt).unwrap(),
         crate::pairing_v2::admission_authority::ReconcileAdmission::Absent
     );
+    assert!(
+        !left.test_has_admission_guard(a_attempt).unwrap(),
+        "exact abort must consume the left guard sidecar"
+    );
+    assert!(
+        !right.test_has_admission_guard(b_attempt).unwrap(),
+        "exact abort must consume the right guard sidecar"
+    );
+    // Reopen from disk after every terminal path.  A process that did not
+    // observe the in-memory abort must neither retain an active sidecar nor
+    // reconstruct an operational admission from the unfinished receipt.
+    let reopened_left =
+        crate::pairing_v2::admission_authority::AdmissionAuthorityStore::open(ta.path()).unwrap();
+    let reopened_right =
+        crate::pairing_v2::admission_authority::AdmissionAuthorityStore::open(tb.path()).unwrap();
+    assert_eq!(
+        reopened_left.reconcile(a_attempt).unwrap(),
+        crate::pairing_v2::admission_authority::ReconcileAdmission::Absent
+    );
+    assert_eq!(
+        reopened_right.reconcile(b_attempt).unwrap(),
+        crate::pairing_v2::admission_authority::ReconcileAdmission::Absent
+    );
+    assert!(!reopened_left.test_has_admission_guard(a_attempt).unwrap());
+    assert!(!reopened_right.test_has_admission_guard(b_attempt).unwrap());
     // Exact compensation must release only the failed transaction.  A fresh
     // same-peer attempt proves no stale reservation, pin, or guard survived.
-    left
-        .prepare(left.version().unwrap(), [91; 32], a_peer)
+    reopened_left
+        .prepare(reopened_left.version().unwrap(), [91; 32], a_peer)
         .expect("left exact abort must not block a later same-peer attempt");
-    right
-        .prepare(right.version().unwrap(), [92; 32], b_peer)
+    reopened_right
+        .prepare(reopened_right.version().unwrap(), [92; 32], b_peer)
         .expect("right exact abort must not block a later same-peer attempt");
     assert_eq!(
         hook.checkpoints(),
@@ -382,8 +420,7 @@ async fn every_durable_bilateral_commit_checkpoint_aborts_exactly() {
     macro_rules! assert_exact_abort {
         ($make_hook:expr, $expected:expr) => {
             bilateral_commit_failure_aborts_exact_transactions_on_both_stores(
-                $make_hook,
-                &$expected,
+                $make_hook, &$expected,
             )
             .await
         };
@@ -394,6 +431,7 @@ async fn every_durable_bilateral_commit_checkpoint_aborts_exactly() {
         vec![
             Checkpoint::PreflightComplete,
             Checkpoint::LeftStaged,
+            Checkpoint::RightAborted,
             Checkpoint::LeftAborted,
         ]
     );
@@ -413,6 +451,7 @@ async fn every_durable_bilateral_commit_checkpoint_aborts_exactly() {
             Checkpoint::PreflightComplete,
             Checkpoint::LeftStaged,
             Checkpoint::RightStaged,
+            Checkpoint::Task3ProofsAttempted,
             Checkpoint::Task3ProofsVerified,
             Checkpoint::LeftFrozen,
             Checkpoint::RightFrozen,
@@ -427,6 +466,7 @@ async fn every_durable_bilateral_commit_checkpoint_aborts_exactly() {
             Checkpoint::PreflightComplete,
             Checkpoint::LeftStaged,
             Checkpoint::RightStaged,
+            Checkpoint::Task3ProofsAttempted,
             Checkpoint::Task3ProofsVerified,
             Checkpoint::LeftFrozen,
             Checkpoint::RightFrozen,
@@ -442,6 +482,7 @@ async fn every_durable_bilateral_commit_checkpoint_aborts_exactly() {
             Checkpoint::PreflightComplete,
             Checkpoint::LeftStaged,
             Checkpoint::RightStaged,
+            Checkpoint::Task3ProofsAttempted,
             Checkpoint::Task3ProofsVerified,
             Checkpoint::LeftFrozen,
             Checkpoint::RightFrozen,
@@ -453,11 +494,12 @@ async fn every_durable_bilateral_commit_checkpoint_aborts_exactly() {
         ]
     );
     assert_exact_abort!(
-        |endpoint| Hook::with_live_left_endpoint(endpoint).reject_task3(),
+        |endpoint| Hook::with_live_left_endpoint(endpoint).wrong_transaction_on_wire(),
         vec![
             Checkpoint::PreflightComplete,
             Checkpoint::LeftStaged,
             Checkpoint::RightStaged,
+            Checkpoint::Task3ProofsAttempted,
             Checkpoint::RightAborted,
             Checkpoint::LeftAborted,
         ]
@@ -475,7 +517,10 @@ async fn endpoint_drop_before_or_after_staging_aborts_exactly() {
     // state. The coordinator must observe the real transport close.
     bilateral_commit_failure_aborts_exact_transactions_on_both_stores(
         |endpoint| Hook::drop_real_left_endpoint_after(Checkpoint::PreflightComplete, endpoint),
-        &[Checkpoint::PreflightComplete, Checkpoint::LeftEndpointDropped],
+        &[
+            Checkpoint::PreflightComplete,
+            Checkpoint::LeftEndpointDropped,
+        ],
     )
     .await;
     bilateral_commit_failure_aborts_exact_transactions_on_both_stores(
@@ -484,6 +529,24 @@ async fn endpoint_drop_before_or_after_staging_aborts_exactly() {
             Checkpoint::PreflightComplete,
             Checkpoint::LeftStaged,
             Checkpoint::LeftEndpointDropped,
+            Checkpoint::RightAborted,
+        ],
+    )
+    .await;
+    // After both sides freeze their exact reservations, dropping the original
+    // endpoint must abort only its frozen handoff.  It may not fall back to a
+    // peer-wide revocation that could erase a later same-peer admission.
+    bilateral_commit_failure_aborts_exact_transactions_on_both_stores(
+        |endpoint| Hook::drop_real_left_endpoint_after(Checkpoint::LeftFrozen, endpoint),
+        &[
+            Checkpoint::PreflightComplete,
+            Checkpoint::LeftStaged,
+            Checkpoint::RightStaged,
+            Checkpoint::Task3ProofsAttempted,
+            Checkpoint::Task3ProofsVerified,
+            Checkpoint::LeftFrozen,
+            Checkpoint::LeftEndpointDropped,
+            Checkpoint::RightAborted,
         ],
     )
     .await;
@@ -491,9 +554,7 @@ async fn endpoint_drop_before_or_after_staging_aborts_exactly() {
 
 #[tokio::test]
 async fn stale_failed_coordinator_abort_cannot_damage_fresh_same_peer_finalization() {
-    use crate::pairing_v2::admission_authority::{
-        BilateralCommitCheckpoint as Checkpoint, BilateralCommitTestHook as Hook,
-    };
+    use crate::pairing_v2::admission_authority::BilateralCommitTestHook as Hook;
 
     // A failed coordinator consumes its endpoints. Reopen fresh endpoints
     // with the same identities so this is a real same-peer retry rather than
@@ -525,44 +586,45 @@ async fn stale_failed_coordinator_abort_cannot_damage_fresh_same_peer_finalizati
     let b = b.unwrap();
     let stale_a_attempt = a.test_attempt();
     let stale_b_attempt = b.test_attempt();
-    let left = crate::pairing_v2::admission_authority::AdmissionAuthorityStore::open(ta.path())
-        .unwrap();
-    let right = crate::pairing_v2::admission_authority::AdmissionAuthorityStore::open(tb.path())
-        .unwrap();
-    let stale_hook = Hook::recording().fail_after(Checkpoint::LeftStaged);
-    assert!(crate::pairing_v2::admission_authority::commit_bilateral_foundation_with_test_hook(
-        &left,
-        a,
-        &right,
-        b,
-        &stale_hook,
-    )
-    .await
-    .is_err());
+    let left =
+        crate::pairing_v2::admission_authority::AdmissionAuthorityStore::open(ta.path()).unwrap();
+    let right =
+        crate::pairing_v2::admission_authority::AdmissionAuthorityStore::open(tb.path()).unwrap();
+    // This is a real Task 3 failure: both receipts are already staged and
+    // one peer sends an HMAC-valid receipt bound to the wrong transaction.
+    // The fresh retry below must still complete a full bilateral commit.
+    let stale_hook = Hook::recording().wrong_transaction_on_wire();
+    assert!(
+        crate::pairing_v2::admission_authority::commit_bilateral_foundation_with_test_hook(
+            &left,
+            a,
+            &right,
+            b,
+            &stale_hook,
+        )
+        .await
+        .is_err()
+    );
 
-    let fresh_ea = ProvisionalEndpoint::bind(
-        "127.0.0.1:0".parse().unwrap(),
-        a_identity,
-        a_retry_key,
-    )
-    .unwrap();
-    let fresh_eb = ProvisionalEndpoint::bind(
-        "127.0.0.1:0".parse().unwrap(),
-        b_identity,
-        b_retry_key,
-    )
-    .unwrap();
+    let fresh_ea =
+        ProvisionalEndpoint::bind("127.0.0.1:0".parse().unwrap(), a_identity, a_retry_key).unwrap();
+    let fresh_eb =
+        ProvisionalEndpoint::bind("127.0.0.1:0".parse().unwrap(), b_identity, b_retry_key).unwrap();
     let (fresh_a, fresh_b) = tokio::join!(
         fresh_ea.connect(fresh_eb.local_addr().unwrap()),
         fresh_eb.accept(),
     );
     let (fresh_a, fresh_b) = tokio::join!(
-        fresh_a.unwrap().handshake(handshake_config(43, 44), &sa, |prompt| async move {
-            prompt.decision(true)
-        }),
-        fresh_b.unwrap().handshake(handshake_config(44, 43), &sb, |prompt| async move {
-            prompt.decision(true)
-        })
+        fresh_a
+            .unwrap()
+            .handshake(handshake_config(43, 44), &sa, |prompt| async move {
+                prompt.decision(true)
+            }),
+        fresh_b
+            .unwrap()
+            .handshake(handshake_config(44, 43), &sb, |prompt| async move {
+                prompt.decision(true)
+            })
     );
     let fresh_a = fresh_a.unwrap();
     let fresh_b = fresh_b.unwrap();
@@ -570,7 +632,11 @@ async fn stale_failed_coordinator_abort_cannot_damage_fresh_same_peer_finalizati
     let fresh_b_attempt = fresh_b.test_attempt();
     let fresh_hook = Hook::recording();
     crate::pairing_v2::admission_authority::commit_bilateral_foundation_with_test_hook(
-        &left, fresh_a, &right, fresh_b, &fresh_hook,
+        &left,
+        fresh_a,
+        &right,
+        fresh_b,
+        &fresh_hook,
     )
     .await
     .expect("fresh same-peer finalization must survive stale exact abort cleanup");
@@ -583,13 +649,21 @@ async fn stale_failed_coordinator_abort_cannot_damage_fresh_same_peer_finalizati
         right.reconcile(stale_b_attempt).unwrap(),
         crate::pairing_v2::admission_authority::ReconcileAdmission::Absent
     );
-    assert!(left.operational_admission_snapshot(fresh_a_attempt).is_err());
-    assert!(right.operational_admission_snapshot(fresh_b_attempt).is_err());
+    assert!(
+        left.operational_admission_snapshot(fresh_a_attempt)
+            .is_err()
+    );
+    assert!(
+        right
+            .operational_admission_snapshot(fresh_b_attempt)
+            .is_err()
+    );
     assert_eq!(
         left.test_bilateral_receipt(fresh_a_attempt)
             .unwrap()
             .unwrap()
-            .bilateral.state,
+            .bilateral
+            .state,
         crate::pairing_pending::BilateralAdmissionState::BilateralConfirmed
     );
     assert_eq!(
@@ -597,7 +671,8 @@ async fn stale_failed_coordinator_abort_cannot_damage_fresh_same_peer_finalizati
             .test_bilateral_receipt(fresh_b_attempt)
             .unwrap()
             .unwrap()
-            .bilateral.state,
+            .bilateral
+            .state,
         crate::pairing_pending::BilateralAdmissionState::BilateralConfirmed
     );
 }
@@ -1071,23 +1146,24 @@ async fn prepared_bilateral_commit_consumes_authority_and_rejects_double_stage()
         a.handshake(handshake_config(61, 62), &pending, |prompt| async move {
             prompt.decision(true)
         }),
-        b.handshake(handshake_config(62, 61), &peer_pending, |prompt| async move {
-            prompt.decision(true)
-        })
+        b.handshake(
+            handshake_config(62, 61),
+            &peer_pending,
+            |prompt| async move { prompt.decision(true) }
+        )
     );
     let peer_attempt = b.as_ref().unwrap().test_attempt();
     let a = a.unwrap();
     let attempt = a.test_attempt();
-    let store = crate::pairing_v2::admission_authority::AdmissionAuthorityStore::open(root.path())
-        .unwrap();
+    let store =
+        crate::pairing_v2::admission_authority::AdmissionAuthorityStore::open(root.path()).unwrap();
 
     // `prepare` consumes the completed authority. There is no production
     // split API that leaves a raw authority available for a second reserve.
-    let mut prepared = crate::pairing_v2::admission_authority::PreparedBilateralCommit::prepare(
-        &store, a,
-    )
-    .await
-    .unwrap();
+    let mut prepared =
+        crate::pairing_v2::admission_authority::PreparedBilateralCommit::prepare(&store, a)
+            .await
+            .unwrap();
     prepared.stage_once(peer_attempt).unwrap();
     assert!(
         store
@@ -1117,20 +1193,21 @@ async fn endpoint_drop_between_stage_and_task3_exactly_removes_live_reservation_
         a.handshake(handshake_config(63, 64), &pending, |prompt| async move {
             prompt.decision(true)
         }),
-        b.handshake(handshake_config(64, 63), &peer_pending, |prompt| async move {
-            prompt.decision(true)
-        })
+        b.handshake(
+            handshake_config(64, 63),
+            &peer_pending,
+            |prompt| async move { prompt.decision(true) }
+        )
     );
     let a = a.unwrap();
     let peer_attempt = b.as_ref().unwrap().test_attempt();
     let attempt = a.test_attempt();
-    let store = crate::pairing_v2::admission_authority::AdmissionAuthorityStore::open(root.path())
-        .unwrap();
-    let mut prepared = crate::pairing_v2::admission_authority::PreparedBilateralCommit::prepare(
-        &store, a,
-    )
-    .await
-    .unwrap();
+    let store =
+        crate::pairing_v2::admission_authority::AdmissionAuthorityStore::open(root.path()).unwrap();
+    let mut prepared =
+        crate::pairing_v2::admission_authority::PreparedBilateralCommit::prepare(&store, a)
+            .await
+            .unwrap();
     prepared.stage_once(peer_attempt).unwrap();
 
     drop(endpoint);
@@ -1173,18 +1250,22 @@ async fn stale_prepared_reservation_cannot_finalize_after_fresh_same_peer_retry(
     let pending = crate::pairing_pending::PendingStore::open(root.path()).unwrap();
     let peer_pending = crate::pairing_pending::PendingStore::open(peer_root.path()).unwrap();
     let (first_client, first_server) = tokio::join!(
-        first_client.unwrap().handshake(handshake_config(65, 66), &pending, |prompt| async move {
-            prompt.decision(true)
-        }),
-        first_server.unwrap().handshake(handshake_config(66, 65), &peer_pending, |prompt| async move {
-            prompt.decision(true)
-        })
+        first_client
+            .unwrap()
+            .handshake(handshake_config(65, 66), &pending, |prompt| async move {
+                prompt.decision(true)
+            }),
+        first_server.unwrap().handshake(
+            handshake_config(66, 65),
+            &peer_pending,
+            |prompt| async move { prompt.decision(true) }
+        )
     );
     let first_client = first_client.unwrap();
     let first_peer_attempt = first_server.as_ref().unwrap().test_attempt();
     let stale_attempt = first_client.test_attempt();
-    let store = crate::pairing_v2::admission_authority::AdmissionAuthorityStore::open(root.path())
-        .unwrap();
+    let store =
+        crate::pairing_v2::admission_authority::AdmissionAuthorityStore::open(root.path()).unwrap();
     let mut stale = crate::pairing_v2::admission_authority::PreparedBilateralCommit::prepare(
         &store,
         first_client,
@@ -1242,8 +1323,8 @@ async fn stale_prepared_reservation_cannot_finalize_after_fresh_same_peer_retry(
         &store,
         retry_client_authority,
     )
-        .await
-        .unwrap();
+    .await
+    .unwrap();
     fresh.stage_once(retry_peer_attempt).unwrap();
     assert!(
         stale.freeze_once().await.is_err(),

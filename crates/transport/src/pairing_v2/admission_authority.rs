@@ -130,7 +130,9 @@ impl<'a> PreparedBilateralCommit<'a> {
             ownership,
         };
         bind_prepared_bilateral_receipt_hash(&mut receipt);
-        let stored = self.store.stage_sealed_admission(expected, &fields.record, &receipt)?;
+        let stored = self
+            .store
+            .stage_sealed_admission(expected, &fields.record, &receipt)?;
         self.receipt = Some(stored);
         self.phase = BilateralCommitPhase::Staged;
         // The endpoint remains the exact owner until freeze.  Record that the
@@ -154,7 +156,10 @@ impl<'a> PreparedBilateralCommit<'a> {
         self.live
             .as_ref()
             .ok_or(StoreError::Invalid)?
-            .local_receipt(receipt.bilateral.fields.peer_attempt, receipt.bilateral.local_receipt_hash)
+            .local_receipt(
+                receipt.bilateral.fields.peer_attempt,
+                receipt.bilateral.local_receipt_hash,
+            )
             .map_err(|_| StoreError::Invalid)
     }
 
@@ -201,7 +206,11 @@ impl<'a> PreparedBilateralCommit<'a> {
         let attempt = self.attempt()?;
         let expected = self.store.version()?;
         let frozen = self.frozen.take().ok_or(StoreError::Invalid)?;
-        let (stored, mut revoker) = self.store.finalize_staged_admission(expected, attempt, frozen.into_store_handoff().1)?;
+        let (stored, mut revoker) = self.store.finalize_staged_admission(
+            expected,
+            attempt,
+            frozen.into_store_handoff().1,
+        )?;
         revoker.release_to_store()?;
         self.receipt = Some(stored);
         self.phase = BilateralCommitPhase::Finalized;
@@ -232,35 +241,43 @@ impl<'a> PreparedBilateralCommit<'a> {
             return false;
         }
         let mut staged = false;
-        if let Some(receipt) = self.receipt.as_ref() {
-            if let Ok(version) = self.store.version() {
-                let result = self.store.abort_bilateral_transaction(
-                    version,
-                    receipt.attempt,
-                    receipt.bilateral.transaction_id,
-                    receipt.bilateral.guard_token,
-                );
-                if result.is_ok() {
-                    staged = true;
-                } else if let (Ok(version), Ok((_, Some(current), _))) =
-                    (self.store.version(), self.store.admission_state(receipt.attempt))
-                {
-                    // Publication may have advanced the exact receipt after a
-                    // local transition. Re-read only this attempt and retry
-                    // its transaction/guard tuple; never peer-revoke.
-                    staged = self
-                        .store
-                        .abort_bilateral_transaction(
-                            version,
-                            current.attempt,
-                            current.bilateral.transaction_id,
-                            current.bilateral.guard_token,
-                        )
-                        .is_ok();
+        if let Some(frozen) = self.frozen.take() {
+            staged = frozen.abort_exact().is_ok();
+        } else if let Some(live) = self.live.take() {
+            staged = live.abort_exact().is_ok();
+        }
+        if !staged {
+            if let Some(receipt) = self.receipt.as_ref() {
+                if let Ok(version) = self.store.version() {
+                    let result = self.store.abort_bilateral_transaction(
+                        version,
+                        receipt.attempt,
+                        receipt.bilateral.transaction_id,
+                        receipt.bilateral.guard_token,
+                    );
+                    if result.is_ok() {
+                        staged = true;
+                    } else if let (Ok(version), Ok((_, Some(current), _))) = (
+                        self.store.version(),
+                        self.store.admission_state(receipt.attempt),
+                    ) {
+                        // Publication may have advanced the exact receipt after a
+                        // local transition. Re-read only this attempt and retry
+                        // its transaction/guard tuple; never peer-revoke.
+                        staged = self
+                            .store
+                            .abort_bilateral_transaction(
+                                version,
+                                current.attempt,
+                                current.bilateral.transaction_id,
+                                current.bilateral.guard_token,
+                            )
+                            .is_ok();
+                    }
                 }
+            } else if let (Ok(version), Ok(attempt)) = (self.store.version(), self.attempt()) {
+                let _ = self.store.cancel(version, attempt);
             }
-        } else if let (Ok(version), Ok(attempt)) = (self.store.version(), self.attempt()) {
-            let _ = self.store.cancel(version, attempt);
         }
         self.phase = BilateralCommitPhase::Aborted;
         staged
@@ -280,8 +297,14 @@ pub(crate) async fn commit_bilateral_foundation(
     right_store: &AdmissionAuthorityStore,
     right_authority: super::provisional_tls::HandshakeCompletePendingAuthority,
 ) -> Result<(), StoreError> {
-    commit_bilateral_foundation_inner(left_store, left_authority, right_store, right_authority, None)
-        .await
+    commit_bilateral_foundation_inner(
+        left_store,
+        left_authority,
+        right_store,
+        right_authority,
+        None,
+    )
+    .await
 }
 
 async fn commit_bilateral_foundation_inner(
@@ -312,7 +335,8 @@ async fn commit_bilateral_foundation_inner(
             return Err(error);
         }
     };
-    #[cfg(test)] if let Err(error) = checkpoint(hook, BilateralCommitCheckpoint::PreflightComplete) {
+    #[cfg(test)]
+    if let Err(error) = checkpoint(hook, BilateralCommitCheckpoint::PreflightComplete) {
         // A fault at preflight is before staging, but both authorities have
         // already consumed their live reservations.  Exact cancellation is
         // required so a fresh same-peer retry is not blocked by either
@@ -323,12 +347,26 @@ async fn commit_bilateral_foundation_inner(
     }
     let outcome = async {
         left.stage_once(right_attempt)?;
-        #[cfg(test)] checkpoint(hook, BilateralCommitCheckpoint::LeftStaged)?;
+        #[cfg(test)]
+        checkpoint(hook, BilateralCommitCheckpoint::LeftStaged)?;
         right.stage_once(left_attempt)?;
-        #[cfg(test)] checkpoint(hook, BilateralCommitCheckpoint::RightStaged)?;
+        #[cfg(test)]
+        checkpoint(hook, BilateralCommitCheckpoint::RightStaged)?;
 
+        #[cfg(test)]
+        let mut left_local = left.local_finalization_receipt()?;
+        #[cfg(not(test))]
         let left_local = left.local_finalization_receipt()?;
         let right_local = right.local_finalization_receipt()?;
+        #[cfg(test)]
+        if hook
+            .as_ref()
+            .is_some_and(|hook| hook.wrong_transaction_on_wire)
+        {
+            left_local.test_fault_wrong_transaction_on_wire();
+        }
+        #[cfg(test)]
+        checkpoint(hook, BilateralCommitCheckpoint::Task3ProofsAttempted)?;
         let (left_exchange, right_exchange) = tokio::join!(
             left.exchange_once(left_local),
             right.exchange_once(right_local),
@@ -350,32 +388,45 @@ async fn commit_bilateral_foundation_inner(
         {
             return Err(StoreError::Invalid);
         }
-        #[cfg(test)] checkpoint(hook, BilateralCommitCheckpoint::Task3ProofsVerified)?;
+        #[cfg(test)]
+        checkpoint(hook, BilateralCommitCheckpoint::Task3ProofsVerified)?;
 
         let (left_freeze, right_freeze) = tokio::join!(left.freeze_once(), right.freeze_once());
         left_freeze?;
-        #[cfg(test)] checkpoint(hook, BilateralCommitCheckpoint::LeftFrozen)?;
+        #[cfg(test)]
+        checkpoint(hook, BilateralCommitCheckpoint::LeftFrozen)?;
         right_freeze?;
-        #[cfg(test)] checkpoint(hook, BilateralCommitCheckpoint::RightFrozen)?;
+        #[cfg(test)]
+        checkpoint(hook, BilateralCommitCheckpoint::RightFrozen)?;
 
         left.finalize_once()?;
-        #[cfg(test)] checkpoint(hook, BilateralCommitCheckpoint::LeftFinalized)?;
+        #[cfg(test)]
+        checkpoint(hook, BilateralCommitCheckpoint::LeftFinalized)?;
         right.finalize_once()?;
-        #[cfg(test)] checkpoint(hook, BilateralCommitCheckpoint::RightFinalized)?;
+        #[cfg(test)]
+        checkpoint(hook, BilateralCommitCheckpoint::RightFinalized)?;
         left.confirm_once()?;
-        #[cfg(test)] checkpoint(hook, BilateralCommitCheckpoint::LeftConfirmed)?;
+        #[cfg(test)]
+        checkpoint(hook, BilateralCommitCheckpoint::LeftConfirmed)?;
         right.confirm_once()?;
-        #[cfg(test)] checkpoint(hook, BilateralCommitCheckpoint::RightConfirmed)?;
+        #[cfg(test)]
+        checkpoint(hook, BilateralCommitCheckpoint::RightConfirmed)?;
         Ok(())
     }
     .await;
     if outcome.is_err() {
         let right_staged = right.abort_exact();
-        #[cfg(test)] if right_staged { let _ = checkpoint(hook, BilateralCommitCheckpoint::RightAborted); }
+        #[cfg(test)]
+        if right_staged {
+            let _ = checkpoint(hook, BilateralCommitCheckpoint::RightAborted);
+        }
         #[cfg(not(test))]
         let _ = right_staged;
         let left_staged = left.abort_exact();
-        #[cfg(test)] if left_staged { let _ = checkpoint(hook, BilateralCommitCheckpoint::LeftAborted); }
+        #[cfg(test)]
+        if left_staged {
+            let _ = checkpoint(hook, BilateralCommitCheckpoint::LeftAborted);
+        }
         #[cfg(not(test))]
         let _ = left_staged;
     }
@@ -397,6 +448,7 @@ pub(crate) enum BilateralCommitCheckpoint {
     PreflightComplete,
     LeftStaged,
     RightStaged,
+    Task3ProofsAttempted,
     Task3ProofsVerified,
     LeftFrozen,
     RightFrozen,
@@ -414,6 +466,7 @@ pub(crate) struct BilateralCommitTestHook {
     checkpoints: std::sync::Mutex<Vec<BilateralCommitCheckpoint>>,
     fail_after: Option<BilateralCommitCheckpoint>,
     drop_at: Option<BilateralCommitCheckpoint>,
+    wrong_transaction_on_wire: bool,
     left_endpoint: std::sync::Mutex<Option<super::provisional_tls::ProvisionalEndpoint>>,
 }
 
@@ -424,6 +477,7 @@ impl BilateralCommitTestHook {
             checkpoints: std::sync::Mutex::new(Vec::new()),
             fail_after: None,
             drop_at: None,
+            wrong_transaction_on_wire: false,
             left_endpoint: std::sync::Mutex::new(None),
         }
     }
@@ -435,9 +489,13 @@ impl BilateralCommitTestHook {
         hook
     }
     pub(crate) fn fail_after(mut self, checkpoint: BilateralCommitCheckpoint) -> Self {
-        self.fail_after = Some(checkpoint); self
+        self.fail_after = Some(checkpoint);
+        self
     }
-    pub(crate) fn reject_task3(self) -> Self { self.fail_after(BilateralCommitCheckpoint::RightStaged) }
+    pub(crate) fn wrong_transaction_on_wire(mut self) -> Self {
+        self.wrong_transaction_on_wire = true;
+        self
+    }
     pub(crate) fn drop_real_left_endpoint_after(
         checkpoint: BilateralCommitCheckpoint,
         endpoint: super::provisional_tls::ProvisionalEndpoint,
@@ -456,7 +514,9 @@ fn checkpoint(
     hook: Option<&BilateralCommitTestHook>,
     point: BilateralCommitCheckpoint,
 ) -> Result<(), StoreError> {
-    let Some(hook) = hook else { return Ok(()); };
+    let Some(hook) = hook else {
+        return Ok(());
+    };
     hook.checkpoints.lock().unwrap().push(point);
     if hook.drop_at == Some(point) {
         drop(hook.left_endpoint.lock().unwrap().take());
@@ -466,7 +526,11 @@ fn checkpoint(
             .push(BilateralCommitCheckpoint::LeftEndpointDropped);
         return Err(StoreError::Invalid);
     }
-    if hook.fail_after == Some(point) { Err(StoreError::Invalid) } else { Ok(()) }
+    if hook.fail_after == Some(point) {
+        Err(StoreError::Invalid)
+    } else {
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -477,7 +541,14 @@ pub(crate) async fn commit_bilateral_foundation_with_test_hook(
     right_authority: super::provisional_tls::HandshakeCompletePendingAuthority,
     hook: &BilateralCommitTestHook,
 ) -> Result<(), StoreError> {
-    commit_bilateral_foundation_inner(left_store, left_authority, right_store, right_authority, Some(hook)).await
+    commit_bilateral_foundation_inner(
+        left_store,
+        left_authority,
+        right_store,
+        right_authority,
+        Some(hook),
+    )
+    .await
 }
 
 fn prepared_bilateral_record(
@@ -580,6 +651,11 @@ impl AdmissionAuthorityStore {
         attempt: [u8; 32],
     ) -> Result<Option<AdmissionReceiptRecord>, StoreError> {
         Ok(self.store.admission_state(attempt)?.1)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_has_admission_guard(&self, attempt: [u8; 32]) -> Result<bool, StoreError> {
+        Ok(self.store.resolve_admission_guard(attempt)?.is_some())
     }
 
     #[cfg(test)]
