@@ -1,5 +1,7 @@
 //! Durable admission foundation. This module deliberately emits no runtime
 //! authority: product behavior remains fail-closed until a later reviewed phase.
+#[cfg(test)]
+use crate::pairing_pending::AdmissionOwnership;
 use crate::pairing_pending::{
     AdmissionReceiptRecord, PendingRecord, PendingStore, StoreError, StoreVersion,
 };
@@ -184,6 +186,11 @@ impl AdmissionAuthorityStore {
                 identity_generation: expected.identity_generation,
                 revocation_generation: expected_revocation_generation,
                 policy_revision: POLICY_REVISION,
+                ownership: AdmissionOwnership::StoreOwned {
+                    guard_token: record.attempt_id,
+                    staged_revision: expected.revision,
+                    handoff_revision: expected.revision.checked_add(1).ok_or(StoreError::Limit)?,
+                },
             },
             None,
         );
@@ -243,6 +250,11 @@ impl AdmissionAuthorityStore {
                 identity_generation: expected.identity_generation,
                 revocation_generation: record.revocation_generation,
                 policy_revision: POLICY_REVISION,
+                ownership: AdmissionOwnership::StoreOwned {
+                    guard_token: record.attempt_id,
+                    staged_revision: expected.revision,
+                    handoff_revision: expected.revision.checked_add(1).ok_or(StoreError::Limit)?,
+                },
             },
             Some(fail_on),
         );
@@ -307,6 +319,10 @@ impl SealedAdmissionCommit {
             identity_generation: expected.identity_generation,
             revocation_generation: fields.record.revocation_generation,
             policy_revision: POLICY_REVISION,
+            ownership: frozen.ownership_for_legacy_commit(
+                expected.revision,
+                expected.revision.checked_add(1).ok_or(StoreError::Limit)?,
+            ),
         };
         Ok(Self {
             record: fields.record,
@@ -679,6 +695,84 @@ mod tests {
                 "{field}"
             );
         }
+    }
+
+    #[test]
+    fn ownership_schema_is_required_ordered_unique_and_store_owned_for_pins() {
+        let root = tempfile::tempdir().unwrap();
+        let store = AdmissionAuthorityStore::open(root.path()).unwrap();
+        let first = store
+            .prepare(store.version().unwrap(), [101; 32], [102; 32])
+            .unwrap();
+        store
+            .commit_metadata(store.version().unwrap(), 0, &first, evidence(&first))
+            .unwrap();
+        let ledger_path = root.path().join("pairing-tombstones/ledger.json");
+        let valid = std::fs::read(&ledger_path).unwrap();
+
+        let mutations: [fn(&mut serde_json::Value); 5] = [
+            |ledger: &mut serde_json::Value| {
+                ledger["schema"] = serde_json::json!(1);
+            },
+            |ledger: &mut serde_json::Value| {
+                ledger["admission_receipts"][0]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("ownership");
+            },
+            |ledger: &mut serde_json::Value| {
+                ledger["admission_receipts"][0]["ownership"]["guard_token"] =
+                    serde_json::to_value([0u8; 32]).unwrap();
+            },
+            |ledger: &mut serde_json::Value| {
+                let revision = ledger["admission_receipts"][0]["revision"]
+                    .as_u64()
+                    .unwrap();
+                ledger["admission_receipts"][0]["ownership"]["staged_revision"] =
+                    serde_json::json!(revision);
+            },
+            |ledger: &mut serde_json::Value| {
+                ledger["admission_receipts"][0]["ownership"]["state"] =
+                    serde_json::json!("awaiting_handoff");
+                ledger["admission_receipts"][0]["ownership"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("handoff_revision");
+            },
+        ];
+        for mutate in mutations {
+            let mut ledger: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&ledger_path).unwrap()).unwrap();
+            mutate(&mut ledger);
+            std::fs::write(&ledger_path, serde_json::to_vec(&ledger).unwrap()).unwrap();
+            assert!(AdmissionAuthorityStore::open(root.path()).is_err());
+            std::fs::write(&ledger_path, &valid).unwrap();
+        }
+    }
+
+    #[test]
+    fn repeated_admission_guard_tokens_fail_closed_on_reopen() {
+        let root = tempfile::tempdir().unwrap();
+        let store = AdmissionAuthorityStore::open(root.path()).unwrap();
+        let first = store
+            .prepare(store.version().unwrap(), [111; 32], [112; 32])
+            .unwrap();
+        store
+            .commit_metadata(store.version().unwrap(), 0, &first, evidence(&first))
+            .unwrap();
+        let second = store
+            .prepare(store.version().unwrap(), [113; 32], [114; 32])
+            .unwrap();
+        store
+            .commit_metadata(store.version().unwrap(), 0, &second, evidence(&second))
+            .unwrap();
+        let ledger_path = root.path().join("pairing-tombstones/ledger.json");
+        let mut ledger: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&ledger_path).unwrap()).unwrap();
+        let token = ledger["admission_receipts"][0]["ownership"]["guard_token"].clone();
+        ledger["admission_receipts"][1]["ownership"]["guard_token"] = token;
+        std::fs::write(&ledger_path, serde_json::to_vec(&ledger).unwrap()).unwrap();
+        assert!(AdmissionAuthorityStore::open(root.path()).is_err());
     }
 
     #[test]

@@ -43,6 +43,58 @@ pub struct PendingRecord {
 
 #[cfg(feature = "pairing-v2-experimental")]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
+pub(crate) enum AdmissionOwnership {
+    /// The receipt is staged, but its provisional endpoint still owns the
+    /// revocation guard. It is never operationally eligible.
+    AwaitingHandoff {
+        guard_token: [u8; 32],
+        staged_revision: u64,
+    },
+    /// The durable store owns the exact guard after a reviewed handoff.
+    StoreOwned {
+        guard_token: [u8; 32],
+        staged_revision: u64,
+        handoff_revision: u64,
+    },
+}
+
+#[cfg(feature = "pairing-v2-experimental")]
+impl AdmissionOwnership {
+    fn guard_token(&self) -> [u8; 32] {
+        match self {
+            Self::AwaitingHandoff { guard_token, .. } | Self::StoreOwned { guard_token, .. } => {
+                *guard_token
+            }
+        }
+    }
+
+    fn is_store_owned(&self) -> bool {
+        matches!(self, Self::StoreOwned { .. })
+    }
+
+    fn is_well_formed_for(&self, receipt_revision: u64) -> bool {
+        match self {
+            Self::AwaitingHandoff {
+                guard_token,
+                staged_revision,
+            } => *guard_token != [0; 32] && *staged_revision == receipt_revision,
+            Self::StoreOwned {
+                guard_token,
+                staged_revision,
+                handoff_revision,
+            } => {
+                *guard_token != [0; 32]
+                    && *staged_revision > 0
+                    && *staged_revision < *handoff_revision
+                    && *handoff_revision == receipt_revision
+            }
+        }
+    }
+}
+
+#[cfg(feature = "pairing-v2-experimental")]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct AdmissionReceiptRecord {
     pub attempt: [u8; 32],
@@ -58,6 +110,9 @@ pub(crate) struct AdmissionReceiptRecord {
     pub identity_generation: u64,
     pub revocation_generation: u64,
     pub policy_revision: u64,
+    /// No default is intentional: an old receipt can never silently become a
+    /// durable admission after this ownership boundary was introduced.
+    pub ownership: AdmissionOwnership,
 }
 
 /// Immutable read of a currently active durable admission.  This is a
@@ -163,6 +218,19 @@ pub(crate) struct AdmissionGuardObservation([u8; 32]);
 
 #[cfg(feature = "pairing-v2-experimental")]
 impl AdmissionRevoker {
+    #[allow(dead_code)] // Consumed by the staged durable handoff in Task 3.
+    pub(crate) fn matches_handoff_token(&self, token: [u8; 32]) -> bool {
+        self.armed
+            && !self.owns_revocation
+            && self.token == token
+            && token != [0; 32]
+            && revocation_guard_phases().get(&token) == Some(&AdmissionGuardPhase::Active)
+    }
+
+    pub(crate) fn handoff_token(&self) -> [u8; 32] {
+        self.token
+    }
+
     pub(crate) fn arm(&mut self) {
         revocation_guard_phases().insert(self.token, AdmissionGuardPhase::Active);
         self.armed = true;
@@ -347,7 +415,7 @@ mod unix {
     impl Ledger {
         fn new() -> Self {
             Self {
-                schema: 1,
+                schema: 2,
                 version: StoreVersion {
                     revision: 0,
                     identity_generation: 0,
@@ -405,8 +473,14 @@ mod unix {
                     .iter()
                     .map(|receipt| receipt.revision)
                     .collect();
+                let receipt_guard_tokens: BTreeSet<_> = self
+                    .admission_receipts
+                    .iter()
+                    .map(|receipt| receipt.ownership.guard_token())
+                    .collect();
                 if receipts.len() != self.admission_receipts.len()
                     || receipt_revisions.len() != self.admission_receipts.len()
+                    || receipt_guard_tokens.len() != self.admission_receipts.len()
                     || receipts != consumed
                     || self.admission_receipts.iter().any(|receipt| {
                         receipt.peer == [0; 32]
@@ -420,6 +494,7 @@ mod unix {
                                 != crate::pairing_v2::admission_authority::PROTOCOL_VERSION
                             || receipt.revision == 0
                             || receipt.revision > self.version.revision
+                            || !receipt.ownership.is_well_formed_for(receipt.revision)
                             || receipt.identity_generation > self.version.identity_generation
                             || receipt.policy_revision
                                 != crate::pairing_v2::admission_authority::POLICY_REVISION
@@ -432,6 +507,7 @@ mod unix {
                                 && receipt.peer_pin == pin.pin
                                 && receipt.identity_generation == pin.identity_generation
                                 && receipt.revocation_generation == pin.revocation_generation
+                                && receipt.ownership.is_store_owned()
                         })
                     })
                     || self
@@ -476,7 +552,7 @@ mod unix {
                     };
                 }
             }
-            if self.schema != 1
+            if self.schema != 2
                 || self.pending.len() > MAX_PENDING
                 || self.tombstones.len() > MAX_HISTORY
                 || self.revocations.len() > MAX_HISTORY
@@ -577,6 +653,7 @@ mod unix {
             let active = receipt.identity_generation == ledger.version.identity_generation
                 && receipt.revocation_generation == ledger.revocation(receipt.peer)
                 && receipt.policy_revision == ledger.policy_revision
+                && receipt.ownership.is_store_owned()
                 && ledger.active_pins.iter().any(|pin| {
                     pin.peer == receipt.peer
                         && pin.pin == receipt.peer_pin
@@ -1317,6 +1394,7 @@ mod unix {
             let active = receipt.as_ref().is_some_and(|receipt| {
                 receipt.identity_generation == ledger.version.identity_generation
                     && receipt.revocation_generation == ledger.revocation(receipt.peer)
+                    && receipt.ownership.is_store_owned()
                     && ledger.active_pins.iter().any(|pin| {
                         pin.peer == receipt.peer
                             && pin.pin == receipt.peer_pin

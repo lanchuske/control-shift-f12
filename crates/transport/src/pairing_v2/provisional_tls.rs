@@ -312,6 +312,10 @@ pub struct ProvisionalEndpoint {
 enum ConsentPhase {
     Active,
     Frozen,
+    /// The exact revocation guard has left the provisional endpoint.  Only the
+    /// durable-store transaction may hold it now; endpoint destruction closes
+    /// transport but cannot revoke the transferred guard.
+    TransferredToStore,
     Revoked,
 }
 struct ConsentState {
@@ -319,6 +323,45 @@ struct ConsentState {
     revoker: Option<crate::pairing_pending::AdmissionRevoker>,
 }
 struct ConsentScope(std::sync::Mutex<ConsentState>);
+
+/// Crate-private, move-only proof that a frozen consent scope owns one exact
+/// revocation guard.  It contains neither a network object nor a token getter;
+/// only the durable-admission boundary can consume it under the scope mutex.
+#[allow(dead_code)] // Kept private until Task 3's store-owned handoff consumes it.
+pub(crate) struct FrozenAdmissionHandoff {
+    scope: Arc<ConsentScope>,
+    token: [u8; 32],
+}
+
+impl FrozenAdmissionHandoff {
+    #[allow(dead_code)] // Invoked by the durable finalization boundary in Task 3.
+    pub(crate) fn claim(self) -> Result<crate::pairing_pending::AdmissionRevoker, Invalid> {
+        let mut state = self.scope.0.lock().map_err(|_| Invalid)?;
+        if state.phase != ConsentPhase::Frozen {
+            return Err(Invalid);
+        }
+        let revoker = state.revoker.take().ok_or(Invalid)?;
+        if !revoker.matches_handoff_token(self.token) {
+            state.revoker = Some(revoker);
+            return Err(Invalid);
+        }
+        state.phase = ConsentPhase::TransferredToStore;
+        Ok(revoker)
+    }
+
+    pub(in crate::pairing_v2) fn store_owned_ownership(
+        &self,
+        staged_revision: u64,
+        handoff_revision: u64,
+    ) -> crate::pairing_pending::AdmissionOwnership {
+        crate::pairing_pending::AdmissionOwnership::StoreOwned {
+            guard_token: self.token,
+            staged_revision,
+            handoff_revision,
+        }
+    }
+}
+
 impl ConsentScope {
     fn new() -> Self {
         Self(std::sync::Mutex::new(ConsentState {
@@ -329,20 +372,30 @@ impl ConsentScope {
     fn is_active(&self) -> Result<bool, Invalid> {
         Ok(self.0.lock().map_err(|_| Invalid)?.phase == ConsentPhase::Active)
     }
-    fn freeze(&self, mut revoker: crate::pairing_pending::AdmissionRevoker) -> Result<(), Invalid> {
+    fn freeze(
+        self: &Arc<Self>,
+        mut revoker: crate::pairing_pending::AdmissionRevoker,
+    ) -> Result<FrozenAdmissionHandoff, Invalid> {
         let mut state = self.0.lock().map_err(|_| Invalid)?;
         if state.phase != ConsentPhase::Active {
             return Err(Invalid);
         }
         revoker.arm();
+        let token = revoker.handoff_token();
         state.phase = ConsentPhase::Frozen;
         state.revoker = Some(revoker);
-        Ok(())
+        Ok(FrozenAdmissionHandoff {
+            scope: self.clone(),
+            token,
+        })
     }
     fn revoke(&self) -> Option<crate::pairing_pending::AdmissionRevoker> {
         let Ok(mut state) = self.0.lock() else {
             return None;
         };
+        if state.phase == ConsentPhase::TransferredToStore {
+            return None;
+        }
         if let Some(revoker) = state.revoker.as_mut() {
             revoker.mark_revoking();
         }

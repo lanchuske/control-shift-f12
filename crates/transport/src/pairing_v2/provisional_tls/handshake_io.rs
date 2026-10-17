@@ -128,9 +128,8 @@ struct IngressWatcher {
     freeze: Option<oneshot::Sender<crate::pairing_pending::AdmissionRevoker>>,
     task: tokio::task::JoinHandle<IngressDisposition>,
 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum IngressDisposition {
-    Frozen,
+    Frozen(super::FrozenAdmissionHandoff),
     Invalid,
 }
 #[allow(dead_code)]
@@ -240,10 +239,10 @@ impl SealedPromotionEvidence {
         signal.send(revoker).map_err(|_| HandshakeError::Rejected)?;
         let static_result = self.revalidate_static();
         let task = self.watcher.task;
-        match task.await.map_err(|_| HandshakeError::Rejected)? {
-            IngressDisposition::Frozen => {}
+        let handoff = match task.await.map_err(|_| HandshakeError::Rejected)? {
+            IngressDisposition::Frozen(handoff) => handoff,
             IngressDisposition::Invalid => return Err(HandshakeError::Rejected),
-        }
+        };
         static_result?;
         Ok(FrozenPromotionEvidence {
             role: self.role,
@@ -252,6 +251,7 @@ impl SealedPromotionEvidence {
             pending: self.pending,
             transcript: self.transcript,
             certificate_fingerprints: self.certificate_fingerprints,
+            handoff,
         })
     }
 
@@ -301,6 +301,7 @@ pub(crate) struct FrozenPromotionEvidence {
     pending: crate::pairing_pending::PendingRecord,
     transcript: [u8; 32],
     certificate_fingerprints: [[u8; 32]; 2],
+    handoff: super::FrozenAdmissionHandoff,
 }
 
 impl FrozenPromotionEvidence {
@@ -325,6 +326,25 @@ impl FrozenPromotionEvidence {
             transcript: self.transcript,
             certificate_fingerprints: self.certificate_fingerprints,
         }
+    }
+
+    /// Transitional metadata binding for the existing single-publication
+    /// foundation. It exposes no guard token; Task 3 replaces this path with a
+    /// consuming staged/final durable handoff before any product bridge exists.
+    pub(in crate::pairing_v2) fn ownership_for_legacy_commit(
+        &self,
+        staged_revision: u64,
+        handoff_revision: u64,
+    ) -> crate::pairing_pending::AdmissionOwnership {
+        self.handoff
+            .store_owned_ownership(staged_revision, handoff_revision)
+    }
+
+    #[cfg(test)]
+    pub(super) fn test_claim_handoff(
+        self,
+    ) -> Result<crate::pairing_pending::AdmissionRevoker, super::Invalid> {
+        self.handoff.claim()
     }
 }
 fn fresh<const N: usize>() -> Result<[u8; N], Invalid> {
@@ -917,34 +937,38 @@ impl ProvisionalChannel {
         // extra streams or a later protocol error. Keep this monitor sealed.
         let task = tokio::spawn(async move {
             let disposition = tokio::select! {biased;
-                _=watch_request(&mut incoming.recv)=>true,
-                extra=connection.accept_bi()=>{if let Ok(pair)=extra{drop(Stream::new(pair));}true},
-                extra=connection.accept_uni()=>{if let Ok(mut recv)=extra{let _=recv.stop(APPLICATION_ERROR.into());}true},
+                _=watch_request(&mut incoming.recv)=>IngressDisposition::Invalid,
+                extra=connection.accept_bi()=>{if let Ok(pair)=extra{drop(Stream::new(pair));}IngressDisposition::Invalid},
+                extra=connection.accept_uni()=>{if let Ok(mut recv)=extra{let _=recv.stop(APPLICATION_ERROR.into());}IngressDisposition::Invalid},
                 request=&mut freeze_request=>{
                     let Ok(revoker) = request else {
                         signal.store(true, Ordering::Release);
                         return IngressDisposition::Invalid;
                     };
-                    if scope.freeze(revoker).is_err() {
-                        signal.store(true, Ordering::Release);
-                        return IngressDisposition::Invalid;
-                    }
+                    let handoff = match scope.freeze(revoker) {
+                        Ok(handoff) => handoff,
+                        Err(_) => {
+                            signal.store(true, Ordering::Release);
+                            return IngressDisposition::Invalid;
+                        }
+                    };
                     connection.close(APPLICATION_ERROR.into(), b"pairing ingress frozen");
-                    false
+                    IngressDisposition::Frozen(handoff)
                 },
-                _=connection.closed()=>true,
+                _=connection.closed()=>IngressDisposition::Invalid,
             };
-            if disposition {
-                signal.store(true, Ordering::Release);
-                incoming.clean = false;
-                drop(incoming);
-                connection.close(
-                    APPLICATION_ERROR.into(),
-                    b"post-completion pairing violation",
-                );
-                IngressDisposition::Invalid
-            } else {
-                IngressDisposition::Frozen
+            match disposition {
+                IngressDisposition::Invalid => {
+                    signal.store(true, Ordering::Release);
+                    incoming.clean = false;
+                    drop(incoming);
+                    connection.close(
+                        APPLICATION_ERROR.into(),
+                        b"post-completion pairing violation",
+                    );
+                    IngressDisposition::Invalid
+                }
+                frozen @ IngressDisposition::Frozen(_) => frozen,
             }
         });
         Ok(Completed {

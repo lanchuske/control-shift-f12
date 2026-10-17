@@ -290,6 +290,49 @@ async fn bilateral_pending_authority_seals_into_live_move_only_evidence() {
 }
 
 #[tokio::test]
+async fn frozen_handoff_transfers_only_the_revocation_guard_not_transport_authority() {
+    let (ea, _eb, a, b, _) = pair().await;
+    let ta = tempfile::tempdir().unwrap();
+    let tb = tempfile::tempdir().unwrap();
+    let sa = crate::pairing_pending::PendingStore::open(ta.path()).unwrap();
+    let sb = crate::pairing_pending::PendingStore::open(tb.path()).unwrap();
+    let (a, b) = tokio::join!(
+        a.handshake(
+            handshake_config(1, 2),
+            &sa,
+            |p| async move { p.decision(true) }
+        ),
+        b.handshake(
+            handshake_config(2, 1),
+            &sb,
+            |p| async move { p.decision(true) }
+        )
+    );
+    let frozen = a
+        .unwrap()
+        .seal_for_promotion()
+        .await
+        .unwrap()
+        .freeze(&sa)
+        .await
+        .unwrap();
+    let scope = ea.scope.clone();
+    let revoker = frozen.test_claim_handoff().unwrap();
+    assert_eq!(
+        scope.0.lock().unwrap().phase,
+        super::ConsentPhase::TransferredToStore
+    );
+    drop(ea);
+    assert_eq!(
+        scope.0.lock().unwrap().phase,
+        super::ConsentPhase::TransferredToStore,
+        "endpoint cleanup must not reclaim a claimed handoff guard"
+    );
+    drop(revoker);
+    drop(b.unwrap());
+}
+
+#[tokio::test]
 async fn bilateral_sealed_evidence_rejects_late_invalidation_before_commit() {
     let (_ea, _eb, a, b, _) = pair().await;
     let ta = tempfile::tempdir().unwrap();
