@@ -291,6 +291,21 @@ impl<'a> PreparedBilateralCommit<'a> {
     }
 }
 
+// A coordinator future may be cancelled at any `.await` after it has consumed
+// a live authority.  Its only safe terminal action is to remove the exact
+// attempt/transaction/guard it owns; never infer a peer-wide revocation.
+// Successful confirmation and an explicit abort both disarm this owner.
+impl Drop for PreparedBilateralCommit<'_> {
+    fn drop(&mut self) {
+        if !matches!(
+            self.phase,
+            BilateralCommitPhase::Confirmed | BilateralCommitPhase::Aborted
+        ) {
+            let _ = self.abort_exact();
+        }
+    }
+}
+
 pub(crate) async fn commit_bilateral_foundation(
     left_store: &AdmissionAuthorityStore,
     left_authority: super::provisional_tls::HandshakeCompletePendingAuthority,
@@ -390,6 +405,8 @@ async fn commit_bilateral_foundation_inner(
         }
         #[cfg(test)]
         checkpoint(hook, BilateralCommitCheckpoint::Task3ProofsVerified)?;
+        #[cfg(test)]
+        pause_at_checkpoint(hook, BilateralCommitCheckpoint::Task3ProofsVerified).await;
 
         let (left_freeze, right_freeze) = tokio::join!(left.freeze_once(), right.freeze_once());
         left_freeze?;
@@ -467,7 +484,40 @@ pub(crate) struct BilateralCommitTestHook {
     fail_after: Option<BilateralCommitCheckpoint>,
     drop_at: Option<BilateralCommitCheckpoint>,
     wrong_transaction_on_wire: bool,
+    pause_at: Option<BilateralCommitCheckpoint>,
+    pause: Option<BilateralCommitPause>,
     left_endpoint: std::sync::Mutex<Option<super::provisional_tls::ProvisionalEndpoint>>,
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+pub(crate) struct BilateralCommitPause {
+    reached: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    reached_notify: std::sync::Arc<tokio::sync::Notify>,
+    resume: std::sync::Arc<tokio::sync::Notify>,
+}
+
+#[cfg(test)]
+impl BilateralCommitPause {
+    async fn pause_here(&self) {
+        self.reached
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.reached_notify.notify_waiters();
+        self.resume.notified().await;
+    }
+
+    pub(crate) async fn wait_until_reached(&self) {
+        loop {
+            if self.reached.load(std::sync::atomic::Ordering::Acquire) {
+                return;
+            }
+            self.reached_notify.notified().await;
+        }
+    }
+
+    pub(crate) fn resume(&self) {
+        self.resume.notify_waiters();
+    }
 }
 
 #[cfg(test)]
@@ -478,6 +528,8 @@ impl BilateralCommitTestHook {
             fail_after: None,
             drop_at: None,
             wrong_transaction_on_wire: false,
+            pause_at: None,
+            pause: None,
             left_endpoint: std::sync::Mutex::new(None),
         }
     }
@@ -495,6 +547,19 @@ impl BilateralCommitTestHook {
     pub(crate) fn wrong_transaction_on_wire(mut self) -> Self {
         self.wrong_transaction_on_wire = true;
         self
+    }
+    pub(crate) fn pause_after(
+        mut self,
+        checkpoint: BilateralCommitCheckpoint,
+    ) -> (Self, BilateralCommitPause) {
+        let pause = BilateralCommitPause {
+            reached: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            reached_notify: std::sync::Arc::new(tokio::sync::Notify::new()),
+            resume: std::sync::Arc::new(tokio::sync::Notify::new()),
+        };
+        self.pause_at = Some(checkpoint);
+        self.pause = Some(pause.clone());
+        (self, pause)
     }
     pub(crate) fn drop_real_left_endpoint_after(
         checkpoint: BilateralCommitCheckpoint,
@@ -530,6 +595,19 @@ fn checkpoint(
         Err(StoreError::Invalid)
     } else {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+async fn pause_at_checkpoint(
+    hook: Option<&BilateralCommitTestHook>,
+    checkpoint: BilateralCommitCheckpoint,
+) {
+    if let Some(pause) = hook
+        .filter(|hook| hook.pause_at == Some(checkpoint))
+        .and_then(|hook| hook.pause.as_ref())
+    {
+        pause.pause_here().await;
     }
 }
 

@@ -678,6 +678,128 @@ async fn stale_failed_coordinator_abort_cannot_damage_fresh_same_peer_finalizati
 }
 
 #[tokio::test]
+async fn cancelling_post_task3_coordinator_aborts_exactly_and_allows_full_same_peer_retry() {
+    use crate::pairing_v2::admission_authority::{
+        BilateralCommitCheckpoint as Checkpoint, BilateralCommitTestHook as Hook,
+    };
+
+    let (a_identity, a_key) = identity(true);
+    let a_retry_key = a_key.clone_key();
+    let (b_identity, b_key) = identity(true);
+    let b_retry_key = b_key.clone_key();
+    let ea = ProvisionalEndpoint::bind("127.0.0.1:0".parse().unwrap(), a_identity.clone(), a_key)
+        .unwrap();
+    let eb = ProvisionalEndpoint::bind("127.0.0.1:0".parse().unwrap(), b_identity.clone(), b_key)
+        .unwrap();
+    let (a, b) = tokio::join!(ea.connect(eb.local_addr().unwrap()), eb.accept());
+    let ta = tempfile::tempdir().unwrap();
+    let tb = tempfile::tempdir().unwrap();
+    let sa = crate::pairing_pending::PendingStore::open(ta.path()).unwrap();
+    let sb = crate::pairing_pending::PendingStore::open(tb.path()).unwrap();
+    let (a, b) = tokio::join!(
+        a.unwrap()
+            .handshake(handshake_config(51, 52), &sa, |prompt| async move {
+                prompt.decision(true)
+            }),
+        b.unwrap()
+            .handshake(handshake_config(52, 51), &sb, |prompt| async move {
+                prompt.decision(true)
+            })
+    );
+    let a = a.unwrap();
+    let b = b.unwrap();
+    let cancelled_a_attempt = a.test_attempt();
+    let cancelled_b_attempt = b.test_attempt();
+    let left_root = ta.path().to_owned();
+    let right_root = tb.path().to_owned();
+    let (hook, pause) = Hook::recording().pause_after(Checkpoint::Task3ProofsVerified);
+
+    let cancelled = tokio::spawn(async move {
+        let left =
+            crate::pairing_v2::admission_authority::AdmissionAuthorityStore::open(&left_root)
+                .unwrap();
+        let right =
+            crate::pairing_v2::admission_authority::AdmissionAuthorityStore::open(&right_root)
+                .unwrap();
+        crate::pairing_v2::admission_authority::commit_bilateral_foundation_with_test_hook(
+            &left, a, &right, b, &hook,
+        )
+        .await
+    });
+    tokio::time::timeout(Duration::from_secs(5), pause.wait_until_reached())
+        .await
+        .expect("Task 3 must complete before cancellation");
+    cancelled.abort();
+    assert!(
+        cancelled.await.unwrap_err().is_cancelled(),
+        "the coordinator task must be cancelled while both endpoints remain alive"
+    );
+
+    let left =
+        crate::pairing_v2::admission_authority::AdmissionAuthorityStore::open(ta.path()).unwrap();
+    let right =
+        crate::pairing_v2::admission_authority::AdmissionAuthorityStore::open(tb.path()).unwrap();
+    for (store, attempt) in [(&left, cancelled_a_attempt), (&right, cancelled_b_attempt)] {
+        assert_eq!(
+            store.reconcile(attempt).unwrap(),
+            crate::pairing_v2::admission_authority::ReconcileAdmission::Absent
+        );
+        assert!(!store.test_has_admission_guard(attempt).unwrap());
+        assert!(store.operational_admission_snapshot(attempt).is_err());
+    }
+
+    let fresh_ea =
+        ProvisionalEndpoint::bind("127.0.0.1:0".parse().unwrap(), a_identity, a_retry_key).unwrap();
+    let fresh_eb =
+        ProvisionalEndpoint::bind("127.0.0.1:0".parse().unwrap(), b_identity, b_retry_key).unwrap();
+    let (fresh_a, fresh_b) = tokio::join!(
+        fresh_ea.connect(fresh_eb.local_addr().unwrap()),
+        fresh_eb.accept(),
+    );
+    let (fresh_a, fresh_b) = tokio::join!(
+        fresh_a
+            .unwrap()
+            .handshake(handshake_config(53, 54), &sa, |prompt| async move {
+                prompt.decision(true)
+            }),
+        fresh_b
+            .unwrap()
+            .handshake(handshake_config(54, 53), &sb, |prompt| async move {
+                prompt.decision(true)
+            })
+    );
+    let fresh_a = fresh_a.unwrap();
+    let fresh_b = fresh_b.unwrap();
+    let fresh_a_attempt = fresh_a.test_attempt();
+    let fresh_b_attempt = fresh_b.test_attempt();
+    crate::pairing_v2::admission_authority::commit_bilateral_foundation(
+        &left, fresh_a, &right, fresh_b,
+    )
+    .await
+    .expect("a cancelled exact transaction must not block a full same-peer retry");
+    assert_eq!(
+        left.test_bilateral_receipt(fresh_a_attempt)
+            .unwrap()
+            .unwrap()
+            .bilateral
+            .state,
+        crate::pairing_pending::BilateralAdmissionState::BilateralConfirmed
+    );
+    assert_eq!(
+        right
+            .test_bilateral_receipt(fresh_b_attempt)
+            .unwrap()
+            .unwrap()
+            .bilateral
+            .state,
+        crate::pairing_pending::BilateralAdmissionState::BilateralConfirmed
+    );
+    pause.resume();
+    drop(ea);
+    drop(eb);
+}
+
+#[tokio::test]
 async fn finalization_rejects_cross_transaction_receipt_on_real_endpoints() {
     let (_ea, _eb, a, b, _) = pair().await;
     let ta = tempfile::tempdir().unwrap();
