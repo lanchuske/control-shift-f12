@@ -707,25 +707,33 @@ async fn endpoint_drop_that_revokes_scope_before_freeze_blocks_publication() {
 /// for the same peer is a different durable owner and must survive.
 #[tokio::test]
 async fn stale_endpoint_drop_after_cancel_keeps_replacement_promoted() {
-    let (ea, _eb, a, b, _) = pair().await;
+    let (a_identity, a_key) = identity(true);
+    let a_retry_key = a_key.clone_key();
+    let (b_identity, b_key) = identity(true);
+    let b_retry_key = b_key.clone_key();
+    let ea = ProvisionalEndpoint::bind("127.0.0.1:0".parse().unwrap(), a_identity.clone(), a_key)
+        .unwrap();
+    let eb = ProvisionalEndpoint::bind("127.0.0.1:0".parse().unwrap(), b_identity.clone(), b_key)
+        .unwrap();
+    let (a, b) = tokio::join!(ea.connect(eb.local_addr().unwrap()), eb.accept());
     let ta = tempfile::tempdir().unwrap();
     let tb = tempfile::tempdir().unwrap();
     let sa = crate::pairing_pending::PendingStore::open(ta.path()).unwrap();
     let sb = crate::pairing_pending::PendingStore::open(tb.path()).unwrap();
     let (a, b) = tokio::join!(
-        a.handshake(
+        a.unwrap().handshake(
             handshake_config(1, 2),
             &sa,
             |p| async move { p.decision(true) }
         ),
-        b.handshake(
+        b.unwrap().handshake(
             handshake_config(2, 1),
             &sb,
             |p| async move { p.decision(true) }
         )
     );
     let a = a.unwrap();
-    let _b = b.unwrap();
+    let b = b.unwrap();
     let attempt = a.test_attempt();
     let store =
         crate::pairing_v2::admission_authority::AdmissionAuthorityStore::open(ta.path()).unwrap();
@@ -733,6 +741,8 @@ async fn stale_endpoint_drop_after_cancel_keeps_replacement_promoted() {
     store
         .cancel(store.version().unwrap(), cancelled.attempt_id)
         .unwrap();
+    sb.cancel(sb.version().unwrap(), b.test_attempt()).unwrap();
+    drop(b);
 
     // Freeze after cancellation so the real endpoint owns a stale guard. The
     // stage fails closed, but the endpoint's Drop still exercises the actual
@@ -744,22 +754,60 @@ async fn stale_endpoint_drop_after_cancel_keeps_replacement_promoted() {
         Err(crate::pairing_pending::StoreError::Invalid)
     );
 
+    // Re-establish B with fresh endpoints but the same two identities. This
+    // creates a real bilateral record and consumes the live sealed authority
+    // through the staged/final durable publication path.
+    drop(eb);
+    let replacement_a =
+        ProvisionalEndpoint::bind("127.0.0.1:0".parse().unwrap(), a_identity, a_retry_key).unwrap();
+    let replacement_b = ProvisionalEndpoint::bind(
+        "127.0.0.1:0".parse().unwrap(),
+        b_identity.clone(),
+        b_retry_key,
+    )
+    .unwrap();
+    let (replacement_a_channel, replacement_b_channel) = tokio::join!(
+        replacement_a.connect(replacement_b.local_addr().unwrap()),
+        replacement_b.accept()
+    );
+    let (replacement_a_authority, replacement_b_authority) = tokio::join!(
+        replacement_a_channel
+            .unwrap()
+            .handshake(
+                handshake_config(3, 4),
+                &sa,
+                |p| async move { p.decision(true) }
+            ),
+        replacement_b_channel
+            .unwrap()
+            .handshake(
+                handshake_config(4, 3),
+                &sb,
+                |p| async move { p.decision(true) }
+            )
+    );
+    let replacement_a_authority = replacement_a_authority.unwrap();
+    drop(replacement_b_authority.unwrap());
+    let replacement_attempt = replacement_a_authority.test_attempt();
     let replacement = store
-        .prepare(
-            store.version().unwrap(),
-            [97; 32],
-            cancelled.peer_fingerprint,
-        )
+        .commit_sealed_foundation(store.version().unwrap(), replacement_a_authority)
+        .await
         .unwrap();
-    store
-        .commit_operational_test_receipt(&replacement, [98; 32])
-        .unwrap();
+    assert_eq!(replacement.attempt(), replacement_attempt);
+    let (_, receipt, active) = sa.admission_state(replacement_attempt).unwrap();
+    assert!(active);
+    assert_eq!(
+        receipt.unwrap().peer_pin,
+        <[u8; 32]>::from(Sha256::digest(&b_identity))
+    );
 
     drop(ea);
     assert_eq!(
-        store.reconcile(replacement.attempt_id).unwrap(),
+        store.reconcile(replacement_attempt).unwrap(),
         crate::pairing_v2::admission_authority::ReconcileAdmission::Promoted
     );
+    drop(replacement_a);
+    drop(replacement_b);
 }
 
 /// Identity rotation invalidates a staged, live handoff. Endpoint destruction
