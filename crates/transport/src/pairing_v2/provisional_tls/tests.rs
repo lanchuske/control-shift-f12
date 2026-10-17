@@ -1072,7 +1072,53 @@ async fn final_manifest_error_after_claim_is_not_operationally_active() {
     drop(b.unwrap());
 }
 
-#[cfg(unix)]
+/// Exercise the production wrapper rather than a direct store call. A
+/// before-rename error may not be reported as success, and a fresh open must
+/// not manufacture an operational admission from the unfinished publication.
+#[tokio::test]
+async fn commit_wrapper_before_rename_error_reopens_without_operational_snapshot() {
+    let (_ea, _eb, a, b, _) = pair().await;
+    let ta = tempfile::tempdir().unwrap();
+    let tb = tempfile::tempdir().unwrap();
+    let sa = crate::pairing_pending::PendingStore::open(ta.path()).unwrap();
+    let sb = crate::pairing_pending::PendingStore::open(tb.path()).unwrap();
+    let (a, b) = tokio::join!(
+        a.handshake(
+            handshake_config(1, 2),
+            &sa,
+            |p| async move { p.decision(true) }
+        ),
+        b.handshake(
+            handshake_config(2, 1),
+            &sb,
+            |p| async move { p.decision(true) }
+        )
+    );
+    let a = a.unwrap();
+    let _b = b.unwrap();
+    let attempt = a.test_attempt();
+    let store =
+        crate::pairing_v2::admission_authority::AdmissionAuthorityStore::open(ta.path()).unwrap();
+
+    unsafe { std::env::set_var("PAIRING_TEST_FS_FAULT", "ledger:before_rename:error") };
+    crate::private_fs::faults::arm();
+    assert_eq!(
+        store
+            .commit_sealed_foundation(store.version().unwrap(), a)
+            .await,
+        Err(crate::pairing_pending::StoreError::Unavailable)
+    );
+    unsafe { std::env::remove_var("PAIRING_TEST_FS_FAULT") };
+
+    let reopened =
+        crate::pairing_v2::admission_authority::AdmissionAuthorityStore::open(ta.path()).unwrap();
+    assert_ne!(
+        reopened.reconcile(attempt).unwrap(),
+        crate::pairing_v2::admission_authority::ReconcileAdmission::Promoted
+    );
+    assert!(reopened.operational_admission_snapshot(attempt).is_err());
+}
+
 #[test]
 fn final_manifest_crash_after_claim_reconciles_durable_boundary() {
     use std::process::Command;
@@ -1196,7 +1242,6 @@ fn final_manifest_fault_worker() {
         });
 }
 
-#[cfg(unix)]
 #[tokio::test]
 async fn guard_cleanup_failure_returns_no_success_and_reconciles_store_owned_metadata() {
     use std::process::Command;
@@ -1285,7 +1330,6 @@ fn mismatched_guard_sidecar_is_never_removed_by_store_cleanup() {
     assert!(guard_path.exists(), "mismatched guard must not be removed");
 }
 
-#[cfg(unix)]
 #[tokio::test]
 async fn store_owned_guard_reconciles_as_cleanup_in_a_fresh_process() {
     use std::process::Command;
@@ -1341,7 +1385,6 @@ async fn store_owned_guard_reconciles_as_cleanup_in_a_fresh_process() {
     drop(ea);
 }
 
-#[cfg(unix)]
 #[test]
 #[ignore]
 fn admission_guard_restart_worker() {
