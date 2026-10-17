@@ -231,6 +231,20 @@ impl AdmissionRevoker {
         self.token
     }
 
+    /// The final manifest publication has made this exact guard store-owned.
+    /// Disarm before best-effort sidecar cleanup: a cleanup failure must be
+    /// reconciled from durable metadata, never turned into a later revocation
+    /// by this destructor.
+    pub(crate) fn release_to_store(&mut self) -> Result<(), StoreError> {
+        if !self.matches_handoff_token(self.token) {
+            return Err(StoreError::Invalid);
+        }
+        self.armed = false;
+        self.owns_revocation = false;
+        revocation_guard_phases().remove(&self.token);
+        self.store.clear_admission_guard(self.attempt)
+    }
+
     pub(crate) fn arm(&mut self) {
         revocation_guard_phases().insert(self.token, AdmissionGuardPhase::Active);
         self.armed = true;
@@ -806,6 +820,36 @@ mod unix {
                     }
                 }
             }
+            // After a process restart there is no in-memory phase entry.  The
+            // ledger therefore makes the sole durable ownership decision: an
+            // exact StoreOwned record only needs stale-sidecar cleanup; every
+            // other state remains conservative and is revoked below.
+            {
+                let _lock = self.ledger_dir.lock()?;
+                let ledger = self.load_validated_manifest()?;
+                let store_owns_guard = ledger.admission_receipts.iter().any(|receipt| {
+                    receipt.attempt == guard.attempt
+                        && receipt.peer == guard.peer
+                        && matches!(
+                            receipt.ownership,
+                            AdmissionOwnership::StoreOwned { guard_token, .. }
+                                if guard_token == guard.token
+                        )
+                        && receipt.identity_generation == ledger.version.identity_generation
+                        && receipt.revocation_generation == ledger.revocation(receipt.peer)
+                        && ledger.active_pins.iter().any(|pin| {
+                            pin.peer == receipt.peer
+                                && pin.pin == receipt.peer_pin
+                                && pin.identity_generation == receipt.identity_generation
+                                && pin.revocation_generation == receipt.revocation_generation
+                        })
+                });
+                if store_owns_guard {
+                    self.clear_admission_guard(attempt)?;
+                    revocation_guard_phases().remove(&guard.token);
+                    return Ok(None);
+                }
+            }
             let mut revoker = AdmissionRevoker {
                 store: PendingStore {
                     pending_dir: self.pending_dir.try_clone()?,
@@ -1376,6 +1420,160 @@ mod unix {
                 self.pending_dir.remove(&file)?;
             }
             Ok(receipt.clone())
+        }
+
+        /// First publication of a live admission finalization.  A staged
+        /// receipt consumes the pending attempt but is explicitly ineligible:
+        /// its provisional endpoint still owns the exact revocation guard.
+        #[cfg(feature = "pairing-v2-experimental")]
+        pub(crate) fn stage_sealed_admission(
+            &self,
+            expected: StoreVersion,
+            record: &PendingRecord,
+            receipt: &AdmissionReceiptRecord,
+        ) -> Result<AdmissionReceiptRecord, StoreError> {
+            let _lock = self.ledger_dir.lock()?;
+            let mut ledger = self.load_validated_manifest()?;
+            let expected_revision = expected.revision.checked_add(1).ok_or(StoreError::Limit)?;
+            if ledger.version != expected
+                || record.version.identity_generation != expected.identity_generation
+                || ledger.policy_revision != receipt.policy_revision
+                || ledger.revocation(record.peer_fingerprint) != receipt.revocation_generation
+                || record.revocation_generation != receipt.revocation_generation
+                || receipt.attempt != record.attempt_id
+                || receipt.peer != record.peer_fingerprint
+                || receipt.revision != expected_revision
+                || receipt.identity_generation != expected.identity_generation
+                || !matches!(
+                    receipt.ownership,
+                    AdmissionOwnership::AwaitingHandoff { .. }
+                )
+            {
+                return Err(StoreError::Conflict);
+            }
+            let pending = ledger
+                .pending
+                .iter()
+                .find(|entry| entry.record.attempt_id == record.attempt_id)
+                .ok_or_else(|| {
+                    if ledger.consumed_attempts.contains(&record.attempt_id) {
+                        StoreError::ConsumedAttempt
+                    } else {
+                        StoreError::Invalid
+                    }
+                })?;
+            if pending.record != *record
+                || ledger.consumed_attempts.contains(&receipt.attempt)
+                || ledger
+                    .admission_receipts
+                    .iter()
+                    .any(|stored| stored.attempt == receipt.attempt)
+                || ledger.tombstones.contains(&receipt.attempt)
+                || ledger.consumed_attempts.len() >= MAX_HISTORY
+                || ledger.admission_receipts.len() >= MAX_HISTORY
+            {
+                return Err(StoreError::ConsumedAttempt);
+            }
+            let old_journals: Vec<_> = ledger
+                .journals
+                .iter()
+                .filter(|entry| entry.attempt == receipt.attempt)
+                .map(journal_filename)
+                .collect();
+            ledger.advance(expected)?;
+            ledger
+                .pending
+                .retain(|entry| entry.record.attempt_id != receipt.attempt);
+            ledger
+                .journals
+                .retain(|entry| entry.attempt != receipt.attempt);
+            ledger.consumed_attempts.push(receipt.attempt);
+            ledger.admission_receipts.push(receipt.clone());
+            self.save(&ledger)?;
+            self.pending_dir.remove(&filename(receipt.attempt))?;
+            for file in old_journals {
+                self.pending_dir.remove(&file)?;
+            }
+            Ok(receipt.clone())
+        }
+
+        /// Second publication of live admission finalization.  Only an exact
+        /// staged receipt may become `StoreOwned`, and the active pin appears
+        /// in the same locked manifest publication as that ownership election.
+        #[cfg(feature = "pairing-v2-experimental")]
+        pub(crate) fn finalize_staged_admission(
+            &self,
+            expected: StoreVersion,
+            attempt: [u8; 32],
+            handoff: crate::pairing_v2::provisional_tls::FrozenAdmissionHandoff,
+        ) -> Result<(AdmissionReceiptRecord, AdmissionRevoker), StoreError> {
+            let _lock = self.ledger_dir.lock()?;
+            let mut ledger = self.load_validated_manifest()?;
+            let final_revision = expected.revision.checked_add(1).ok_or(StoreError::Limit)?;
+            let ownership = handoff.store_owned_ownership(expected.revision, final_revision);
+            let receipt_index = ledger
+                .admission_receipts
+                .iter()
+                .position(|stored| stored.attempt == attempt)
+                .ok_or(StoreError::Invalid)?;
+            let receipt = &ledger.admission_receipts[receipt_index];
+            let current_revocation = ledger.revocation(receipt.peer);
+            let matches_stage = matches!(
+                (&receipt.ownership, &ownership),
+                (
+                    AdmissionOwnership::AwaitingHandoff {
+                        guard_token: staged_token,
+                        staged_revision,
+                    },
+                    AdmissionOwnership::StoreOwned {
+                        guard_token: final_token,
+                        staged_revision: final_staged_revision,
+                        handoff_revision,
+                    },
+                ) if *staged_token == *final_token
+                    && *staged_revision == expected.revision
+                    && *final_staged_revision == expected.revision
+                    && *handoff_revision == final_revision
+            );
+            if ledger.version != expected
+                || !matches_stage
+                || receipt.revision != expected.revision
+                || receipt.identity_generation != expected.identity_generation
+                || receipt.revocation_generation != current_revocation
+                || receipt.policy_revision != ledger.policy_revision
+                || ledger
+                    .active_pins
+                    .iter()
+                    .any(|pin| pin.peer == receipt.peer && pin.pin != receipt.peer_pin)
+            {
+                return Err(StoreError::Conflict);
+            }
+            if ledger.active_pins.len() >= MAX_HISTORY {
+                return Err(StoreError::Limit);
+            }
+            // The file lock is held across this short ownership election, but
+            // `claim` releases the consent mutex before any filesystem I/O.
+            // Thus endpoint drop and final publication have one ordered owner
+            // without ever holding a mutex across a save.
+            let revoker = handoff.claim().map_err(|_| StoreError::Invalid)?;
+            let peer = receipt.peer;
+            let peer_pin = receipt.peer_pin;
+            let identity_generation = receipt.identity_generation;
+            let revocation_generation = receipt.revocation_generation;
+            ledger.advance(expected)?;
+            ledger.admission_receipts[receipt_index].revision = final_revision;
+            ledger.admission_receipts[receipt_index].ownership = ownership;
+            if !ledger.active_pins.iter().any(|pin| pin.peer == peer) {
+                ledger.active_pins.push(ActivePin {
+                    peer,
+                    pin: peer_pin,
+                    identity_generation,
+                    revocation_generation,
+                });
+            }
+            let finalized = ledger.admission_receipts[receipt_index].clone();
+            self.save(&ledger)?;
+            Ok((finalized, revoker))
         }
 
         #[cfg(feature = "pairing-v2-experimental")]

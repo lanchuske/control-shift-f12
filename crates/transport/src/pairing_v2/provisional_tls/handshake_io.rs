@@ -328,16 +328,14 @@ impl FrozenPromotionEvidence {
         }
     }
 
-    /// Transitional metadata binding for the existing single-publication
-    /// foundation. It exposes no guard token; Task 3 replaces this path with a
-    /// consuming staged/final durable handoff before any product bridge exists.
-    pub(in crate::pairing_v2) fn ownership_for_legacy_commit(
-        &self,
-        staged_revision: u64,
-        handoff_revision: u64,
-    ) -> crate::pairing_pending::AdmissionOwnership {
-        self.handoff
-            .store_owned_ownership(staged_revision, handoff_revision)
+    /// Separates immutable handshake fields from the one-shot, private guard
+    /// witness. The caller can stage the former but cannot produce a durable
+    /// admission until it consumes the latter under the consent mutex.
+    pub(in crate::pairing_v2) fn into_store_handoff(
+        self,
+    ) -> (SealedPromotionFields, super::FrozenAdmissionHandoff) {
+        let fields = self.fields();
+        (fields, self.handoff)
     }
 
     #[cfg(test)]

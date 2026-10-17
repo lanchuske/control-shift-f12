@@ -22,6 +22,7 @@ use std::sync::{
 mod handshake_io;
 #[cfg(test)]
 mod tests;
+#[allow(unused_imports)] // Constructed through the sealed handoff boundary.
 pub(crate) use handshake_io::FrozenPromotionEvidence;
 pub use handshake_io::{
     HandshakeCompletePendingAuthority, HandshakeConfig, HandshakeError, VerificationDecision,
@@ -334,6 +335,18 @@ pub(crate) struct FrozenAdmissionHandoff {
 }
 
 impl FrozenAdmissionHandoff {
+    pub(crate) fn store_owned_ownership(
+        &self,
+        staged_revision: u64,
+        handoff_revision: u64,
+    ) -> crate::pairing_pending::AdmissionOwnership {
+        crate::pairing_pending::AdmissionOwnership::StoreOwned {
+            guard_token: self.token,
+            staged_revision,
+            handoff_revision,
+        }
+    }
+
     #[allow(dead_code)] // Invoked by the durable finalization boundary in Task 3.
     pub(crate) fn claim(self) -> Result<crate::pairing_pending::AdmissionRevoker, Invalid> {
         let mut state = self.scope.0.lock().map_err(|_| Invalid)?;
@@ -349,15 +362,13 @@ impl FrozenAdmissionHandoff {
         Ok(revoker)
     }
 
-    pub(in crate::pairing_v2) fn store_owned_ownership(
+    pub(in crate::pairing_v2) fn awaiting_handoff_ownership(
         &self,
         staged_revision: u64,
-        handoff_revision: u64,
     ) -> crate::pairing_pending::AdmissionOwnership {
-        crate::pairing_pending::AdmissionOwnership::StoreOwned {
+        crate::pairing_pending::AdmissionOwnership::AwaitingHandoff {
             guard_token: self.token,
             staged_revision,
-            handoff_revision,
         }
     }
 }

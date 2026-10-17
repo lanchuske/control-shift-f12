@@ -95,7 +95,7 @@ async fn one_local_sas_approval_never_commits_a_relationship() {
 }
 
 #[tokio::test]
-async fn current_foundation_revokes_committed_metadata_on_listener_shutdown() {
+async fn current_foundation_preserves_store_owned_metadata_on_listener_shutdown() {
     let (ea, _eb, a, b, _) = pair().await;
     let ta = tempfile::tempdir().unwrap();
     let tb = tempfile::tempdir().unwrap();
@@ -125,12 +125,11 @@ async fn current_foundation_revokes_committed_metadata_on_listener_shutdown() {
         crate::pairing_v2::admission_authority::ReconcileAdmission::Promoted
     );
     drop(ea);
-    // This is the current reviewed foundation boundary, not product success.
-    // Task 3 requires an independently reviewed, crash-safe handoff of durable
-    // ownership before normal listener cleanup can preserve a relationship.
+    // This remains durable metadata only.  The handoff has transferred just
+    // the revocation guard, so listener cleanup must not revoke it.
     assert_eq!(
         store.reconcile(receipt.attempt()).unwrap(),
-        crate::pairing_v2::admission_authority::ReconcileAdmission::Revoked
+        crate::pairing_v2::admission_authority::ReconcileAdmission::Promoted
     );
 }
 #[tokio::test]
@@ -363,7 +362,7 @@ async fn bilateral_sealed_evidence_rejects_late_invalidation_before_commit() {
 
 #[tokio::test]
 async fn bilateral_sealed_evidence_commits_only_durable_metadata_not_runtime_authority() {
-    let (_ea, _eb, a, b, _) = pair().await;
+    let (ea, _eb, a, b, _) = pair().await;
     let ta = tempfile::tempdir().unwrap();
     let tb = tempfile::tempdir().unwrap();
     let sa = crate::pairing_pending::PendingStore::open(ta.path()).unwrap();
@@ -399,6 +398,14 @@ async fn bilateral_sealed_evidence_commits_only_durable_metadata_not_runtime_aut
             .iter()
             .all(|name| !name.starts_with("journal-")),
         "admission left an orphan journal: {pending_files:?}"
+    );
+    // Once the durable store owns the exact revocation guard, endpoint cleanup
+    // must only close provisional transport.  Before that transfer, drop still
+    // retains its existing cancellation/revocation behavior.
+    drop(ea);
+    assert_eq!(
+        store.reconcile(receipt.attempt()).unwrap(),
+        crate::pairing_v2::admission_authority::ReconcileAdmission::Promoted
     );
     drop(b.unwrap());
 }
@@ -682,7 +689,7 @@ async fn freeze_before_endpoint_drop_is_durably_revoked_before_future_authority(
     );
     drop_pause.release();
     drop_thread.join().unwrap();
-    assert!(result.is_ok());
+    assert_eq!(result, Err(crate::pairing_pending::StoreError::Invalid));
     let reopened =
         crate::pairing_v2::admission_authority::AdmissionAuthorityStore::open(ta.path()).unwrap();
     assert_eq!(
@@ -692,29 +699,8 @@ async fn freeze_before_endpoint_drop_is_durably_revoked_before_future_authority(
 }
 
 #[tokio::test]
-async fn endpoint_drop_revocation_faults_remain_observable_and_retryable() {
-    for (setting, first_reconcile) in [
-        (
-            "ledger:before_revoke_lock:error",
-            Err(crate::pairing_pending::StoreError::Unavailable),
-        ),
-        (
-            "ledger:before_revoke_load:error",
-            Err(crate::pairing_pending::StoreError::Unavailable),
-        ),
-        (
-            "ledger:before_write:error",
-            Err(crate::pairing_pending::StoreError::Unavailable),
-        ),
-        (
-            "pending:before_remove:error",
-            Err(crate::pairing_pending::StoreError::Unavailable),
-        ),
-        (
-            "pending:after_remove:error",
-            Ok(crate::pairing_v2::admission_authority::ReconcileAdmission::Revoked),
-        ),
-    ] {
+async fn endpoint_drop_after_store_handoff_does_not_run_revocation_cleanup() {
+    for _ in 0..5 {
         let (ea, _eb, a, b, _) = pair().await;
         let ta = tempfile::tempdir().unwrap();
         let tb = tempfile::tempdir().unwrap();
@@ -743,22 +729,57 @@ async fn endpoint_drop_revocation_faults_remain_observable_and_retryable() {
             .await
             .unwrap();
 
-        unsafe { std::env::set_var("PAIRING_TEST_FS_FAULT", setting) };
-        crate::private_fs::faults::arm();
         drop(ea);
-        assert_eq!(store.reconcile(attempt), first_reconcile, "{setting}");
-        unsafe { std::env::remove_var("PAIRING_TEST_FS_FAULT") };
         assert_eq!(
             store.reconcile(attempt).unwrap(),
-            crate::pairing_v2::admission_authority::ReconcileAdmission::Revoked,
-            "retry after {setting}"
+            crate::pairing_v2::admission_authority::ReconcileAdmission::Promoted
         );
     }
 }
 
+#[tokio::test]
+async fn guard_cleanup_failure_returns_no_success_and_reconciles_store_owned_metadata() {
+    let (_ea, _eb, a, b, _) = pair().await;
+    let ta = tempfile::tempdir().unwrap();
+    let tb = tempfile::tempdir().unwrap();
+    let sa = crate::pairing_pending::PendingStore::open(ta.path()).unwrap();
+    let sb = crate::pairing_pending::PendingStore::open(tb.path()).unwrap();
+    let (a, b) = tokio::join!(
+        a.handshake(
+            handshake_config(1, 2),
+            &sa,
+            |p| async move { p.decision(true) }
+        ),
+        b.handshake(
+            handshake_config(2, 1),
+            &sb,
+            |p| async move { p.decision(true) }
+        )
+    );
+    let a = a.unwrap();
+    let _b = b.unwrap();
+    let attempt = a.test_attempt();
+    let store =
+        crate::pairing_v2::admission_authority::AdmissionAuthorityStore::open(ta.path()).unwrap();
+
+    unsafe { std::env::set_var("PAIRING_TEST_FS_FAULT", "guard:before_remove:error") };
+    crate::private_fs::faults::arm();
+    assert_eq!(
+        store
+            .commit_sealed_foundation(store.version().unwrap(), a)
+            .await,
+        Err(crate::pairing_pending::StoreError::Unavailable)
+    );
+    unsafe { std::env::remove_var("PAIRING_TEST_FS_FAULT") };
+    assert_eq!(
+        store.reconcile(attempt).unwrap(),
+        crate::pairing_v2::admission_authority::ReconcileAdmission::Promoted
+    );
+}
+
 #[cfg(unix)]
 #[tokio::test]
-async fn durable_guard_fails_closed_in_a_fresh_process() {
+async fn store_owned_guard_reconciles_as_cleanup_in_a_fresh_process() {
     use std::process::Command;
 
     let (ea, _eb, a, b, _) = pair().await;
@@ -807,7 +828,7 @@ async fn durable_guard_fails_closed_in_a_fresh_process() {
     assert!(status.success());
     assert_eq!(
         store.reconcile(attempt).unwrap(),
-        crate::pairing_v2::admission_authority::ReconcileAdmission::Revoked
+        crate::pairing_v2::admission_authority::ReconcileAdmission::Promoted
     );
     drop(ea);
 }
@@ -827,7 +848,7 @@ fn admission_guard_restart_worker() {
         crate::pairing_v2::admission_authority::AdmissionAuthorityStore::open(root).unwrap();
     assert_eq!(
         store.reconcile(attempt).unwrap(),
-        crate::pairing_v2::admission_authority::ReconcileAdmission::Revoked
+        crate::pairing_v2::admission_authority::ReconcileAdmission::Promoted
     );
 }
 #[tokio::test]

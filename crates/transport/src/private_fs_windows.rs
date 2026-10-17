@@ -55,6 +55,8 @@ pub(crate) mod faults {
         }
         let target = if file == "ledger.json" {
             "ledger"
+        } else if file.starts_with("admission-revocation-") {
+            "guard"
         } else if file.starts_with("journal-") {
             "journal"
         } else {

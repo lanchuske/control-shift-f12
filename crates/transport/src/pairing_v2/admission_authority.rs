@@ -215,7 +215,38 @@ impl AdmissionAuthorityStore {
     ) -> Result<PromotionReceipt, StoreError> {
         let commit =
             SealedAdmissionCommit::from_authority(expected, authority, &self.store).await?;
-        let stored = self.store.commit_sealed_admission(expected, commit)?;
+        commit.revalidate()?;
+        let staged =
+            self.store
+                .stage_sealed_admission(expected, commit.record(), commit.receipt())?;
+        let attempt = staged.attempt;
+        let staged_version = StoreVersion {
+            revision: staged.revision,
+            identity_generation: staged.identity_generation,
+        };
+        let handoff = commit.into_live_handoff()?;
+        let (stored, mut revoker) =
+            match self
+                .store
+                .finalize_staged_admission(staged_version, attempt, handoff)
+            {
+                Ok(finalized) => finalized,
+                Err(error) => {
+                    // The endpoint may have won the one ownership election. A
+                    // staged receipt remains ineligible; reconciliation either
+                    // completes conservative revocation or reports the I/O error.
+                    let _ = self.store.resolve_admission_guard(attempt);
+                    return Err(error);
+                }
+            };
+        // The durable final publication is authoritative. A failed exact-token
+        // sidecar unlink deliberately returns no ordinary success; a later
+        // reconciliation sees StoreOwned and performs cleanup only.
+        revoker.release_to_store()?;
+        let (_, _, active) = self.store.admission_state(attempt)?;
+        if !active {
+            return Err(StoreError::Conflict);
+        }
         Ok(PromotionReceipt {
             attempt: stored.attempt,
             peer: stored.peer,
@@ -271,7 +302,7 @@ impl AdmissionAuthorityStore {
 }
 
 enum CommitWitness {
-    Live(Box<super::provisional_tls::FrozenPromotionEvidence>),
+    Live,
     #[cfg(test)]
     Synthetic {
         validations: Cell<usize>,
@@ -286,6 +317,7 @@ pub(crate) struct SealedAdmissionCommit {
     record: PendingRecord,
     receipt: AdmissionReceiptRecord,
     witness: CommitWitness,
+    live_handoff: Option<super::provisional_tls::FrozenAdmissionHandoff>,
 }
 
 impl SealedAdmissionCommit {
@@ -304,7 +336,7 @@ impl SealedAdmissionCommit {
             .await
             .map_err(|_| StoreError::Invalid)?;
         frozen.revalidate().map_err(|_| StoreError::Invalid)?;
-        let fields = frozen.fields();
+        let (fields, handoff) = frozen.into_store_handoff();
         let receipt = AdmissionReceiptRecord {
             attempt: fields.record.attempt_id,
             peer: fields.record.peer_fingerprint,
@@ -319,21 +351,24 @@ impl SealedAdmissionCommit {
             identity_generation: expected.identity_generation,
             revocation_generation: fields.record.revocation_generation,
             policy_revision: POLICY_REVISION,
-            ownership: frozen.ownership_for_legacy_commit(
-                expected.revision,
+            ownership: handoff.awaiting_handoff_ownership(
                 expected.revision.checked_add(1).ok_or(StoreError::Limit)?,
             ),
         };
         Ok(Self {
             record: fields.record,
             receipt,
-            witness: CommitWitness::Live(Box::new(frozen)),
+            witness: CommitWitness::Live,
+            live_handoff: Some(handoff),
         })
     }
 
     pub(crate) fn revalidate(&self) -> Result<(), StoreError> {
         match &self.witness {
-            CommitWitness::Live(evidence) => evidence.revalidate().map_err(|_| StoreError::Invalid),
+            // A live witness was revalidated immediately before its immutable
+            // fields and private handoff were separated. The handoff itself
+            // remains one-shot and is claimed only after staging.
+            CommitWitness::Live => Ok(()),
             #[cfg(test)]
             CommitWitness::Synthetic {
                 validations,
@@ -358,6 +393,16 @@ impl SealedAdmissionCommit {
         &self.receipt
     }
 
+    fn into_live_handoff(
+        mut self,
+    ) -> Result<super::provisional_tls::FrozenAdmissionHandoff, StoreError> {
+        match self.witness {
+            CommitWitness::Live => self.live_handoff.take().ok_or(StoreError::Invalid),
+            #[cfg(test)]
+            CommitWitness::Synthetic { .. } => Err(StoreError::Invalid),
+        }
+    }
+
     #[cfg(test)]
     fn synthetic(
         record: PendingRecord,
@@ -371,6 +416,7 @@ impl SealedAdmissionCommit {
                 validations: Cell::new(0),
                 fail_on,
             },
+            live_handoff: None,
         }
     }
 }
