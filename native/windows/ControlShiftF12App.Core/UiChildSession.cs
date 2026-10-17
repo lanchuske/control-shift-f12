@@ -16,6 +16,7 @@ public sealed class UiChildSession
     public ChildSessionState State { get; private set; } = ChildSessionState.Starting();
     public DesktopSnapshotProjection? Snapshot { get; private set; }
     public DiagnosticsProjection? Diagnostics { get; private set; }
+    public PairingProjection? Pairing { get; private set; }
 
     public static byte[] InitialRefreshFrame()
         => CreateFixedRequest("windows-refresh", "ui.refresh");
@@ -123,6 +124,15 @@ public sealed class UiChildSession
                     }
                     Diagnostics = diagnostics;
                     return;
+                case "ui_pairing_v1" when PairingProjection.TryParse(json, out var pairing):
+                    if (State.Phase != ChildSessionPhase.Running
+                        || Pairing is { Generation: var previousPairing } && pairing!.Generation <= previousPairing)
+                    {
+                        Fault();
+                        return;
+                    }
+                    Pairing = pairing;
+                    return;
                 case "ui_response_v1" when IsRecognizedResponse(document.RootElement):
                     return;
                 default:
@@ -156,5 +166,6 @@ public sealed class UiChildSession
     {
         Snapshot = null;
         Diagnostics = null;
+        Pairing = null;
     }
 }
