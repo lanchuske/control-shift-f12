@@ -631,6 +631,57 @@ mod tests {
     }
 
     #[test]
+    fn stale_cancelled_guard_cannot_revoke_newer_promoted_peer() {
+        let root = tempfile::tempdir().unwrap();
+        let store = AdmissionAuthorityStore::open(root.path()).unwrap();
+        let first = store
+            .prepare(store.version().unwrap(), [54; 32], [55; 32])
+            .unwrap();
+        let mut stale = store
+            .store
+            .admission_revoker(first.peer_fingerprint, first.attempt_id)
+            .unwrap();
+        stale.arm();
+        store
+            .cancel(store.version().unwrap(), first.attempt_id)
+            .unwrap();
+
+        let replacement = store
+            .prepare(store.version().unwrap(), [56; 32], first.peer_fingerprint)
+            .unwrap();
+        store
+            .commit_metadata(
+                store.version().unwrap(),
+                replacement.revocation_generation,
+                &replacement,
+                evidence(&replacement),
+            )
+            .unwrap();
+        stale.revoke().unwrap();
+
+        assert_eq!(
+            store.reconcile(replacement.attempt_id).unwrap(),
+            ReconcileAdmission::Promoted
+        );
+    }
+
+    #[test]
+    fn identity_rotation_releases_pending_peer_reservation() {
+        let root = tempfile::tempdir().unwrap();
+        let store = AdmissionAuthorityStore::open(root.path()).unwrap();
+        let pending = store
+            .prepare(store.version().unwrap(), [57; 32], [58; 32])
+            .unwrap();
+        store
+            .store
+            .rotate_identity(store.version().unwrap())
+            .unwrap();
+        store
+            .prepare(store.version().unwrap(), [59; 32], pending.peer_fingerprint)
+            .unwrap();
+    }
+
+    #[test]
     fn revocation_and_identity_rotation_invalidate_active_pin_without_revival() {
         let root = tempfile::tempdir().unwrap();
         let store = AdmissionAuthorityStore::open(root.path()).unwrap();

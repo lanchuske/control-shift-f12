@@ -279,7 +279,8 @@ impl AdmissionRevoker {
         }
         // Ownership survives after the registry mutex is released. Durable I/O
         // therefore runs lock-free with respect to the in-memory phase machine.
-        self.store.revoke_current(self.peer)?;
+        self.store
+            .revoke_current(self.peer, self.attempt, self.token)?;
         self.store
             .clear_admission_guard_exact(self.attempt, self.token)?;
         revocation_guard_phases().remove(&self.token);
@@ -959,18 +960,52 @@ mod unix {
         }
 
         #[cfg(feature = "pairing-v2-experimental")]
-        pub(super) fn revoke_current(&self, peer: [u8; 32]) -> Result<(), StoreError> {
+        pub(super) fn revoke_current(
+            &self,
+            peer: [u8; 32],
+            attempt: [u8; 32],
+            token: [u8; 32],
+        ) -> Result<(), StoreError> {
             #[cfg(all(test, feature = "pairing-v2-experimental"))]
             crate::private_fs::faults::point("ledger.json", "before_revoke_lock")?;
             let _lock = self.ledger_dir.lock()?;
             #[cfg(all(test, feature = "pairing-v2-experimental"))]
             crate::private_fs::faults::point("ledger.json", "before_revoke_load")?;
             let mut ledger = self.load_validated_manifest()?;
-            let expected = ledger.version;
-            ledger.advance(expected)?;
-            if peer == [0; 32] {
+            if peer == [0; 32] || attempt == [0; 32] || token == [0; 32] {
                 return Err(StoreError::Invalid);
             }
+            // A delayed endpoint may still hold an old guard after its attempt
+            // was cancelled and another attempt for this peer completed. Only
+            // the exact current reservation (or staged receipt with the same
+            // guard token) can revoke peer-scoped metadata. Everything else is
+            // stale and is limited to exact sidecar cleanup by the caller.
+            let owns_pending = ledger.pending.iter().any(|entry| {
+                entry.record.attempt_id == attempt
+                    && entry.record.peer_fingerprint == peer
+                    && ledger.admission_reservations.iter().any(|reservation| {
+                        reservation.attempt == attempt && reservation.peer == peer
+                    })
+            });
+            let owns_staged = ledger.admission_receipts.iter().any(|receipt| {
+                receipt.attempt == attempt
+                    && receipt.peer == peer
+                    && receipt.identity_generation == ledger.version.identity_generation
+                    && receipt.revocation_generation == ledger.revocation(peer)
+                    && matches!(
+                        receipt.ownership,
+                        AdmissionOwnership::AwaitingHandoff { guard_token, .. }
+                            if guard_token == token
+                    )
+                    && ledger.admission_reservations.iter().any(|reservation| {
+                        reservation.attempt == attempt && reservation.peer == peer
+                    })
+            });
+            if !owns_pending && !owns_staged {
+                return Ok(());
+            }
+            let expected = ledger.version;
+            ledger.advance(expected)?;
             if let Some(revocation) = ledger.revocations.iter_mut().find(|r| r.peer == peer) {
                 revocation.generation = revocation
                     .generation
@@ -1761,6 +1796,8 @@ mod unix {
                 .ok_or(StoreError::Limit)?;
             #[cfg(feature = "pairing-v2-experimental")]
             ledger.active_pins.clear();
+            #[cfg(feature = "pairing-v2-experimental")]
+            ledger.admission_reservations.clear();
             let removed: Vec<_> = ledger.pending.iter().map(|r| r.record.attempt_id).collect();
             ledger.tombstones.extend(&removed);
             ledger.pending.clear();

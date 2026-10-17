@@ -115,6 +115,12 @@ def validate(handshake: str, provisional: str, authority: str, pending: str) -> 
     assert drop_body.find("let revoker = self.scope.revoke()") < drop_body.find("self.endpoint.close")
     assert drop_body.find("revoker.revoke()") < drop_body.find("self.endpoint.close")
     revocation = section(pending, "fn revoke_current", "fn reconcile_pairing")
+    assert "peer: [u8; 32],\n            attempt: [u8; 32],\n            token: [u8; 32]" in revocation
+    assert "let owns_pending" in revocation
+    assert "let owns_staged" in revocation
+    assert "AdmissionOwnership::AwaitingHandoff { guard_token, .. }" in revocation
+    assert "if !owns_pending && !owns_staged" in revocation
+    assert revocation.find("if !owns_pending && !owns_staged") < revocation.find("ledger.advance(expected)?")
     before_save = revocation.split("self.save(&ledger)?", 1)[0]
     assert "ledger.active_pins.retain(|pin| pin.peer != peer)" in before_save
     assert re.search(
@@ -122,6 +128,8 @@ def validate(handshake: str, provisional: str, authority: str, pending: str) -> 
         before_save,
     )
     assert "ledger.tombstones.extend(&removed)" in before_save
+    rotation = section(pending, "pub fn rotate_identity", "impl OperationalPreflightLease")
+    assert "ledger.admission_reservations.clear();" in rotation
 
 
 def main() -> None:
@@ -180,8 +188,8 @@ def main() -> None:
         ),
         "permit-staged-retry": (
             "pending",
-            "reservation.peer == peer",
-            "false",
+            ".any(|reservation| reservation.peer == peer)\n            {\n                return Err(StoreError::Conflict);\n            }",
+            ".any(|_| false)\n            {\n                return Err(StoreError::Conflict);\n            }",
         ),
         "attempt-only-cleanup": (
             "pending",
@@ -202,6 +210,16 @@ def main() -> None:
             "pending",
             "ledger.active_pins.retain(|pin| pin.peer != peer);",
             "ledger.active_pins.retain(|_| true);",
+        ),
+        "stale-guard-revokes-newer-peer": (
+            "pending",
+            "if !owns_pending && !owns_staged {\n                return Ok(());\n            }",
+            "if false {\n                return Ok(());\n            }",
+        ),
+        "rotation-keeps-reservation": (
+            "pending",
+            "ledger.admission_reservations.clear();",
+            "let _ = &ledger.admission_reservations;",
         ),
     }
     for name, (key, old, new) in mutants.items():
