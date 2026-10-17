@@ -1,5 +1,7 @@
 //! Quarantined setup metadata. Nothing in this module grants trust or input.
 use serde::{Deserialize, Serialize};
+#[cfg(feature = "pairing-v2-experimental")]
+use sha2::{Digest, Sha256};
 use std::path::Path;
 #[cfg(feature = "pairing-v2-experimental")]
 use std::{
@@ -25,6 +27,60 @@ pub enum StoreError {
     UnsupportedPlatform,
 }
 
+#[cfg(all(test, feature = "pairing-v2-experimental", any(unix, windows)))]
+mod bilateral_admission_state_tests {
+    use super::*;
+
+    #[test]
+    fn store_owned_awaiting_peer_is_never_operational() {
+        let root = tempfile::tempdir().unwrap();
+        let store =
+            crate::pairing_v2::admission_authority::AdmissionAuthorityStore::open(root.path())
+                .unwrap();
+        let record = store
+            .prepare(store.version().unwrap(), [61; 32], [62; 32])
+            .unwrap();
+        store
+            .commit_operational_test_receipt(&record, [63; 32])
+            .unwrap();
+
+        assert_eq!(
+            store.operational_admission_snapshot(record.attempt_id),
+            Err(StoreError::Invalid)
+        );
+    }
+
+    #[test]
+    fn bilateral_transaction_id_changes_when_attempt_or_transcript_changes() {
+        let fields = BilateralTransactionFields {
+            first_identity: [1; 32],
+            second_identity: [2; 32],
+            first_attempt: [3; 32],
+            second_attempt: [4; 32],
+            transcript: [5; 32],
+            suite: crate::pairing_v2::SUITE.to_owned(),
+            policy_revision: 1,
+        };
+        let changed_transcript = BilateralTransactionFields {
+            transcript: [6; 32],
+            ..fields.clone()
+        };
+        let changed_attempt = BilateralTransactionFields {
+            second_attempt: [7; 32],
+            ..fields.clone()
+        };
+
+        assert_ne!(
+            derive_bilateral_transaction_id(&fields),
+            derive_bilateral_transaction_id(&changed_transcript)
+        );
+        assert_ne!(
+            derive_bilateral_transaction_id(&fields),
+            derive_bilateral_transaction_id(&changed_attempt)
+        );
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StoreVersion {
@@ -39,6 +95,176 @@ pub struct PendingRecord {
     pub peer_fingerprint: [u8; 32],
     pub version: StoreVersion,
     pub revocation_generation: u64,
+}
+
+#[cfg(feature = "pairing-v2-experimental")]
+const BILATERAL_TRANSACTION_DOMAIN: &[u8] = b"control-shift-f12/admission-v1";
+
+#[cfg(feature = "pairing-v2-experimental")]
+const BILATERAL_RECEIPT_DOMAIN: &[u8] = b"control-shift-f12/admission-receipt-v1";
+
+/// Domain-separated identifier for one bilateral admission attempt. It is
+/// derived from authenticated handshake data; callers never supply it.
+#[cfg(feature = "pairing-v2-experimental")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(transparent)]
+pub(crate) struct BilateralTransactionId([u8; 32]);
+
+#[cfg(feature = "pairing-v2-experimental")]
+impl BilateralTransactionId {
+    fn is_valid(self) -> bool {
+        self.0 != [0; 32]
+    }
+}
+
+/// Inputs that determine a bilateral transaction identity. The two identity /
+/// attempt pairs are sorted before hashing, so each peer derives the same ID.
+#[cfg(feature = "pairing-v2-experimental")]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct BilateralTransactionFields {
+    pub(crate) first_identity: [u8; 32],
+    pub(crate) second_identity: [u8; 32],
+    pub(crate) first_attempt: [u8; 32],
+    pub(crate) second_attempt: [u8; 32],
+    pub(crate) transcript: [u8; 32],
+    pub(crate) suite: String,
+    pub(crate) policy_revision: u64,
+}
+
+#[cfg(feature = "pairing-v2-experimental")]
+pub(crate) fn derive_bilateral_transaction_id(
+    fields: &BilateralTransactionFields,
+) -> BilateralTransactionId {
+    let mut sides = [
+        (fields.first_identity, fields.first_attempt),
+        (fields.second_identity, fields.second_attempt),
+    ];
+    sides.sort_unstable();
+    let mut digest = Sha256::new();
+    digest.update(BILATERAL_TRANSACTION_DOMAIN);
+    for (identity, attempt) in sides {
+        digest.update(identity);
+        digest.update(attempt);
+    }
+    digest.update(fields.transcript);
+    digest.update((fields.suite.len() as u64).to_be_bytes());
+    digest.update(fields.suite.as_bytes());
+    digest.update(fields.policy_revision.to_be_bytes());
+    BilateralTransactionId(digest.finalize().into())
+}
+
+#[cfg(feature = "pairing-v2-experimental")]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub(crate) enum BilateralAdmissionState {
+    Prepared,
+    StoreOwnedAwaitingPeer,
+    BilateralConfirmed,
+    Aborted,
+}
+
+/// Durable bilateral status attached to every admission receipt. A local
+/// receipt starts prepared, then can become store-owned but remains inactive
+/// until a later authenticated peer confirmation changes it to confirmed.
+#[cfg(feature = "pairing-v2-experimental")]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct BilateralAdmissionRecord {
+    pub(crate) fields: BilateralTransactionFields,
+    pub(crate) transaction_id: BilateralTransactionId,
+    pub(crate) state: BilateralAdmissionState,
+    pub(crate) local_receipt_hash: [u8; 32],
+    pub(crate) peer_receipt_hash: Option<[u8; 32]>,
+    pub(crate) guard_token: [u8; 32],
+    pub(crate) identity_generation: u64,
+    pub(crate) revocation_generation: u64,
+    pub(crate) policy_revision: u64,
+}
+
+#[cfg(feature = "pairing-v2-experimental")]
+impl BilateralAdmissionRecord {
+    pub(crate) fn prepared(
+        fields: &BilateralTransactionFields,
+        guard_token: [u8; 32],
+        identity_generation: u64,
+        revocation_generation: u64,
+        policy_revision: u64,
+    ) -> Self {
+        Self {
+            fields: fields.clone(),
+            transaction_id: derive_bilateral_transaction_id(fields),
+            state: BilateralAdmissionState::Prepared,
+            // Filled from the completed receipt before it reaches the ledger.
+            local_receipt_hash: [0; 32],
+            peer_receipt_hash: None,
+            guard_token,
+            identity_generation,
+            revocation_generation,
+            policy_revision,
+        }
+    }
+
+    pub(crate) fn bind_local_receipt_hash(&mut self, hash: [u8; 32]) {
+        self.local_receipt_hash = hash;
+    }
+
+    fn transition_to_store_owned(
+        &mut self,
+        ownership: &AdmissionOwnership,
+    ) -> Result<(), StoreError> {
+        if !matches!(self.state, BilateralAdmissionState::Prepared)
+            || self.guard_token != ownership.guard_token()
+        {
+            return Err(StoreError::Invalid);
+        }
+        self.state = BilateralAdmissionState::StoreOwnedAwaitingPeer;
+        Ok(())
+    }
+
+    fn is_well_formed_for(&self, receipt: &AdmissionReceiptRecord) -> bool {
+        if !self.transaction_id.is_valid()
+            || self.transaction_id != derive_bilateral_transaction_id(&self.fields)
+            || self.fields.first_identity == [0; 32]
+            || self.fields.second_identity == [0; 32]
+            || self.fields.first_attempt == [0; 32]
+            || self.fields.second_attempt == [0; 32]
+            || self.fields.transcript == [0; 32]
+            || self.fields.suite.is_empty()
+            || self.fields.policy_revision != self.policy_revision
+            || self.local_receipt_hash == [0; 32]
+            || self.guard_token == [0; 32]
+            || self.guard_token != receipt.ownership.guard_token()
+            || self.identity_generation != receipt.identity_generation
+            || self.revocation_generation != receipt.revocation_generation
+            || self.policy_revision != receipt.policy_revision
+            || self.local_receipt_hash != admission_receipt_hash(receipt)
+        {
+            return false;
+        }
+        match self.state {
+            BilateralAdmissionState::Prepared => {
+                self.peer_receipt_hash.is_none()
+                    && matches!(
+                        receipt.ownership,
+                        AdmissionOwnership::AwaitingHandoff { .. }
+                    )
+            }
+            BilateralAdmissionState::StoreOwnedAwaitingPeer => {
+                self.peer_receipt_hash.is_none() && receipt.ownership.is_store_owned()
+            }
+            BilateralAdmissionState::BilateralConfirmed => {
+                self.peer_receipt_hash.is_some_and(|hash| hash != [0; 32])
+                    && receipt.ownership.is_store_owned()
+            }
+            BilateralAdmissionState::Aborted => false,
+        }
+    }
+
+    fn is_operational_for(&self, receipt: &AdmissionReceiptRecord) -> bool {
+        matches!(self.state, BilateralAdmissionState::BilateralConfirmed)
+            && self.is_well_formed_for(receipt)
+    }
 }
 
 #[cfg(feature = "pairing-v2-experimental")]
@@ -61,7 +287,7 @@ pub(crate) enum AdmissionOwnership {
 
 #[cfg(feature = "pairing-v2-experimental")]
 impl AdmissionOwnership {
-    fn guard_token(&self) -> [u8; 32] {
+    pub(crate) fn guard_token(&self) -> [u8; 32] {
         match self {
             Self::AwaitingHandoff { guard_token, .. } | Self::StoreOwned { guard_token, .. } => {
                 *guard_token
@@ -113,6 +339,37 @@ pub(crate) struct AdmissionReceiptRecord {
     /// No default is intentional: an old receipt can never silently become a
     /// durable admission after this ownership boundary was introduced.
     pub ownership: AdmissionOwnership,
+    /// Every receipt belongs to an inactive bilateral transaction until a
+    /// later authenticated confirmation explicitly changes its state.
+    pub bilateral: BilateralAdmissionRecord,
+}
+
+#[cfg(feature = "pairing-v2-experimental")]
+fn admission_receipt_hash(receipt: &AdmissionReceiptRecord) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(BILATERAL_RECEIPT_DOMAIN);
+    digest.update(receipt.attempt);
+    digest.update(receipt.peer);
+    digest.update(receipt.peer_pin);
+    digest.update(receipt.durable_fc_hash);
+    digest.update([receipt.role]);
+    digest.update((receipt.suite.len() as u64).to_be_bytes());
+    digest.update(receipt.suite.as_bytes());
+    digest.update(receipt.protocol_version.to_be_bytes());
+    digest.update(receipt.transcript);
+    digest.update(receipt.binding);
+    digest.update(receipt.revision.to_be_bytes());
+    digest.update(receipt.identity_generation.to_be_bytes());
+    digest.update(receipt.revocation_generation.to_be_bytes());
+    digest.update(receipt.policy_revision.to_be_bytes());
+    digest.update(receipt.ownership.guard_token());
+    digest.finalize().into()
+}
+
+#[cfg(feature = "pairing-v2-experimental")]
+pub(crate) fn bind_prepared_bilateral_receipt_hash(receipt: &mut AdmissionReceiptRecord) {
+    let hash = admission_receipt_hash(receipt);
+    receipt.bilateral.bind_local_receipt_hash(hash);
 }
 
 /// Immutable read of a currently active durable admission.  This is a
@@ -579,6 +836,7 @@ mod unix {
                             || receipt.revision == 0
                             || receipt.revision > self.version.revision
                             || !receipt.ownership.is_well_formed_for(receipt.revision)
+                            || !receipt.bilateral.is_well_formed_for(receipt)
                             || receipt.identity_generation > self.version.identity_generation
                             || receipt.policy_revision
                                 != crate::pairing_v2::admission_authority::POLICY_REVISION
@@ -738,6 +996,7 @@ mod unix {
                 && receipt.revocation_generation == ledger.revocation(receipt.peer)
                 && receipt.policy_revision == ledger.policy_revision
                 && receipt.ownership.is_store_owned()
+                && receipt.bilateral.is_operational_for(&receipt)
                 && ledger.active_pins.iter().any(|pin| {
                     pin.peer == receipt.peer
                         && pin.pin == receipt.peer_pin
@@ -1732,8 +1991,12 @@ mod unix {
             let identity_generation = receipt.identity_generation;
             let revocation_generation = receipt.revocation_generation;
             ledger.advance(expected)?;
-            ledger.admission_receipts[receipt_index].revision = final_revision;
-            ledger.admission_receipts[receipt_index].ownership = ownership;
+            let receipt = &mut ledger.admission_receipts[receipt_index];
+            receipt.revision = final_revision;
+            receipt.ownership = ownership;
+            let ownership = receipt.ownership.clone();
+            receipt.bilateral.transition_to_store_owned(&ownership)?;
+            bind_prepared_bilateral_receipt_hash(receipt);
             ledger
                 .admission_reservations
                 .retain(|reservation| reservation.attempt != attempt);

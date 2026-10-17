@@ -853,7 +853,8 @@ async fn rotation_then_endpoint_drop_recovers_staged_guard_without_reservation()
     let record = fields.record.clone();
     let expected = sa.version().unwrap();
     let staged_revision = expected.revision.checked_add(1).unwrap();
-    let receipt = crate::pairing_pending::AdmissionReceiptRecord {
+    let ownership = handoff.awaiting_handoff_ownership(staged_revision);
+    let mut receipt = crate::pairing_pending::AdmissionReceiptRecord {
         attempt: record.attempt_id,
         peer: record.peer_fingerprint,
         peer_pin: fields.certificate_fingerprints[1 - fields.role.index()],
@@ -867,8 +868,24 @@ async fn rotation_then_endpoint_drop_recovers_staged_guard_without_reservation()
         identity_generation: expected.identity_generation,
         revocation_generation: record.revocation_generation,
         policy_revision: 0,
-        ownership: handoff.awaiting_handoff_ownership(staged_revision),
+        bilateral: crate::pairing_pending::BilateralAdmissionRecord::prepared(
+            &crate::pairing_pending::BilateralTransactionFields {
+                first_identity: fields.certificate_fingerprints[fields.role.index()],
+                second_identity: fields.certificate_fingerprints[1 - fields.role.index()],
+                first_attempt: record.attempt_id,
+                second_attempt: record.attempt_id,
+                transcript: fields.transcript,
+                suite: SUITE.to_owned(),
+                policy_revision: 0,
+            },
+            ownership.guard_token(),
+            expected.identity_generation,
+            record.revocation_generation,
+            0,
+        ),
+        ownership,
     };
+    crate::pairing_pending::bind_prepared_bilateral_receipt_hash(&mut receipt);
     sa.stage_sealed_admission(expected, &record, &receipt)
         .unwrap();
     let (pending, staged, active) = sa.admission_state(record.attempt_id).unwrap();
@@ -1043,7 +1060,8 @@ async fn final_manifest_error_after_claim_is_not_operationally_active() {
     let record = fields.record.clone();
     let expected = sa.version().unwrap();
     let staged_revision = expected.revision.checked_add(1).unwrap();
-    let receipt = crate::pairing_pending::AdmissionReceiptRecord {
+    let ownership = handoff.awaiting_handoff_ownership(staged_revision);
+    let mut receipt = crate::pairing_pending::AdmissionReceiptRecord {
         attempt: record.attempt_id,
         peer: record.peer_fingerprint,
         peer_pin: fields.certificate_fingerprints[1 - fields.role.index()],
@@ -1057,8 +1075,24 @@ async fn final_manifest_error_after_claim_is_not_operationally_active() {
         identity_generation: expected.identity_generation,
         revocation_generation: record.revocation_generation,
         policy_revision: 0,
-        ownership: handoff.awaiting_handoff_ownership(staged_revision),
+        bilateral: crate::pairing_pending::BilateralAdmissionRecord::prepared(
+            &crate::pairing_pending::BilateralTransactionFields {
+                first_identity: fields.certificate_fingerprints[fields.role.index()],
+                second_identity: fields.certificate_fingerprints[1 - fields.role.index()],
+                first_attempt: record.attempt_id,
+                second_attempt: record.attempt_id,
+                transcript: fields.transcript,
+                suite: SUITE.to_owned(),
+                policy_revision: 0,
+            },
+            ownership.guard_token(),
+            expected.identity_generation,
+            record.revocation_generation,
+            0,
+        ),
+        ownership,
     };
+    crate::pairing_pending::bind_prepared_bilateral_receipt_hash(&mut receipt);
     sa.stage_sealed_admission(expected, &record, &receipt)
         .unwrap();
 
@@ -1217,7 +1251,8 @@ fn final_manifest_fault_worker() {
             let record = fields.record.clone();
             let expected = sa.version().unwrap();
             let staged_revision = expected.revision.checked_add(1).unwrap();
-            let receipt = crate::pairing_pending::AdmissionReceiptRecord {
+            let ownership = handoff.awaiting_handoff_ownership(staged_revision);
+            let mut receipt = crate::pairing_pending::AdmissionReceiptRecord {
                 attempt: record.attempt_id,
                 peer: record.peer_fingerprint,
                 peer_pin: fields.certificate_fingerprints[1 - fields.role.index()],
@@ -1231,8 +1266,24 @@ fn final_manifest_fault_worker() {
                 identity_generation: expected.identity_generation,
                 revocation_generation: record.revocation_generation,
                 policy_revision: 0,
-                ownership: handoff.awaiting_handoff_ownership(staged_revision),
+                bilateral: crate::pairing_pending::BilateralAdmissionRecord::prepared(
+                    &crate::pairing_pending::BilateralTransactionFields {
+                        first_identity: fields.certificate_fingerprints[fields.role.index()],
+                        second_identity: fields.certificate_fingerprints[1 - fields.role.index()],
+                        first_attempt: record.attempt_id,
+                        second_attempt: record.attempt_id,
+                        transcript: fields.transcript,
+                        suite: SUITE.to_owned(),
+                        policy_revision: 0,
+                    },
+                    ownership.guard_token(),
+                    expected.identity_generation,
+                    record.revocation_generation,
+                    0,
+                ),
+                ownership,
             };
+            crate::pairing_pending::bind_prepared_bilateral_receipt_hash(&mut receipt);
             sa.stage_sealed_admission(expected, &record, &receipt)
                 .unwrap();
             writeln!(

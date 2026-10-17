@@ -3,7 +3,8 @@
 #[cfg(test)]
 use crate::pairing_pending::AdmissionOwnership;
 use crate::pairing_pending::{
-    AdmissionReceiptRecord, PendingRecord, PendingStore, StoreError, StoreVersion,
+    AdmissionReceiptRecord, BilateralAdmissionRecord, BilateralTransactionFields, PendingRecord,
+    PendingStore, StoreError, StoreVersion, bind_prepared_bilateral_receipt_hash,
 };
 #[cfg(test)]
 use std::cell::Cell;
@@ -37,6 +38,33 @@ pub enum ReconcileAdmission {
     Promoted,
     Revoked,
     Absent,
+}
+
+fn prepared_bilateral_record(
+    local_identity: [u8; 32],
+    peer_identity: [u8; 32],
+    local_attempt: [u8; 32],
+    peer_attempt: [u8; 32],
+    transcript: [u8; 32],
+    guard_token: [u8; 32],
+    identity_generation: u64,
+    revocation_generation: u64,
+) -> BilateralAdmissionRecord {
+    BilateralAdmissionRecord::prepared(
+        &BilateralTransactionFields {
+            first_identity: local_identity,
+            second_identity: peer_identity,
+            first_attempt: local_attempt,
+            second_attempt: peer_attempt,
+            transcript,
+            suite: super::SUITE.to_owned(),
+            policy_revision: POLICY_REVISION,
+        },
+        guard_token,
+        identity_generation,
+        revocation_generation,
+        POLICY_REVISION,
+    )
 }
 
 /// The only owner of pairing-v2 pending and durable admission metadata.
@@ -170,30 +198,41 @@ impl AdmissionAuthorityStore {
         {
             return Err(StoreError::Invalid);
         }
-        let commit = SealedAdmissionCommit::synthetic(
-            record.clone(),
-            AdmissionReceiptRecord {
-                attempt: evidence.attempt,
-                peer: evidence.peer,
-                peer_pin: evidence.peer_pin,
-                durable_fc_hash: evidence.fc,
-                role: evidence.role,
-                suite: evidence.suite.to_owned(),
-                protocol_version: PROTOCOL_VERSION,
-                transcript: evidence.transcript,
-                binding: evidence.binding,
-                revision: expected.revision.checked_add(1).ok_or(StoreError::Limit)?,
-                identity_generation: expected.identity_generation,
-                revocation_generation: expected_revocation_generation,
-                policy_revision: POLICY_REVISION,
-                ownership: AdmissionOwnership::StoreOwned {
-                    guard_token: record.attempt_id,
-                    staged_revision: expected.revision,
-                    handoff_revision: expected.revision.checked_add(1).ok_or(StoreError::Limit)?,
-                },
-            },
-            None,
-        );
+        let ownership = AdmissionOwnership::StoreOwned {
+            guard_token: record.attempt_id,
+            staged_revision: expected.revision,
+            handoff_revision: expected.revision.checked_add(1).ok_or(StoreError::Limit)?,
+        };
+        let mut receipt = AdmissionReceiptRecord {
+            attempt: evidence.attempt,
+            peer: evidence.peer,
+            peer_pin: evidence.peer_pin,
+            durable_fc_hash: evidence.fc,
+            role: evidence.role,
+            suite: evidence.suite.to_owned(),
+            protocol_version: PROTOCOL_VERSION,
+            transcript: evidence.transcript,
+            binding: evidence.binding,
+            revision: expected.revision.checked_add(1).ok_or(StoreError::Limit)?,
+            identity_generation: expected.identity_generation,
+            revocation_generation: expected_revocation_generation,
+            policy_revision: POLICY_REVISION,
+            ownership,
+            bilateral: prepared_bilateral_record(
+                record.peer_fingerprint,
+                evidence.peer_pin,
+                record.attempt_id,
+                record.attempt_id,
+                evidence.transcript,
+                record.attempt_id,
+                expected.identity_generation,
+                expected_revocation_generation,
+            ),
+        };
+        receipt.bilateral.state =
+            crate::pairing_pending::BilateralAdmissionState::StoreOwnedAwaitingPeer;
+        bind_prepared_bilateral_receipt_hash(&mut receipt);
+        let commit = SealedAdmissionCommit::synthetic(record.clone(), receipt, None);
         let stored = self.store.commit_sealed_admission(expected, commit)?;
         Ok(PromotionReceipt {
             attempt: stored.attempt,
@@ -265,30 +304,41 @@ impl AdmissionAuthorityStore {
         evidence: EvidenceFields,
         fail_on: usize,
     ) -> Result<PromotionReceipt, StoreError> {
-        let commit = SealedAdmissionCommit::synthetic(
-            record.clone(),
-            AdmissionReceiptRecord {
-                attempt: evidence.attempt,
-                peer: evidence.peer,
-                peer_pin: evidence.peer_pin,
-                durable_fc_hash: evidence.fc,
-                role: evidence.role,
-                suite: evidence.suite.to_owned(),
-                protocol_version: PROTOCOL_VERSION,
-                transcript: evidence.transcript,
-                binding: evidence.binding,
-                revision: expected.revision.checked_add(1).ok_or(StoreError::Limit)?,
-                identity_generation: expected.identity_generation,
-                revocation_generation: record.revocation_generation,
-                policy_revision: POLICY_REVISION,
-                ownership: AdmissionOwnership::StoreOwned {
-                    guard_token: record.attempt_id,
-                    staged_revision: expected.revision,
-                    handoff_revision: expected.revision.checked_add(1).ok_or(StoreError::Limit)?,
-                },
-            },
-            Some(fail_on),
-        );
+        let ownership = AdmissionOwnership::StoreOwned {
+            guard_token: record.attempt_id,
+            staged_revision: expected.revision,
+            handoff_revision: expected.revision.checked_add(1).ok_or(StoreError::Limit)?,
+        };
+        let mut receipt = AdmissionReceiptRecord {
+            attempt: evidence.attempt,
+            peer: evidence.peer,
+            peer_pin: evidence.peer_pin,
+            durable_fc_hash: evidence.fc,
+            role: evidence.role,
+            suite: evidence.suite.to_owned(),
+            protocol_version: PROTOCOL_VERSION,
+            transcript: evidence.transcript,
+            binding: evidence.binding,
+            revision: expected.revision.checked_add(1).ok_or(StoreError::Limit)?,
+            identity_generation: expected.identity_generation,
+            revocation_generation: record.revocation_generation,
+            policy_revision: POLICY_REVISION,
+            ownership,
+            bilateral: prepared_bilateral_record(
+                record.peer_fingerprint,
+                evidence.peer_pin,
+                record.attempt_id,
+                record.attempt_id,
+                evidence.transcript,
+                record.attempt_id,
+                expected.identity_generation,
+                record.revocation_generation,
+            ),
+        };
+        receipt.bilateral.state =
+            crate::pairing_pending::BilateralAdmissionState::StoreOwnedAwaitingPeer;
+        bind_prepared_bilateral_receipt_hash(&mut receipt);
+        let commit = SealedAdmissionCommit::synthetic(record.clone(), receipt, Some(fail_on));
         let stored = self.store.commit_sealed_admission(expected, commit)?;
         Ok(PromotionReceipt {
             attempt: stored.attempt,
@@ -337,7 +387,9 @@ impl SealedAdmissionCommit {
             .map_err(|_| StoreError::Invalid)?;
         frozen.revalidate().map_err(|_| StoreError::Invalid)?;
         let (fields, handoff) = frozen.into_store_handoff();
-        let receipt = AdmissionReceiptRecord {
+        let ownership = handoff
+            .awaiting_handoff_ownership(expected.revision.checked_add(1).ok_or(StoreError::Limit)?);
+        let mut receipt = AdmissionReceiptRecord {
             attempt: fields.record.attempt_id,
             peer: fields.record.peer_fingerprint,
             peer_pin: fields.certificate_fingerprints[1 - fields.role.index()],
@@ -351,10 +403,19 @@ impl SealedAdmissionCommit {
             identity_generation: expected.identity_generation,
             revocation_generation: fields.record.revocation_generation,
             policy_revision: POLICY_REVISION,
-            ownership: handoff.awaiting_handoff_ownership(
-                expected.revision.checked_add(1).ok_or(StoreError::Limit)?,
+            bilateral: prepared_bilateral_record(
+                fields.certificate_fingerprints[fields.role.index()],
+                fields.certificate_fingerprints[1 - fields.role.index()],
+                fields.record.attempt_id,
+                fields.record.attempt_id,
+                fields.transcript,
+                ownership.guard_token(),
+                expected.identity_generation,
+                fields.record.revocation_generation,
             ),
+            ownership,
         };
+        bind_prepared_bilateral_receipt_hash(&mut receipt);
         Ok(Self {
             record: fields.record,
             receipt,
@@ -454,7 +515,11 @@ mod tests {
     fn awaiting_receipt(record: &PendingRecord, expected: StoreVersion) -> AdmissionReceiptRecord {
         let evidence = evidence(record);
         let revision = expected.revision.checked_add(1).unwrap();
-        AdmissionReceiptRecord {
+        let ownership = AdmissionOwnership::AwaitingHandoff {
+            guard_token: [46; 32],
+            staged_revision: revision,
+        };
+        let mut receipt = AdmissionReceiptRecord {
             attempt: evidence.attempt,
             peer: evidence.peer,
             peer_pin: evidence.peer_pin,
@@ -468,11 +533,20 @@ mod tests {
             identity_generation: expected.identity_generation,
             revocation_generation: record.revocation_generation,
             policy_revision: POLICY_REVISION,
-            ownership: AdmissionOwnership::AwaitingHandoff {
-                guard_token: [46; 32],
-                staged_revision: revision,
-            },
-        }
+            bilateral: prepared_bilateral_record(
+                record.peer_fingerprint,
+                evidence.peer_pin,
+                record.attempt_id,
+                record.attempt_id,
+                evidence.transcript,
+                ownership.guard_token(),
+                expected.identity_generation,
+                record.revocation_generation,
+            ),
+            ownership,
+        };
+        bind_prepared_bilateral_receipt_hash(&mut receipt);
+        receipt
     }
 
     #[test]
@@ -724,7 +798,7 @@ mod tests {
     }
 
     #[test]
-    fn operational_lease_abort_never_revokes_durable_admission() {
+    fn store_owned_receipt_cannot_acquire_operational_lease_before_bilateral_confirmation() {
         let root = tempfile::tempdir().unwrap();
         let store = AdmissionAuthorityStore::open(root.path()).unwrap();
         let record = store
@@ -734,11 +808,10 @@ mod tests {
             .commit_metadata(store.version().unwrap(), 0, &record, evidence(&record))
             .unwrap();
 
-        let lease = store
-            .acquire_operational_preflight_lease(record.attempt_id, [83; 32], [84; 32])
-            .unwrap();
-        assert_eq!(lease.snapshot().receipt.attempt, record.attempt_id);
-        drop(lease);
+        assert!(matches!(
+            store.acquire_operational_preflight_lease(record.attempt_id, [83; 32], [84; 32]),
+            Err(StoreError::Invalid)
+        ));
         assert_eq!(
             store.reconcile(record.attempt_id).unwrap(),
             ReconcileAdmission::Promoted
@@ -746,7 +819,7 @@ mod tests {
     }
 
     #[test]
-    fn operational_snapshot_copies_the_active_pairing_receipt_v2_exactly() {
+    fn store_owned_snapshot_is_inactive_before_bilateral_confirmation() {
         let root = tempfile::tempdir().unwrap();
         let store = AdmissionAuthorityStore::open(root.path()).unwrap();
         let record = store
@@ -755,16 +828,14 @@ mod tests {
         store
             .commit_metadata(store.version().unwrap(), 0, &record, evidence(&record))
             .unwrap();
-        let snapshot = store
-            .operational_admission_snapshot(record.attempt_id)
-            .unwrap();
-        assert_eq!(snapshot.receipt.attempt, record.attempt_id);
-        assert_eq!(snapshot.receipt.protocol_version, PROTOCOL_VERSION);
-        assert_eq!(snapshot.receipt.protocol_version, 2);
+        assert_eq!(
+            store.operational_admission_snapshot(record.attempt_id),
+            Err(StoreError::Invalid)
+        );
     }
 
     #[test]
-    fn operational_final_lease_fails_closed_when_revoke_or_rotation_wins() {
+    fn inactive_store_owned_receipt_remains_non_operational_after_revoke_or_rotation() {
         for rotate in [false, true] {
             let root = tempfile::tempdir().unwrap();
             let store = AdmissionAuthorityStore::open(root.path()).unwrap();
@@ -774,12 +845,10 @@ mod tests {
             store
                 .commit_metadata(store.version().unwrap(), 0, &record, evidence(&record))
                 .unwrap();
-            let final_lease = store
-                .acquire_operational_preflight_lease(record.attempt_id, [87; 32], [88; 32])
-                .unwrap()
-                .promote([89; 32])
-                .unwrap();
-            final_lease.assert_current().unwrap();
+            assert!(matches!(
+                store.acquire_operational_preflight_lease(record.attempt_id, [87; 32], [88; 32]),
+                Err(StoreError::Invalid)
+            ));
 
             if rotate {
                 store
@@ -791,12 +860,15 @@ mod tests {
                     .revoke_candidate(store.version().unwrap(), record.peer_fingerprint)
                     .unwrap();
             }
-            assert!(final_lease.assert_current().is_err());
+            assert_eq!(
+                store.operational_admission_snapshot(record.attempt_id),
+                Err(StoreError::Invalid)
+            );
         }
     }
 
     #[test]
-    fn operational_revoke_vs_promote_race_never_leaves_a_usable_final_lease() {
+    fn inactive_store_owned_receipt_cannot_race_into_an_operational_lease() {
         let root = tempfile::tempdir().unwrap();
         let store = AdmissionAuthorityStore::open(root.path()).unwrap();
         let record = store
@@ -805,28 +877,13 @@ mod tests {
         store
             .commit_metadata(store.version().unwrap(), 0, &record, evidence(&record))
             .unwrap();
-        let preflight = store
-            .acquire_operational_preflight_lease(record.attempt_id, [93; 32], [94; 32])
-            .unwrap();
-        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
-        let path = root.path().to_path_buf();
-        let peer = record.peer_fingerprint;
-        let peer_barrier = barrier.clone();
-        let revoke = std::thread::spawn(move || {
-            peer_barrier.wait();
-            let peer_store = AdmissionAuthorityStore::open(path).unwrap();
-            let version = peer_store.version().unwrap();
-            peer_store.revoke_candidate(version, peer)
-        });
-        barrier.wait();
-        let final_lease = preflight.promote([95; 32]);
-        revoke.join().unwrap().unwrap();
-        if let Ok(final_lease) = final_lease {
-            assert!(final_lease.assert_current().is_err());
-        }
+        assert!(matches!(
+            store.acquire_operational_preflight_lease(record.attempt_id, [93; 32], [94; 32]),
+            Err(StoreError::Invalid)
+        ));
         assert_eq!(
             store.reconcile(record.attempt_id).unwrap(),
-            ReconcileAdmission::Revoked
+            ReconcileAdmission::Promoted
         );
     }
 
