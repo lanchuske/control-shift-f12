@@ -108,8 +108,7 @@ fn canonical_wordlist(bytes: &[u8]) -> Result<Cow<'_, [u8]>, Invalid> {
 mod wordlist_tests {
     use super::*;
 
-    #[test]
-    fn crlf_wordlist_is_canonicalized_before_validation() {
+    fn crlf_wordlist() -> Vec<u8> {
         let mut crlf = Vec::new();
         for byte in include_bytes!("bip39-english.txt")
             .iter()
@@ -122,7 +121,67 @@ mod wordlist_tests {
                 crlf.push(byte);
             }
         }
+        crlf
+    }
 
-        assert!(validate_wordlist(&crlf).is_ok());
+    #[test]
+    fn crlf_wordlist_is_canonicalized_before_validation() {
+        assert!(validate_wordlist(&crlf_wordlist()).is_ok());
+    }
+
+    #[test]
+    fn isolated_carriage_returns_are_rejected() {
+        let lf: Vec<_> = include_bytes!("bip39-english.txt")
+            .iter()
+            .copied()
+            .filter(|byte| *byte != b'\r')
+            .collect();
+        let mut at_start = lf.clone();
+        at_start.insert(0, b'\r');
+        let mut in_middle = lf.clone();
+        in_middle.insert(lf.len() / 2, b'\r');
+        let mut at_end = lf;
+        at_end.push(b'\r');
+
+        for malformed in [at_start, in_middle, at_end] {
+            assert!(validate_wordlist(&malformed).is_err());
+        }
+    }
+
+    #[test]
+    fn crcrlf_and_mixed_line_endings_with_lone_carriage_return_are_rejected() {
+        let mut repeated_cr = crlf_wordlist();
+        let first_cr = repeated_cr.iter().position(|byte| *byte == b'\r').unwrap();
+        repeated_cr.insert(first_cr, b'\r');
+        let mut mixed = crlf_wordlist();
+        mixed.insert(mixed.len() / 2, b'\r');
+
+        assert!(validate_wordlist(&repeated_cr).is_err());
+        assert!(validate_wordlist(&mixed).is_err());
+    }
+
+    #[test]
+    fn changed_word_under_crlf_still_fails_canonical_hash_validation() {
+        let mut changed = crlf_wordlist();
+        changed[0] = b'z';
+
+        assert!(validate_wordlist(&changed).is_err());
+    }
+
+    #[test]
+    fn sas_vectors_are_stable_when_the_embedded_wordlist_is_crlf() {
+        assert_eq!(
+            sas_words(&[0; 32]).unwrap(),
+            ["abandon", "abandon", "abandon", "abandon"]
+        );
+        assert_eq!(
+            sas_words(&[
+                0x00, 0x20, 0x08, 0x01, 0x80, 0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x00, 0x00, 0x00, 0x00,
+            ])
+            .unwrap(),
+            ["ability", "able", "about", "above"]
+        );
     }
 }
