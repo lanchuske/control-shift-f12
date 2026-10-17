@@ -299,13 +299,26 @@ async fn finalization_with_a_fault_is_rejected(fault: FinalizationTestFault) {
         .local_finalization_receipt(a.test_attempt(), [77; 32])
         .unwrap();
     match fault {
-        FinalizationTestFault::UnknownFrame => a_receipt.test_fault(fault),
+        FinalizationTestFault::UnknownFrame | FinalizationTestFault::WrongTransactionOnWire => {
+            if a.role() == Role::A {
+                a_receipt.test_fault(fault);
+            } else {
+                b_receipt.test_fault(fault);
+            }
+        }
         FinalizationTestFault::ExtraBi | FinalizationTestFault::ExtraUni => {
             if a.role() == Role::B {
                 a_receipt.test_fault(fault);
             } else {
                 b_receipt.test_fault(fault);
             }
+        }
+        FinalizationTestFault::NoBidi
+        | FinalizationTestFault::NoBody
+        | FinalizationTestFault::StopAfterLocalPublished
+        | FinalizationTestFault::StopBeforeFirstAck
+        | FinalizationTestFault::StopBeforeAck => {
+            unreachable!("stall faults use finalization_stall_is_rejected_at_one_deadline")
         }
     }
     let (a_result, b_result) = tokio::join!(
@@ -320,6 +333,85 @@ async fn finalization_with_a_fault_is_rejected(fault: FinalizationTestFault) {
         b_result.is_err(),
         "peer accepted a forbidden finalization path: a={a_result:?}, b={b_result:?}"
     );
+}
+
+async fn finalization_stall_is_rejected_at_one_deadline(fault: FinalizationTestFault) {
+    let (_ea, _eb, a, b, _) = pair().await;
+    let ta = tempfile::tempdir().unwrap();
+    let tb = tempfile::tempdir().unwrap();
+    let sa = crate::pairing_pending::PendingStore::open(ta.path()).unwrap();
+    let sb = crate::pairing_pending::PendingStore::open(tb.path()).unwrap();
+    let (a, b) = tokio::join!(
+        a.handshake(handshake_config(9, 10), &sa, |prompt| async move {
+            prompt.decision(true)
+        }),
+        b.handshake(handshake_config(10, 9), &sb, |prompt| async move {
+            prompt.decision(true)
+        })
+    );
+    let mut a = a.unwrap();
+    let mut b = b.unwrap();
+    let mut a_receipt = a
+        .local_finalization_receipt(b.test_attempt(), [81; 32])
+        .unwrap();
+    let mut b_receipt = b
+        .local_finalization_receipt(a.test_attempt(), [82; 32])
+        .unwrap();
+    if matches!(fault, FinalizationTestFault::StopBeforeAck) {
+        if a.role() == Role::B {
+            a_receipt.test_fault(fault);
+        } else {
+            b_receipt.test_fault(fault);
+        }
+    } else if a.role() == Role::A {
+        a_receipt.test_fault(fault);
+    } else {
+        b_receipt.test_fault(fault);
+    }
+    let (a_result, b_result) = tokio::time::timeout(Duration::from_secs(7), async {
+        tokio::join!(
+            a.exchange_local_receipt(a_receipt),
+            b.exchange_local_receipt(b_receipt)
+        )
+    })
+    .await
+    .expect("both finalization endpoints must terminate at the shared deadline");
+    assert!(
+        a_result.is_err() && b_result.is_err(),
+        "no peer proof may survive a stall"
+    );
+    assert!(!a.is_protocol_valid() && !b.is_protocol_valid());
+}
+
+#[tokio::test]
+async fn finalization_deadline_rejects_when_b_never_receives_bidi() {
+    finalization_stall_is_rejected_at_one_deadline(FinalizationTestFault::NoBidi).await;
+}
+
+#[tokio::test]
+async fn finalization_deadline_rejects_expected_stream_without_body() {
+    finalization_stall_is_rejected_at_one_deadline(FinalizationTestFault::NoBody).await;
+}
+
+#[tokio::test]
+async fn finalization_deadline_rejects_stop_after_local_published() {
+    finalization_stall_is_rejected_at_one_deadline(FinalizationTestFault::StopAfterLocalPublished)
+        .await;
+}
+
+#[tokio::test]
+async fn finalization_deadline_rejects_stop_before_peer_ack() {
+    finalization_stall_is_rejected_at_one_deadline(FinalizationTestFault::StopBeforeAck).await;
+}
+
+#[tokio::test]
+async fn finalization_deadline_rejects_stop_before_first_peer_ack() {
+    finalization_stall_is_rejected_at_one_deadline(FinalizationTestFault::StopBeforeFirstAck).await;
+}
+
+#[tokio::test]
+async fn finalization_rejects_authenticated_wrong_transaction_on_wire() {
+    finalization_with_a_fault_is_rejected(FinalizationTestFault::WrongTransactionOnWire).await;
 }
 
 #[tokio::test]

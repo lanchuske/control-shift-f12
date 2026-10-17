@@ -64,6 +64,7 @@ pub enum HandshakeError {
 
 const FINALIZATION_DOMAIN: &[u8] = b"control-shift-f12/finalization-v1";
 const FINALIZATION_EXPORTER_LABEL: &[u8] = b"EXPORTER-ControlShiftF12-Finalization-v1";
+const FINALIZATION_DEADLINE: Duration = Duration::from_secs(5);
 
 /// Local-only data prepared for the bounded finalization exchange.  It is not
 /// a durable receipt and cannot activate any capability by itself.
@@ -85,6 +86,12 @@ pub(super) enum FinalizationTestFault {
     ExtraBi,
     ExtraUni,
     UnknownFrame,
+    NoBidi,
+    NoBody,
+    StopAfterLocalPublished,
+    StopBeforeFirstAck,
+    StopBeforeAck,
+    WrongTransactionOnWire,
 }
 
 impl LocalFinalizationReceipt {
@@ -407,6 +414,28 @@ impl HandshakeCompletePendingAuthority {
         &mut self,
         receipt: LocalFinalizationReceipt,
     ) -> Result<PeerFinalizationReceipt, HandshakeError> {
+        let result = tokio::time::timeout(
+            FINALIZATION_DEADLINE,
+            self.exchange_local_receipt_bounded(receipt),
+        )
+        .await;
+        match result {
+            Ok(Ok(proof)) => Ok(proof),
+            Ok(Err(_)) | Err(_) => {
+                self.failed.store(true, Ordering::Release);
+                self._channel.connection.close(
+                    APPLICATION_ERROR.into(),
+                    b"finalization rejected or timed out",
+                );
+                Err(HandshakeError::Rejected)
+            }
+        }
+    }
+
+    async fn exchange_local_receipt_bounded(
+        &mut self,
+        receipt: LocalFinalizationReceipt,
+    ) -> Result<PeerFinalizationReceipt, HandshakeError> {
         if !self.is_protocol_valid()
             || self.finalization_complete
             || receipt.transaction_id != derive_bilateral_transaction_id(&receipt.fields)
@@ -450,13 +479,19 @@ impl HandshakeCompletePendingAuthority {
             _ => return Err(HandshakeError::Rejected),
         };
         let mut stream = match access {
-            FinalizationAccess::Initiator => Stream::new(
-                self._channel
-                    .connection
-                    .open_bi()
-                    .await
-                    .map_err(|_| HandshakeError::Rejected)?,
-            ),
+            FinalizationAccess::Initiator => {
+                #[cfg(test)]
+                if matches!(receipt.test_fault, Some(FinalizationTestFault::NoBidi)) {
+                    std::future::pending::<()>().await;
+                }
+                Stream::new(
+                    self._channel
+                        .connection
+                        .open_bi()
+                        .await
+                        .map_err(|_| HandshakeError::Rejected)?,
+                )
+            }
             FinalizationAccess::Responder(stream) => stream,
         };
         let key = finalization_key(
@@ -477,15 +512,45 @@ impl HandshakeCompletePendingAuthority {
             };
             #[cfg(not(test))]
             let local_kind = "finalization-local-published";
-            let local = finalization_record(local_kind, &local_values(&receipt), &key)
+            let local_values = local_values(&receipt);
+            #[cfg(test)]
+            let local_values = {
+                let mut local_values = local_values;
+                if matches!(
+                    receipt.test_fault,
+                    Some(FinalizationTestFault::WrongTransactionOnWire)
+                ) {
+                    local_values[0] = Value::Bytes([0xA5; 32].to_vec());
+                }
+                local_values
+            };
+            let local = finalization_record(local_kind, &local_values, &key)
                 .map_err(|_| HandshakeError::Rejected)?;
             let peer_hash = if self.role == Role::A {
+                #[cfg(test)]
+                if matches!(receipt.test_fault, Some(FinalizationTestFault::NoBody)) {
+                    std::future::pending::<()>().await;
+                }
                 finalization_send(&mut stream, &local).await?;
+                #[cfg(test)]
+                if matches!(
+                    receipt.test_fault,
+                    Some(FinalizationTestFault::StopAfterLocalPublished)
+                ) {
+                    std::future::pending::<()>().await;
+                }
                 let remote = finalization_read(&mut stream.recv)
                     .await
                     .map_err(|_| HandshakeError::Rejected)?;
                 let hash = decode_local_receipt(&remote, &key, &receipt)
                     .map_err(|_| HandshakeError::Rejected)?;
+                #[cfg(test)]
+                if matches!(
+                    receipt.test_fault,
+                    Some(FinalizationTestFault::StopBeforeFirstAck)
+                ) {
+                    std::future::pending::<()>().await;
+                }
                 let ack =
                     finalization_record("finalization-peer-ack", &ack_values(&receipt, hash), &key)
                         .map_err(|_| HandshakeError::Rejected)?;
@@ -510,6 +575,13 @@ impl HandshakeCompletePendingAuthority {
                     .map_err(|_| HandshakeError::Rejected)?;
                 #[cfg(test)]
                 inject_finalization_extra(&self._channel.connection, receipt.test_fault).await?;
+                #[cfg(test)]
+                if matches!(
+                    receipt.test_fault,
+                    Some(FinalizationTestFault::StopBeforeAck)
+                ) {
+                    std::future::pending::<()>().await;
+                }
                 let ack =
                     finalization_record("finalization-peer-ack", &ack_values(&receipt, hash), &key)
                         .map_err(|_| HandshakeError::Rejected)?;
@@ -542,16 +614,6 @@ impl HandshakeCompletePendingAuthority {
                 return Err(error);
             }
         };
-        // A successful grammar exchange is not enough if a second stream was
-        // already queued behind it. Drain that race window before returning a
-        // normal proof; later streams remain owned by the re-armed watcher.
-        if finalization_quiet(&self._channel.connection).await.is_err() {
-            self.failed.store(true, Ordering::Release);
-            self._channel
-                .connection
-                .close(APPLICATION_ERROR.into(), b"finalization ingress violation");
-            return Err(HandshakeError::Rejected);
-        }
         self.watcher = spawn_ingress_watcher(
             self.role,
             self._channel.connection.clone(),
@@ -927,27 +989,6 @@ async fn inject_finalization_extra(
         _ => {}
     }
     Ok(())
-}
-
-async fn finalization_quiet(connection: &quinn::Connection) -> Result<(), Invalid> {
-    let observed = tokio::time::timeout(Duration::from_millis(25), async {
-        tokio::select! { biased;
-            extra = connection.accept_bi() => {
-                if let Ok(pair) = extra { drop(Stream::new(pair)); }
-                Err(Invalid)
-            },
-            extra = connection.accept_uni() => {
-                if let Ok(mut recv) = extra { let _ = recv.stop(APPLICATION_ERROR.into()); }
-                Err(Invalid)
-            },
-            _ = connection.closed() => Err(Invalid),
-        }
-    })
-    .await;
-    match observed {
-        Err(_) => Ok(()),
-        Ok(result) => result,
-    }
 }
 
 fn bytes32(value: &Value) -> Result<[u8; 32], Invalid> {
