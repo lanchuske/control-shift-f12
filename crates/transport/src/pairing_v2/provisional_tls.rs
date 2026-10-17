@@ -184,7 +184,14 @@ pub(crate) fn strict_configs(
     max_bidi_streams: u32,
     max_uni_streams: u32,
 ) -> Result<(quinn::ServerConfig, StrictClient), Invalid> {
-    strict_configs_for_peer(certificate, key, None, alpn, max_bidi_streams, max_uni_streams)
+    strict_configs_for_peer(
+        certificate,
+        key,
+        None,
+        alpn,
+        max_bidi_streams,
+        max_uni_streams,
+    )
 }
 
 /// Same sealed profile with a fixed durable peer fingerprint. This is reserved

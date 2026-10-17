@@ -1,9 +1,8 @@
 //! Exact bilateral recovery evidence.
 //!
-//! This is deliberately only the sealed record grammar and comparison rule.
-//! It does not open a connection, trust a peer, mutate durable state, or
-//! activate a session.  A later mutual-TLS exchange must authenticate this
-//! record before the durable store can consume it.
+//! The sealed grammar and bounded exchange operate on a caller-owned pinned
+//! mutual-TLS control connection. This module cannot mutate durable state or
+//! activate a session; only its authenticated result reaches the coordinator.
 
 use super::{
     Invalid,
@@ -127,6 +126,28 @@ impl ExactPeerRecovery {
             && self.revocation_generation == peer.revocation_generation
             && self.policy_revision == peer.policy_revision
     }
+
+    pub(crate) fn sender_receipt_hash(&self) -> [u8; 32] {
+        self.sender_receipt_hash
+    }
+}
+
+/// Evidence returned only after the fresh pinned mutual-TLS exchange has
+/// compared the two descriptors. Its payload remains crate-private so raw
+/// serialized recovery data cannot be mistaken for transport-authenticated
+/// evidence by the durable store.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AuthenticatedExactPeerRecovery(ExactPeerRecovery);
+
+impl AuthenticatedExactPeerRecovery {
+    pub(crate) fn evidence(&self) -> &ExactPeerRecovery {
+        &self.0
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_only(evidence: ExactPeerRecovery) -> Self {
+        Self(evidence)
+    }
 }
 
 /// Exchanges exactly one evidence record on a fresh pinned mutual-TLS
@@ -140,36 +161,36 @@ pub(crate) async fn exchange_exact_pair(
     connection: &quinn::Connection,
     initiator: bool,
     local: ExactPeerRecovery,
-) -> Result<ExactPeerRecovery, Invalid> {
+) -> Result<AuthenticatedExactPeerRecovery, Invalid> {
     let result = tokio::time::timeout(RECOVERY_DEADLINE, async {
         let protocol = async {
-        if initiator {
-            let (mut send, mut recv) = connection.open_bi().await.map_err(|_| Invalid)?;
-            write_recovery_record(&mut send, &local).await?;
-            let peer = read_recovery_record(&mut recv).await?;
-            if !local.accepts_peer(&peer) {
-                return Err(Invalid);
+            if initiator {
+                let (mut send, mut recv) = connection.open_bi().await.map_err(|_| Invalid)?;
+                write_recovery_record(&mut send, &local).await?;
+                let peer = read_recovery_record(&mut recv).await?;
+                if !local.accepts_peer(&peer) {
+                    return Err(Invalid);
+                }
+                send.write_all(&[RECOVERY_ACK]).await.map_err(|_| Invalid)?;
+                send.finish().map_err(|_| Invalid)?;
+                recovery_eof(&mut recv).await?;
+                Ok(AuthenticatedExactPeerRecovery(peer))
+            } else {
+                let (mut send, mut recv) = connection.accept_bi().await.map_err(|_| Invalid)?;
+                let peer = read_recovery_record(&mut recv).await?;
+                if !local.accepts_peer(&peer) {
+                    return Err(Invalid);
+                }
+                write_recovery_record(&mut send, &local).await?;
+                let mut ack = [0; 1];
+                recv.read_exact(&mut ack).await.map_err(|_| Invalid)?;
+                if ack != [RECOVERY_ACK] {
+                    return Err(Invalid);
+                }
+                recovery_eof(&mut recv).await?;
+                send.finish().map_err(|_| Invalid)?;
+                Ok(AuthenticatedExactPeerRecovery(peer))
             }
-            send.write_all(&[RECOVERY_ACK]).await.map_err(|_| Invalid)?;
-            send.finish().map_err(|_| Invalid)?;
-            recovery_eof(&mut recv).await?;
-            Ok(peer)
-        } else {
-            let (mut send, mut recv) = connection.accept_bi().await.map_err(|_| Invalid)?;
-            let peer = read_recovery_record(&mut recv).await?;
-            if !local.accepts_peer(&peer) {
-                return Err(Invalid);
-            }
-            write_recovery_record(&mut send, &local).await?;
-            let mut ack = [0; 1];
-            recv.read_exact(&mut ack).await.map_err(|_| Invalid)?;
-            if ack != [RECOVERY_ACK] {
-                return Err(Invalid);
-            }
-            recovery_eof(&mut recv).await?;
-            send.finish().map_err(|_| Invalid)?;
-            Ok(peer)
-        }
         };
         tokio::select! { biased;
             result = protocol => result,
@@ -208,9 +229,7 @@ async fn write_recovery_record(
     send.write_all(&payload).await.map_err(|_| Invalid)
 }
 
-async fn read_recovery_record(
-    recv: &mut quinn::RecvStream,
-) -> Result<ExactPeerRecovery, Invalid> {
+async fn read_recovery_record(recv: &mut quinn::RecvStream) -> Result<ExactPeerRecovery, Invalid> {
     let mut length = [0; 4];
     recv.read_exact(&mut length).await.map_err(|_| Invalid)?;
     let length = u32::from_be_bytes(length) as usize;
@@ -277,6 +296,9 @@ mod tests {
         let left = ExactPeerRecovery::new([1; 32], [2; 32], None, 7, 11, 0).unwrap();
         let right = ExactPeerRecovery::new([1; 32], [3; 32], None, 7, 11, 0).unwrap();
         assert!(left.accepts_peer(&right));
-        assert_eq!(ExactPeerRecovery::decode(&left.encode().unwrap()).unwrap(), left);
+        assert_eq!(
+            ExactPeerRecovery::decode(&left.encode().unwrap()).unwrap(),
+            left
+        );
     }
 }

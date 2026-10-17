@@ -199,7 +199,11 @@ impl<'a> PreparedBilateralCommit<'a> {
         Ok(())
     }
 
-    fn finalize_once(&mut self) -> Result<(), StoreError> {
+    async fn finalize_once(
+        &mut self,
+        #[cfg(test)] hook: Option<&BilateralCommitTestHook>,
+        #[cfg(not(test))] _hook: Option<()>,
+    ) -> Result<(), StoreError> {
         if self.phase != BilateralCommitPhase::Frozen {
             return Err(StoreError::Invalid);
         }
@@ -211,6 +215,13 @@ impl<'a> PreparedBilateralCommit<'a> {
             attempt,
             frozen.into_store_handoff().1,
         )?;
+        #[cfg(test)]
+        if hook.is_some_and(|hook| {
+            hook.pause_at == Some(BilateralCommitCheckpoint::StoreOwnedBeforeRelease)
+        }) {
+            checkpoint(hook, BilateralCommitCheckpoint::StoreOwnedBeforeRelease)?;
+            pause_at_checkpoint(hook, BilateralCommitCheckpoint::StoreOwnedBeforeRelease).await;
+        }
         revoker.release_to_store()?;
         self.receipt = Some(stored);
         self.phase = BilateralCommitPhase::Finalized;
@@ -328,7 +339,7 @@ async fn commit_bilateral_foundation_inner(
     right_store: &AdmissionAuthorityStore,
     right_authority: super::provisional_tls::HandshakeCompletePendingAuthority,
     #[cfg(test)] hook: Option<&BilateralCommitTestHook>,
-    #[cfg(not(test))] _hook: Option<()>,
+    #[cfg(not(test))] hook: Option<()>,
 ) -> Result<(), StoreError> {
     let left_attempt = left_authority.test_attempt_for_commit();
     let right_attempt = right_authority.test_attempt_for_commit();
@@ -428,12 +439,12 @@ async fn commit_bilateral_foundation_inner(
         #[cfg(test)]
         pause_at_checkpoint(hook, BilateralCommitCheckpoint::RightFrozen).await;
 
-        left.finalize_once()?;
+        left.finalize_once(hook).await?;
         #[cfg(test)]
         checkpoint(hook, BilateralCommitCheckpoint::LeftFinalized)?;
         #[cfg(test)]
         pause_at_checkpoint(hook, BilateralCommitCheckpoint::LeftFinalized).await;
-        right.finalize_once()?;
+        right.finalize_once(hook).await?;
         #[cfg(test)]
         checkpoint(hook, BilateralCommitCheckpoint::RightFinalized)?;
         #[cfg(test)]
@@ -479,6 +490,116 @@ fn cancel_pending_attempt_exact(store: &AdmissionAuthorityStore, attempt: [u8; 3
     }
 }
 
+/// Recovery-only counterpart of the bilateral foundation coordinator. The
+/// caller owns the fresh control connections for both durable stores; absent
+/// channels are an explicit failure, never evidence that a peer committed.
+/// Success records reciprocal receipt hashes only and grants no runtime lease.
+pub(crate) async fn recover_bilateral_foundation(
+    left: &AdmissionAuthorityStore,
+    left_attempt: [u8; 32],
+    right: &AdmissionAuthorityStore,
+    right_attempt: [u8; 32],
+    channels: Option<(&quinn::Connection, &quinn::Connection)>,
+) -> Result<(), StoreError> {
+    // Reconcile stale guards before capturing receipts. A staged dead owner is
+    // independently exact-aborted by the existing sidecar resolver.
+    let left_guard = left.store.resolve_admission_guard(left_attempt);
+    let right_guard = right.store.resolve_admission_guard(right_attempt);
+    if left_guard?.is_some() || right_guard?.is_some() {
+        return Err(StoreError::Conflict);
+    }
+    let left_receipt = left.store.admission_state(left_attempt)?.1;
+    let right_receipt = right.store.admission_state(right_attempt)?.1;
+    let outcome = async {
+        let local_left = left_receipt.as_ref().ok_or(StoreError::Invalid)?;
+        let local_right = right_receipt.as_ref().ok_or(StoreError::Invalid)?;
+        let (left_channel, right_channel) = channels.ok_or(StoreError::Unavailable)?;
+        validate_recovery_channel(left_channel, local_left.peer_pin)?;
+        validate_recovery_channel(right_channel, local_right.peer_pin)?;
+        if local_left.bilateral.transaction_id != local_right.bilateral.transaction_id
+            || local_left.bilateral.fields.peer_attempt != right_attempt
+            || local_right.bilateral.fields.peer_attempt != left_attempt
+            || local_left.bilateral.fields.local_identity != local_right.peer
+            || local_right.bilateral.fields.local_identity != local_left.peer
+        {
+            return Err(StoreError::Invalid);
+        }
+        let left_evidence = left.store.recovery_evidence(left_attempt)?;
+        let right_evidence = right.store.recovery_evidence(right_attempt)?;
+        let (left_peer, right_peer) = tokio::join!(
+            super::recovery::exchange_exact_pair(left_channel, true, left_evidence.clone()),
+            super::recovery::exchange_exact_pair(right_channel, false, right_evidence.clone()),
+        );
+        let left_peer = left_peer.map_err(|_| StoreError::Invalid)?;
+        let right_peer = right_peer.map_err(|_| StoreError::Invalid)?;
+        if left_peer.evidence() != &right_evidence || right_peer.evidence() != &left_evidence {
+            return Err(StoreError::Invalid);
+        }
+        left.store
+            .confirm_authenticated_peer_recovery(left_attempt, left_peer)?;
+        right
+            .store
+            .confirm_authenticated_peer_recovery(right_attempt, right_peer)?;
+        Ok(())
+    }
+    .await;
+    if outcome.is_err() {
+        if let Some((left, right)) = channels {
+            left.close(0u32.into(), b"exact recovery aborted");
+            right.close(0u32.into(), b"exact recovery aborted");
+        }
+        // Both cleanups run even when the first fails. Retain captured immutable
+        // tuples across the await: never replace them with a newer peer receipt.
+        let left_abort = abort_recovery_receipt(left, left_receipt.as_ref());
+        let right_abort = abort_recovery_receipt(right, right_receipt.as_ref());
+        left_abort?;
+        right_abort?;
+    }
+    outcome
+}
+
+fn abort_recovery_receipt(
+    store: &AdmissionAuthorityStore,
+    receipt: Option<&AdmissionReceiptRecord>,
+) -> Result<(), StoreError> {
+    let Some(receipt) = receipt else {
+        return Ok(());
+    };
+    store.store.abort_bilateral_transaction(
+        store.version()?,
+        receipt.attempt,
+        receipt.bilateral.transaction_id,
+        receipt.bilateral.guard_token,
+    )?;
+    store
+        .store
+        .clear_admission_guard_exact(receipt.attempt, receipt.bilateral.guard_token)
+}
+
+fn validate_recovery_channel(
+    connection: &quinn::Connection,
+    pin: [u8; 32],
+) -> Result<(), StoreError> {
+    let handshake = connection
+        .handshake_data()
+        .ok_or(StoreError::Invalid)?
+        .downcast::<quinn::crypto::rustls::HandshakeData>()
+        .map_err(|_| StoreError::Invalid)?;
+    let certificates = connection
+        .peer_identity()
+        .ok_or(StoreError::Invalid)?
+        .downcast::<Vec<rustls::pki_types::CertificateDer<'static>>>()
+        .map_err(|_| StoreError::Invalid)?;
+    if connection.close_reason().is_some()
+        || handshake.protocol.as_deref() != Some(b"control-shift-f12-recovery/1")
+        || certificates.len() != 1
+        || super::evidence::hash(certificates[0].as_ref()) != pin
+    {
+        return Err(StoreError::Invalid);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum BilateralCommitCheckpoint {
@@ -496,6 +617,7 @@ pub(crate) enum BilateralCommitCheckpoint {
     LeftAborted,
     RightAborted,
     LeftEndpointDropped,
+    StoreOwnedBeforeRelease,
 }
 
 #[cfg(test)]
@@ -1150,6 +1272,43 @@ mod tests {
             suite: super::super::SUITE,
             transcript: [23; 32],
             binding: [24; 32],
+        }
+    }
+
+    #[tokio::test]
+    async fn recovery_without_authenticated_channels_exact_aborts_both_and_allows_retry() {
+        let left_root = tempfile::tempdir().unwrap();
+        let right_root = tempfile::tempdir().unwrap();
+        let left = AdmissionAuthorityStore::open(left_root.path()).unwrap();
+        let right = AdmissionAuthorityStore::open(right_root.path()).unwrap();
+        let a = left
+            .prepare(left.version().unwrap(), [161; 32], [162; 32])
+            .unwrap();
+        let b = right
+            .prepare(right.version().unwrap(), [163; 32], [164; 32])
+            .unwrap();
+        left.commit_operational_test_receipt(&a, [165; 32]).unwrap();
+        right
+            .commit_operational_test_receipt(&b, [166; 32])
+            .unwrap();
+        assert!(
+            recover_bilateral_foundation(&left, a.attempt_id, &right, b.attempt_id, None)
+                .await
+                .is_err()
+        );
+        for (store, record, retry) in [(&left, &a, [167; 32]), (&right, &b, [168; 32])] {
+            assert_eq!(
+                store.reconcile(record.attempt_id).unwrap(),
+                ReconcileAdmission::Absent
+            );
+            assert!(
+                store
+                    .operational_admission_snapshot(record.attempt_id)
+                    .is_err()
+            );
+            store
+                .prepare(store.version().unwrap(), retry, record.peer_fingerprint)
+                .unwrap();
         }
     }
 
