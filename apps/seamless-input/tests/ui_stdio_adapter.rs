@@ -593,6 +593,88 @@ fn framed_stdio_rejects_malformed_and_oversized_requests_before_dispatch() {
     assert!(control_api::read_request(&mut oversized.as_slice()).is_err());
 }
 
+fn assert_duplicate_args_rejected(command: &str, args: &str) {
+    let body = format!(r#"{{"v":1,"id":"duplicate","command":"{command}","args":{args}}}"#);
+    let mut frame = (body.len() as u32).to_be_bytes().to_vec();
+    frame.extend_from_slice(body.as_bytes());
+    let result = control_api::read_request(&mut frame.as_slice());
+    assert!(
+        result.is_err(),
+        "duplicate wire arguments reached Request: {result:?}"
+    );
+    let error = result.unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    assert_eq!(error.to_string(), "control protocol: invalid frame");
+}
+
+#[test]
+fn raw_pairing_frames_reject_duplicate_handle_in_either_order() {
+    for args in [
+        r#"{"handle":{"address":"192.0.2.4"},"handle":"nearby-1"}"#,
+        r#"{"handle":"nearby-1","handle":{"address":"192.0.2.4"}}"#,
+        r#"{"handle":"nearby-1","handle":"nearby-1"}"#,
+        r#"{"handle":"nearby-1","\u0068andle":"nearby-1"}"#,
+    ] {
+        assert_duplicate_args_rejected("ui.select_candidate", args);
+    }
+}
+
+#[test]
+fn raw_pairing_frames_reject_duplicate_generation_in_either_order() {
+    for args in [
+        r#"{"generation":0,"generation":1,"matches":true}"#,
+        r#"{"generation":1,"generation":0,"matches":true}"#,
+        r#"{"generation":1,"generation":1,"matches":true}"#,
+    ] {
+        assert_duplicate_args_rejected("ui.approve_sas", args);
+    }
+}
+
+#[test]
+fn raw_pairing_frames_reject_duplicate_matches_and_nested_members() {
+    for (command, args) in [
+        (
+            "ui.approve_sas",
+            r#"{"generation":1,"matches":false,"matches":true}"#,
+        ),
+        (
+            "ui.approve_sas",
+            r#"{"generation":1,"matches":true,"matches":false}"#,
+        ),
+        (
+            "ui.confirm_v01",
+            r#"{"matches":{"certificate":"private-value"},"matches":true}"#,
+        ),
+        (
+            "ui.confirm_v01",
+            r#"{"matches":true,"matches":{"certificate":"private-value"}}"#,
+        ),
+        (
+            "ui.select_candidate",
+            r#"{"handle":{"nested":[{"address":"first","address":"second"}]}}"#,
+        ),
+    ] {
+        assert_duplicate_args_rejected(command, args);
+    }
+}
+
+#[test]
+fn framed_unique_arguments_preserve_json_values_and_independent_nested_keys() {
+    let body = br#"{"v":1,"id":"unique","command":"ui.refresh","args":{"values":[null,true,false,-1,1,1.5,"hello",{"same":1},{"same":2}],"maximum":18446744073709551615}}"#;
+    let mut frame = (body.len() as u32).to_be_bytes().to_vec();
+    frame.extend_from_slice(body);
+    let decoded = control_api::read_request(&mut frame.as_slice())
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        decoded.args,
+        json!({
+            "values":[null,true,false,-1,1,1.5,"hello",{"same":1},{"same":2}],
+            "maximum":u64::MAX
+        })
+    );
+}
+
 #[derive(Default)]
 struct DelayedEof {
     waited: bool,

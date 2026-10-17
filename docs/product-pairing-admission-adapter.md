@@ -134,6 +134,14 @@ return `invalid_request` without echoing their contents. An unknown command
 returns `invalid_command`. V01 remains a distinct local comparison command;
 its arguments cannot contain a pairing generation or code.
 
+Before arguments become a generic JSON value, the shared request decoder
+recursively rejects duplicate object members anywhere in `args`, including
+inside arrays and escaped spellings of the same key. Duplicate members make
+the entire wire frame malformed: the reader terminates with its existing
+redacted invalid-frame error, without constructing a `Request` or emitting a
+typed UI response. This rule also applies to the foundations control reader;
+valid unique-member requests retain their existing representation.
+
 The pairing frame has exactly `v`, `kind`, `generation`, `phase`,
 `candidate_handle` and `verification_words`. Version is exactly 1, kind is
 exactly `ui_pairing_v1`, generation is nonzero, and the sole admitted phase is
