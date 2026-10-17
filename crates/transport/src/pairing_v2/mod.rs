@@ -35,6 +35,7 @@ pub use session::*;
 mod journal;
 pub use journal::*;
 use sha2::{Digest, Sha256};
+use std::borrow::Cow;
 
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
 #[error("invalid pairing v2 evidence")]
@@ -45,9 +46,8 @@ pub const WORDLIST_HASH: [u8; 32] = [
     0x90, 0xe5, 0x85, 0x03, 0x64, 0x6d, 0x9f, 0xf8, 0xef, 0xf3, 0xa2, 0xed, 0x3b, 0x24, 0xdb, 0xda,
 ];
 pub fn sas_words(digest: &[u8; 32]) -> Result<[String; 4], Invalid> {
-    let raw = include_bytes!("bip39-english.txt");
-    validate_wordlist(raw)?;
-    let words: Vec<_> = std::str::from_utf8(raw)
+    let raw = validated_wordlist(include_bytes!("bip39-english.txt"))?;
+    let words: Vec<_> = std::str::from_utf8(raw.as_ref())
         .map_err(|_| Invalid)?
         .lines()
         .collect();
@@ -57,11 +57,16 @@ pub fn sas_words(digest: &[u8; 32]) -> Result<[String; 4], Invalid> {
     Ok([33, 22, 11, 0].map(|shift| words[((prefix >> shift) & 2047) as usize].to_owned()))
 }
 pub fn validate_wordlist(bytes: &[u8]) -> Result<(), Invalid> {
-    let hash: [u8; 32] = Sha256::digest(bytes).into();
+    validated_wordlist(bytes).map(|_| ())
+}
+
+fn validated_wordlist(bytes: &[u8]) -> Result<Cow<'_, [u8]>, Invalid> {
+    let raw = canonical_wordlist(bytes)?;
+    let hash: [u8; 32] = Sha256::digest(raw.as_ref()).into();
     if hash != WORDLIST_HASH {
         return Err(Invalid);
     }
-    let words: Vec<_> = std::str::from_utf8(bytes)
+    let words: Vec<_> = std::str::from_utf8(raw.as_ref())
         .map_err(|_| Invalid)?
         .lines()
         .collect();
@@ -77,5 +82,47 @@ pub fn validate_wordlist(bytes: &[u8]) -> Result<(), Invalid> {
     {
         return Err(Invalid);
     }
-    Ok(())
+    Ok(raw)
+}
+
+fn canonical_wordlist(bytes: &[u8]) -> Result<Cow<'_, [u8]>, Invalid> {
+    if !bytes.contains(&b'\r') {
+        return Ok(Cow::Borrowed(bytes));
+    }
+
+    let mut canonical = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\r' if bytes.get(index + 1) == Some(&b'\n') => index += 1,
+            b'\r' => return Err(Invalid),
+            _ => {}
+        }
+        canonical.push(bytes[index]);
+        index += 1;
+    }
+    Ok(Cow::Owned(canonical))
+}
+
+#[cfg(test)]
+mod wordlist_tests {
+    use super::*;
+
+    #[test]
+    fn crlf_wordlist_is_canonicalized_before_validation() {
+        let mut crlf = Vec::new();
+        for byte in include_bytes!("bip39-english.txt")
+            .iter()
+            .copied()
+            .filter(|byte| *byte != b'\r')
+        {
+            if byte == b'\n' {
+                crlf.extend_from_slice(b"\r\n");
+            } else {
+                crlf.push(byte);
+            }
+        }
+
+        assert!(validate_wordlist(&crlf).is_ok());
+    }
 }
