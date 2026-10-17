@@ -717,11 +717,12 @@ fn admission_receipt_hash(receipt: &AdmissionReceiptRecord) -> [u8; 32] {
     digest.update(receipt.protocol_version.to_be_bytes());
     digest.update(receipt.transcript);
     digest.update(receipt.binding);
-    digest.update(receipt.revision.to_be_bytes());
     digest.update(receipt.identity_generation.to_be_bytes());
     digest.update(receipt.revocation_generation.to_be_bytes());
     digest.update(receipt.policy_revision.to_be_bytes());
-    digest.update(receipt.ownership.guard_token());
+    // Revision and ownership are publication-phase metadata. The bilateral
+    // proof must remain stable from AwaitingHandoff through StoreOwned, so it
+    // commits only the immutable receipt descriptor and bilateral transaction.
     digest.update(receipt.bilateral.transaction_id.0);
     let fields = &receipt.bilateral.fields;
     digest.update(fields.local_identity);
@@ -908,6 +909,40 @@ impl AdmissionRevoker {
         // therefore runs lock-free with respect to the in-memory phase machine.
         self.store
             .revoke_current(self.peer, self.attempt, self.token)?;
+        self.store
+            .clear_admission_guard_exact(self.attempt, self.token)?;
+        revocation_guard_phases().remove(&self.token);
+        self.armed = false;
+        self.owns_revocation = false;
+        Ok(())
+    }
+
+    /// Cancels only the pending attempt currently owned by this live guard.
+    /// This is the pre-staging cleanup path for a prepared bilateral commit;
+    /// unlike `revoke`, it never changes peer-scoped revocation state.
+    pub(crate) fn cancel_exact(&mut self) -> Result<(), StoreError> {
+        if !self.mark_revoking() {
+            return Err(StoreError::Unavailable);
+        }
+        let version = self.store.version()?;
+        self.store.cancel(version, self.attempt)?;
+        self.store
+            .clear_admission_guard_exact(self.attempt, self.token)?;
+        revocation_guard_phases().remove(&self.token);
+        self.armed = false;
+        self.owns_revocation = false;
+        Ok(())
+    }
+
+    /// Aborts the exact staged bilateral receipt held by this guard.  This is
+    /// deliberately narrower than legacy peer-wide revocation so a delayed
+    /// endpoint can never damage a newer same-peer admission.
+    pub(crate) fn abort_staged_exact(&mut self) -> Result<(), StoreError> {
+        if !self.mark_revoking() {
+            return Err(StoreError::Unavailable);
+        }
+        self.store
+            .abort_bilateral_guard_exact(self.attempt, self.token)?;
         self.store
             .clear_admission_guard_exact(self.attempt, self.token)?;
         revocation_guard_phases().remove(&self.token);
@@ -2508,6 +2543,54 @@ mod unix {
             let pin = receipt.peer_pin;
             let identity_generation = receipt.identity_generation;
             let revocation_generation = receipt.revocation_generation;
+            ledger.advance(expected)?;
+            ledger.admission_receipts.remove(index);
+            ledger.consumed_attempts.retain(|stored| *stored != attempt);
+            ledger.active_pins.retain(|active| {
+                !(active.peer == peer
+                    && active.pin == pin
+                    && active.identity_generation == identity_generation
+                    && active.revocation_generation == revocation_generation)
+            });
+            ledger
+                .admission_reservations
+                .retain(|reservation| reservation.attempt != attempt);
+            ledger.tombstones.push(attempt);
+            self.save(&ledger)
+        }
+
+        /// Endpoint-drop recovery for a live staged bilateral transaction.
+        /// The opaque sidecar token is the sole authority: no peer lookup or
+        /// peer-wide revocation is allowed on this path.
+        #[cfg(feature = "pairing-v2-experimental")]
+        pub(crate) fn abort_bilateral_guard_exact(
+            &self,
+            attempt: [u8; 32],
+            guard_token: [u8; 32],
+        ) -> Result<(), StoreError> {
+            if attempt == [0; 32] || guard_token == [0; 32] {
+                return Err(StoreError::Invalid);
+            }
+            let _lock = self.ledger_dir.lock()?;
+            let mut ledger = self.load_validated_manifest()?;
+            let index = ledger
+                .admission_receipts
+                .iter()
+                .position(|receipt| receipt.attempt == attempt)
+                .ok_or(StoreError::Invalid)?;
+            let receipt = &ledger.admission_receipts[index];
+            if receipt.bilateral.guard_token != guard_token
+                || receipt.ownership.guard_token() != guard_token
+                || receipt.identity_generation != ledger.version.identity_generation
+                || receipt.revocation_generation != ledger.revocation(receipt.peer)
+            {
+                return Err(StoreError::Invalid);
+            }
+            let peer = receipt.peer;
+            let pin = receipt.peer_pin;
+            let identity_generation = receipt.identity_generation;
+            let revocation_generation = receipt.revocation_generation;
+            let expected = ledger.version;
             ledger.advance(expected)?;
             ledger.admission_receipts.remove(index);
             ledger.consumed_attempts.retain(|stored| *stored != attempt);

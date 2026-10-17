@@ -129,6 +129,15 @@ impl PeerFinalizationReceipt {
     pub(crate) fn transcript(&self) -> [u8; 32] {
         self.transcript
     }
+    pub(crate) fn identity_generation(&self) -> u64 {
+        self.identity_generation
+    }
+    pub(crate) fn revocation_generation(&self) -> u64 {
+        self.revocation_generation
+    }
+    pub(crate) fn policy_revision(&self) -> u64 {
+        self.policy_revision
+    }
 }
 /// Move-only protocol evidence that remains quarantined from product runtime.
 ///
@@ -183,6 +192,87 @@ pub struct HandshakeCompletePendingAuthority {
     failed: Arc<AtomicBool>,
     watcher: IngressWatcher,
     finalization_complete: bool,
+}
+
+/// Internal, move-only live authority reserved for a bilateral durable
+/// transition. It is intentionally unavailable outside pairing-v2 internals.
+pub(crate) struct PreparedHandshakeAuthority {
+    authority: HandshakeCompletePendingAuthority,
+    reservation: super::PreparedAdmissionHandoff,
+}
+
+impl PreparedHandshakeAuthority {
+    pub(in crate::pairing_v2) fn fields(&self) -> SealedPromotionFields {
+        SealedPromotionFields {
+            record: self.authority.pending.clone(),
+            role: self.authority.role,
+            durable_fc_hash: self.authority.durable_fc_hash,
+            local_binding: self.authority.local_binding,
+            transcript: self.authority.transcript,
+            certificate_fingerprints: self.authority.certificate_fingerprints,
+        }
+    }
+
+    pub(in crate::pairing_v2) fn staged_ownership(
+        &self,
+        revision: u64,
+    ) -> crate::pairing_pending::AdmissionOwnership {
+        self.reservation.awaiting_handoff_ownership(revision)
+    }
+
+    pub(in crate::pairing_v2) fn mark_staged(&self) -> Result<(), HandshakeError> {
+        self.reservation
+            .mark_staged()
+            .map_err(|_| HandshakeError::Rejected)
+    }
+
+    pub(in crate::pairing_v2) fn local_receipt(
+        &self,
+        peer_attempt: [u8; 32],
+        receipt_hash: [u8; 32],
+    ) -> Result<LocalFinalizationReceipt, HandshakeError> {
+        self.authority.local_finalization_receipt(peer_attempt, receipt_hash)
+    }
+
+    pub(in crate::pairing_v2) async fn exchange(
+        &mut self,
+        receipt: LocalFinalizationReceipt,
+    ) -> Result<PeerFinalizationReceipt, HandshakeError> {
+        self.authority.exchange_local_receipt(receipt).await
+    }
+
+    pub(in crate::pairing_v2) async fn freeze(
+        mut self,
+    ) -> Result<FrozenPromotionEvidence, HandshakeError> {
+        if !self.authority.is_protocol_valid() {
+            return Err(HandshakeError::Rejected);
+        }
+        let handoff = self.reservation.freeze().map_err(|_| HandshakeError::Rejected)?;
+        self.authority
+            ._channel
+            .connection
+            .close(APPLICATION_ERROR.into(), b"bilateral finalization frozen");
+        if let Some(task) = self.authority.watcher.task.take() {
+            task.abort();
+        }
+        Ok(FrozenPromotionEvidence {
+            role: self.authority.role,
+            durable_fc_hash: self.authority.durable_fc_hash,
+            local_binding: Zeroizing::new(self.authority.local_binding),
+            pending: self.authority.pending,
+            transcript: self.authority.transcript,
+            certificate_fingerprints: self.authority.certificate_fingerprints,
+            handoff,
+        })
+    }
+
+    #[cfg(test)]
+    pub(in crate::pairing_v2) fn test_matches_ownership(
+        &self,
+        ownership: &crate::pairing_pending::AdmissionOwnership,
+    ) -> bool {
+        self.reservation.test_matches_ownership(ownership)
+    }
 }
 /// Move-only, non-serializable protocol evidence. It deliberately has no public
 /// binding getter and cannot be reconstructed after restart.
@@ -374,6 +464,9 @@ impl HandshakeCompletePendingAuthority {
     pub(super) fn test_attempt(&self) -> [u8; 32] {
         self.pending.attempt_id
     }
+    pub(in crate::pairing_v2) fn test_attempt_for_commit(&self) -> [u8; 32] {
+        self.pending.attempt_id
+    }
 
     pub(crate) fn local_finalization_receipt(
         &self,
@@ -404,6 +497,27 @@ impl HandshakeCompletePendingAuthority {
             policy_revision: 0,
             #[cfg(test)]
             test_fault: None,
+        })
+    }
+
+    pub(in crate::pairing_v2) fn prepare_bilateral(
+        self,
+        store: &PendingStore,
+    ) -> Result<PreparedHandshakeAuthority, HandshakeError> {
+        if !self.is_protocol_valid() {
+            return Err(HandshakeError::Rejected);
+        }
+        let revoker = store
+            .admission_revoker(self.pending.peer_fingerprint, self.pending.attempt_id)
+            .map_err(|_| HandshakeError::Rejected)?;
+        let reservation = self
+            ._channel
+            .scope
+            .reserve_live(revoker)
+            .map_err(|_| HandshakeError::Rejected)?;
+        Ok(PreparedHandshakeAuthority {
+            authority: self,
+            reservation,
         })
     }
 

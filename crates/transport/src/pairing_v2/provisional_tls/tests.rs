@@ -241,6 +241,368 @@ async fn finalization_exchanges_authenticated_peer_proofs_on_real_endpoints() {
 }
 
 #[tokio::test]
+async fn bilateral_commit_requires_both_stores_confirmed_before_any_snapshot() {
+    let (_ea, _eb, a, b, _) = pair().await;
+    let ta = tempfile::tempdir().unwrap();
+    let tb = tempfile::tempdir().unwrap();
+    let sa = crate::pairing_pending::PendingStore::open(ta.path()).unwrap();
+    let sb = crate::pairing_pending::PendingStore::open(tb.path()).unwrap();
+    let (a, b) = tokio::join!(
+        a.handshake(handshake_config(31, 32), &sa, |prompt| async move {
+            prompt.decision(true)
+        }),
+        b.handshake(handshake_config(32, 31), &sb, |prompt| async move {
+            prompt.decision(true)
+        })
+    );
+    let a = a.unwrap();
+    let b = b.unwrap();
+    let a_attempt = a.test_attempt();
+    let b_attempt = b.test_attempt();
+    let left = crate::pairing_v2::admission_authority::AdmissionAuthorityStore::open(ta.path())
+        .unwrap();
+    let right = crate::pairing_v2::admission_authority::AdmissionAuthorityStore::open(tb.path())
+        .unwrap();
+    let hook = crate::pairing_v2::admission_authority::BilateralCommitTestHook::recording();
+
+    crate::pairing_v2::admission_authority::commit_bilateral_foundation_with_test_hook(
+        &left, a, &right, b, &hook,
+    )
+    .await
+    .expect("both exact local receipts must confirm after authenticated peer proofs");
+
+    use crate::pairing_v2::admission_authority::BilateralCommitCheckpoint as Checkpoint;
+    assert_eq!(
+        hook.checkpoints(),
+        vec![
+            Checkpoint::PreflightComplete,
+            Checkpoint::LeftStaged,
+            Checkpoint::RightStaged,
+            Checkpoint::Task3ProofsVerified,
+            Checkpoint::LeftFrozen,
+            Checkpoint::RightFrozen,
+            Checkpoint::LeftFinalized,
+            Checkpoint::RightFinalized,
+            Checkpoint::LeftConfirmed,
+            Checkpoint::RightConfirmed,
+        ],
+        "the trace is append-only evidence of actual transitions: Task 3 must finish while both endpoints remain live, before either freeze"
+    );
+    let left_receipt = left
+        .test_bilateral_receipt(a_attempt)
+        .unwrap()
+        .expect("left confirmed receipt");
+    let right_receipt = right
+        .test_bilateral_receipt(b_attempt)
+        .unwrap()
+        .expect("right confirmed receipt");
+    assert_eq!(
+        left_receipt.bilateral.state,
+        crate::pairing_pending::BilateralAdmissionState::BilateralConfirmed
+    );
+    assert_eq!(
+        right_receipt.bilateral.state,
+        crate::pairing_pending::BilateralAdmissionState::BilateralConfirmed
+    );
+    assert_eq!(left_receipt.bilateral.transaction_id, right_receipt.bilateral.transaction_id);
+    assert_eq!(left_receipt.bilateral.local_receipt_hash, right_receipt.bilateral.peer_receipt_hash.unwrap());
+    assert_eq!(right_receipt.bilateral.local_receipt_hash, left_receipt.bilateral.peer_receipt_hash.unwrap());
+    assert!(left.operational_admission_snapshot(a_attempt).is_err());
+    assert!(right.operational_admission_snapshot(b_attempt).is_err());
+}
+
+async fn bilateral_commit_failure_aborts_exact_transactions_on_both_stores(
+    make_hook: impl FnOnce(ProvisionalEndpoint) -> crate::pairing_v2::admission_authority::BilateralCommitTestHook,
+    expected_checkpoints: &[crate::pairing_v2::admission_authority::BilateralCommitCheckpoint],
+) {
+    let (ea, _eb, a, b, _) = pair().await;
+    let ta = tempfile::tempdir().unwrap();
+    let tb = tempfile::tempdir().unwrap();
+    let sa = crate::pairing_pending::PendingStore::open(ta.path()).unwrap();
+    let sb = crate::pairing_pending::PendingStore::open(tb.path()).unwrap();
+    let (a, b) = tokio::join!(
+        a.handshake(handshake_config(33, 34), &sa, |prompt| async move {
+            prompt.decision(true)
+        }),
+        b.handshake(handshake_config(34, 33), &sb, |prompt| async move {
+            prompt.decision(true)
+        })
+    );
+    let a = a.unwrap();
+    let b = b.unwrap();
+    let a_attempt = a.test_attempt();
+    let b_attempt = b.test_attempt();
+    let left = crate::pairing_v2::admission_authority::AdmissionAuthorityStore::open(ta.path())
+        .unwrap();
+    let right = crate::pairing_v2::admission_authority::AdmissionAuthorityStore::open(tb.path())
+        .unwrap();
+
+    let a_peer = sa.pending(a_attempt).unwrap().unwrap().peer_fingerprint;
+    let b_peer = sb.pending(b_attempt).unwrap().unwrap().peer_fingerprint;
+    // The hook keeps the real client endpoint alive unless this exact test
+    // chooses to drop it at a named transition. This rules out a fake
+    // store-only endpoint failure seam.
+    let hook = make_hook(ea);
+    let result = crate::pairing_v2::admission_authority::commit_bilateral_foundation_with_test_hook(
+        &left, a, &right, b, &hook,
+    )
+    .await;
+    assert!(result.is_err());
+    assert!(left.operational_admission_snapshot(a_attempt).is_err());
+    assert!(right.operational_admission_snapshot(b_attempt).is_err());
+    assert_eq!(
+        left.reconcile(a_attempt).unwrap(),
+        crate::pairing_v2::admission_authority::ReconcileAdmission::Absent
+    );
+    assert_eq!(
+        right.reconcile(b_attempt).unwrap(),
+        crate::pairing_v2::admission_authority::ReconcileAdmission::Absent
+    );
+    // Exact compensation must release only the failed transaction.  A fresh
+    // same-peer attempt proves no stale reservation, pin, or guard survived.
+    left
+        .prepare(left.version().unwrap(), [91; 32], a_peer)
+        .expect("left exact abort must not block a later same-peer attempt");
+    right
+        .prepare(right.version().unwrap(), [92; 32], b_peer)
+        .expect("right exact abort must not block a later same-peer attempt");
+    assert_eq!(
+        hook.checkpoints(),
+        expected_checkpoints,
+        "the test hook must report immutable checkpoints after real transitions"
+    );
+}
+
+#[tokio::test]
+async fn every_durable_bilateral_commit_checkpoint_aborts_exactly() {
+    use crate::pairing_v2::admission_authority::{
+        BilateralCommitCheckpoint as Checkpoint, BilateralCommitTestHook as Hook,
+    };
+
+    macro_rules! assert_exact_abort {
+        ($make_hook:expr, $expected:expr) => {
+            bilateral_commit_failure_aborts_exact_transactions_on_both_stores(
+                $make_hook,
+                &$expected,
+            )
+            .await
+        };
+    }
+
+    assert_exact_abort!(
+        |endpoint| Hook::with_live_left_endpoint(endpoint).fail_after(Checkpoint::LeftStaged),
+        vec![
+            Checkpoint::PreflightComplete,
+            Checkpoint::LeftStaged,
+            Checkpoint::LeftAborted,
+        ]
+    );
+    assert_exact_abort!(
+        |endpoint| Hook::with_live_left_endpoint(endpoint).fail_after(Checkpoint::RightStaged),
+        vec![
+            Checkpoint::PreflightComplete,
+            Checkpoint::LeftStaged,
+            Checkpoint::RightStaged,
+            Checkpoint::RightAborted,
+            Checkpoint::LeftAborted,
+        ]
+    );
+    assert_exact_abort!(
+        |endpoint| Hook::with_live_left_endpoint(endpoint).fail_after(Checkpoint::LeftFinalized),
+        vec![
+            Checkpoint::PreflightComplete,
+            Checkpoint::LeftStaged,
+            Checkpoint::RightStaged,
+            Checkpoint::Task3ProofsVerified,
+            Checkpoint::LeftFrozen,
+            Checkpoint::RightFrozen,
+            Checkpoint::LeftFinalized,
+            Checkpoint::RightAborted,
+            Checkpoint::LeftAborted,
+        ]
+    );
+    assert_exact_abort!(
+        |endpoint| Hook::with_live_left_endpoint(endpoint).fail_after(Checkpoint::RightFinalized),
+        vec![
+            Checkpoint::PreflightComplete,
+            Checkpoint::LeftStaged,
+            Checkpoint::RightStaged,
+            Checkpoint::Task3ProofsVerified,
+            Checkpoint::LeftFrozen,
+            Checkpoint::RightFrozen,
+            Checkpoint::LeftFinalized,
+            Checkpoint::RightFinalized,
+            Checkpoint::RightAborted,
+            Checkpoint::LeftAborted,
+        ]
+    );
+    assert_exact_abort!(
+        |endpoint| Hook::with_live_left_endpoint(endpoint).fail_after(Checkpoint::LeftConfirmed),
+        vec![
+            Checkpoint::PreflightComplete,
+            Checkpoint::LeftStaged,
+            Checkpoint::RightStaged,
+            Checkpoint::Task3ProofsVerified,
+            Checkpoint::LeftFrozen,
+            Checkpoint::RightFrozen,
+            Checkpoint::LeftFinalized,
+            Checkpoint::RightFinalized,
+            Checkpoint::LeftConfirmed,
+            Checkpoint::RightAborted,
+            Checkpoint::LeftAborted,
+        ]
+    );
+    assert_exact_abort!(
+        |endpoint| Hook::with_live_left_endpoint(endpoint).reject_task3(),
+        vec![
+            Checkpoint::PreflightComplete,
+            Checkpoint::LeftStaged,
+            Checkpoint::RightStaged,
+            Checkpoint::RightAborted,
+            Checkpoint::LeftAborted,
+        ]
+    );
+}
+
+#[tokio::test]
+async fn endpoint_drop_before_or_after_staging_aborts_exactly() {
+    use crate::pairing_v2::admission_authority::{
+        BilateralCommitCheckpoint as Checkpoint, BilateralCommitTestHook as Hook,
+    };
+
+    // The hook owns the actual provisional endpoint; reaching the named
+    // checkpoint drops it and its watcher rather than synthesizing a storage
+    // state. The coordinator must observe the real transport close.
+    bilateral_commit_failure_aborts_exact_transactions_on_both_stores(
+        |endpoint| Hook::drop_real_left_endpoint_after(Checkpoint::PreflightComplete, endpoint),
+        &[Checkpoint::PreflightComplete, Checkpoint::LeftEndpointDropped],
+    )
+    .await;
+    bilateral_commit_failure_aborts_exact_transactions_on_both_stores(
+        |endpoint| Hook::drop_real_left_endpoint_after(Checkpoint::LeftStaged, endpoint),
+        &[
+            Checkpoint::PreflightComplete,
+            Checkpoint::LeftStaged,
+            Checkpoint::LeftEndpointDropped,
+        ],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn stale_failed_coordinator_abort_cannot_damage_fresh_same_peer_finalization() {
+    use crate::pairing_v2::admission_authority::{
+        BilateralCommitCheckpoint as Checkpoint, BilateralCommitTestHook as Hook,
+    };
+
+    // A failed coordinator consumes its endpoints. Reopen fresh endpoints
+    // with the same identities so this is a real same-peer retry rather than
+    // an invalid reuse of a closed provisional consent scope.
+    let (a_identity, a_key) = identity(true);
+    let a_retry_key = a_key.clone_key();
+    let (b_identity, b_key) = identity(true);
+    let b_retry_key = b_key.clone_key();
+    let ea = ProvisionalEndpoint::bind("127.0.0.1:0".parse().unwrap(), a_identity.clone(), a_key)
+        .unwrap();
+    let eb = ProvisionalEndpoint::bind("127.0.0.1:0".parse().unwrap(), b_identity.clone(), b_key)
+        .unwrap();
+    let (a, b) = tokio::join!(ea.connect(eb.local_addr().unwrap()), eb.accept());
+    let a = a.unwrap();
+    let b = b.unwrap();
+    let ta = tempfile::tempdir().unwrap();
+    let tb = tempfile::tempdir().unwrap();
+    let sa = crate::pairing_pending::PendingStore::open(ta.path()).unwrap();
+    let sb = crate::pairing_pending::PendingStore::open(tb.path()).unwrap();
+    let (a, b) = tokio::join!(
+        a.handshake(handshake_config(41, 42), &sa, |prompt| async move {
+            prompt.decision(true)
+        }),
+        b.handshake(handshake_config(42, 41), &sb, |prompt| async move {
+            prompt.decision(true)
+        })
+    );
+    let a = a.unwrap();
+    let b = b.unwrap();
+    let stale_a_attempt = a.test_attempt();
+    let stale_b_attempt = b.test_attempt();
+    let left = crate::pairing_v2::admission_authority::AdmissionAuthorityStore::open(ta.path())
+        .unwrap();
+    let right = crate::pairing_v2::admission_authority::AdmissionAuthorityStore::open(tb.path())
+        .unwrap();
+    let stale_hook = Hook::recording().fail_after(Checkpoint::LeftStaged);
+    assert!(crate::pairing_v2::admission_authority::commit_bilateral_foundation_with_test_hook(
+        &left,
+        a,
+        &right,
+        b,
+        &stale_hook,
+    )
+    .await
+    .is_err());
+
+    let fresh_ea = ProvisionalEndpoint::bind(
+        "127.0.0.1:0".parse().unwrap(),
+        a_identity,
+        a_retry_key,
+    )
+    .unwrap();
+    let fresh_eb = ProvisionalEndpoint::bind(
+        "127.0.0.1:0".parse().unwrap(),
+        b_identity,
+        b_retry_key,
+    )
+    .unwrap();
+    let (fresh_a, fresh_b) = tokio::join!(
+        fresh_ea.connect(fresh_eb.local_addr().unwrap()),
+        fresh_eb.accept(),
+    );
+    let (fresh_a, fresh_b) = tokio::join!(
+        fresh_a.unwrap().handshake(handshake_config(43, 44), &sa, |prompt| async move {
+            prompt.decision(true)
+        }),
+        fresh_b.unwrap().handshake(handshake_config(44, 43), &sb, |prompt| async move {
+            prompt.decision(true)
+        })
+    );
+    let fresh_a = fresh_a.unwrap();
+    let fresh_b = fresh_b.unwrap();
+    let fresh_a_attempt = fresh_a.test_attempt();
+    let fresh_b_attempt = fresh_b.test_attempt();
+    let fresh_hook = Hook::recording();
+    crate::pairing_v2::admission_authority::commit_bilateral_foundation_with_test_hook(
+        &left, fresh_a, &right, fresh_b, &fresh_hook,
+    )
+    .await
+    .expect("fresh same-peer finalization must survive stale exact abort cleanup");
+
+    assert_eq!(
+        left.reconcile(stale_a_attempt).unwrap(),
+        crate::pairing_v2::admission_authority::ReconcileAdmission::Absent
+    );
+    assert_eq!(
+        right.reconcile(stale_b_attempt).unwrap(),
+        crate::pairing_v2::admission_authority::ReconcileAdmission::Absent
+    );
+    assert!(left.operational_admission_snapshot(fresh_a_attempt).is_err());
+    assert!(right.operational_admission_snapshot(fresh_b_attempt).is_err());
+    assert_eq!(
+        left.test_bilateral_receipt(fresh_a_attempt)
+            .unwrap()
+            .unwrap()
+            .bilateral.state,
+        crate::pairing_pending::BilateralAdmissionState::BilateralConfirmed
+    );
+    assert_eq!(
+        right
+            .test_bilateral_receipt(fresh_b_attempt)
+            .unwrap()
+            .unwrap()
+            .bilateral.state,
+        crate::pairing_pending::BilateralAdmissionState::BilateralConfirmed
+    );
+}
+
+#[tokio::test]
 async fn finalization_rejects_cross_transaction_receipt_on_real_endpoints() {
     let (_ea, _eb, a, b, _) = pair().await;
     let ta = tempfile::tempdir().unwrap();
@@ -696,6 +1058,204 @@ async fn bilateral_pending_authority_seals_into_live_move_only_evidence() {
     let sealed = a.unwrap().seal_for_promotion().await.unwrap();
     sealed.revalidate().unwrap();
     drop(b.unwrap());
+}
+
+#[tokio::test]
+async fn prepared_bilateral_commit_consumes_authority_and_rejects_double_stage() {
+    let (_ea, _eb, a, b, _) = pair().await;
+    let root = tempfile::tempdir().unwrap();
+    let peer_root = tempfile::tempdir().unwrap();
+    let pending = crate::pairing_pending::PendingStore::open(root.path()).unwrap();
+    let peer_pending = crate::pairing_pending::PendingStore::open(peer_root.path()).unwrap();
+    let (a, b) = tokio::join!(
+        a.handshake(handshake_config(61, 62), &pending, |prompt| async move {
+            prompt.decision(true)
+        }),
+        b.handshake(handshake_config(62, 61), &peer_pending, |prompt| async move {
+            prompt.decision(true)
+        })
+    );
+    let peer_attempt = b.as_ref().unwrap().test_attempt();
+    let a = a.unwrap();
+    let attempt = a.test_attempt();
+    let store = crate::pairing_v2::admission_authority::AdmissionAuthorityStore::open(root.path())
+        .unwrap();
+
+    // `prepare` consumes the completed authority. There is no production
+    // split API that leaves a raw authority available for a second reserve.
+    let mut prepared = crate::pairing_v2::admission_authority::PreparedBilateralCommit::prepare(
+        &store, a,
+    )
+    .await
+    .unwrap();
+    prepared.stage_once(peer_attempt).unwrap();
+    assert!(
+        store
+            .test_staged_receipt_uses_prepared_reservation(attempt, &prepared)
+            .unwrap(),
+        "the staged AwaitingHandoff receipt must be bound to this opaque live reservation"
+    );
+    assert!(
+        prepared.stage_once(peer_attempt).is_err(),
+        "the same move-only commit cannot publish a second staged receipt"
+    );
+    assert!(
+        prepared.freeze_once().await.is_err(),
+        "freeze is impossible from Staged without a stored authenticated Task 3 proof"
+    );
+    drop(b.unwrap());
+}
+
+#[tokio::test]
+async fn endpoint_drop_between_stage_and_task3_exactly_removes_live_reservation_receipt() {
+    let (endpoint, _peer_endpoint, a, b, _) = pair().await;
+    let root = tempfile::tempdir().unwrap();
+    let peer_root = tempfile::tempdir().unwrap();
+    let pending = crate::pairing_pending::PendingStore::open(root.path()).unwrap();
+    let peer_pending = crate::pairing_pending::PendingStore::open(peer_root.path()).unwrap();
+    let (a, b) = tokio::join!(
+        a.handshake(handshake_config(63, 64), &pending, |prompt| async move {
+            prompt.decision(true)
+        }),
+        b.handshake(handshake_config(64, 63), &peer_pending, |prompt| async move {
+            prompt.decision(true)
+        })
+    );
+    let a = a.unwrap();
+    let peer_attempt = b.as_ref().unwrap().test_attempt();
+    let attempt = a.test_attempt();
+    let store = crate::pairing_v2::admission_authority::AdmissionAuthorityStore::open(root.path())
+        .unwrap();
+    let mut prepared = crate::pairing_v2::admission_authority::PreparedBilateralCommit::prepare(
+        &store, a,
+    )
+    .await
+    .unwrap();
+    prepared.stage_once(peer_attempt).unwrap();
+
+    drop(endpoint);
+    assert_eq!(
+        store.reconcile(attempt).unwrap(),
+        crate::pairing_v2::admission_authority::ReconcileAdmission::Absent,
+        "a real endpoint/watcher drop before Task 3 must exact-revoke only its staged receipt"
+    );
+    assert!(
+        prepared.freeze_once().await.is_err(),
+        "a dropped live reservation must not be convertible into a finalization handoff"
+    );
+    drop(b.unwrap());
+}
+
+#[tokio::test]
+async fn stale_prepared_reservation_cannot_finalize_after_fresh_same_peer_retry() {
+    let (client_certificate, client_key) = identity(true);
+    let retry_client_key = client_key.clone_key();
+    let (server_certificate, server_key) = identity(true);
+    let retry_server_key = server_key.clone_key();
+    let server = ProvisionalEndpoint::bind(
+        "127.0.0.1:0".parse().unwrap(),
+        server_certificate.clone(),
+        server_key,
+    )
+    .unwrap();
+    let client = ProvisionalEndpoint::bind(
+        "127.0.0.1:0".parse().unwrap(),
+        client_certificate.clone(),
+        client_key,
+    )
+    .unwrap();
+    let (first_client, first_server) = tokio::join!(
+        client.connect(server.local_addr().unwrap()),
+        server.accept(),
+    );
+    let root = tempfile::tempdir().unwrap();
+    let peer_root = tempfile::tempdir().unwrap();
+    let pending = crate::pairing_pending::PendingStore::open(root.path()).unwrap();
+    let peer_pending = crate::pairing_pending::PendingStore::open(peer_root.path()).unwrap();
+    let (first_client, first_server) = tokio::join!(
+        first_client.unwrap().handshake(handshake_config(65, 66), &pending, |prompt| async move {
+            prompt.decision(true)
+        }),
+        first_server.unwrap().handshake(handshake_config(66, 65), &peer_pending, |prompt| async move {
+            prompt.decision(true)
+        })
+    );
+    let first_client = first_client.unwrap();
+    let first_peer_attempt = first_server.as_ref().unwrap().test_attempt();
+    let stale_attempt = first_client.test_attempt();
+    let store = crate::pairing_v2::admission_authority::AdmissionAuthorityStore::open(root.path())
+        .unwrap();
+    let mut stale = crate::pairing_v2::admission_authority::PreparedBilateralCommit::prepare(
+        &store,
+        first_client,
+    )
+    .await
+    .unwrap();
+    stale.stage_once(first_peer_attempt).unwrap();
+
+    drop(client);
+    drop(server);
+    drop(first_server.unwrap());
+    assert_eq!(
+        store.reconcile(stale_attempt).unwrap(),
+        crate::pairing_v2::admission_authority::ReconcileAdmission::Absent
+    );
+
+    let retry_client = ProvisionalEndpoint::bind(
+        "127.0.0.1:0".parse().unwrap(),
+        client_certificate,
+        retry_client_key,
+    )
+    .unwrap();
+    let retry_server = ProvisionalEndpoint::bind(
+        "127.0.0.1:0".parse().unwrap(),
+        server_certificate,
+        retry_server_key,
+    )
+    .unwrap();
+    // This test owns only the client's prepared reservation.  The original
+    // unprepared peer pending record is intentionally left to its own normal
+    // recovery path, so use a clean peer store for the independent retry.
+    let retry_peer_root = tempfile::tempdir().unwrap();
+    let retry_peer_pending =
+        crate::pairing_pending::PendingStore::open(retry_peer_root.path()).unwrap();
+    let (retry_client_channel, retry_server_channel) = tokio::join!(
+        retry_client.connect(retry_server.local_addr().unwrap()),
+        retry_server.accept(),
+    );
+    let (retry_client_authority, retry_server_authority) = tokio::join!(
+        retry_client_channel.unwrap().handshake(
+            handshake_config(67, 68),
+            &pending,
+            |prompt| async move { prompt.decision(true) },
+        ),
+        retry_server_channel.unwrap().handshake(
+            handshake_config(68, 67),
+            &retry_peer_pending,
+            |prompt| async move { prompt.decision(true) },
+        )
+    );
+    let retry_client_authority = retry_client_authority.unwrap();
+    let retry_peer_attempt = retry_server_authority.as_ref().unwrap().test_attempt();
+    let fresh_attempt = retry_client_authority.test_attempt();
+    let mut fresh = crate::pairing_v2::admission_authority::PreparedBilateralCommit::prepare(
+        &store,
+        retry_client_authority,
+    )
+        .await
+        .unwrap();
+    fresh.stage_once(retry_peer_attempt).unwrap();
+    assert!(
+        stale.freeze_once().await.is_err(),
+        "a stale prepared reservation cannot reach finalization after the retry owns a fresh exact reservation"
+    );
+    assert!(
+        store
+            .test_staged_receipt_uses_prepared_reservation(fresh_attempt, &fresh)
+            .unwrap(),
+        "the fresh exact retry remains staged; only the real paired coordinator may later exchange proof, freeze, and finalize it"
+    );
+    drop(retry_server_authority.unwrap());
 }
 
 #[tokio::test]
