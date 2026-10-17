@@ -1,3 +1,4 @@
+use crate::pairing_pending::{BilateralTransactionFields, derive_bilateral_transaction_id};
 use crate::pairing_v2::{
     SUITE,
     codec::{Value, encode},
@@ -130,6 +131,66 @@ async fn current_foundation_preserves_store_owned_metadata_on_listener_shutdown(
     assert_eq!(
         store.reconcile(receipt.attempt()).unwrap(),
         crate::pairing_v2::admission_authority::ReconcileAdmission::Promoted
+    );
+}
+
+#[tokio::test]
+async fn real_handshake_inverted_perspectives_derive_one_bilateral_transaction_id() {
+    let (_ea, _eb, a, b, _) = pair().await;
+    let ta = tempfile::tempdir().unwrap();
+    let tb = tempfile::tempdir().unwrap();
+    let sa = crate::pairing_pending::PendingStore::open(ta.path()).unwrap();
+    let sb = crate::pairing_pending::PendingStore::open(tb.path()).unwrap();
+    let (a, b) = tokio::join!(
+        a.handshake(handshake_config(1, 2), &sa, |prompt| async move {
+            prompt.decision(true)
+        }),
+        b.handshake(handshake_config(2, 1), &sb, |prompt| async move {
+            prompt.decision(true)
+        })
+    );
+    let (a, b) = tokio::join!(
+        a.unwrap().seal_for_promotion(),
+        b.unwrap().seal_for_promotion()
+    );
+    let a = a.unwrap();
+    let b = b.unwrap();
+    let fields_a = a.fields();
+    let fields_b = b.fields();
+    assert_eq!(fields_a.transcript, fields_b.transcript);
+    assert_eq!(fields_a.record.attempt_id, fields_b.record.attempt_id);
+    assert_eq!(
+        fields_a.record.peer_fingerprint,
+        fields_a.certificate_fingerprints[1 - fields_a.role.index()]
+    );
+    assert_eq!(
+        fields_b.record.peer_fingerprint,
+        fields_b.certificate_fingerprints[1 - fields_b.role.index()]
+    );
+
+    let descriptor_a = BilateralTransactionFields {
+        local_identity: fields_a.certificate_fingerprints[fields_a.role.index()],
+        peer_identity: fields_a.record.peer_fingerprint,
+        local_attempt: fields_a.record.attempt_id,
+        peer_attempt: fields_b.record.attempt_id,
+        peer_pin: fields_a.certificate_fingerprints[1 - fields_a.role.index()],
+        transcript: fields_a.transcript,
+        suite: SUITE.to_owned(),
+        policy_revision: 0,
+    };
+    let descriptor_b = BilateralTransactionFields {
+        local_identity: fields_b.certificate_fingerprints[fields_b.role.index()],
+        peer_identity: fields_b.record.peer_fingerprint,
+        local_attempt: fields_b.record.attempt_id,
+        peer_attempt: fields_a.record.attempt_id,
+        peer_pin: fields_b.certificate_fingerprints[1 - fields_b.role.index()],
+        transcript: fields_b.transcript,
+        suite: SUITE.to_owned(),
+        policy_revision: 0,
+    };
+    assert_eq!(
+        derive_bilateral_transaction_id(&descriptor_a),
+        derive_bilateral_transaction_id(&descriptor_b)
     );
 }
 
@@ -870,10 +931,11 @@ async fn rotation_then_endpoint_drop_recovers_staged_guard_without_reservation()
         policy_revision: 0,
         bilateral: crate::pairing_pending::BilateralAdmissionRecord::prepared(
             &crate::pairing_pending::BilateralTransactionFields {
-                first_identity: fields.certificate_fingerprints[fields.role.index()],
-                second_identity: fields.certificate_fingerprints[1 - fields.role.index()],
-                first_attempt: record.attempt_id,
-                second_attempt: record.attempt_id,
+                local_identity: fields.certificate_fingerprints[fields.role.index()],
+                peer_identity: fields.certificate_fingerprints[1 - fields.role.index()],
+                local_attempt: record.attempt_id,
+                peer_attempt: record.attempt_id,
+                peer_pin: fields.certificate_fingerprints[1 - fields.role.index()],
                 transcript: fields.transcript,
                 suite: SUITE.to_owned(),
                 policy_revision: 0,
@@ -1077,10 +1139,11 @@ async fn final_manifest_error_after_claim_is_not_operationally_active() {
         policy_revision: 0,
         bilateral: crate::pairing_pending::BilateralAdmissionRecord::prepared(
             &crate::pairing_pending::BilateralTransactionFields {
-                first_identity: fields.certificate_fingerprints[fields.role.index()],
-                second_identity: fields.certificate_fingerprints[1 - fields.role.index()],
-                first_attempt: record.attempt_id,
-                second_attempt: record.attempt_id,
+                local_identity: fields.certificate_fingerprints[fields.role.index()],
+                peer_identity: fields.certificate_fingerprints[1 - fields.role.index()],
+                local_attempt: record.attempt_id,
+                peer_attempt: record.attempt_id,
+                peer_pin: fields.certificate_fingerprints[1 - fields.role.index()],
                 transcript: fields.transcript,
                 suite: SUITE.to_owned(),
                 policy_revision: 0,
@@ -1268,10 +1331,11 @@ fn final_manifest_fault_worker() {
                 policy_revision: 0,
                 bilateral: crate::pairing_pending::BilateralAdmissionRecord::prepared(
                     &crate::pairing_pending::BilateralTransactionFields {
-                        first_identity: fields.certificate_fingerprints[fields.role.index()],
-                        second_identity: fields.certificate_fingerprints[1 - fields.role.index()],
-                        first_attempt: record.attempt_id,
-                        second_attempt: record.attempt_id,
+                        local_identity: fields.certificate_fingerprints[fields.role.index()],
+                        peer_identity: fields.certificate_fingerprints[1 - fields.role.index()],
+                        local_attempt: record.attempt_id,
+                        peer_attempt: record.attempt_id,
+                        peer_pin: fields.certificate_fingerprints[1 - fields.role.index()],
                         transcript: fields.transcript,
                         suite: SUITE.to_owned(),
                         policy_revision: 0,

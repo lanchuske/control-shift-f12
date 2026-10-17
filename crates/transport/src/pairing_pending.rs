@@ -53,20 +53,21 @@ mod bilateral_admission_state_tests {
     #[test]
     fn bilateral_transaction_id_changes_when_attempt_or_transcript_changes() {
         let fields = BilateralTransactionFields {
-            first_identity: [1; 32],
-            second_identity: [2; 32],
-            first_attempt: [3; 32],
-            second_attempt: [4; 32],
-            transcript: [5; 32],
+            local_identity: [1; 32],
+            peer_identity: [2; 32],
+            local_attempt: [3; 32],
+            peer_attempt: [4; 32],
+            peer_pin: [5; 32],
+            transcript: [6; 32],
             suite: crate::pairing_v2::SUITE.to_owned(),
-            policy_revision: 1,
+            policy_revision: 0,
         };
         let changed_transcript = BilateralTransactionFields {
-            transcript: [6; 32],
+            transcript: [7; 32],
             ..fields.clone()
         };
         let changed_attempt = BilateralTransactionFields {
-            second_attempt: [7; 32],
+            peer_attempt: [8; 32],
             ..fields.clone()
         };
 
@@ -78,6 +79,126 @@ mod bilateral_admission_state_tests {
             derive_bilateral_transaction_id(&fields),
             derive_bilateral_transaction_id(&changed_attempt)
         );
+    }
+
+    #[test]
+    fn inverted_bilateral_perspectives_derive_the_same_transaction_id() {
+        let a = BilateralTransactionFields {
+            local_identity: [1; 32],
+            peer_identity: [2; 32],
+            local_attempt: [3; 32],
+            peer_attempt: [4; 32],
+            peer_pin: [5; 32],
+            transcript: [6; 32],
+            suite: crate::pairing_v2::SUITE.to_owned(),
+            policy_revision: 0,
+        };
+        let b = BilateralTransactionFields {
+            local_identity: a.peer_identity,
+            peer_identity: a.local_identity,
+            local_attempt: a.peer_attempt,
+            peer_attempt: a.local_attempt,
+            peer_pin: [7; 32],
+            transcript: a.transcript,
+            suite: a.suite.clone(),
+            policy_revision: a.policy_revision,
+        };
+        assert_eq!(
+            derive_bilateral_transaction_id(&a),
+            derive_bilateral_transaction_id(&b)
+        );
+    }
+
+    fn bilateral_test_receipt() -> AdmissionReceiptRecord {
+        let fields = BilateralTransactionFields {
+            local_identity: [11; 32],
+            peer_identity: [12; 32],
+            local_attempt: [13; 32],
+            peer_attempt: [14; 32],
+            peer_pin: [15; 32],
+            transcript: [16; 32],
+            suite: crate::pairing_v2::SUITE.to_owned(),
+            policy_revision: 0,
+        };
+        let ownership = AdmissionOwnership::AwaitingHandoff {
+            guard_token: [17; 32],
+            staged_revision: 1,
+        };
+        let mut receipt = AdmissionReceiptRecord {
+            attempt: fields.local_attempt,
+            peer: fields.peer_identity,
+            peer_pin: fields.peer_pin,
+            durable_fc_hash: [18; 32],
+            role: 0,
+            suite: fields.suite.clone(),
+            protocol_version: 2,
+            transcript: fields.transcript,
+            binding: [19; 32],
+            revision: 1,
+            identity_generation: 1,
+            revocation_generation: 0,
+            policy_revision: fields.policy_revision,
+            ownership,
+            bilateral: BilateralAdmissionRecord::prepared(&fields, [17; 32], 1, 0, 0),
+        };
+        bind_prepared_bilateral_receipt_hash(&mut receipt);
+        receipt
+    }
+
+    #[test]
+    fn every_bilateral_descriptor_mutation_or_transaction_id_mutation_is_invalid() {
+        let receipt = bilateral_test_receipt();
+        assert!(receipt.bilateral.is_well_formed_for(&receipt));
+
+        let mut mutations = vec![];
+        let mut local_identity = receipt.clone();
+        local_identity.bilateral.fields.local_identity = [21; 32];
+        mutations.push(local_identity);
+        let mut peer_identity = receipt.clone();
+        peer_identity.bilateral.fields.peer_identity = [22; 32];
+        mutations.push(peer_identity);
+        let mut local_attempt = receipt.clone();
+        local_attempt.bilateral.fields.local_attempt = [23; 32];
+        mutations.push(local_attempt);
+        let mut peer_attempt = receipt.clone();
+        peer_attempt.bilateral.fields.peer_attempt = [24; 32];
+        mutations.push(peer_attempt);
+        let mut peer_pin = receipt.clone();
+        peer_pin.bilateral.fields.peer_pin = [25; 32];
+        mutations.push(peer_pin);
+        let mut transcript = receipt.clone();
+        transcript.bilateral.fields.transcript = [26; 32];
+        mutations.push(transcript);
+        let mut suite = receipt.clone();
+        suite.bilateral.fields.suite.push_str("-mutated");
+        mutations.push(suite);
+        let mut policy = receipt.clone();
+        policy.bilateral.fields.policy_revision = 1;
+        mutations.push(policy);
+        let mut transaction_id = receipt.clone();
+        transaction_id.bilateral.transaction_id = BilateralTransactionId([27; 32]);
+        mutations.push(transaction_id);
+
+        for mutated in mutations {
+            assert!(!mutated.bilateral.is_well_formed_for(&mutated));
+        }
+    }
+
+    #[test]
+    fn receipt_hash_commits_the_transaction_descriptor() {
+        let mut receipt = bilateral_test_receipt();
+        receipt.bilateral.fields.peer_attempt = [28; 32];
+        receipt.bilateral.transaction_id =
+            derive_bilateral_transaction_id(&receipt.bilateral.fields);
+        assert!(!receipt.bilateral.is_well_formed_for(&receipt));
+    }
+
+    #[test]
+    fn legacy_receipt_without_bilateral_field_is_rejected() {
+        let receipt = bilateral_test_receipt();
+        let mut json = serde_json::to_value(receipt).unwrap();
+        json.as_object_mut().unwrap().remove("bilateral");
+        assert!(serde_json::from_value::<AdmissionReceiptRecord>(json).is_err());
     }
 }
 
@@ -117,16 +238,18 @@ impl BilateralTransactionId {
     }
 }
 
-/// Inputs that determine a bilateral transaction identity. The two identity /
-/// attempt pairs are sorted before hashing, so each peer derives the same ID.
+/// Inputs that determine a bilateral transaction identity and bind the local
+/// receipt descriptor. The two identity / attempt pairs are sorted before
+/// hashing, so each peer derives the same ID from inverted perspectives.
 #[cfg(feature = "pairing-v2-experimental")]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct BilateralTransactionFields {
-    pub(crate) first_identity: [u8; 32],
-    pub(crate) second_identity: [u8; 32],
-    pub(crate) first_attempt: [u8; 32],
-    pub(crate) second_attempt: [u8; 32],
+    pub(crate) local_identity: [u8; 32],
+    pub(crate) peer_identity: [u8; 32],
+    pub(crate) local_attempt: [u8; 32],
+    pub(crate) peer_attempt: [u8; 32],
+    pub(crate) peer_pin: [u8; 32],
     pub(crate) transcript: [u8; 32],
     pub(crate) suite: String,
     pub(crate) policy_revision: u64,
@@ -137,8 +260,8 @@ pub(crate) fn derive_bilateral_transaction_id(
     fields: &BilateralTransactionFields,
 ) -> BilateralTransactionId {
     let mut sides = [
-        (fields.first_identity, fields.first_attempt),
-        (fields.second_identity, fields.second_attempt),
+        (fields.local_identity, fields.local_attempt),
+        (fields.peer_identity, fields.peer_attempt),
     ];
     sides.sort_unstable();
     let mut digest = Sha256::new();
@@ -225,13 +348,19 @@ impl BilateralAdmissionRecord {
     fn is_well_formed_for(&self, receipt: &AdmissionReceiptRecord) -> bool {
         if !self.transaction_id.is_valid()
             || self.transaction_id != derive_bilateral_transaction_id(&self.fields)
-            || self.fields.first_identity == [0; 32]
-            || self.fields.second_identity == [0; 32]
-            || self.fields.first_attempt == [0; 32]
-            || self.fields.second_attempt == [0; 32]
+            || self.fields.local_identity == [0; 32]
+            || self.fields.peer_identity == [0; 32]
+            || self.fields.local_attempt == [0; 32]
+            || self.fields.peer_attempt == [0; 32]
+            || self.fields.peer_pin == [0; 32]
             || self.fields.transcript == [0; 32]
             || self.fields.suite.is_empty()
             || self.fields.policy_revision != self.policy_revision
+            || self.fields.local_attempt != receipt.attempt
+            || self.fields.peer_identity != receipt.peer
+            || self.fields.peer_pin != receipt.peer_pin
+            || self.fields.transcript != receipt.transcript
+            || self.fields.suite != receipt.suite
             || self.local_receipt_hash == [0; 32]
             || self.guard_token == [0; 32]
             || self.guard_token != receipt.ownership.guard_token()
@@ -363,6 +492,17 @@ fn admission_receipt_hash(receipt: &AdmissionReceiptRecord) -> [u8; 32] {
     digest.update(receipt.revocation_generation.to_be_bytes());
     digest.update(receipt.policy_revision.to_be_bytes());
     digest.update(receipt.ownership.guard_token());
+    digest.update(receipt.bilateral.transaction_id.0);
+    let fields = &receipt.bilateral.fields;
+    digest.update(fields.local_identity);
+    digest.update(fields.peer_identity);
+    digest.update(fields.local_attempt);
+    digest.update(fields.peer_attempt);
+    digest.update(fields.peer_pin);
+    digest.update(fields.transcript);
+    digest.update((fields.suite.len() as u64).to_be_bytes());
+    digest.update(fields.suite.as_bytes());
+    digest.update(fields.policy_revision.to_be_bytes());
     digest.finalize().into()
 }
 

@@ -43,6 +43,7 @@ pub enum ReconcileAdmission {
 fn prepared_bilateral_record(
     local_identity: [u8; 32],
     peer_identity: [u8; 32],
+    peer_pin: [u8; 32],
     local_attempt: [u8; 32],
     peer_attempt: [u8; 32],
     transcript: [u8; 32],
@@ -52,10 +53,11 @@ fn prepared_bilateral_record(
 ) -> BilateralAdmissionRecord {
     BilateralAdmissionRecord::prepared(
         &BilateralTransactionFields {
-            first_identity: local_identity,
-            second_identity: peer_identity,
-            first_attempt: local_attempt,
-            second_attempt: peer_attempt,
+            local_identity,
+            peer_identity,
+            local_attempt,
+            peer_attempt,
+            peer_pin,
             transcript,
             suite: super::SUITE.to_owned(),
             policy_revision: POLICY_REVISION,
@@ -219,6 +221,7 @@ impl AdmissionAuthorityStore {
             policy_revision: POLICY_REVISION,
             ownership,
             bilateral: prepared_bilateral_record(
+                evidence.peer_pin,
                 record.peer_fingerprint,
                 evidence.peer_pin,
                 record.attempt_id,
@@ -325,6 +328,7 @@ impl AdmissionAuthorityStore {
             policy_revision: POLICY_REVISION,
             ownership,
             bilateral: prepared_bilateral_record(
+                evidence.peer_pin,
                 record.peer_fingerprint,
                 evidence.peer_pin,
                 record.attempt_id,
@@ -405,6 +409,7 @@ impl SealedAdmissionCommit {
             policy_revision: POLICY_REVISION,
             bilateral: prepared_bilateral_record(
                 fields.certificate_fingerprints[fields.role.index()],
+                fields.certificate_fingerprints[1 - fields.role.index()],
                 fields.certificate_fingerprints[1 - fields.role.index()],
                 fields.record.attempt_id,
                 fields.record.attempt_id,
@@ -534,6 +539,7 @@ mod tests {
             revocation_generation: record.revocation_generation,
             policy_revision: POLICY_REVISION,
             bilateral: prepared_bilateral_record(
+                evidence.peer_pin,
                 record.peer_fingerprint,
                 evidence.peer_pin,
                 record.attempt_id,
