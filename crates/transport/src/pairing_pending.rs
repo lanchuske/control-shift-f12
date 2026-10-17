@@ -1571,13 +1571,16 @@ mod unix {
                 }
             }
             // After a process restart there is no in-memory phase entry.  The
-            // ledger therefore makes the sole durable ownership decision: an
-            // exact StoreOwned record only needs stale-sidecar cleanup; every
-            // other state remains conservative and is revoked below.
-            let store_owns_guard = {
+            // ledger therefore makes the sole durable ownership decision. An
+            // exact AwaitingHandoff receipt is still a live transaction, so
+            // it can be aborted by its immutable sidecar token without the
+            // legacy peer-wide revocation path. An exact StoreOwned record
+            // only needs stale-sidecar cleanup; every ambiguous state remains
+            // conservative and is revoked below.
+            let (store_owns_guard, staged_owns_guard) = {
                 let _lock = self.ledger_dir.lock()?;
                 let ledger = self.load_validated_manifest()?;
-                ledger.admission_receipts.iter().any(|receipt| {
+                let store_owns_guard = ledger.admission_receipts.iter().any(|receipt| {
                     receipt.attempt == guard.attempt
                         && receipt.peer == guard.peer
                         && matches!(
@@ -1593,9 +1596,32 @@ mod unix {
                                 && pin.identity_generation == receipt.identity_generation
                                 && pin.revocation_generation == receipt.revocation_generation
                         })
-                })
+                });
+                let staged_owns_guard = ledger.admission_receipts.iter().any(|receipt| {
+                    receipt.attempt == guard.attempt
+                        && receipt.peer == guard.peer
+                        && receipt.bilateral.guard_token == guard.token
+                        && matches!(
+                            receipt.ownership,
+                            AdmissionOwnership::AwaitingHandoff { guard_token, .. }
+                                if guard_token == guard.token
+                        )
+                        && receipt.identity_generation == ledger.version.identity_generation
+                        && receipt.revocation_generation == ledger.revocation(receipt.peer)
+                        && ledger.admission_reservations.iter().any(|reservation| {
+                            reservation.attempt == guard.attempt
+                                && reservation.peer == guard.peer
+                        })
+                });
+                (store_owns_guard, staged_owns_guard)
             };
             if store_owns_guard {
+                self.clear_admission_guard_exact(attempt, guard.token)?;
+                revocation_guard_phases().remove(&guard.token);
+                return Ok(None);
+            }
+            if staged_owns_guard {
+                self.abort_bilateral_guard_exact(attempt, guard.token)?;
                 self.clear_admission_guard_exact(attempt, guard.token)?;
                 revocation_guard_phases().remove(&guard.token);
                 return Ok(None);

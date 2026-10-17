@@ -799,6 +799,360 @@ async fn cancelling_post_task3_coordinator_aborts_exactly_and_allows_full_same_p
     drop(eb);
 }
 
+#[test]
+fn task4_prepared_subprocess_crash_reconciles_exactly_before_fresh_same_peer_retry() {
+    fn parse_marker(stdout: &str, prefix: &str) -> [u8; 32] {
+        let hex = stdout
+            .lines()
+            .find_map(|line| line.strip_prefix(prefix))
+            .expect("crash worker must report its durable identity before exit");
+        assert_eq!(hex.len(), 64);
+        let mut value = [0u8; 32];
+        for (index, byte) in value.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(&hex[index * 2..index * 2 + 2], 16).unwrap();
+        }
+        value
+    }
+
+    let left_root = tempfile::tempdir().unwrap();
+    let right_root = tempfile::tempdir().unwrap();
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--ignored",
+            "--exact",
+            "pairing_v2::provisional_tls::tests::task4_crash_matrix_worker",
+            "--nocapture",
+        ])
+        .env("CSF12_TASK4_LEFT_ROOT", left_root.path())
+        .env("CSF12_TASK4_RIGHT_ROOT", right_root.path())
+        .env("CSF12_TASK4_BOUNDARY", "prepared")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(91));
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let left_attempt = parse_marker(&stdout, "TASK4_LEFT_ATTEMPT:");
+    let right_attempt = parse_marker(&stdout, "TASK4_RIGHT_ATTEMPT:");
+    let left_peer = parse_marker(&stdout, "TASK4_LEFT_PEER:");
+    let right_peer = parse_marker(&stdout, "TASK4_RIGHT_PEER:");
+
+    let left = crate::pairing_v2::admission_authority::AdmissionAuthorityStore::open(left_root.path())
+        .unwrap();
+    let right = crate::pairing_v2::admission_authority::AdmissionAuthorityStore::open(right_root.path())
+        .unwrap();
+    for (store, attempt, peer, retry) in [
+        (&left, left_attempt, left_peer, [201; 32]),
+        (&right, right_attempt, right_peer, [202; 32]),
+    ] {
+        assert_eq!(
+            store.reconcile(attempt).unwrap(),
+            crate::pairing_v2::admission_authority::ReconcileAdmission::Absent,
+            "a dead Prepared coordinator must not survive as a pending or revoked admission"
+        );
+        assert!(!store.test_has_admission_guard(attempt).unwrap());
+        assert!(store.operational_admission_snapshot(attempt).is_err());
+        store
+            .prepare(store.version().unwrap(), retry, peer)
+            .expect("stale prepared reservation must not block same-peer retry");
+    }
+}
+
+#[test]
+fn task4_staged_subprocess_crash_reconciles_exactly_before_fresh_same_peer_retry() {
+    fn parse_marker(stdout: &str, prefix: &str) -> [u8; 32] {
+        let hex = stdout
+            .lines()
+            .find_map(|line| line.strip_prefix(prefix))
+            .expect("crash worker must report its durable identity before exit");
+        assert_eq!(hex.len(), 64);
+        let mut value = [0u8; 32];
+        for (index, byte) in value.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(&hex[index * 2..index * 2 + 2], 16).unwrap();
+        }
+        value
+    }
+
+    let left_root = tempfile::tempdir().unwrap();
+    let right_root = tempfile::tempdir().unwrap();
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--ignored",
+            "--exact",
+            "pairing_v2::provisional_tls::tests::task4_crash_matrix_worker",
+            "--nocapture",
+        ])
+        .env("CSF12_TASK4_LEFT_ROOT", left_root.path())
+        .env("CSF12_TASK4_RIGHT_ROOT", right_root.path())
+        .env("CSF12_TASK4_BOUNDARY", "staged")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(91));
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let left_attempt = parse_marker(&stdout, "TASK4_LEFT_ATTEMPT:");
+    let right_attempt = parse_marker(&stdout, "TASK4_RIGHT_ATTEMPT:");
+    let left_peer = parse_marker(&stdout, "TASK4_LEFT_PEER:");
+    let right_peer = parse_marker(&stdout, "TASK4_RIGHT_PEER:");
+
+    let left = crate::pairing_v2::admission_authority::AdmissionAuthorityStore::open(left_root.path())
+        .unwrap();
+    let right = crate::pairing_v2::admission_authority::AdmissionAuthorityStore::open(right_root.path())
+        .unwrap();
+    for (store, attempt, peer, retry) in [
+        (&left, left_attempt, left_peer, [203; 32]),
+        (&right, right_attempt, right_peer, [204; 32]),
+    ] {
+        assert_eq!(
+            store.reconcile(attempt).unwrap(),
+            crate::pairing_v2::admission_authority::ReconcileAdmission::Absent,
+            "a dead Staged coordinator must not survive as a pending or revoked admission"
+        );
+        assert!(!store.test_has_admission_guard(attempt).unwrap());
+        assert!(store.operational_admission_snapshot(attempt).is_err());
+        store
+            .prepare(store.version().unwrap(), retry, peer)
+            .expect("stale staged reservation must not block same-peer retry");
+    }
+}
+
+#[test]
+fn task4_proof_verified_subprocess_crash_reconciles_exactly_before_fresh_same_peer_retry() {
+    fn parse_marker(stdout: &str, prefix: &str) -> [u8; 32] {
+        let hex = stdout
+            .lines()
+            .find_map(|line| line.strip_prefix(prefix))
+            .expect("crash worker must report its durable identity before exit");
+        assert_eq!(hex.len(), 64);
+        let mut value = [0u8; 32];
+        for (index, byte) in value.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(&hex[index * 2..index * 2 + 2], 16).unwrap();
+        }
+        value
+    }
+
+    let left_root = tempfile::tempdir().unwrap();
+    let right_root = tempfile::tempdir().unwrap();
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--ignored",
+            "--exact",
+            "pairing_v2::provisional_tls::tests::task4_crash_matrix_worker",
+            "--nocapture",
+        ])
+        .env("CSF12_TASK4_LEFT_ROOT", left_root.path())
+        .env("CSF12_TASK4_RIGHT_ROOT", right_root.path())
+        .env("CSF12_TASK4_BOUNDARY", "proof_verified")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(91));
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let left_attempt = parse_marker(&stdout, "TASK4_LEFT_ATTEMPT:");
+    let right_attempt = parse_marker(&stdout, "TASK4_RIGHT_ATTEMPT:");
+    let left_peer = parse_marker(&stdout, "TASK4_LEFT_PEER:");
+    let right_peer = parse_marker(&stdout, "TASK4_RIGHT_PEER:");
+
+    let left = crate::pairing_v2::admission_authority::AdmissionAuthorityStore::open(left_root.path())
+        .unwrap();
+    let right = crate::pairing_v2::admission_authority::AdmissionAuthorityStore::open(right_root.path())
+        .unwrap();
+    for (store, attempt, peer, retry) in [
+        (&left, left_attempt, left_peer, [206; 32]),
+        (&right, right_attempt, right_peer, [207; 32]),
+    ] {
+        assert_eq!(
+            store.reconcile(attempt).unwrap(),
+            crate::pairing_v2::admission_authority::ReconcileAdmission::Absent,
+            "a verified in-memory proof must not survive a process crash as durable authority"
+        );
+        assert!(!store.test_has_admission_guard(attempt).unwrap());
+        assert!(store.operational_admission_snapshot(attempt).is_err());
+        store
+            .prepare(store.version().unwrap(), retry, peer)
+            .expect("a stale verified-proof transaction must not block same-peer retry");
+    }
+}
+
+#[test]
+fn task4_frozen_subprocess_crash_reconciles_exactly_before_fresh_same_peer_retry() {
+    fn parse_marker(stdout: &str, prefix: &str) -> [u8; 32] {
+        let hex = stdout
+            .lines()
+            .find_map(|line| line.strip_prefix(prefix))
+            .expect("crash worker must report its durable identity before exit");
+        assert_eq!(hex.len(), 64);
+        let mut value = [0u8; 32];
+        for (index, byte) in value.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(&hex[index * 2..index * 2 + 2], 16).unwrap();
+        }
+        value
+    }
+
+    let left_root = tempfile::tempdir().unwrap();
+    let right_root = tempfile::tempdir().unwrap();
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--ignored",
+            "--exact",
+            "pairing_v2::provisional_tls::tests::task4_crash_matrix_worker",
+            "--nocapture",
+        ])
+        .env("CSF12_TASK4_LEFT_ROOT", left_root.path())
+        .env("CSF12_TASK4_RIGHT_ROOT", right_root.path())
+        .env("CSF12_TASK4_BOUNDARY", "frozen")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(91));
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let left_attempt = parse_marker(&stdout, "TASK4_LEFT_ATTEMPT:");
+    let right_attempt = parse_marker(&stdout, "TASK4_RIGHT_ATTEMPT:");
+    let left_peer = parse_marker(&stdout, "TASK4_LEFT_PEER:");
+    let right_peer = parse_marker(&stdout, "TASK4_RIGHT_PEER:");
+
+    let left = crate::pairing_v2::admission_authority::AdmissionAuthorityStore::open(left_root.path())
+        .unwrap();
+    let right = crate::pairing_v2::admission_authority::AdmissionAuthorityStore::open(right_root.path())
+        .unwrap();
+    for (store, attempt, peer, retry) in [
+        (&left, left_attempt, left_peer, [208; 32]),
+        (&right, right_attempt, right_peer, [209; 32]),
+    ] {
+        assert_eq!(
+            store.reconcile(attempt).unwrap(),
+            crate::pairing_v2::admission_authority::ReconcileAdmission::Absent,
+            "frozen reservations must be removed exactly after a process crash"
+        );
+        assert!(!store.test_has_admission_guard(attempt).unwrap());
+        assert!(store.operational_admission_snapshot(attempt).is_err());
+        store
+            .prepare(store.version().unwrap(), retry, peer)
+            .expect("a frozen transaction from a dead coordinator must not block retry");
+    }
+}
+
+#[test]
+fn task4_ambiguous_staged_sidecar_uses_legacy_fail_closed_recovery() {
+    fn parse_marker(stdout: &str, prefix: &str) -> [u8; 32] {
+        let hex = stdout
+            .lines()
+            .find_map(|line| line.strip_prefix(prefix))
+            .expect("crash worker must report its durable identity before exit");
+        assert_eq!(hex.len(), 64);
+        let mut value = [0u8; 32];
+        for (index, byte) in value.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(&hex[index * 2..index * 2 + 2], 16).unwrap();
+        }
+        value
+    }
+    fn guard_path(root: &std::path::Path, attempt: [u8; 32]) -> std::path::PathBuf {
+        let attempt = attempt
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        root.join("pairing-tombstones")
+            .join(format!("admission-revocation-{attempt}.json"))
+    }
+
+    let left_root = tempfile::tempdir().unwrap();
+    let right_root = tempfile::tempdir().unwrap();
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--ignored",
+            "--exact",
+            "pairing_v2::provisional_tls::tests::task4_crash_matrix_worker",
+            "--nocapture",
+        ])
+        .env("CSF12_TASK4_LEFT_ROOT", left_root.path())
+        .env("CSF12_TASK4_RIGHT_ROOT", right_root.path())
+        .env("CSF12_TASK4_BOUNDARY", "staged")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(91));
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let attempt = parse_marker(&stdout, "TASK4_LEFT_ATTEMPT:");
+    let peer = parse_marker(&stdout, "TASK4_LEFT_PEER:");
+
+    // A sidecar whose token no longer agrees with the staged receipt is not
+    // eligible for the narrow exact-abort path. It must use the conservative
+    // legacy resolver and leave the staged receipt ineligible rather than
+    // deleting durable state based on an untrusted token.
+    let path = guard_path(left_root.path(), attempt);
+    let mut guard: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    guard["token"] = serde_json::to_value([255u8; 32]).unwrap();
+    std::fs::write(&path, serde_json::to_vec(&guard).unwrap()).unwrap();
+
+    let left = crate::pairing_v2::admission_authority::AdmissionAuthorityStore::open(left_root.path())
+        .unwrap();
+    assert_eq!(
+        left.reconcile(attempt).unwrap(),
+        crate::pairing_v2::admission_authority::ReconcileAdmission::Revoked,
+        "ambiguous staged ownership must not be exact-aborted"
+    );
+    assert!(!left.test_has_admission_guard(attempt).unwrap());
+    assert!(left.test_bilateral_receipt(attempt).unwrap().is_some());
+    assert!(left.prepare(left.version().unwrap(), [205; 32], peer).is_err());
+}
+
+#[test]
+#[ignore = "subprocess helper"]
+fn task4_crash_matrix_worker() {
+    let left_root = std::env::var_os("CSF12_TASK4_LEFT_ROOT").unwrap();
+    let right_root = std::env::var_os("CSF12_TASK4_RIGHT_ROOT").unwrap();
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            use crate::pairing_v2::admission_authority::{
+                BilateralCommitCheckpoint as Checkpoint, BilateralCommitTestHook as Hook,
+            };
+
+            let (_ea, _eb, a, b, _) = pair().await;
+            let left_pending = crate::pairing_pending::PendingStore::open(&left_root).unwrap();
+            let right_pending = crate::pairing_pending::PendingStore::open(&right_root).unwrap();
+            let (a, b) = tokio::join!(
+                a.handshake(handshake_config(61, 62), &left_pending, |prompt| async move {
+                    prompt.decision(true)
+                }),
+                b.handshake(handshake_config(62, 61), &right_pending, |prompt| async move {
+                    prompt.decision(true)
+                })
+            );
+            let a = a.unwrap();
+            let b = b.unwrap();
+            let a_attempt = a.test_attempt();
+            let b_attempt = b.test_attempt();
+            let a_peer = left_pending.pending(a_attempt).unwrap().unwrap().peer_fingerprint;
+            let b_peer = right_pending.pending(b_attempt).unwrap().unwrap().peer_fingerprint;
+            let checkpoint = match std::env::var("CSF12_TASK4_BOUNDARY")
+                .as_deref()
+                .unwrap_or("prepared")
+            {
+                "prepared" => Checkpoint::PreflightComplete,
+                "staged" => Checkpoint::RightStaged,
+                "proof_verified" => Checkpoint::Task3ProofsVerified,
+                "frozen" => Checkpoint::RightFrozen,
+                other => panic!("unsupported Task4 crash boundary: {other}"),
+            };
+            let (hook, pause) = Hook::recording().pause_after(checkpoint);
+            tokio::spawn(async move {
+                let left = crate::pairing_v2::admission_authority::AdmissionAuthorityStore::open(&left_root)
+                    .unwrap();
+                let right = crate::pairing_v2::admission_authority::AdmissionAuthorityStore::open(&right_root)
+                    .unwrap();
+                let _ = crate::pairing_v2::admission_authority::commit_bilateral_foundation_with_test_hook(
+                    &left, a, &right, b, &hook,
+                )
+                .await;
+            });
+            pause.wait_until_reached().await;
+            let hex = |value: [u8; 32]| value.iter().map(|byte| format!("{byte:02x}")).collect::<String>();
+            println!("TASK4_LEFT_ATTEMPT:{}", hex(a_attempt));
+            println!("TASK4_RIGHT_ATTEMPT:{}", hex(b_attempt));
+            println!("TASK4_LEFT_PEER:{}", hex(a_peer));
+            println!("TASK4_RIGHT_PEER:{}", hex(b_peer));
+            std::io::Write::flush(&mut std::io::stdout()).unwrap();
+            std::process::exit(91);
+        });
+}
+
 #[tokio::test]
 async fn finalization_rejects_cross_transaction_receipt_on_real_endpoints() {
     let (_ea, _eb, a, b, _) = pair().await;

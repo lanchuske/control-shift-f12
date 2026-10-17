@@ -360,13 +360,19 @@ async fn commit_bilateral_foundation_inner(
         let _ = left.abort_exact();
         return Err(error);
     }
+    #[cfg(test)]
+    pause_at_checkpoint(hook, BilateralCommitCheckpoint::PreflightComplete).await;
     let outcome = async {
         left.stage_once(right_attempt)?;
         #[cfg(test)]
         checkpoint(hook, BilateralCommitCheckpoint::LeftStaged)?;
+        #[cfg(test)]
+        pause_at_checkpoint(hook, BilateralCommitCheckpoint::LeftStaged).await;
         right.stage_once(left_attempt)?;
         #[cfg(test)]
         checkpoint(hook, BilateralCommitCheckpoint::RightStaged)?;
+        #[cfg(test)]
+        pause_at_checkpoint(hook, BilateralCommitCheckpoint::RightStaged).await;
 
         #[cfg(test)]
         let mut left_local = left.local_finalization_receipt()?;
@@ -382,6 +388,8 @@ async fn commit_bilateral_foundation_inner(
         }
         #[cfg(test)]
         checkpoint(hook, BilateralCommitCheckpoint::Task3ProofsAttempted)?;
+        #[cfg(test)]
+        pause_at_checkpoint(hook, BilateralCommitCheckpoint::Task3ProofsAttempted).await;
         let (left_exchange, right_exchange) = tokio::join!(
             left.exchange_once(left_local),
             right.exchange_once(right_local),
@@ -412,22 +420,34 @@ async fn commit_bilateral_foundation_inner(
         left_freeze?;
         #[cfg(test)]
         checkpoint(hook, BilateralCommitCheckpoint::LeftFrozen)?;
+        #[cfg(test)]
+        pause_at_checkpoint(hook, BilateralCommitCheckpoint::LeftFrozen).await;
         right_freeze?;
         #[cfg(test)]
         checkpoint(hook, BilateralCommitCheckpoint::RightFrozen)?;
+        #[cfg(test)]
+        pause_at_checkpoint(hook, BilateralCommitCheckpoint::RightFrozen).await;
 
         left.finalize_once()?;
         #[cfg(test)]
         checkpoint(hook, BilateralCommitCheckpoint::LeftFinalized)?;
+        #[cfg(test)]
+        pause_at_checkpoint(hook, BilateralCommitCheckpoint::LeftFinalized).await;
         right.finalize_once()?;
         #[cfg(test)]
         checkpoint(hook, BilateralCommitCheckpoint::RightFinalized)?;
+        #[cfg(test)]
+        pause_at_checkpoint(hook, BilateralCommitCheckpoint::RightFinalized).await;
         left.confirm_once()?;
         #[cfg(test)]
         checkpoint(hook, BilateralCommitCheckpoint::LeftConfirmed)?;
+        #[cfg(test)]
+        pause_at_checkpoint(hook, BilateralCommitCheckpoint::LeftConfirmed).await;
         right.confirm_once()?;
         #[cfg(test)]
         checkpoint(hook, BilateralCommitCheckpoint::RightConfirmed)?;
+        #[cfg(test)]
+        pause_at_checkpoint(hook, BilateralCommitCheckpoint::RightConfirmed).await;
         Ok(())
     }
     .await;
