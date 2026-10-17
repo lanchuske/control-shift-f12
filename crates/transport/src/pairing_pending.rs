@@ -349,6 +349,14 @@ mod bilateral_admission_state_tests {
             store.recovery_disposition(record.attempt_id).unwrap(),
             BilateralRecoveryDisposition::NeedsPeerRecovery
         );
+        let store_owned_evidence = store.recovery_evidence(record.attempt_id).unwrap();
+        assert_eq!(
+            crate::pairing_v2::recovery::ExactPeerRecovery::decode(
+                &store_owned_evidence.encode().unwrap()
+            )
+            .unwrap(),
+            store_owned_evidence
+        );
         store
             .confirm_bilateral_receipt(
                 store.version().unwrap(),
@@ -363,6 +371,8 @@ mod bilateral_admission_state_tests {
             reopened.recovery_disposition(record.attempt_id).unwrap(),
             BilateralRecoveryDisposition::NeedsPeerRecovery
         );
+        let confirmed_evidence = reopened.recovery_evidence(record.attempt_id).unwrap();
+        assert_ne!(confirmed_evidence, store_owned_evidence);
         assert_eq!(
             reopened.operational_admission_snapshot(record.attempt_id),
             Err(StoreError::Invalid)
@@ -2837,6 +2847,35 @@ mod unix {
                     Ok(BilateralRecoveryDisposition::AbortExact)
                 }
             }
+        }
+
+        /// Returns the exact local durable descriptor for a future
+        /// authenticated peer-recovery exchange. The descriptor itself has no
+        /// authority: callers must bind it to the pinned peer over a fresh
+        /// mutual-TLS channel before they can transition either receipt.
+        #[cfg(feature = "pairing-v2-experimental")]
+        #[allow(dead_code)] // The authenticated transport is the following recovery phase.
+        pub(crate) fn recovery_evidence(
+            &self,
+            attempt: [u8; 32],
+        ) -> Result<crate::pairing_v2::recovery::ExactPeerRecovery, StoreError> {
+            if !matches!(
+                self.recovery_disposition(attempt)?,
+                BilateralRecoveryDisposition::NeedsPeerRecovery
+            ) {
+                return Err(StoreError::Invalid);
+            }
+            let (_, receipt, active) = self.admission_state(attempt)?;
+            let receipt = receipt.filter(|_| active).ok_or(StoreError::Invalid)?;
+            crate::pairing_v2::recovery::ExactPeerRecovery::new(
+                receipt.bilateral.transaction_id.as_bytes(),
+                receipt.bilateral.local_receipt_hash,
+                receipt.bilateral.peer_receipt_hash,
+                receipt.identity_generation,
+                receipt.revocation_generation,
+                receipt.policy_revision,
+            )
+            .map_err(|_| StoreError::Invalid)
         }
 
         /// Advances the setup epoch. Does not regenerate, read, or write a device private key.
