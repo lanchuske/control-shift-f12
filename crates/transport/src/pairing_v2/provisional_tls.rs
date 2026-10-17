@@ -44,11 +44,27 @@ pub(crate) fn profile(leaf: &[u8], now: i64) -> Result<(), Invalid> {
     let node = hash(leaf)[..16].try_into().map_err(|_| Invalid)?;
     validate_identity(leaf, node, now).map(|_| ())
 }
+/// Validates the normal short-lived identity profile and binds it to one
+/// previously durable peer fingerprint. This remains only a TLS identity
+/// check; it does not recover, admit, or activate a relationship.
+pub(crate) fn profile_for_pinned_peer(
+    leaf: &[u8],
+    expected_peer: [u8; 32],
+    now: i64,
+) -> Result<(), Invalid> {
+    if expected_peer == [0; 32] || hash(leaf) != expected_peer {
+        return Err(Invalid);
+    }
+    profile(leaf, now)
+}
 fn tls_error() -> rustls::Error {
     rustls::Error::General("provisional identity rejected".into())
 }
 #[derive(Debug)]
-struct ProfileVerifier(Arc<rustls::crypto::CryptoProvider>);
+struct ProfileVerifier {
+    provider: Arc<rustls::crypto::CryptoProvider>,
+    expected_peer: Option<[u8; 32]>,
+}
 impl ProfileVerifier {
     fn certificate(
         &self,
@@ -59,10 +75,11 @@ impl ProfileVerifier {
         if !intermediates.is_empty() {
             return Err(tls_error());
         }
-        profile(
-            leaf.as_ref(),
-            i64::try_from(now.as_secs()).map_err(|_| tls_error())?,
-        )
+        let now = i64::try_from(now.as_secs()).map_err(|_| tls_error())?;
+        match self.expected_peer {
+            Some(expected_peer) => profile_for_pinned_peer(leaf.as_ref(), expected_peer, now),
+            None => profile(leaf.as_ref(), now),
+        }
         .map_err(|_| tls_error())
     }
     fn signature(
@@ -78,7 +95,7 @@ impl ProfileVerifier {
             message,
             cert,
             signature,
-            &self.0.signature_verification_algorithms,
+            &self.provider.signature_verification_algorithms,
         )
     }
 }
@@ -167,12 +184,50 @@ pub(crate) fn strict_configs(
     max_bidi_streams: u32,
     max_uni_streams: u32,
 ) -> Result<(quinn::ServerConfig, StrictClient), Invalid> {
+    strict_configs_for_peer(certificate, key, None, alpn, max_bidi_streams, max_uni_streams)
+}
+
+/// Same sealed profile with a fixed durable peer fingerprint. This is reserved
+/// for the recovery control channel and is intentionally crate-private.
+#[allow(dead_code)] // Wired when the recovery endpoint is introduced.
+pub(crate) fn strict_pinned_configs(
+    certificate: Vec<u8>,
+    key: PrivateKeyDer<'static>,
+    expected_peer: [u8; 32],
+    alpn: &[u8],
+    max_bidi_streams: u32,
+    max_uni_streams: u32,
+) -> Result<(quinn::ServerConfig, StrictClient), Invalid> {
+    if expected_peer == [0; 32] {
+        return Err(Invalid);
+    }
+    strict_configs_for_peer(
+        certificate,
+        key,
+        Some(expected_peer),
+        alpn,
+        max_bidi_streams,
+        max_uni_streams,
+    )
+}
+
+fn strict_configs_for_peer(
+    certificate: Vec<u8>,
+    key: PrivateKeyDer<'static>,
+    expected_peer: Option<[u8; 32]>,
+    alpn: &[u8],
+    max_bidi_streams: u32,
+    max_uni_streams: u32,
+) -> Result<(quinn::ServerConfig, StrictClient), Invalid> {
     if alpn.is_empty() || !alpn.is_ascii() || max_bidi_streams == 0 {
         return Err(Invalid);
     }
     profile(&certificate, utc()?)?;
     let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let verifier = Arc::new(ProfileVerifier(provider.clone()));
+    let verifier = Arc::new(ProfileVerifier {
+        provider: provider.clone(),
+        expected_peer,
+    });
     let cert = CertificateDer::from(certificate);
     let mut server = rustls::ServerConfig::builder_with_provider(provider.clone())
         .with_protocol_versions(&[&rustls::version::TLS13])
