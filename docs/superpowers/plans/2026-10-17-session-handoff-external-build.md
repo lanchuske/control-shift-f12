@@ -58,22 +58,22 @@ It must report `/Volumes/LMCP/ControlShiftF12/cargo-target`.
 Task 5 is testing recovery from a process death during each durable bilateral
 admission phase.
 
-Verified locally on macOS after the current uncommitted fix:
+Verified locally on macOS:
 
 ```sh
 "$TASK_CARGO" test -p seamless-transport --features pairing-v2-experimental task4_ -- --nocapture
 ```
 
-Result: Prepared, Staged, and the ambiguous legacy case pass; one intentional
-test is ignored. The staged crash recovery bug was that a restart returned
-`Revoked` instead of `Absent`. The pending fix recognizes a matching exact
+Result: Prepared, Staged, ProofVerified, Frozen, and the ambiguous legacy case
+pass; one intentional test helper is ignored. The staged crash recovery bug was
+that a restart returned `Revoked` instead of `Absent`. The fix recognizes a matching exact
 `AwaitingHandoff` receipt and exact-aborts it, rather than using the legacy
 ambiguous revocation fallback.
 
 Windows verification completed on the isolated checkout on 2026-10-17:
-Prepared, Staged, and the ambiguous legacy recovery case passed (3 passed, 0
+Prepared, Staged, ProofVerified, Frozen, and the ambiguous legacy recovery case passed (5 passed, 0
 failed, 1 intentional subprocess helper ignored). Re-run the same command if
-the pending Task 5 changes change:
+the Task 5 changes change:
 
 ```sh
 ssh windows 'powershell -NoProfile -Command "Set-Location C:\\Users\\lanch\\csf12-task5-staged; cargo test -p seamless-transport --features pairing-v2-experimental task4_ -- --nocapture"'
@@ -83,12 +83,16 @@ Do not treat a compilation or partial output as a Windows pass.
 
 ## Next work in order
 
-1. Finish actual subprocess kill/restart coverage for `ProofVerified`, `Frozen`,
-   `StoreOwned`, one-finalize, and one-confirm boundaries.
-3. Require each recovery case to leave no snapshot, pin, unilateral relation, or
+1. Design the peer-aware recovery/commit acknowledgement required for
+   `StoreOwnedBeforeRelease`, `LeftFinalized`, and `LeftConfirmed`. A local-only
+   cleanup rule was rejected because it regressed valid durable recovery.
+2. Require each covered recovery case to leave no snapshot, pin, unilateral relation, or
    durable admission; the same peer must be able to retry cleanly.
-4. Run an independent security review of the Task 5 changes, then commit only
-   after the review and both platform results are recorded.
+3. Run an independent security review of the Task 5 changes before integration.
+4. Investigate the full serial transport suite before integration. Its last
+   run had 150 passed, 10 failed, 8 ignored; at least the final-publication
+   recovery failure reproduces at baseline `798f0b8`, so do not call those
+   failures a regression from Task 5 without further evidence.
 5. Continue the native desktop work only after the secure pairing engine passes
    its gates: WinForms host, AppKit parity, bilateral visual confirmation,
    draggable display map, synchronized sharing controls, connection panel, and
