@@ -124,6 +124,111 @@ async fn recovery_tls_rejects_an_unpinned_peer_before_any_recovery_record() {
     assert!(server_rejected.is_err());
 }
 
+async fn pinned_recovery_connection() -> (
+    quinn::Endpoint,
+    quinn::Endpoint,
+    quinn::Connection,
+    quinn::Connection,
+) {
+    let (a_certificate, a_key) = identity(true);
+    let (b_certificate, b_key) = identity(true);
+    let a_fingerprint: [u8; 32] = Sha256::digest(&a_certificate).into();
+    let b_fingerprint: [u8; 32] = Sha256::digest(&b_certificate).into();
+    let alpn = b"control-shift-f12-recovery/1";
+    let (server_config, _) = super::strict_pinned_configs(
+        b_certificate,
+        b_key,
+        a_fingerprint,
+        alpn,
+        1,
+        0,
+    )
+    .unwrap();
+    let server = quinn::Endpoint::server(server_config, "127.0.0.1:0".parse().unwrap()).unwrap();
+    let (_, a_client) = super::strict_pinned_configs(
+        a_certificate,
+        a_key,
+        b_fingerprint,
+        alpn,
+        1,
+        0,
+    )
+    .unwrap();
+    let mut client = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+    let (config, _) = a_client.fresh().unwrap();
+    client.set_default_client_config(config);
+    let connecting = client
+        .connect(server.local_addr().unwrap(), "pairing.local")
+        .unwrap();
+    let (left_connection, right_connection) = tokio::join!(
+        connecting,
+        async { server.accept().await.unwrap().await.unwrap() }
+    );
+    (server, client, left_connection.unwrap(), right_connection)
+}
+
+#[tokio::test]
+async fn exact_peer_recovery_exchanges_one_complementary_record_over_pinned_tls() {
+    let (_server, _client, left_connection, right_connection) = pinned_recovery_connection().await;
+    let left = crate::pairing_v2::recovery::ExactPeerRecovery::new(
+        [1; 32],
+        [2; 32],
+        Some([3; 32]),
+        7,
+        11,
+        0,
+    )
+    .unwrap();
+    let right = crate::pairing_v2::recovery::ExactPeerRecovery::new(
+        [1; 32],
+        [3; 32],
+        Some([2; 32]),
+        7,
+        11,
+        0,
+    )
+    .unwrap();
+    let (left_peer, right_peer) = tokio::join!(
+        crate::pairing_v2::recovery::exchange_exact_pair(
+            &left_connection,
+            true,
+            left.clone(),
+        ),
+        crate::pairing_v2::recovery::exchange_exact_pair(&right_connection, false, right.clone()),
+    );
+    assert_eq!(left_peer.unwrap(), right);
+    assert_eq!(right_peer.unwrap(), left);
+}
+
+#[tokio::test]
+async fn exact_peer_recovery_rejects_a_changed_binding_over_pinned_tls() {
+    let (_server, _client, left_connection, right_connection) = pinned_recovery_connection().await;
+    let left = crate::pairing_v2::recovery::ExactPeerRecovery::new(
+        [1; 32],
+        [2; 32],
+        Some([3; 32]),
+        7,
+        11,
+        0,
+    )
+    .unwrap();
+    let changed = crate::pairing_v2::recovery::ExactPeerRecovery::new(
+        [1; 32],
+        [3; 32],
+        Some([2; 32]),
+        7,
+        12,
+        0,
+    )
+    .unwrap();
+    let (left_result, right_result) = tokio::join!(
+        crate::pairing_v2::recovery::exchange_exact_pair(&left_connection, true, left),
+        crate::pairing_v2::recovery::exchange_exact_pair(&right_connection, false, changed),
+    );
+    assert!(left_result.is_err());
+    assert!(right_result.is_err());
+}
+
 fn handshake_config(local: u8, remote: u8) -> super::HandshakeConfig {
     super::HandshakeConfig {
         device_name: format!("Peer {local}"),
