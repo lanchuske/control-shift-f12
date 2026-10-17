@@ -307,7 +307,8 @@ final class DiagnosticsFrameController {
               let state = snapshot["state"] as? String,
               ["not_started", "browsing"].contains(state),
               let diagnostics = snapshot["diagnostics"] as? [Any], diagnostics.isEmpty,
-              let candidates = snapshot["candidates"] as? [Any], candidates.isEmpty,
+              let candidates = snapshot["candidates"] as? [[String: Any]],
+              validCandidates(candidates, while: state),
               let confirmed = snapshot["confirmed"] as? [Any], confirmed.isEmpty,
               snapshot["inventory"] is NSNull,
               let layout = snapshot["layout"] as? [String: Any],
@@ -319,6 +320,25 @@ final class DiagnosticsFrameController {
               capabilities["clipboard_enabled"] as? Bool == false
         else { throw HostError.invalidFrame }
         shell = state == "not_started" ? .readyToDiscover : .browsing
+    }
+
+    private func validCandidates(_ candidates: [[String: Any]], while state: String) -> Bool {
+        guard candidates.count <= 32 else { return false }
+        if state == "not_started" && !candidates.isEmpty { return false }
+        var handles = Set<String>()
+        for candidate in candidates {
+            guard Set(candidate.keys) == ["handle", "compatibility", "freshness"],
+                  let handle = candidate["handle"] as? String,
+                  !handle.isEmpty, handle.count <= 64,
+                  handle.allSatisfy({ $0.isASCII && ($0.isLetter || $0.isNumber || $0 == "-" || $0 == "_") }),
+                  handles.insert(handle).inserted,
+                  let compatibility = candidate["compatibility"] as? String,
+                  ["compatible", "needs_update", "incompatible"].contains(compatibility),
+                  let freshness = candidate["freshness"] as? String,
+                  ["current", "stale", "gone"].contains(freshness)
+            else { return false }
+        }
+        return true
     }
 
     private func validateIgnoredSuccessResponse(_ object: [String: Any]) throws {

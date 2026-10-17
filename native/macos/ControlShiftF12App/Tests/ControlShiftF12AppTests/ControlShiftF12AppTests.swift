@@ -76,6 +76,24 @@ final class ControlShiftF12AppTests: XCTestCase {
         XCTAssertFalse(controller.shell.saveLayoutEnabled)
     }
 
+    func testBrowsingSnapshotAcceptsOneCurrentRedactedCandidateWithoutEnablingSharing() {
+        let controller = DiagnosticsFrameController()
+        let snapshot = """
+        {"v":1,"kind":"ui_snapshot_v1","snapshot":{
+          "schema_version":1,"generation":2,"state":"browsing",
+          "candidates":[{"handle":"windows-studio","compatibility":"compatible","freshness":"current"}],
+          "confirmed":[],"inventory":null,
+          "layout":{"state":"not_configured"},
+          "capabilities":{"input_enabled":false,"clipboard_enabled":false},
+          "diagnostics":[]
+        }}
+        """.data(using: .utf8)!
+
+        XCTAssertNoThrow(try controller.consume(lengthPrefixed: frame(snapshot)))
+        XCTAssertFalse(controller.shell.inputSharingEnabled)
+        XCTAssertFalse(controller.shell.clipboardSharingEnabled)
+    }
+
     func testStartDiscoverySendsOnlyTheDedicatedTypedRequestWhileOpen() {
         let child = RecordingChild()
         let lifecycle = ChildLifecycle(child: child)
