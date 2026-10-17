@@ -1,8 +1,9 @@
 //! Bounded, child-owned stdio projection for native presentation hosts.
 //!
 //! This module is intentionally not a transport, input, clipboard, or layout
-//! authority. The host can only refresh a redacted projection or record its
-//! own V01 comparison choice. Engine-owned facts enter through
+//! authority. The host can refresh a redacted projection, change local browsing
+//! state, or record its own V01 comparison choice. Pairing gestures are typed
+//! but remain state-gated until their engine owner is admitted. Facts enter through
 //! `AuthoritativeUiEvent` with an injected monotonic clock.
 
 use std::{
@@ -11,14 +12,13 @@ use std::{
     time::{Duration, Instant},
 };
 
-use serde::Serialize;
-use serde_json::Value;
+use serde::{Deserialize, Serialize};
 
 use crate::{
     control_api::{self, Request},
     ui_contract::{
-        CandidateView, CapabilityView, DiagnosticRow, InventoryView, LayoutView, RelationshipView,
-        UiCommand, UiError, UiSnapshot, UiState, V01View,
+        CandidateHandle, CandidateView, CapabilityView, DiagnosticRow, InventoryView, LayoutView,
+        RelationshipView, UiCommand, UiError, UiSnapshot, UiState, V01View,
     },
     ui_controller::{UiController, UiRuntimeEvent},
 };
@@ -111,12 +111,95 @@ pub struct ResponseFrame {
     pub error: Option<UiError>,
 }
 
+/// A transient bootstrap-code projection, never V01 or admission evidence.
+/// Construction validates display bounds only; no current engine path emits it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PairingFrame {
+    v: u8,
+    kind: &'static str,
+    generation: u64,
+    phase: PairingPhase,
+    candidate_handle: CandidateHandle,
+    verification_words: [String; 4],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum PairingPhase {
+    AwaitingLocalConfirmation,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PairingFrameWire {
+    v: u8,
+    kind: String,
+    generation: u64,
+    phase: String,
+    candidate_handle: CandidateHandle,
+    verification_words: [String; 4],
+}
+
+impl PairingFrame {
+    pub fn awaiting_local_confirmation(
+        generation: u64,
+        candidate_handle: CandidateHandle,
+        verification_words: [String; 4],
+    ) -> Result<Self, UiError> {
+        if generation == 0
+            || verification_words.iter().any(|word| {
+                word.is_empty()
+                    || word.len() > 16
+                    || !word.bytes().all(|byte| byte.is_ascii_lowercase())
+            })
+        {
+            return Err(UiError::InvalidRequest);
+        }
+        Ok(Self {
+            v: 1,
+            kind: "ui_pairing_v1",
+            generation,
+            phase: PairingPhase::AwaitingLocalConfirmation,
+            candidate_handle,
+            verification_words,
+        })
+    }
+}
+
+impl TryFrom<PairingFrameWire> for PairingFrame {
+    type Error = &'static str;
+
+    fn try_from(value: PairingFrameWire) -> Result<Self, Self::Error> {
+        if value.v != 1
+            || value.kind != "ui_pairing_v1"
+            || value.phase != "awaiting_local_confirmation"
+        {
+            return Err("invalid pairing projection");
+        }
+        Self::awaiting_local_confirmation(
+            value.generation,
+            value.candidate_handle,
+            value.verification_words,
+        )
+        .map_err(|_| "invalid pairing projection")
+    }
+}
+
+impl<'de> Deserialize<'de> for PairingFrame {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        PairingFrameWire::deserialize(deserializer)?
+            .try_into()
+            .map_err(serde::de::Error::custom)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(untagged)]
 pub enum ChildFrame {
     Snapshot(SnapshotFrame),
     Diagnostics(DiagnosticsFrame),
     SasDisplay(SasDisplayFrame),
+    Pairing(PairingFrame),
     Response(ResponseFrame),
 }
 
@@ -131,7 +214,32 @@ enum HostCommand {
     Refresh,
     StartDiscovery,
     StopDiscovery,
+    SelectCandidate { handle: CandidateHandle },
+    ApproveSas { generation: u64, matches: bool },
     ConfirmV01 { matches: bool },
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EmptyArgs {}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SelectCandidateArgs {
+    handle: CandidateHandle,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ApproveSasArgs {
+    generation: std::num::NonZeroU64,
+    matches: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConfirmV01Args {
+    matches: bool,
 }
 
 pub struct UiStdioAdapter {
@@ -285,6 +393,11 @@ impl UiStdioAdapter {
                     Err(error) => self.rejected(&request.id, error),
                 }
             }
+            // Schema admission is not pairing authority. The engine-owned
+            // discovery lease and pairing owner are not wired in this slice.
+            Ok(HostCommand::SelectCandidate { .. } | HostCommand::ApproveSas { .. }) => {
+                self.rejected(&request.id, UiError::InvalidState)
+            }
             Err(error) => self.rejected(&request.id, error),
         };
         self.replays
@@ -405,42 +518,29 @@ fn response(id: &str, ok: bool, error: Option<UiError>) -> ChildFrame {
 }
 
 fn parse_host_command(request: &Request) -> Result<HostCommand, UiError> {
-    if request.v != 1 || contains_sas_field(&request.args) {
+    if request.v != 1 || !request.args.is_object() {
         return Err(UiError::InvalidRequest);
     }
-    let object = request.args.as_object().ok_or(UiError::InvalidRequest)?;
-    match request.command.as_str() {
-        "ui.refresh" if object.is_empty() => Ok(HostCommand::Refresh),
-        "ui.start_discovery" if object.is_empty() => Ok(HostCommand::StartDiscovery),
-        "ui.stop_discovery" if object.is_empty() => Ok(HostCommand::StopDiscovery),
-        "ui.confirm_v01" if object.len() == 1 => object
-            .get("matches")
-            .and_then(Value::as_bool)
-            .map(|matches| HostCommand::ConfirmV01 { matches })
-            .ok_or(UiError::InvalidRequest),
-        _ => Err(UiError::InvalidCommand),
+    fn args<T: serde::de::DeserializeOwned>(request: &Request) -> Result<T, UiError> {
+        serde_json::from_value(request.args.clone()).map_err(|_| UiError::InvalidRequest)
     }
-}
-
-fn contains_sas_field(value: &Value) -> bool {
-    const FORBIDDEN: &[&str] = &[
-        "v",
-        "kind",
-        "sas_display_v1",
-        "attempt_binding",
-        "generation",
-        "current",
-        "remaining_ms",
-        "code_groups",
-        "details_suffix",
-    ];
-    match value {
-        Value::Object(object) => object
-            .iter()
-            .any(|(key, value)| FORBIDDEN.contains(&key.as_str()) || contains_sas_field(value)),
-        Value::Array(values) => values.iter().any(contains_sas_field),
-        Value::String(value) => value == "sas_display_v1",
-        _ => false,
+    match request.command.as_str() {
+        "ui.refresh" => args::<EmptyArgs>(request).map(|_| HostCommand::Refresh),
+        "ui.start_discovery" => args::<EmptyArgs>(request).map(|_| HostCommand::StartDiscovery),
+        "ui.stop_discovery" => args::<EmptyArgs>(request).map(|_| HostCommand::StopDiscovery),
+        "ui.select_candidate" => {
+            args::<SelectCandidateArgs>(request).map(|args| HostCommand::SelectCandidate {
+                handle: args.handle,
+            })
+        }
+        "ui.approve_sas" => args::<ApproveSasArgs>(request).map(|args| HostCommand::ApproveSas {
+            generation: args.generation.get(),
+            matches: args.matches,
+        }),
+        "ui.confirm_v01" => args::<ConfirmV01Args>(request).map(|args| HostCommand::ConfirmV01 {
+            matches: args.matches,
+        }),
+        _ => Err(UiError::InvalidCommand),
     }
 }
 

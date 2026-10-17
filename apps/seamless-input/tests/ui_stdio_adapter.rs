@@ -1,9 +1,9 @@
 use seamless_input::{
     control_api::{self, Request},
-    ui_contract::{RemainingDuration, SasCode, UiState, V01View},
+    ui_contract::{RemainingDuration, SasCode, UiError, UiState, V01View},
     ui_stdio_adapter::{
-        AuthoritativeUiEvent, ChildFrame, MonotonicClock, StdioReadEvent, TimedRequestReader,
-        UiStdioAdapter, run_stdio_with_adapter,
+        AuthoritativeUiEvent, ChildFrame, MonotonicClock, PairingFrame, StdioReadEvent,
+        TimedRequestReader, UiStdioAdapter, run_stdio_with_adapter,
     },
 };
 use serde_json::json;
@@ -61,6 +61,323 @@ fn adapter_in_v01() -> (UiStdioAdapter, Vec<ChildFrame>) {
         },
     );
     (adapter, frames)
+}
+
+#[test]
+fn select_extra_fields_are_invalid_but_valid_pairing_commands_remain_state_gated() {
+    let mut adapter = UiStdioAdapter::new(0);
+    let rejected = adapter.handle_host_request_at(
+        1,
+        &request(
+            "select-extra",
+            "ui.select_candidate",
+            json!({"handle":"nearby-1","address":"192.0.2.4"}),
+        ),
+    );
+    assert!(rejected.iter().any(|frame| matches!(frame,
+        ChildFrame::Response(response) if !response.ok && response.error == Some(UiError::InvalidRequest)
+    )));
+
+    for (id, command, args) in [
+        (
+            "select",
+            "ui.select_candidate",
+            json!({"handle":"nearby-1"}),
+        ),
+        (
+            "approve",
+            "ui.approve_sas",
+            json!({"generation":1,"matches":true}),
+        ),
+        (
+            "reject",
+            "ui.approve_sas",
+            json!({"generation":1,"matches":false}),
+        ),
+    ] {
+        let frames = adapter.handle_host_request_at(2, &request(id, command, args));
+        assert_eq!(frames.len(), 1, "a schema alone must not change projection");
+        assert!(matches!(&frames[0], ChildFrame::Response(response)
+            if !response.ok && response.error == Some(UiError::InvalidState)));
+    }
+}
+
+#[test]
+fn pairing_request_fields_are_bounded_strict_and_replays_are_deterministic() {
+    let mut adapter = UiStdioAdapter::new(0);
+    let invalid = [
+        ("ui.select_candidate", json!({})),
+        ("ui.select_candidate", json!({"handle":""})),
+        ("ui.select_candidate", json!({"handle":"a".repeat(65)})),
+        ("ui.select_candidate", json!({"handle":"192.0.2.4"})),
+        (
+            "ui.select_candidate",
+            json!({"handle":{"address":"192.0.2.4"}}),
+        ),
+        ("ui.select_candidate", json!({"handle":["nearby-1"]})),
+        ("ui.approve_sas", json!({"generation":0,"matches":true})),
+        ("ui.approve_sas", json!({"generation":-1,"matches":true})),
+        ("ui.approve_sas", json!({"generation":1.5,"matches":true})),
+        ("ui.approve_sas", json!({"generation":"1","matches":true})),
+        ("ui.approve_sas", json!({"generation":1,"matches":"true"})),
+        ("ui.approve_sas", json!({"generation":1})),
+    ];
+    for (index, (command, args)) in invalid.into_iter().enumerate() {
+        let frames =
+            adapter.handle_host_request_at(1, &request(&format!("bad-{index}"), command, args));
+        assert!(
+            matches!(&frames[..], [ChildFrame::Response(response)]
+            if !response.ok && response.error == Some(UiError::InvalidRequest)),
+            "{frames:?}"
+        );
+    }
+    for field in [
+        "address",
+        "identity",
+        "certificate",
+        "sas",
+        "capability",
+        "layout",
+    ] {
+        for (command, mut args) in [
+            ("ui.select_candidate", json!({"handle":"nearby-1"})),
+            ("ui.approve_sas", json!({"generation":1,"matches":true})),
+        ] {
+            args["nested"] = json!([{field: "private-value"}]);
+            let frames = adapter.handle_host_request_at(
+                1,
+                &request(&format!("nested-{command}-{field}"), command, args),
+            );
+            assert!(matches!(&frames[..], [ChildFrame::Response(response)]
+                if !response.ok && response.error == Some(UiError::InvalidRequest)));
+            assert!(
+                !serde_json::to_string(&frames)
+                    .unwrap()
+                    .contains("private-value")
+            );
+        }
+    }
+    for (id, command, args) in [
+        (
+            "select-boundary",
+            "ui.select_candidate",
+            json!({"handle":"a".repeat(64)}),
+        ),
+        (
+            "approve-boundary",
+            "ui.approve_sas",
+            json!({"generation":u64::MAX,"matches":true}),
+        ),
+    ] {
+        let valid = request(id, command, args);
+        let first = adapter.handle_host_request_at(2, &valid);
+        assert!(matches!(&first[..], [ChildFrame::Response(response)]
+            if response.error == Some(UiError::InvalidState)));
+        assert_eq!(adapter.handle_host_request_at(3, &valid), first);
+        let conflict = adapter.handle_host_request_at(4, &request(id, command, json!({})));
+        assert!(matches!(&conflict[..], [ChildFrame::Response(response)]
+            if response.error == Some(UiError::RequestIdConflict)));
+    }
+}
+
+#[test]
+fn host_command_arguments_are_objects_never_positional_arrays() {
+    let mut adapter = UiStdioAdapter::new(0);
+    for (index, (command, args)) in [
+        ("ui.refresh", json!([])),
+        ("ui.start_discovery", json!([])),
+        ("ui.stop_discovery", json!([])),
+        ("ui.select_candidate", json!(["nearby-1"])),
+        ("ui.approve_sas", json!([1, true])),
+        ("ui.confirm_v01", json!([true])),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let frames =
+            adapter.handle_host_request_at(1, &request(&format!("array-{index}"), command, args));
+        assert!(
+            matches!(&frames[..], [ChildFrame::Response(response)]
+            if !response.ok && response.error == Some(UiError::InvalidRequest)),
+            "{frames:?}"
+        );
+    }
+}
+
+fn pairing_projection() -> serde_json::Value {
+    json!({
+        "v":1,
+        "kind":"ui_pairing_v1",
+        "generation":1,
+        "phase":"awaiting_local_confirmation",
+        "candidate_handle":"nearby-1",
+        "verification_words":["abandon","ability","able","about"]
+    })
+}
+
+#[test]
+fn pairing_projection_is_exact_bounded_and_separate_from_v01() {
+    let expected = pairing_projection();
+    let pairing: PairingFrame = serde_json::from_value(expected.clone()).unwrap();
+    assert_eq!(
+        serde_json::to_value(ChildFrame::Pairing(pairing)).unwrap(),
+        expected
+    );
+
+    for (field, value) in [
+        ("v", json!(2)),
+        ("kind", json!("sas_display_v1")),
+        ("generation", json!(0)),
+        ("generation", json!(-1)),
+        ("generation", json!("1")),
+        ("phase", json!("admitted")),
+        ("phase", json!({"awaiting_local_confirmation":null})),
+        ("candidate_handle", json!("")),
+        ("candidate_handle", json!("a".repeat(65))),
+        ("candidate_handle", json!("192.0.2.4")),
+        ("verification_words", json!(["abandon", "ability", "able"])),
+        (
+            "verification_words",
+            json!(["abandon", "ability", "able", "about", "above"]),
+        ),
+        (
+            "verification_words",
+            json!(["Abandon", "ability", "able", "about"]),
+        ),
+        (
+            "verification_words",
+            json!(["", "ability", "able", "about"]),
+        ),
+        (
+            "verification_words",
+            json!(["a".repeat(17), "ability", "able", "about"]),
+        ),
+        (
+            "verification_words",
+            json!([{"address":"192.0.2.4"},"ability","able","about"]),
+        ),
+    ] {
+        let mut invalid = expected.clone();
+        invalid[field] = value;
+        assert!(
+            serde_json::from_value::<PairingFrame>(invalid.clone()).is_err(),
+            "{invalid}"
+        );
+    }
+    for field in [
+        "address",
+        "identity",
+        "certificate",
+        "sas",
+        "capability",
+        "layout",
+        "attempt_binding",
+        "transcript",
+    ] {
+        let mut invalid = expected.clone();
+        invalid[field] = json!({"nested":"private-value"});
+        assert!(serde_json::from_value::<PairingFrame>(invalid).is_err());
+    }
+    for field in [
+        "v",
+        "kind",
+        "generation",
+        "phase",
+        "candidate_handle",
+        "verification_words",
+    ] {
+        let mut invalid = expected.clone();
+        invalid.as_object_mut().unwrap().remove(field);
+        assert!(serde_json::from_value::<PairingFrame>(invalid).is_err());
+    }
+}
+
+#[test]
+fn pairing_schema_cannot_change_browsing_v01_or_the_redacted_snapshot() {
+    let mut browsing = UiStdioAdapter::new(0);
+    browsing.handle_host_request_at(1, &request("start", "ui.start_discovery", json!({})));
+    let (v01, _) = adapter_in_v01();
+    for mut adapter in [browsing, v01] {
+        let before = adapter.handle_host_request_at(2, &request("before", "ui.refresh", json!({})));
+        let before = before
+            .into_iter()
+            .find_map(|frame| match frame {
+                ChildFrame::Snapshot(frame) => Some(frame.snapshot),
+                _ => None,
+            })
+            .unwrap();
+        for (id, command, args) in [
+            (
+                "select",
+                "ui.select_candidate",
+                json!({"handle":"nearby-1"}),
+            ),
+            (
+                "approve",
+                "ui.approve_sas",
+                json!({"generation":1,"matches":true}),
+            ),
+        ] {
+            let frames = adapter.handle_host_request_at(3, &request(id, command, args));
+            assert!(matches!(&frames[..], [ChildFrame::Response(response)]
+                if response.error == Some(UiError::InvalidState)));
+        }
+        let after = adapter.handle_host_request_at(4, &request("after", "ui.refresh", json!({})));
+        let mut after = after
+            .into_iter()
+            .find_map(|frame| match frame {
+                ChildFrame::Snapshot(frame) => Some(frame.snapshot),
+                _ => None,
+            })
+            .unwrap();
+        after.generation = before.generation;
+        assert_eq!(after, before);
+        assert_eq!(
+            adapter.has_current_sas(),
+            before.state == UiState::V01Pending
+        );
+    }
+}
+
+#[test]
+fn snapshot_and_response_frames_have_only_the_frozen_redacted_fields() {
+    let mut adapter = UiStdioAdapter::new(0);
+    let frames = adapter.handle_host_request_at(1, &request("refresh", "ui.refresh", json!({})));
+    let snapshot = frames
+        .iter()
+        .find(|frame| matches!(frame, ChildFrame::Snapshot(_)))
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(snapshot).unwrap(),
+        json!({
+            "v":1,"kind":"ui_snapshot_v1","snapshot":{
+                "schema_version":1,"generation":1,"state":"not_started",
+                "diagnostics":[],"candidates":[],"confirmed":[],"inventory":null,
+                "layout":{"state":"not_configured"},
+                "capabilities":{"input_enabled":false,"clipboard_enabled":false}
+            }
+        })
+    );
+    assert_eq!(
+        serde_json::to_value(frames.last().unwrap()).unwrap(),
+        json!({
+            "v":1,"kind":"ui_response_v1","id":"refresh","ok":true
+        })
+    );
+    let rejected = adapter.handle_host_request_at(
+        2,
+        &request(
+            "select",
+            "ui.select_candidate",
+            json!({"handle":"nearby-1"}),
+        ),
+    );
+    assert_eq!(
+        serde_json::to_value(&rejected).unwrap(),
+        json!([{
+            "v":1,"kind":"ui_response_v1","id":"select","ok":false,"error":"invalid_state"
+        }])
+    );
 }
 
 #[test]
@@ -122,7 +439,11 @@ fn host_accepts_only_empty_discovery_actions_or_boolean_confirm_and_rejects_sas_
 
     let rejected = adapter.handle_host_request_at(
         2,
-        &request("bad2", "ui.start_discovery", json!({"address": "192.0.2.1"})),
+        &request(
+            "bad2",
+            "ui.start_discovery",
+            json!({"address": "192.0.2.1"}),
+        ),
     );
     assert!(
         rejected
@@ -145,24 +466,24 @@ fn host_accepts_only_empty_discovery_actions_or_boolean_confirm_and_rejects_sas_
 fn empty_discovery_actions_only_transition_the_local_browsing_projection() {
     let mut adapter = UiStdioAdapter::new(0);
 
-    let started = adapter.handle_host_request_at(
-        1,
-        &request("start", "ui.start_discovery", json!({})),
+    let started =
+        adapter.handle_host_request_at(1, &request("start", "ui.start_discovery", json!({})));
+    assert!(
+        started
+            .iter()
+            .any(|frame| matches!(frame, ChildFrame::Response(response) if response.ok))
     );
-    assert!(started.iter().any(
-        |frame| matches!(frame, ChildFrame::Response(response) if response.ok)
-    ));
     assert!(started.iter().any(|frame| {
         matches!(frame, ChildFrame::Snapshot(snapshot) if snapshot.snapshot.state == UiState::Browsing)
     }));
 
-    let stopped = adapter.handle_host_request_at(
-        2,
-        &request("stop", "ui.stop_discovery", json!({})),
+    let stopped =
+        adapter.handle_host_request_at(2, &request("stop", "ui.stop_discovery", json!({})));
+    assert!(
+        stopped
+            .iter()
+            .any(|frame| matches!(frame, ChildFrame::Response(response) if response.ok))
     );
-    assert!(stopped.iter().any(
-        |frame| matches!(frame, ChildFrame::Response(response) if response.ok)
-    ));
     assert!(stopped.iter().any(|frame| {
         matches!(frame, ChildFrame::Snapshot(snapshot) if snapshot.snapshot.state == UiState::NotStarted)
     }));

@@ -91,8 +91,17 @@ the desktop hosts.
 
 ## Redacted IPC contract
 
-The adapter emits only the fixed schema below.  Fields not listed are rejected
-by both engine and native hosts.
+The typed pairing IPC schema is frozen ahead of its engine owner. In the
+current `UiStdioAdapter`, valid `ui.select_candidate` and `ui.approve_sas`
+requests return `ui_response_v1` with `ok: false` and `error: "invalid_state"`.
+They do not change the snapshot, select a candidate, start a listener, approve
+an attempt, or create an admission. The discovery commands retain only their
+existing local browsing-state transitions. Tasks admitting the discovery
+lease and pairing owner must separately wire any effect.
+
+`PairingFrame` is a validated, child-to-host value type. No current adapter
+path emits it. Once a reviewed owner supplies the current prompt, its only
+admitted shape is the fixed schema below. Fields not listed are rejected.
 
 ```json
 {
@@ -105,17 +114,50 @@ by both engine and native hosts.
 }
 ```
 
-The only pairing requests accepted from a native host are:
+The complete host command allowlist and exact argument objects are:
 
 ```text
-ui.select_candidate { handle }
-ui.approve_sas     { generation, matches }
+ui.refresh          {}
+ui.start_discovery  {}
+ui.stop_discovery   {}
+ui.select_candidate { handle: string }
+ui.approve_sas      { generation: unsigned integer, matches: boolean }
+ui.confirm_v01      { matches: boolean }
 ```
 
-They have bounded typed fields, normal request-id replay semantics, and no
-arbitrary command dispatch.  Native hosts disable every sharing and layout
-control until a later, separately bounded relationship projection says a
-durable admission is current.
+Every argument must be an object with exactly the listed keys. Handles are
+1–64 ASCII bytes containing only letters, digits, hyphen or underscore;
+generation is a nonzero `u64`. Nested objects/arrays in typed scalar fields,
+unknown keys at any depth (including address, identity, certificate, SAS,
+capability and layout material), incorrect types and out-of-range values
+return `invalid_request` without echoing their contents. An unknown command
+returns `invalid_command`. V01 remains a distinct local comparison command;
+its arguments cannot contain a pairing generation or code.
+
+The pairing frame has exactly `v`, `kind`, `generation`, `phase`,
+`candidate_handle` and `verification_words`. Version is exactly 1, kind is
+exactly `ui_pairing_v1`, generation is nonzero, and the sole admitted phase is
+`awaiting_local_confirmation`. Its handle follows the same opaque bounds;
+words are exactly four nonempty lowercase ASCII strings, each at most 16
+bytes. These are display validation rules, not verification of a current
+protocol prompt, deadline, dictionary or transcript. The engine owner must
+establish those facts before emission; a host cannot manufacture them.
+
+The ordinary `ui_snapshot_v1` envelope remains exactly `{ v, kind, snapshot }`.
+Its snapshot contains only `schema_version`, `generation`, `state`,
+`diagnostics`, `candidates`, `confirmed`, `inventory`, `layout` and
+`capabilities` using the existing redacted types. No bootstrap words or V01
+code is included. `ui_response_v1` contains exactly `{ v, kind, id, ok }` on
+success and additionally `error` on rejection; it never echoes arguments.
+Existing `ui_diagnostics_v1` and transient `sas_display_v1` V01 frames remain
+unchanged and are not pairing frames.
+
+Requests retain the existing bounded request-id replay semantics: an identical
+request replays its deterministic result, a different request with the same
+id returns `request_id_conflict`, and the 256-entry replay limit still applies.
+No arbitrary command dispatch exists. Native hosts keep sharing and layout
+controls disabled until their separate runtime gates are admitted; even a
+current durable relationship is not authority to enable them.
 
 ## Post-admission boundary
 
