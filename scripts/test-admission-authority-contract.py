@@ -77,8 +77,20 @@ def validate(handshake: str, provisional: str, authority: str, pending: str) -> 
     # Admission is one durable relationship per peer. Rejecting a retry in
     # prepare is earlier than sidecar creation, so a later endpoint drop cannot
     # run peer-scoped revocation against an existing StoreOwned record.
+    assert "admission_reservations: Vec<AdmissionReservation>" in pending
     prepare = section(pending, "pub fn prepare", "pub fn pending")
     assert "ledger.active_pins.iter().any(|pin| pin.peer == peer)" in prepare
+    assert "reservation.peer == peer" in prepare
+    assert "admission_reservations" in prepare
+    assert "push(AdmissionReservation { peer, attempt })" in prepare
+    assert "ledger.pending.push" in prepare
+    assert prepare.find("push(AdmissionReservation { peer, attempt })") < prepare.find("ledger.pending.push")
+    assert "admission_reservations" in stage
+    assert "reservation.attempt == receipt.attempt && reservation.peer == receipt.peer" in stage
+    assert "admission_reservations" in finalizer
+    assert "retain(|reservation| reservation.attempt != attempt)" in finalizer
+    cancel = section(pending, "pub fn cancel", "pub fn revoke_candidate")
+    assert "retain(|reservation| reservation.attempt != attempt)" in cancel
 
     # Every post-store sidecar removal reads and compares both attempt and
     # token under the ledger lock. An attempt-only cleanup could erase a newer
@@ -159,6 +171,16 @@ def main() -> None:
         "permit-duplicate-live-prepare": (
             "pending",
             "ledger.active_pins.iter().any(|pin| pin.peer == peer)",
+            "false",
+        ),
+        "drop-peer-reservation": (
+            "pending",
+            "push(AdmissionReservation { peer, attempt });",
+            "let _ = (peer, attempt);",
+        ),
+        "permit-staged-retry": (
+            "pending",
+            "reservation.peer == peer",
             "false",
         ),
         "attempt-only-cleanup": (

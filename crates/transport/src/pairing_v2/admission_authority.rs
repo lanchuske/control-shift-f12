@@ -451,6 +451,30 @@ mod tests {
         }
     }
 
+    fn awaiting_receipt(record: &PendingRecord, expected: StoreVersion) -> AdmissionReceiptRecord {
+        let evidence = evidence(record);
+        let revision = expected.revision.checked_add(1).unwrap();
+        AdmissionReceiptRecord {
+            attempt: evidence.attempt,
+            peer: evidence.peer,
+            peer_pin: evidence.peer_pin,
+            durable_fc_hash: evidence.fc,
+            role: evidence.role,
+            suite: evidence.suite.to_owned(),
+            protocol_version: PROTOCOL_VERSION,
+            transcript: evidence.transcript,
+            binding: evidence.binding,
+            revision,
+            identity_generation: expected.identity_generation,
+            revocation_generation: record.revocation_generation,
+            policy_revision: POLICY_REVISION,
+            ownership: AdmissionOwnership::AwaitingHandoff {
+                guard_token: [46; 32],
+                staged_revision: revision,
+            },
+        }
+    }
+
     #[test]
     fn single_manifest_consumes_pending_and_publishes_pin_receipt_atomically() {
         let root = tempfile::tempdir().unwrap();
@@ -515,7 +539,7 @@ mod tests {
     }
 
     #[test]
-    fn incompatible_pin_is_rejected_without_partial_consumption() {
+    fn incompatible_pin_retry_is_rejected_before_partial_consumption() {
         let root = tempfile::tempdir().unwrap();
         let store = AdmissionAuthorityStore::open(root.path()).unwrap();
         let first = store
@@ -524,18 +548,13 @@ mod tests {
         store
             .commit_metadata(store.version().unwrap(), 0, &first, evidence(&first))
             .unwrap();
-        let second = store
-            .prepare(store.version().unwrap(), [33; 32], first.peer_fingerprint)
-            .unwrap();
-        let mut conflicting = evidence(&second);
-        conflicting.peer_pin = [99; 32];
         assert_eq!(
-            store.commit_metadata(store.version().unwrap(), 0, &second, conflicting),
+            store.prepare(store.version().unwrap(), [33; 32], first.peer_fingerprint),
             Err(StoreError::Conflict)
         );
         assert_eq!(
-            store.reconcile(second.attempt_id).unwrap(),
-            ReconcileAdmission::Pending
+            store.reconcile(first.attempt_id).unwrap(),
+            ReconcileAdmission::Promoted
         );
     }
 
@@ -549,17 +568,66 @@ mod tests {
         store
             .commit_metadata(store.version().unwrap(), 0, &first, evidence(&first))
             .unwrap();
-        let second = store
-            .prepare(store.version().unwrap(), [43; 32], first.peer_fingerprint)
-            .unwrap();
         assert_eq!(
-            store.commit_metadata(store.version().unwrap(), 0, &second, evidence(&second)),
+            store.prepare(store.version().unwrap(), [43; 32], first.peer_fingerprint),
             Err(StoreError::Conflict)
         );
         assert_eq!(
-            store.reconcile(second.attempt_id).unwrap(),
-            ReconcileAdmission::Pending
+            store.reconcile(first.attempt_id).unwrap(),
+            ReconcileAdmission::Promoted
         );
+    }
+
+    #[test]
+    fn staged_peer_reservation_rejects_retry_before_finalization() {
+        let root = tempfile::tempdir().unwrap();
+        let store = AdmissionAuthorityStore::open(root.path()).unwrap();
+        let first = store
+            .prepare(store.version().unwrap(), [44; 32], [45; 32])
+            .unwrap();
+        let expected = store.version().unwrap();
+        let staged = awaiting_receipt(&first, expected);
+        store
+            .store
+            .stage_sealed_admission(expected, &first, &staged)
+            .unwrap();
+
+        let retry = [47; 32];
+        assert_eq!(
+            store.prepare(store.version().unwrap(), retry, first.peer_fingerprint),
+            Err(StoreError::Conflict)
+        );
+        assert_eq!(store.pending(retry).unwrap(), None);
+    }
+
+    #[test]
+    fn cancellation_and_revocation_release_peer_reservations() {
+        let root = tempfile::tempdir().unwrap();
+        let store = AdmissionAuthorityStore::open(root.path()).unwrap();
+        let pending = store
+            .prepare(store.version().unwrap(), [48; 32], [49; 32])
+            .unwrap();
+        store
+            .cancel(store.version().unwrap(), pending.attempt_id)
+            .unwrap();
+        store
+            .prepare(store.version().unwrap(), [50; 32], pending.peer_fingerprint)
+            .unwrap();
+
+        let staged = store
+            .prepare(store.version().unwrap(), [51; 32], [52; 32])
+            .unwrap();
+        let expected = store.version().unwrap();
+        store
+            .store
+            .stage_sealed_admission(expected, &staged, &awaiting_receipt(&staged, expected))
+            .unwrap();
+        store
+            .revoke_candidate(store.version().unwrap(), staged.peer_fingerprint)
+            .unwrap();
+        store
+            .prepare(store.version().unwrap(), [53; 32], staged.peer_fingerprint)
+            .unwrap();
     }
 
     #[test]
@@ -817,6 +885,24 @@ mod tests {
             assert!(AdmissionAuthorityStore::open(root.path()).is_err());
             std::fs::write(&ledger_path, &valid).unwrap();
         }
+    }
+
+    #[test]
+    fn pending_ledger_without_peer_reservation_fails_closed_on_reopen() {
+        let root = tempfile::tempdir().unwrap();
+        let store = AdmissionAuthorityStore::open(root.path()).unwrap();
+        store
+            .prepare(store.version().unwrap(), [107; 32], [108; 32])
+            .unwrap();
+        let ledger_path = root.path().join("pairing-tombstones/ledger.json");
+        let mut ledger: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&ledger_path).unwrap()).unwrap();
+        ledger
+            .as_object_mut()
+            .unwrap()
+            .remove("admission_reservations");
+        std::fs::write(&ledger_path, serde_json::to_vec(&ledger).unwrap()).unwrap();
+        assert!(AdmissionAuthorityStore::open(root.path()).is_err());
     }
 
     #[test]

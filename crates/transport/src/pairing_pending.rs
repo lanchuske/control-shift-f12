@@ -381,6 +381,17 @@ mod unix {
         revocation_generation: u64,
     }
 
+    /// One durable reservation per peer while an admission is pending or
+    /// awaiting the live-to-store handoff.  StoreOwned admissions use their
+    /// active pin as the durable reservation instead.
+    #[cfg(feature = "pairing-v2-experimental")]
+    #[derive(Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct AdmissionReservation {
+        peer: [u8; 32],
+        attempt: [u8; 32],
+    }
+
     #[derive(Serialize, Deserialize)]
     #[serde(deny_unknown_fields)]
     struct Ledger {
@@ -392,6 +403,9 @@ mod unix {
         #[cfg(feature = "pairing-v2-experimental")]
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         active_pins: Vec<ActivePin>,
+        #[cfg(feature = "pairing-v2-experimental")]
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        admission_reservations: Vec<AdmissionReservation>,
         #[cfg(feature = "pairing-v2-experimental")]
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         consumed_attempts: Vec<[u8; 32]>,
@@ -444,6 +458,8 @@ mod unix {
                 #[cfg(feature = "pairing-v2-experimental")]
                 active_pins: vec![],
                 #[cfg(feature = "pairing-v2-experimental")]
+                admission_reservations: vec![],
+                #[cfg(feature = "pairing-v2-experimental")]
                 consumed_attempts: vec![],
                 #[cfg(feature = "pairing-v2-experimental")]
                 admission_receipts: vec![],
@@ -459,13 +475,62 @@ mod unix {
             #[cfg(feature = "pairing-v2-experimental")]
             {
                 if self.active_pins.len() > MAX_HISTORY
+                    || self.admission_reservations.len() > MAX_PENDING
                     || self.consumed_attempts.len() > MAX_HISTORY
                     || self.admission_receipts.len() > MAX_HISTORY
                 {
                     return Err(StoreError::Invalid);
                 }
                 let pins: BTreeSet<_> = self.active_pins.iter().map(|p| p.peer).collect();
+                let reserved_peers: BTreeSet<_> = self
+                    .admission_reservations
+                    .iter()
+                    .map(|reservation| reservation.peer)
+                    .collect();
+                let reserved_attempts: BTreeSet<_> = self
+                    .admission_reservations
+                    .iter()
+                    .map(|reservation| reservation.attempt)
+                    .collect();
                 if pins.len() != self.active_pins.len()
+                    || reserved_peers.len() != self.admission_reservations.len()
+                    || reserved_attempts.len() != self.admission_reservations.len()
+                    || self.admission_reservations.iter().any(|reservation| {
+                        reservation.peer == [0; 32]
+                            || reservation.attempt == [0; 32]
+                            || !self.pending.iter().any(|pending| {
+                                pending.record.attempt_id == reservation.attempt
+                                    && pending.record.peer_fingerprint == reservation.peer
+                            }) && !self.admission_receipts.iter().any(|receipt| {
+                                receipt.attempt == reservation.attempt
+                                    && receipt.peer == reservation.peer
+                                    && matches!(
+                                        receipt.ownership,
+                                        AdmissionOwnership::AwaitingHandoff { .. }
+                                    )
+                                    && receipt.identity_generation
+                                        == self.version.identity_generation
+                                    && receipt.revocation_generation
+                                        == self.revocation(receipt.peer)
+                            })
+                    })
+                    || self.pending.iter().any(|pending| {
+                        !self.admission_reservations.iter().any(|reservation| {
+                            reservation.attempt == pending.record.attempt_id
+                                && reservation.peer == pending.record.peer_fingerprint
+                        })
+                    })
+                    || self.admission_receipts.iter().any(|receipt| {
+                        matches!(
+                            receipt.ownership,
+                            AdmissionOwnership::AwaitingHandoff { .. }
+                        ) && receipt.identity_generation == self.version.identity_generation
+                            && receipt.revocation_generation == self.revocation(receipt.peer)
+                            && !self.admission_reservations.iter().any(|reservation| {
+                                reservation.attempt == receipt.attempt
+                                    && reservation.peer == receipt.peer
+                            })
+                    })
                     || self.active_pins.iter().any(|p| {
                         p.peer == [0; 32]
                             || p.pin == [0; 32]
@@ -918,6 +983,9 @@ mod unix {
                 });
             }
             ledger.active_pins.retain(|pin| pin.peer != peer);
+            ledger
+                .admission_reservations
+                .retain(|reservation| reservation.peer != peer);
             let removed: Vec<_> = ledger
                 .pending
                 .iter()
@@ -1212,6 +1280,14 @@ mod unix {
             if ledger.active_pins.iter().any(|pin| pin.peer == peer) {
                 return Err(StoreError::Conflict);
             }
+            #[cfg(feature = "pairing-v2-experimental")]
+            if ledger
+                .admission_reservations
+                .iter()
+                .any(|reservation| reservation.peer == peer)
+            {
+                return Err(StoreError::Conflict);
+            }
             if ledger
                 .pending
                 .iter()
@@ -1232,6 +1308,10 @@ mod unix {
             let digest = Sha256::digest(&bytes).into();
             // An interrupted prepare may leave an orphan file. Only the locked ledger can reference it.
             self.pending_dir.replace(&filename(attempt), &bytes)?;
+            #[cfg(feature = "pairing-v2-experimental")]
+            ledger
+                .admission_reservations
+                .push(AdmissionReservation { peer, attempt });
             ledger.pending.push(Reference {
                 record: record.clone(),
                 digest,
@@ -1265,6 +1345,10 @@ mod unix {
                 return Err(StoreError::Invalid);
             }
             ledger.pending.retain(|r| r.record.attempt_id != attempt);
+            #[cfg(feature = "pairing-v2-experimental")]
+            ledger
+                .admission_reservations
+                .retain(|reservation| reservation.attempt != attempt);
             #[cfg(feature = "pairing-v2-experimental")]
             let old_journals: Vec<_> = ledger
                 .journals
@@ -1307,6 +1391,10 @@ mod unix {
             }
             #[cfg(feature = "pairing-v2-experimental")]
             ledger.active_pins.retain(|pin| pin.peer != peer);
+            #[cfg(feature = "pairing-v2-experimental")]
+            ledger
+                .admission_reservations
+                .retain(|reservation| reservation.peer != peer);
             let removed: Vec<_> = ledger
                 .pending
                 .iter()
@@ -1388,6 +1476,11 @@ mod unix {
             {
                 return Err(StoreError::Invalid);
             }
+            if !ledger.admission_reservations.iter().any(|reservation| {
+                reservation.attempt == receipt.attempt && reservation.peer == receipt.peer
+            }) {
+                return Err(StoreError::Invalid);
+            }
             // A pin is bound to exactly one durable admission receipt.  A
             // later attempt for that peer must never inherit the first
             // receipt's pin, even when it presents the same value.
@@ -1439,6 +1532,9 @@ mod unix {
             ledger
                 .journals
                 .retain(|entry| entry.attempt != receipt.attempt);
+            ledger
+                .admission_reservations
+                .retain(|reservation| reservation.attempt != receipt.attempt);
             ledger.consumed_attempts.push(receipt.attempt);
             ledger.admission_receipts.push(receipt.clone());
             // Final protocol check immediately precedes the single publication
@@ -1503,6 +1599,11 @@ mod unix {
                 || ledger.admission_receipts.len() >= MAX_HISTORY
             {
                 return Err(StoreError::ConsumedAttempt);
+            }
+            if !ledger.admission_reservations.iter().any(|reservation| {
+                reservation.attempt == receipt.attempt && reservation.peer == receipt.peer
+            }) {
+                return Err(StoreError::Invalid);
             }
             let old_journals: Vec<_> = ledger
                 .journals
@@ -1581,6 +1682,11 @@ mod unix {
             if ledger.active_pins.len() >= MAX_HISTORY {
                 return Err(StoreError::Limit);
             }
+            if !ledger.admission_reservations.iter().any(|reservation| {
+                reservation.attempt == attempt && reservation.peer == receipt.peer
+            }) {
+                return Err(StoreError::Invalid);
+            }
             // The file lock is held across this short ownership election, but
             // `claim` releases the consent mutex before any filesystem I/O.
             // Thus endpoint drop and final publication have one ordered owner
@@ -1593,6 +1699,9 @@ mod unix {
             ledger.advance(expected)?;
             ledger.admission_receipts[receipt_index].revision = final_revision;
             ledger.admission_receipts[receipt_index].ownership = ownership;
+            ledger
+                .admission_reservations
+                .retain(|reservation| reservation.attempt != attempt);
             if !ledger.active_pins.iter().any(|pin| pin.peer == peer) {
                 ledger.active_pins.push(ActivePin {
                     peer,
