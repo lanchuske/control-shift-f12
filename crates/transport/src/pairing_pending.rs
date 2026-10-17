@@ -390,9 +390,12 @@ impl BilateralAdmissionRecord {
         }
     }
 
-    fn is_operational_for(&self, receipt: &AdmissionReceiptRecord) -> bool {
-        matches!(self.state, BilateralAdmissionState::BilateralConfirmed)
-            && self.is_well_formed_for(receipt)
+    fn is_operational_for(&self, _receipt: &AdmissionReceiptRecord) -> bool {
+        // `BilateralConfirmed` is durable metadata only until Task 3 supplies
+        // an authenticated peer-finalization proof.  A persisted state label
+        // and hash are attacker-controlled at rest, so neither may activate
+        // an operational snapshot or preflight lease by themselves.
+        false
     }
 }
 

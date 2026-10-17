@@ -1233,16 +1233,14 @@ async fn commit_wrapper_before_rename_error_reopens_without_operational_snapshot
 fn final_manifest_crash_after_claim_reconciles_durable_boundary() {
     use std::process::Command;
 
-    for (stage, expected, operational) in [
+    for (stage, expected) in [
         (
             "before_rename",
             crate::pairing_v2::admission_authority::ReconcileAdmission::Revoked,
-            false,
         ),
         (
             "after_rename",
             crate::pairing_v2::admission_authority::ReconcileAdmission::Promoted,
-            true,
         ),
     ] {
         let root = tempfile::tempdir().unwrap();
@@ -1272,9 +1270,8 @@ fn final_manifest_crash_after_claim_reconciles_durable_boundary() {
             crate::pairing_v2::admission_authority::AdmissionAuthorityStore::open(root.path())
                 .unwrap();
         assert_eq!(reopened.reconcile(attempt).unwrap(), expected, "{stage}");
-        assert_eq!(
-            reopened.operational_admission_snapshot(attempt).is_ok(),
-            operational,
+        assert!(
+            reopened.operational_admission_snapshot(attempt).is_err(),
             "{stage}"
         );
     }

@@ -841,6 +841,37 @@ mod tests {
     }
 
     #[test]
+    fn persisted_bilateral_confirmed_without_authenticated_proof_is_non_operational() {
+        let root = tempfile::tempdir().unwrap();
+        let store = AdmissionAuthorityStore::open(root.path()).unwrap();
+        let record = store
+            .prepare(store.version().unwrap(), [80; 32], [81; 32])
+            .unwrap();
+        store
+            .commit_metadata(store.version().unwrap(), 0, &record, evidence(&record))
+            .unwrap();
+
+        let ledger_path = root.path().join("pairing-tombstones/ledger.json");
+        let mut ledger: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&ledger_path).unwrap()).unwrap();
+        ledger["admission_receipts"][0]["bilateral"]["state"] =
+            serde_json::json!("bilateral_confirmed");
+        ledger["admission_receipts"][0]["bilateral"]["peer_receipt_hash"] =
+            serde_json::to_value([82u8; 32]).unwrap();
+        std::fs::write(&ledger_path, serde_json::to_vec(&ledger).unwrap()).unwrap();
+
+        let reopened = AdmissionAuthorityStore::open(root.path()).unwrap();
+        assert!(matches!(
+            reopened.operational_admission_snapshot(record.attempt_id),
+            Err(StoreError::Invalid)
+        ));
+        assert!(matches!(
+            reopened.acquire_operational_preflight_lease(record.attempt_id, [83; 32], [84; 32]),
+            Err(StoreError::Invalid)
+        ));
+    }
+
+    #[test]
     fn inactive_store_owned_receipt_remains_non_operational_after_revoke_or_rotation() {
         for rotate in [false, true] {
             let root = tempfile::tempdir().unwrap();
