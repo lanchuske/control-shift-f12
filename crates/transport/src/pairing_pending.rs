@@ -523,6 +523,38 @@ mod bilateral_admission_state_tests {
     }
 
     #[test]
+    fn journal_discard_releases_only_its_exact_admission_reservation() {
+        let root = tempfile::tempdir().unwrap();
+        let store = PendingStore::open(root.path()).unwrap();
+        let first = store
+            .prepare(store.version().unwrap(), [211; 32], [212; 32])
+            .unwrap();
+        let other = store
+            .prepare(store.version().unwrap(), [213; 32], [214; 32])
+            .unwrap();
+        assert!(matches!(
+            store.reconcile_pairing(first.attempt_id, None).unwrap(),
+            crate::pairing_v2::ReconcileOutcome::Discarded
+        ));
+        let reopened = PendingStore::open(root.path()).unwrap();
+        assert!(reopened.pending(first.attempt_id).unwrap().is_none());
+        assert_eq!(reopened.pending(other.attempt_id).unwrap(), Some(other));
+        reopened
+            .prepare(
+                reopened.version().unwrap(),
+                [215; 32],
+                first.peer_fingerprint,
+            )
+            .unwrap();
+        assert!(
+            reopened
+                .prepare(reopened.version().unwrap(), [216; 32], [214; 32])
+                .is_err(),
+            "unrelated reservation must remain held"
+        );
+    }
+
+    #[test]
     fn stale_generation_exact_abort_preserves_a_later_same_peer_transaction() {
         let root = tempfile::tempdir().unwrap();
         let store = PendingStore::open(root.path()).unwrap();
@@ -1972,6 +2004,9 @@ mod unix {
             ledger.advance(version)?;
             ledger.pending.retain(|r| r.record.attempt_id != attempt);
             ledger.journals.retain(|r| r.attempt != attempt);
+            ledger
+                .admission_reservations
+                .retain(|reservation| reservation.attempt != attempt);
             ledger.tombstones.push(attempt);
             self.save(&ledger)?;
             self.pending_dir.remove(&filename(attempt))?;

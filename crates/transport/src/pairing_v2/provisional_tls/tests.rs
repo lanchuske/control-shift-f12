@@ -3137,6 +3137,29 @@ async fn commit_wrapper_before_rename_error_reopens_without_operational_snapshot
 }
 
 #[test]
+fn final_manifest_worker_uses_the_cross_platform_crash_hook() {
+    let worker: fn() = final_manifest_fault_worker;
+    let _ = worker;
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "pairing_v2::provisional_tls::tests::final_manifest_fault_worker",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env("CSF12_FINALIZATION_WORKER_PROBE", "1")
+        .env("PAIRING_TEST_FS_FAULT", "ledger:before_rename:crash")
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(91),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn final_manifest_crash_after_claim_reconciles_durable_boundary() {
     use std::process::Command;
 
@@ -3184,12 +3207,16 @@ fn final_manifest_crash_after_claim_reconciles_durable_boundary() {
     }
 }
 
-#[cfg(unix)]
 #[test]
 #[ignore = "subprocess helper"]
 fn final_manifest_fault_worker() {
     use std::io::Write;
 
+    if std::env::var_os("CSF12_FINALIZATION_WORKER_PROBE").is_some() {
+        crate::private_fs::faults::arm();
+        crate::private_fs::faults::point("ledger.json", "before_rename").unwrap();
+        panic!("cross-platform fault probe did not exit");
+    }
     let root = std::env::var_os("CSF12_FINALIZATION_FAULT_ROOT").unwrap();
     tokio::runtime::Builder::new_current_thread()
         .enable_all()

@@ -10,12 +10,12 @@ public sealed class UiChildSessionTests
     [Fact]
     public void Initial_request_is_only_a_framed_refresh()
     {
-        var request = UiChildSession.InitialRefreshFrame();
+        var request = new UiChildSession().InitialRefreshFrame();
         var length = (request[0] << 24) | (request[1] << 16) | (request[2] << 8) | request[3];
         using var document = JsonDocument.Parse(request.Skip(4).Take(length).ToArray());
 
         Assert.Equal("ui.refresh", document.RootElement.GetProperty("command").GetString());
-        Assert.Equal("windows-refresh", document.RootElement.GetProperty("id").GetString());
+        Assert.StartsWith("windows-", document.RootElement.GetProperty("id").GetString());
         Assert.Equal(JsonValueKind.Object, document.RootElement.GetProperty("args").ValueKind);
         Assert.False(document.RootElement.GetProperty("args").EnumerateObject().Any());
     }
@@ -23,24 +23,24 @@ public sealed class UiChildSessionTests
     [Fact]
     public void Discovery_request_is_a_fixed_empty_command()
     {
-        var request = UiChildSession.StartDiscoveryFrame();
+        var request = new UiChildSession().StartDiscoveryFrame();
         var length = (request[0] << 24) | (request[1] << 16) | (request[2] << 8) | request[3];
         using var document = JsonDocument.Parse(request.Skip(4).Take(length).ToArray());
 
         Assert.Equal("ui.start_discovery", document.RootElement.GetProperty("command").GetString());
-        Assert.Equal("windows-start-discovery", document.RootElement.GetProperty("id").GetString());
+        Assert.StartsWith("windows-", document.RootElement.GetProperty("id").GetString());
         Assert.False(document.RootElement.GetProperty("args").EnumerateObject().Any());
     }
 
     [Fact]
     public void Stop_discovery_request_is_a_fixed_empty_command()
     {
-        var request = UiChildSession.StopDiscoveryFrame();
+        var request = new UiChildSession().StopDiscoveryFrame();
         var length = (request[0] << 24) | (request[1] << 16) | (request[2] << 8) | request[3];
         using var document = JsonDocument.Parse(request.Skip(4).Take(length).ToArray());
 
         Assert.Equal("ui.stop_discovery", document.RootElement.GetProperty("command").GetString());
-        Assert.Equal("windows-stop-discovery", document.RootElement.GetProperty("id").GetString());
+        Assert.StartsWith("windows-", document.RootElement.GetProperty("id").GetString());
         Assert.False(document.RootElement.GetProperty("args").EnumerateObject().Any());
     }
 
@@ -48,6 +48,7 @@ public sealed class UiChildSessionTests
     public void Discovery_response_is_accepted_only_after_a_current_projection()
     {
         var session = new UiChildSession();
+        var id = RequestId(session.StartDiscoveryFrame());
 
         session.ReceiveOutput(Frame("""
         {"v":1,"kind":"ui_snapshot_v1","snapshot":{
@@ -57,12 +58,30 @@ public sealed class UiChildSessionTests
           "capabilities":{"input_enabled":false,"clipboard_enabled":false}
         }}
         """));
-        session.ReceiveOutput(Frame("""{"v":1,"kind":"ui_response_v1","id":"windows-start-discovery","ok":true}"""));
+        session.ReceiveOutput(Frame(JsonSerializer.Serialize(new { v = 1, kind = "ui_response_v1", id, ok = true })));
 
         Assert.Equal(ChildSessionPhase.Running, session.State.Phase);
         Assert.Equal("browsing", session.Snapshot!.State);
         Assert.False(session.Snapshot.InputEnabled);
         Assert.False(session.Snapshot.ClipboardEnabled);
+    }
+
+    [Fact]
+    public void Repeated_gestures_use_fresh_bounded_ids_and_replies_are_single_use()
+    {
+        var session = new UiChildSession();
+        var requests = new[] { session.StartDiscoveryFrame(), session.StopDiscoveryFrame(),
+            session.StartDiscoveryFrame(), session.InitialRefreshFrame(), session.InitialRefreshFrame() };
+        var ids = requests.Select(RequestId).ToArray();
+        Assert.Equal(requests.Length, ids.Distinct().Count());
+        Assert.All(ids, id => Assert.InRange(id.Length, 1, 64));
+        foreach (var id in ids)
+        {
+            session.ReceiveOutput(Frame(JsonSerializer.Serialize(new { v = 1, kind = "ui_response_v1", id, ok = true })));
+            Assert.NotEqual(ChildSessionPhase.Terminal, session.State.Phase);
+        }
+        session.ReceiveOutput(Frame(JsonSerializer.Serialize(new { v = 1, kind = "ui_response_v1", id = ids[0], ok = true })));
+        Assert.Equal(ChildSessionPhase.Terminal, session.State.Phase);
     }
 
     [Fact]
@@ -109,6 +128,12 @@ public sealed class UiChildSessionTests
         Assert.Equal(ChildSessionPhase.Terminal, session.State.Phase);
         Assert.Null(session.Snapshot);
         Assert.Null(session.Diagnostics);
+    }
+
+    private static string RequestId(byte[] frame)
+    {
+        using var document = JsonDocument.Parse(frame.AsMemory(4));
+        return document.RootElement.GetProperty("id").GetString()!;
     }
 
     private static byte[] Frame(string json)

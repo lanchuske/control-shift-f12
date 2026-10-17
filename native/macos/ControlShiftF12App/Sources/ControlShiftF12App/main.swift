@@ -224,15 +224,43 @@ private struct SnapshotGeneration: Decodable {
     let generation: UInt64
 }
 
-/// Owns the redacted diagnostics view state. Calls to `consume` must be made
-/// on the AppKit main thread after a complete frame has been decoded.
+/// Bounded, single-use correlation for the gestures sent to one child.
+final class ChildRequestTracker {
+    private var nextID: UInt64 = 0
+    private var pending = Set<String>()
+
+    func frame(command: String) throws -> Data {
+        guard ["ui.refresh", "ui.start_discovery", "ui.stop_discovery"].contains(command),
+              pending.count < 256, nextID < UInt64.max
+        else { throw HostError.invalidFrame }
+        nextID += 1
+        let id = "mac-\(nextID)"
+        let request: [String: Any] = ["v": 1, "id": id, "command": command, "args": [:]]
+        let payload = try JSONSerialization.data(withJSONObject: request)
+        guard payload.count > 0, payload.count <= maximumFrameBytes else { throw HostError.invalidFrame }
+        var length = UInt32(payload.count).bigEndian
+        var frame = Data(bytes: &length, count: 4)
+        frame.append(payload)
+        pending.insert(id)
+        return frame
+    }
+
+    func acknowledge(_ id: String) -> Bool { pending.remove(id) != nil }
+}
+
+/// Owns the redacted view state on the AppKit main thread.
 final class DiagnosticsFrameController {
+    let requests: ChildRequestTracker
     private(set) var presentation = DiagnosticsPresentation(runtime: .unknown, rows: [])
     private(set) var shell = MacDesktopShellPresentation.initial
     private(set) var pairing: MacPairingBridgeState?
     private(set) var nearbyCandidates: [NearbyCandidatePresentation] = []
     private var highestGeneration: UInt64 = 0
     private var isClosed = false
+
+    init(requests: ChildRequestTracker = ChildRequestTracker()) {
+        self.requests = requests
+    }
 
     func consume(lengthPrefixed frame: Data) throws {
         guard Thread.isMainThread else { throw HostError.notOnMainThread }
@@ -250,8 +278,7 @@ final class DiagnosticsFrameController {
             // that inert baseline, never identities, relationships, or SAS.
             try validateIgnoredSnapshot(object)
         case "ui_response_v1":
-            // A successful response can only acknowledge this host's single,
-            // fixed local refresh request. It carries no presentation state.
+            // A response acknowledges one outstanding gesture exactly once.
             try validateIgnoredSuccessResponse(object)
         case "ui_diagnostics_v1":
             try consumeDiagnostics(payload: payload, object: object)
@@ -367,9 +394,8 @@ final class DiagnosticsFrameController {
               let version = object["v"] as? Int,
               version == 1,
               let id = object["id"] as? String,
-              ["mac-refresh", "mac-start-discovery", "mac-stop-discovery"].contains(id),
               let ok = object["ok"] as? Bool,
-              ok
+              ok, requests.acknowledge(id)
         else { throw HostError.invalidFrame }
     }
 
@@ -543,8 +569,10 @@ final class BundledChild: ChildLifecycleChild {
     private let outputPipe = Pipe()
     private let errorPipe = Pipe()
     private let process: Process
+    private let requests: ChildRequestTracker
 
-    init?(bundle: Bundle = .main) {
+    init?(bundle: Bundle = .main, requests: ChildRequestTracker) {
+        self.requests = requests
         let candidate = bundle.bundleURL
             .appendingPathComponent("Contents/Resources/seamless-input", isDirectory: false)
         guard candidate.isFileURL,
@@ -565,29 +593,19 @@ final class BundledChild: ChildLifecycleChild {
     }
 
     func sendRefresh() throws {
-        try sendFixedRequest(id: "mac-refresh", command: "ui.refresh")
+        try sendRequest(command: "ui.refresh")
     }
 
     func sendStartDiscovery() throws {
-        try sendFixedRequest(id: "mac-start-discovery", command: "ui.start_discovery")
+        try sendRequest(command: "ui.start_discovery")
     }
 
     func sendStopDiscovery() throws {
-        try sendFixedRequest(id: "mac-stop-discovery", command: "ui.stop_discovery")
+        try sendRequest(command: "ui.stop_discovery")
     }
 
-    private func sendFixedRequest(id: String, command: String) throws {
-        let request: [String: Any] = [
-            "v": 1,
-            "id": id,
-            "command": command,
-            "args": [:],
-        ]
-        let payload = try JSONSerialization.data(withJSONObject: request)
-        guard payload.count > 0, payload.count <= maximumFrameBytes else { throw HostError.invalidFrame }
-        var length = UInt32(payload.count).bigEndian
-        var frame = Data(bytes: &length, count: MemoryLayout<UInt32>.size)
-        frame.append(payload)
+    private func sendRequest(command: String) throws {
+        let frame = try requests.frame(command: command)
         try inputPipe.fileHandleForWriting.write(contentsOf: frame)
     }
 
@@ -703,7 +721,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             scroll.heightAnchor.constraint(greaterThanOrEqualToConstant: 180),
         ])
 
-        if let child = BundledChild(), (try? child.start()) != nil {
+        if let child = BundledChild(requests: diagnostics.requests), (try? child.start()) != nil {
             let lifecycle = ChildLifecycle(child: child)
             self.lifecycle = lifecycle
             let session = DiagnosticsSession(controller: diagnostics, lifecycle: lifecycle)
