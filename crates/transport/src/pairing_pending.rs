@@ -242,7 +242,8 @@ impl AdmissionRevoker {
         self.armed = false;
         self.owns_revocation = false;
         revocation_guard_phases().remove(&self.token);
-        self.store.clear_admission_guard(self.attempt)
+        self.store
+            .clear_admission_guard_exact(self.attempt, self.token)
     }
 
     pub(crate) fn arm(&mut self) {
@@ -279,7 +280,8 @@ impl AdmissionRevoker {
         // Ownership survives after the registry mutex is released. Durable I/O
         // therefore runs lock-free with respect to the in-memory phase machine.
         self.store.revoke_current(self.peer)?;
-        self.store.clear_admission_guard(self.attempt)?;
+        self.store
+            .clear_admission_guard_exact(self.attempt, self.token)?;
         revocation_guard_phases().remove(&self.token);
         self.armed = false;
         self.owns_revocation = false;
@@ -303,7 +305,9 @@ impl Drop for AdmissionRevoker {
             }
             self.release_for_retry();
         } else {
-            let _ = self.store.clear_admission_guard(self.attempt);
+            let _ = self
+                .store
+                .clear_admission_guard_exact(self.attempt, self.token);
         }
     }
 }
@@ -779,8 +783,24 @@ mod unix {
         }
 
         #[cfg(feature = "pairing-v2-experimental")]
-        pub(crate) fn clear_admission_guard(&self, attempt: [u8; 32]) -> Result<(), StoreError> {
+        pub(crate) fn clear_admission_guard_exact(
+            &self,
+            attempt: [u8; 32],
+            token: [u8; 32],
+        ) -> Result<(), StoreError> {
+            if token == [0; 32] {
+                return Err(StoreError::Invalid);
+            }
+            let _lock = self.ledger_dir.lock()?;
             let file = admission_guard_filename(attempt);
+            let Some(bytes) = self.ledger_dir.read(&file, RECORD_LIMIT)? else {
+                return Ok(());
+            };
+            let guard: AdmissionRevocationGuard =
+                serde_json::from_slice(&bytes).map_err(|_| StoreError::Invalid)?;
+            if guard.attempt != attempt || guard.token != token {
+                return Err(StoreError::Invalid);
+            }
             #[cfg(all(test, feature = "pairing-v2-experimental"))]
             crate::private_fs::faults::point(&file, "before_remove")?;
             self.ledger_dir.remove(&file)?;
@@ -824,10 +844,10 @@ mod unix {
             // ledger therefore makes the sole durable ownership decision: an
             // exact StoreOwned record only needs stale-sidecar cleanup; every
             // other state remains conservative and is revoked below.
-            {
+            let store_owns_guard = {
                 let _lock = self.ledger_dir.lock()?;
                 let ledger = self.load_validated_manifest()?;
-                let store_owns_guard = ledger.admission_receipts.iter().any(|receipt| {
+                ledger.admission_receipts.iter().any(|receipt| {
                     receipt.attempt == guard.attempt
                         && receipt.peer == guard.peer
                         && matches!(
@@ -843,12 +863,12 @@ mod unix {
                                 && pin.identity_generation == receipt.identity_generation
                                 && pin.revocation_generation == receipt.revocation_generation
                         })
-                });
-                if store_owns_guard {
-                    self.clear_admission_guard(attempt)?;
-                    revocation_guard_phases().remove(&guard.token);
-                    return Ok(None);
-                }
+                })
+            };
+            if store_owns_guard {
+                self.clear_admission_guard_exact(attempt, guard.token)?;
+                revocation_guard_phases().remove(&guard.token);
+                return Ok(None);
             }
             let mut revoker = AdmissionRevoker {
                 store: PendingStore {
@@ -1360,11 +1380,13 @@ mod unix {
             {
                 return Err(StoreError::Invalid);
             }
-            if let Some(pin) = ledger
+            // A pin is bound to exactly one durable admission receipt.  A
+            // later attempt for that peer must never inherit the first
+            // receipt's pin, even when it presents the same value.
+            if ledger
                 .active_pins
                 .iter()
-                .find(|pin| pin.peer == receipt.peer)
-                && pin.pin != receipt.peer_pin
+                .any(|pin| pin.peer == receipt.peer)
             {
                 return Err(StoreError::Conflict);
             }
@@ -1544,7 +1566,7 @@ mod unix {
                 || ledger
                     .active_pins
                     .iter()
-                    .any(|pin| pin.peer == receipt.peer && pin.pin != receipt.peer_pin)
+                    .any(|pin| pin.peer == receipt.peer)
             {
                 return Err(StoreError::Conflict);
             }

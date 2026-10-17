@@ -540,6 +540,29 @@ mod tests {
     }
 
     #[test]
+    fn second_attempt_for_same_peer_and_pin_is_rejected_without_inheriting_pin() {
+        let root = tempfile::tempdir().unwrap();
+        let store = AdmissionAuthorityStore::open(root.path()).unwrap();
+        let first = store
+            .prepare(store.version().unwrap(), [41; 32], [42; 32])
+            .unwrap();
+        store
+            .commit_metadata(store.version().unwrap(), 0, &first, evidence(&first))
+            .unwrap();
+        let second = store
+            .prepare(store.version().unwrap(), [43; 32], first.peer_fingerprint)
+            .unwrap();
+        assert_eq!(
+            store.commit_metadata(store.version().unwrap(), 0, &second, evidence(&second)),
+            Err(StoreError::Conflict)
+        );
+        assert_eq!(
+            store.reconcile(second.attempt_id).unwrap(),
+            ReconcileAdmission::Pending
+        );
+    }
+
+    #[test]
     fn revocation_and_identity_rotation_invalidate_active_pin_without_revival() {
         let root = tempfile::tempdir().unwrap();
         let store = AdmissionAuthorityStore::open(root.path()).unwrap();

@@ -777,6 +777,33 @@ async fn guard_cleanup_failure_returns_no_success_and_reconciles_store_owned_met
     );
 }
 
+#[test]
+fn mismatched_guard_sidecar_is_never_removed_by_store_cleanup() {
+    let ta = tempfile::tempdir().unwrap();
+    let store = crate::pairing_pending::PendingStore::open(ta.path()).unwrap();
+    let attempt = [90; 32];
+    let mut revoker = store.admission_revoker([89; 32], attempt).unwrap();
+    revoker.arm();
+    let filename = format!(
+        "admission-revocation-{}.json",
+        attempt
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    );
+    let guard_path = ta.path().join("pairing-tombstones").join(filename);
+    let mut guard: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&guard_path).unwrap()).unwrap();
+    guard["token"] = serde_json::to_value([91u8; 32]).unwrap();
+    std::fs::write(&guard_path, serde_json::to_vec(&guard).unwrap()).unwrap();
+
+    assert_eq!(
+        revoker.release_to_store(),
+        Err(crate::pairing_pending::StoreError::Invalid)
+    );
+    assert!(guard_path.exists(), "mismatched guard must not be removed");
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn store_owned_guard_reconciles_as_cleanup_in_a_fresh_process() {
