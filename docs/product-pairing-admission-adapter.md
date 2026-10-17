@@ -27,6 +27,24 @@ The adapter rejects construction if any prerequisite is unavailable.  It has no
 fallback to the legacy CLI pairing path, no caller-supplied endpoint/config,
 and no mutable global trust/pin API.
 
+### Discovery publication and listener lease
+
+The existing `GuidedMdns` type is browse-only.  Product pairing therefore also
+needs a separate engine-owned `PairingAdvertisementLease`, not a UI-owned mDNS
+publisher.  The lease starts only after the user explicitly opens the pairing
+screen and before discovery is shown.  It binds one `ProvisionalEndpoint` on a
+bounded local port, publishes only the currently valid rendezvous identifier,
+protocol version and a pairable bit, and withdraws publication before dropping
+the endpoint.
+
+The advertisement contains no friendly name, certificate, durable-peer data,
+SAS, device capability, layout, or active-session claim.  Its listener accepts
+only the strict pairing-v2 channel; it cannot hand a raw connection to input,
+clipboard, runtime-session or legacy-pairing code.  The lease expires and
+withdraws on every pairing-window close, timeout, cancellation, endpoint fault
+or completed attempt.  Browsing must not start a listener and advertising must
+not select or trust another device.
+
 ## Pairing state machine
 
 Only the following transition sequence is allowed.  Any error, timeout,
