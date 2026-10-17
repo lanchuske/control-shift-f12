@@ -1002,8 +1002,205 @@ async fn endpoint_drop_after_store_handoff_does_not_run_revocation_cleanup() {
     }
 }
 
+/// Once the handoff has been claimed, an error before the final manifest
+/// rename is uncertain rather than successful. Recovery must revoke the
+/// ineligible staged receipt and leave no operational snapshot.
+#[tokio::test]
+async fn final_manifest_error_after_claim_is_not_operationally_active() {
+    let (ea, _eb, a, b, _) = pair().await;
+    let ta = tempfile::tempdir().unwrap();
+    let tb = tempfile::tempdir().unwrap();
+    let sa = crate::pairing_pending::PendingStore::open(ta.path()).unwrap();
+    let sb = crate::pairing_pending::PendingStore::open(tb.path()).unwrap();
+    let (a, b) = tokio::join!(
+        a.handshake(
+            handshake_config(1, 2),
+            &sa,
+            |p| async move { p.decision(true) }
+        ),
+        b.handshake(
+            handshake_config(2, 1),
+            &sb,
+            |p| async move { p.decision(true) }
+        )
+    );
+    let sealed = a.unwrap().seal_for_promotion().await.unwrap();
+    let frozen = sealed.freeze(&sa).await.unwrap();
+    let (fields, handoff) = frozen.into_store_handoff();
+    let record = fields.record.clone();
+    let expected = sa.version().unwrap();
+    let staged_revision = expected.revision.checked_add(1).unwrap();
+    let receipt = crate::pairing_pending::AdmissionReceiptRecord {
+        attempt: record.attempt_id,
+        peer: record.peer_fingerprint,
+        peer_pin: fields.certificate_fingerprints[1 - fields.role.index()],
+        durable_fc_hash: fields.durable_fc_hash,
+        role: fields.role.index() as u8,
+        suite: SUITE.to_owned(),
+        protocol_version: 2,
+        transcript: fields.transcript,
+        binding: fields.local_binding,
+        revision: staged_revision,
+        identity_generation: expected.identity_generation,
+        revocation_generation: record.revocation_generation,
+        policy_revision: 0,
+        ownership: handoff.awaiting_handoff_ownership(staged_revision),
+    };
+    sa.stage_sealed_admission(expected, &record, &receipt)
+        .unwrap();
+
+    unsafe { std::env::set_var("PAIRING_TEST_FS_FAULT", "ledger:before_rename:error") };
+    crate::private_fs::faults::arm();
+    assert!(matches!(
+        sa.finalize_staged_admission(sa.version().unwrap(), record.attempt_id, handoff,),
+        Err(crate::pairing_pending::StoreError::Unavailable)
+    ));
+    unsafe { std::env::remove_var("PAIRING_TEST_FS_FAULT") };
+
+    let store =
+        crate::pairing_v2::admission_authority::AdmissionAuthorityStore::open(ta.path()).unwrap();
+    assert_eq!(
+        store.reconcile(record.attempt_id).unwrap(),
+        crate::pairing_v2::admission_authority::ReconcileAdmission::Revoked
+    );
+    assert!(
+        store
+            .operational_admission_snapshot(record.attempt_id)
+            .is_err()
+    );
+    drop(ea);
+    drop(b.unwrap());
+}
+
+#[cfg(unix)]
+#[test]
+fn final_manifest_crash_after_claim_reconciles_durable_boundary() {
+    use std::process::Command;
+
+    for (stage, expected, operational) in [
+        (
+            "before_rename",
+            crate::pairing_v2::admission_authority::ReconcileAdmission::Revoked,
+            false,
+        ),
+        (
+            "after_rename",
+            crate::pairing_v2::admission_authority::ReconcileAdmission::Promoted,
+            true,
+        ),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "pairing_v2::provisional_tls::tests::final_manifest_fault_worker",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("CSF12_FINALIZATION_FAULT_ROOT", root.path())
+            .env("PAIRING_TEST_FS_FAULT", format!("ledger:{stage}:crash"))
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(91), "{stage}");
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        let attempt_hex = stdout
+            .lines()
+            .find_map(|line| line.strip_prefix("FINALIZATION_ATTEMPT:"))
+            .unwrap_or_else(|| panic!("missing attempt for {stage}: {stdout}"));
+        assert_eq!(attempt_hex.len(), 64);
+        let mut attempt = [0u8; 32];
+        for (index, byte) in attempt.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(&attempt_hex[index * 2..index * 2 + 2], 16).unwrap();
+        }
+        let reopened =
+            crate::pairing_v2::admission_authority::AdmissionAuthorityStore::open(root.path())
+                .unwrap();
+        assert_eq!(reopened.reconcile(attempt).unwrap(), expected, "{stage}");
+        assert_eq!(
+            reopened.operational_admission_snapshot(attempt).is_ok(),
+            operational,
+            "{stage}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+#[ignore = "subprocess helper"]
+fn final_manifest_fault_worker() {
+    use std::io::Write;
+
+    let root = std::env::var_os("CSF12_FINALIZATION_FAULT_ROOT").unwrap();
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async move {
+            let (ea, _eb, a, b, _) = pair().await;
+            let other = tempfile::tempdir().unwrap();
+            let sa = crate::pairing_pending::PendingStore::open(root).unwrap();
+            let sb = crate::pairing_pending::PendingStore::open(other.path()).unwrap();
+            let (a, b) = tokio::join!(
+                a.handshake(
+                    handshake_config(1, 2),
+                    &sa,
+                    |p| async move { p.decision(true) }
+                ),
+                b.handshake(
+                    handshake_config(2, 1),
+                    &sb,
+                    |p| async move { p.decision(true) }
+                )
+            );
+            let sealed = a.unwrap().seal_for_promotion().await.unwrap();
+            let frozen = sealed.freeze(&sa).await.unwrap();
+            let (fields, handoff) = frozen.into_store_handoff();
+            let record = fields.record.clone();
+            let expected = sa.version().unwrap();
+            let staged_revision = expected.revision.checked_add(1).unwrap();
+            let receipt = crate::pairing_pending::AdmissionReceiptRecord {
+                attempt: record.attempt_id,
+                peer: record.peer_fingerprint,
+                peer_pin: fields.certificate_fingerprints[1 - fields.role.index()],
+                durable_fc_hash: fields.durable_fc_hash,
+                role: fields.role.index() as u8,
+                suite: SUITE.to_owned(),
+                protocol_version: 2,
+                transcript: fields.transcript,
+                binding: fields.local_binding,
+                revision: staged_revision,
+                identity_generation: expected.identity_generation,
+                revocation_generation: record.revocation_generation,
+                policy_revision: 0,
+                ownership: handoff.awaiting_handoff_ownership(staged_revision),
+            };
+            sa.stage_sealed_admission(expected, &record, &receipt)
+                .unwrap();
+            writeln!(
+                std::io::stdout(),
+                "FINALIZATION_ATTEMPT:{}",
+                record
+                    .attempt_id
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>()
+            )
+            .unwrap();
+            std::io::stdout().flush().unwrap();
+            crate::private_fs::faults::arm();
+            let result =
+                sa.finalize_staged_admission(sa.version().unwrap(), record.attempt_id, handoff);
+            assert!(result.is_err(), "fault worker unexpectedly finalized");
+            drop(ea);
+            drop(b.unwrap());
+        });
+}
+
+#[cfg(unix)]
 #[tokio::test]
 async fn guard_cleanup_failure_returns_no_success_and_reconciles_store_owned_metadata() {
+    use std::process::Command;
+
     let (_ea, _eb, a, b, _) = pair().await;
     let ta = tempfile::tempdir().unwrap();
     let tb = tempfile::tempdir().unwrap();
@@ -1036,6 +1233,25 @@ async fn guard_cleanup_failure_returns_no_success_and_reconciles_store_owned_met
         Err(crate::pairing_pending::StoreError::Unavailable)
     );
     unsafe { std::env::remove_var("PAIRING_TEST_FS_FAULT") };
+    // A process that did not witness the failed unlink must still recognize
+    // StoreOwned and perform cleanup only, never re-run revocation.
+    let status = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "pairing_v2::provisional_tls::tests::admission_guard_restart_worker",
+            "--ignored",
+        ])
+        .env("CSF12_ADMISSION_GUARD_ROOT", ta.path())
+        .env(
+            "CSF12_ADMISSION_GUARD_ATTEMPT",
+            attempt
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>(),
+        )
+        .status()
+        .unwrap();
+    assert!(status.success());
     assert_eq!(
         store.reconcile(attempt).unwrap(),
         crate::pairing_v2::admission_authority::ReconcileAdmission::Promoted
