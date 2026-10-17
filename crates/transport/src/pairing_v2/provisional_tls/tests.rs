@@ -132,6 +132,86 @@ async fn current_foundation_preserves_store_owned_metadata_on_listener_shutdown(
         crate::pairing_v2::admission_authority::ReconcileAdmission::Promoted
     );
 }
+
+#[tokio::test]
+async fn duplicate_live_attempt_cannot_revoke_existing_promoted_peer() {
+    let (a_identity, a_key) = identity(true);
+    let a_retry_key = a_key.clone_key();
+    let (b_identity, b_key) = identity(true);
+    let b_retry_key = b_key.clone_key();
+    let ea = ProvisionalEndpoint::bind("127.0.0.1:0".parse().unwrap(), a_identity.clone(), a_key)
+        .unwrap();
+    let eb = ProvisionalEndpoint::bind("127.0.0.1:0".parse().unwrap(), b_identity.clone(), b_key)
+        .unwrap();
+    let (first_a, first_b) = tokio::join!(ea.connect(eb.local_addr().unwrap()), eb.accept());
+    let ta = tempfile::tempdir().unwrap();
+    let tb = tempfile::tempdir().unwrap();
+    let sa = crate::pairing_pending::PendingStore::open(ta.path()).unwrap();
+    let sb = crate::pairing_pending::PendingStore::open(tb.path()).unwrap();
+    let (first_a, first_b) = tokio::join!(
+        first_a.unwrap().handshake(
+            handshake_config(1, 2),
+            &sa,
+            |p| async move { p.decision(true) }
+        ),
+        first_b.unwrap().handshake(
+            handshake_config(2, 1),
+            &sb,
+            |p| async move { p.decision(true) }
+        )
+    );
+    let _first_b = first_b.unwrap();
+    let store =
+        crate::pairing_v2::admission_authority::AdmissionAuthorityStore::open(ta.path()).unwrap();
+    let receipt = store
+        .commit_sealed_foundation(store.version().unwrap(), first_a.unwrap())
+        .await
+        .unwrap();
+    assert_eq!(
+        store.reconcile(receipt.attempt()).unwrap(),
+        crate::pairing_v2::admission_authority::ReconcileAdmission::Promoted
+    );
+
+    drop(ea);
+    drop(eb);
+    let retry_a =
+        ProvisionalEndpoint::bind("127.0.0.1:0".parse().unwrap(), a_identity, a_retry_key).unwrap();
+    let retry_b =
+        ProvisionalEndpoint::bind("127.0.0.1:0".parse().unwrap(), b_identity, b_retry_key).unwrap();
+    let (second_a, second_b) = tokio::join!(
+        retry_a.connect(retry_b.local_addr().unwrap()),
+        retry_b.accept()
+    );
+    let (second_a, second_b) = tokio::join!(
+        second_a.unwrap().handshake(
+            handshake_config(3, 4),
+            &sa,
+            |p| async move { p.decision(true) }
+        ),
+        second_b.unwrap().handshake(
+            handshake_config(4, 3),
+            &sb,
+            |p| async move { p.decision(true) }
+        )
+    );
+    assert!(
+        second_a.is_err(),
+        "duplicate attempt must be rejected before handoff"
+    );
+    assert!(
+        second_b.is_err(),
+        "duplicate attempt must be rejected before handoff"
+    );
+    drop(retry_a);
+    drop(retry_b);
+
+    assert_eq!(
+        store.reconcile(receipt.attempt()).unwrap(),
+        crate::pairing_v2::admission_authority::ReconcileAdmission::Promoted,
+        "a duplicate live attempt must not revoke an already promoted peer"
+    );
+}
+
 #[tokio::test]
 async fn bilateral_rejects_substituted_tls_connection_before_candidate_io() {
     let (_ea, _eb, mut a, _b, _) = pair().await;

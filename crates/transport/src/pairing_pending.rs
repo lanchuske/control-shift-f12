@@ -1204,6 +1204,14 @@ mod unix {
             if ledger.consumed_attempts.contains(&attempt) {
                 return Err(StoreError::ConsumedAttempt);
             }
+            // A current StoreOwned pin represents the one admitted durable
+            // relationship for this peer.  Reject a retry before it can create
+            // pending metadata or a live revocation guard: later cancellation
+            // is peer-scoped and must never revoke that existing relationship.
+            #[cfg(feature = "pairing-v2-experimental")]
+            if ledger.active_pins.iter().any(|pin| pin.peer == peer) {
+                return Err(StoreError::Conflict);
+            }
             if ledger
                 .pending
                 .iter()

@@ -74,6 +74,12 @@ def validate(handshake: str, provisional: str, authority: str, pending: str) -> 
     # one guards its subsequent pin insertion, and one guards finalization.
     assert len(pin_for_peer.findall(pending)) >= 3
 
+    # Admission is one durable relationship per peer. Rejecting a retry in
+    # prepare is earlier than sidecar creation, so a later endpoint drop cannot
+    # run peer-scoped revocation against an existing StoreOwned record.
+    prepare = section(pending, "pub fn prepare", "pub fn pending")
+    assert "ledger.active_pins.iter().any(|pin| pin.peer == peer)" in prepare
+
     # Every post-store sidecar removal reads and compares both attempt and
     # token under the ledger lock. An attempt-only cleanup could erase a newer
     # guard created for the same attempt.
@@ -148,6 +154,11 @@ def main() -> None:
         "permit-pin-inheritance": (
             "pending",
             "ledger\n                .active_pins\n                .iter()\n                .any(|pin| pin.peer == receipt.peer)",
+            "false",
+        ),
+        "permit-duplicate-live-prepare": (
+            "pending",
+            "ledger.active_pins.iter().any(|pin| pin.peer == peer)",
             "false",
         ),
         "attempt-only-cleanup": (
