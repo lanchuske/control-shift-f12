@@ -9,8 +9,13 @@ use super::super::{
     operational_wire::{CandidateRequest, FrameKind, TransportFrame},
 };
 use super::*;
-use crate::pairing_pending::PendingStore;
+use crate::pairing_pending::{
+    BilateralTransactionFields, BilateralTransactionId, PendingStore,
+    derive_bilateral_transaction_id,
+};
+use hmac::{Hmac, Mac};
 use rand::RngCore;
+use sha2::{Digest, Sha256};
 use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
 use zeroize::Zeroizing;
@@ -55,6 +60,68 @@ impl VerificationPrompt {
 pub enum HandshakeError {
     Rejected,
     Cancelled,
+}
+
+const FINALIZATION_DOMAIN: &[u8] = b"control-shift-f12/finalization-v1";
+const FINALIZATION_EXPORTER_LABEL: &[u8] = b"EXPORTER-ControlShiftF12-Finalization-v1";
+
+/// Local-only data prepared for the bounded finalization exchange.  It is not
+/// a durable receipt and cannot activate any capability by itself.
+#[derive(Clone)]
+pub(crate) struct LocalFinalizationReceipt {
+    transaction_id: BilateralTransactionId,
+    receipt_hash: [u8; 32],
+    fields: BilateralTransactionFields,
+    identity_generation: u64,
+    revocation_generation: u64,
+    policy_revision: u64,
+    #[cfg(test)]
+    test_fault: Option<FinalizationTestFault>,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy)]
+pub(super) enum FinalizationTestFault {
+    ExtraBi,
+    ExtraUni,
+    UnknownFrame,
+}
+
+impl LocalFinalizationReceipt {
+    #[cfg(test)]
+    pub(super) fn test_transaction_id(&self) -> BilateralTransactionId {
+        self.transaction_id
+    }
+
+    #[cfg(test)]
+    pub(super) fn test_fault(&mut self, fault: FinalizationTestFault) {
+        self.test_fault = Some(fault);
+    }
+}
+
+/// Authenticated observation of the peer's finalization publication.  This is
+/// deliberately separated from store confirmation; Task 4 coordinates that
+/// separately and Task 3 never opens an operational snapshot.
+#[derive(Debug)]
+pub(crate) struct PeerFinalizationReceipt {
+    transaction_id: BilateralTransactionId,
+    peer_receipt_hash: [u8; 32],
+    transcript: [u8; 32],
+    identity_generation: u64,
+    revocation_generation: u64,
+    policy_revision: u64,
+}
+
+impl PeerFinalizationReceipt {
+    pub(crate) fn transaction_id(&self) -> BilateralTransactionId {
+        self.transaction_id
+    }
+    pub(crate) fn peer_receipt_hash(&self) -> [u8; 32] {
+        self.peer_receipt_hash
+    }
+    pub(crate) fn transcript(&self) -> [u8; 32] {
+        self.transcript
+    }
 }
 /// Move-only protocol evidence that remains quarantined from product runtime.
 ///
@@ -108,6 +175,7 @@ pub struct HandshakeCompletePendingAuthority {
     _request: Stream,
     failed: Arc<AtomicBool>,
     watcher: IngressWatcher,
+    finalization_complete: bool,
 }
 /// Move-only, non-serializable protocol evidence. It deliberately has no public
 /// binding getter and cannot be reconstructed after restart.
@@ -126,11 +194,116 @@ pub(crate) struct SealedPromotionEvidence {
 }
 struct IngressWatcher {
     freeze: Option<oneshot::Sender<crate::pairing_pending::AdmissionRevoker>>,
-    task: tokio::task::JoinHandle<IngressDisposition>,
+    finalization: Option<oneshot::Sender<oneshot::Sender<Result<FinalizationAccess, Invalid>>>>,
+    task: Option<tokio::task::JoinHandle<IngressDisposition>>,
 }
+
+enum FinalizationAccess {
+    Initiator,
+    Responder(Stream),
+}
+
 enum IngressDisposition {
     Frozen(super::FrozenAdmissionHandoff),
+    FinalizationReady(Stream),
     Invalid,
+}
+
+/// Owns every post-handshake ingress path. The only non-freeze transition is
+/// a one-shot finalization handoff: it preserves the already-open request
+/// stream and grants exactly one fresh bidi stream to the finalization grammar.
+fn spawn_ingress_watcher(
+    role: Role,
+    connection: quinn::Connection,
+    scope: Arc<super::ConsentScope>,
+    failed: Arc<AtomicBool>,
+    incoming: Stream,
+) -> IngressWatcher {
+    let (freeze, mut freeze_request) = oneshot::channel();
+    let (finalization, mut finalization_request) =
+        oneshot::channel::<oneshot::Sender<Result<FinalizationAccess, Invalid>>>();
+    let task = tokio::spawn(async move {
+        let mut incoming = Some(incoming);
+        let disposition = tokio::select! { biased;
+            _ = watch_request(&mut incoming.as_mut().expect("ingress present").recv) => IngressDisposition::Invalid,
+            extra = connection.accept_bi() => {
+                if let Ok(pair) = extra { drop(Stream::new(pair)); }
+                IngressDisposition::Invalid
+            },
+            extra = connection.accept_uni() => {
+                if let Ok(mut recv) = extra { let _ = recv.stop(APPLICATION_ERROR.into()); }
+                IngressDisposition::Invalid
+            },
+            request = &mut freeze_request => {
+                let Ok(revoker) = request else {
+                    failed.store(true, Ordering::Release);
+                    return IngressDisposition::Invalid;
+                };
+                let handoff = match scope.freeze(revoker) {
+                    Ok(handoff) => handoff,
+                    Err(_) => {
+                        failed.store(true, Ordering::Release);
+                        return IngressDisposition::Invalid;
+                    }
+                };
+                connection.close(APPLICATION_ERROR.into(), b"pairing ingress frozen");
+                IngressDisposition::Frozen(handoff)
+            },
+            request = &mut finalization_request => {
+                let Ok(reply) = request else {
+                    failed.store(true, Ordering::Release);
+                    return IngressDisposition::Invalid;
+                };
+                // This stream was cleanly finished by the handshake and must
+                // survive the watcher transition; dropping it as unclean would
+                // reset the peer before it can open/accept finalization.
+                incoming.as_mut().expect("ingress present").clean = true;
+                let access = if role == Role::A {
+                    Ok(FinalizationAccess::Initiator)
+                } else {
+                    tokio::select! { biased;
+                        pair = connection.accept_bi() => pair
+                            .map(Stream::new)
+                            .map(FinalizationAccess::Responder)
+                            .map_err(|_| Invalid),
+                        extra = connection.accept_uni() => {
+                            if let Ok(mut recv) = extra { let _ = recv.stop(APPLICATION_ERROR.into()); }
+                            Err(Invalid)
+                        },
+                        _ = connection.closed() => Err(Invalid),
+                    }
+                };
+                if reply.send(access).is_err() {
+                    failed.store(true, Ordering::Release);
+                    return IngressDisposition::Invalid;
+                }
+                IngressDisposition::FinalizationReady(incoming.take().expect("ingress present"))
+            },
+            _ = connection.closed() => IngressDisposition::Invalid,
+        };
+        match disposition {
+            IngressDisposition::Invalid => {
+                let mut incoming = incoming.expect("invalid retains ingress");
+                failed.store(true, Ordering::Release);
+                incoming.clean = false;
+                drop(incoming);
+                connection.close(
+                    APPLICATION_ERROR.into(),
+                    b"post-completion pairing violation",
+                );
+                IngressDisposition::Invalid
+            }
+            IngressDisposition::Frozen(handoff) => IngressDisposition::Frozen(handoff),
+            IngressDisposition::FinalizationReady(incoming) => {
+                IngressDisposition::FinalizationReady(incoming)
+            }
+        }
+    });
+    IngressWatcher {
+        freeze: Some(freeze),
+        finalization: Some(finalization),
+        task: Some(task),
+    }
 }
 #[allow(dead_code)]
 pub(in crate::pairing_v2) struct SealedPromotionFields {
@@ -195,6 +368,208 @@ impl HandshakeCompletePendingAuthority {
         self.pending.attempt_id
     }
 
+    pub(crate) fn local_finalization_receipt(
+        &self,
+        peer_attempt: [u8; 32],
+        receipt_hash: [u8; 32],
+    ) -> Result<LocalFinalizationReceipt, HandshakeError> {
+        if !self.is_protocol_valid() || peer_attempt == [0; 32] || receipt_hash == [0; 32] {
+            return Err(HandshakeError::Rejected);
+        }
+        let local_identity = self.certificate_fingerprints[self.role.index()];
+        let peer_identity = self.certificate_fingerprints[1 - self.role.index()];
+        let fields = BilateralTransactionFields {
+            local_identity,
+            peer_identity,
+            local_attempt: self.pending.attempt_id,
+            peer_attempt,
+            peer_pin: peer_identity,
+            transcript: self.transcript,
+            suite: SUITE.to_owned(),
+            policy_revision: 0,
+        };
+        Ok(LocalFinalizationReceipt {
+            transaction_id: derive_bilateral_transaction_id(&fields),
+            receipt_hash,
+            fields,
+            identity_generation: self.pending.version.identity_generation,
+            revocation_generation: self.pending.revocation_generation,
+            policy_revision: 0,
+            #[cfg(test)]
+            test_fault: None,
+        })
+    }
+
+    /// Runs a single fixed finalization exchange on a fresh stream, then
+    /// closes the provisional channel.  It returns only an authenticated peer
+    /// proof; it never calls the durable store and cannot activate a session.
+    pub(crate) async fn exchange_local_receipt(
+        &mut self,
+        receipt: LocalFinalizationReceipt,
+    ) -> Result<PeerFinalizationReceipt, HandshakeError> {
+        if !self.is_protocol_valid()
+            || self.finalization_complete
+            || receipt.transaction_id != derive_bilateral_transaction_id(&receipt.fields)
+            || receipt.fields.local_attempt != self.pending.attempt_id
+            || receipt.fields.local_identity != self.certificate_fingerprints[self.role.index()]
+            || receipt.fields.peer_identity != self.certificate_fingerprints[1 - self.role.index()]
+            || receipt.fields.peer_pin != self.certificate_fingerprints[1 - self.role.index()]
+            || receipt.fields.transcript != self.transcript
+            || receipt.identity_generation != self.pending.version.identity_generation
+            || receipt.revocation_generation != self.pending.revocation_generation
+            || receipt.policy_revision != 0
+        {
+            // A local receipt mismatch is terminal for this one-shot channel.
+            // Leaving the peer's watcher waiting would turn a rejected
+            // transaction into an unbounded remote wait.
+            self.failed.store(true, Ordering::Release);
+            self._channel
+                .connection
+                .close(APPLICATION_ERROR.into(), b"invalid finalization receipt");
+            return Err(HandshakeError::Rejected);
+        }
+        // Transition the owner of the post-handshake ingress stream instead
+        // of aborting it. Aborting its task drops the stream and resets the
+        // peer's QUIC stream, which is indistinguishable from a violation.
+        let (reply, access) = oneshot::channel();
+        let finalization = self
+            .watcher
+            .finalization
+            .take()
+            .ok_or(HandshakeError::Rejected)?;
+        finalization
+            .send(reply)
+            .map_err(|_| HandshakeError::Rejected)?;
+        let access = access
+            .await
+            .map_err(|_| HandshakeError::Rejected)?
+            .map_err(|_| HandshakeError::Rejected)?;
+        let task = self.watcher.task.take().ok_or(HandshakeError::Rejected)?;
+        let incoming = match task.await.map_err(|_| HandshakeError::Rejected)? {
+            IngressDisposition::FinalizationReady(incoming) => incoming,
+            _ => return Err(HandshakeError::Rejected),
+        };
+        let mut stream = match access {
+            FinalizationAccess::Initiator => Stream::new(
+                self._channel
+                    .connection
+                    .open_bi()
+                    .await
+                    .map_err(|_| HandshakeError::Rejected)?,
+            ),
+            FinalizationAccess::Responder(stream) => stream,
+        };
+        let key = finalization_key(
+            &self._channel.connection,
+            receipt.transaction_id,
+            receipt.fields.transcript,
+        )
+        .map_err(|_| HandshakeError::Rejected)?;
+        let protocol = async {
+            #[cfg(test)]
+            let local_kind = if matches!(
+                receipt.test_fault,
+                Some(FinalizationTestFault::UnknownFrame)
+            ) {
+                "finalization-unknown"
+            } else {
+                "finalization-local-published"
+            };
+            #[cfg(not(test))]
+            let local_kind = "finalization-local-published";
+            let local = finalization_record(local_kind, &local_values(&receipt), &key)
+                .map_err(|_| HandshakeError::Rejected)?;
+            let peer_hash = if self.role == Role::A {
+                finalization_send(&mut stream, &local).await?;
+                let remote = finalization_read(&mut stream.recv)
+                    .await
+                    .map_err(|_| HandshakeError::Rejected)?;
+                let hash = decode_local_receipt(&remote, &key, &receipt)
+                    .map_err(|_| HandshakeError::Rejected)?;
+                let ack =
+                    finalization_record("finalization-peer-ack", &ack_values(&receipt, hash), &key)
+                        .map_err(|_| HandshakeError::Rejected)?;
+                finalization_send(&mut stream, &ack).await?;
+                let remote_ack = finalization_read(&mut stream.recv)
+                    .await
+                    .map_err(|_| HandshakeError::Rejected)?;
+                decode_ack(&remote_ack, &key, &receipt, hash)
+                    .map_err(|_| HandshakeError::Rejected)?;
+                hash
+            } else {
+                let remote = finalization_read(&mut stream.recv)
+                    .await
+                    .map_err(|_| HandshakeError::Rejected)?;
+                let hash = decode_local_receipt(&remote, &key, &receipt)
+                    .map_err(|_| HandshakeError::Rejected)?;
+                finalization_send(&mut stream, &local).await?;
+                let remote_ack = finalization_read(&mut stream.recv)
+                    .await
+                    .map_err(|_| HandshakeError::Rejected)?;
+                decode_ack(&remote_ack, &key, &receipt, hash)
+                    .map_err(|_| HandshakeError::Rejected)?;
+                #[cfg(test)]
+                inject_finalization_extra(&self._channel.connection, receipt.test_fault).await?;
+                let ack =
+                    finalization_record("finalization-peer-ack", &ack_values(&receipt, hash), &key)
+                        .map_err(|_| HandshakeError::Rejected)?;
+                finalization_send(&mut stream, &ack).await?;
+                hash
+            };
+            stream.send.finish().map_err(|_| HandshakeError::Rejected)?;
+            stream.clean = true;
+            Ok::<_, HandshakeError>(peer_hash)
+        };
+        let result = tokio::select! { biased;
+            extra = self._channel.connection.accept_bi() => {
+                if let Ok(pair) = extra { drop(Stream::new(pair)); }
+                Err(HandshakeError::Rejected)
+            },
+            extra = self._channel.connection.accept_uni() => {
+                if let Ok(mut recv) = extra { let _ = recv.stop(APPLICATION_ERROR.into()); }
+                Err(HandshakeError::Rejected)
+            },
+            _ = self._channel.connection.closed() => Err(HandshakeError::Rejected),
+            result = protocol => result,
+        };
+        let peer_receipt_hash = match result {
+            Ok(hash) => hash,
+            Err(error) => {
+                self.failed.store(true, Ordering::Release);
+                self._channel
+                    .connection
+                    .close(APPLICATION_ERROR.into(), b"finalization rejected");
+                return Err(error);
+            }
+        };
+        // A successful grammar exchange is not enough if a second stream was
+        // already queued behind it. Drain that race window before returning a
+        // normal proof; later streams remain owned by the re-armed watcher.
+        if finalization_quiet(&self._channel.connection).await.is_err() {
+            self.failed.store(true, Ordering::Release);
+            self._channel
+                .connection
+                .close(APPLICATION_ERROR.into(), b"finalization ingress violation");
+            return Err(HandshakeError::Rejected);
+        }
+        self.watcher = spawn_ingress_watcher(
+            self.role,
+            self._channel.connection.clone(),
+            self._channel.scope.clone(),
+            self.failed.clone(),
+            incoming,
+        );
+        self.finalization_complete = true;
+        Ok(PeerFinalizationReceipt {
+            transaction_id: receipt.transaction_id,
+            peer_receipt_hash,
+            transcript: receipt.fields.transcript,
+            identity_generation: receipt.identity_generation,
+            revocation_generation: receipt.revocation_generation,
+            policy_revision: receipt.policy_revision,
+        })
+    }
+
     #[allow(dead_code)] // Foundation-only boundary; product wiring remains disabled.
     pub(crate) async fn seal_for_promotion(
         self,
@@ -223,6 +598,13 @@ impl HandshakeCompletePendingAuthority {
     }
 }
 
+#[cfg(test)]
+impl LocalFinalizationReceipt {
+    pub(super) fn test_replace_transaction_id(&mut self, transaction_id: [u8; 32]) {
+        self.transaction_id = BilateralTransactionId::from_bytes(transaction_id).unwrap();
+    }
+}
+
 impl SealedPromotionEvidence {
     /// Atomically closes pairing ingress at the watcher that owns all possible
     /// post-handshake inputs. The biased state transition is the protocol
@@ -238,10 +620,12 @@ impl SealedPromotionEvidence {
             .map_err(|_| HandshakeError::Rejected)?;
         signal.send(revoker).map_err(|_| HandshakeError::Rejected)?;
         let static_result = self.revalidate_static();
-        let task = self.watcher.task;
+        let task = self.watcher.task.take().ok_or(HandshakeError::Rejected)?;
         let handoff = match task.await.map_err(|_| HandshakeError::Rejected)? {
             IngressDisposition::Frozen(handoff) => handoff,
-            IngressDisposition::Invalid => return Err(HandshakeError::Rejected),
+            IngressDisposition::FinalizationReady(_) | IngressDisposition::Invalid => {
+                return Err(HandshakeError::Rejected);
+            }
         };
         static_result?;
         Ok(FrozenPromotionEvidence {
@@ -448,6 +832,226 @@ async fn eof(recv: &mut quinn::RecvStream) -> Result<(), Invalid> {
     }
     Ok(())
 }
+
+fn finalization_key(
+    connection: &quinn::Connection,
+    transaction_id: BilateralTransactionId,
+    transcript: [u8; 32],
+) -> Result<[u8; 32], Invalid> {
+    let mut context = Sha256::new();
+    context.update(FINALIZATION_DOMAIN);
+    context.update(transaction_id.as_bytes());
+    context.update(transcript);
+    let mut key = [0; 32];
+    connection
+        .export_keying_material(&mut key, FINALIZATION_EXPORTER_LABEL, &context.finalize())
+        .map_err(|_| Invalid)?;
+    Ok(key)
+}
+
+fn finalization_mac(key: &[u8; 32], label: &[u8], body: &[u8]) -> Result<[u8; 32], Invalid> {
+    let mut mac = Hmac::<Sha256>::new_from_slice(key).map_err(|_| Invalid)?;
+    mac.update(FINALIZATION_DOMAIN);
+    mac.update(label);
+    mac.update(body);
+    Ok(mac.finalize().into_bytes().into())
+}
+
+fn finalization_record(kind: &str, body: &[Value], key: &[u8; 32]) -> Result<Vec<u8>, Invalid> {
+    let unsigned = encode(kind, body)?;
+    let mut values = body.to_vec();
+    values.push(Value::Bytes(
+        finalization_mac(key, kind.as_bytes(), &unsigned)?.to_vec(),
+    ));
+    let payload = encode(kind, &values)?;
+    if payload.is_empty() || payload.len() > 16_384 {
+        return Err(Invalid);
+    }
+    let mut record = (payload.len() as u32).to_be_bytes().to_vec();
+    record.extend(payload);
+    Ok(record)
+}
+
+async fn finalization_read(recv: &mut quinn::RecvStream) -> Result<Vec<u8>, Invalid> {
+    let length =
+        u32::from_be_bytes(read_exact(recv, 4).await?.try_into().map_err(|_| Invalid)?) as usize;
+    if length == 0 || length > 16_384 {
+        return Err(Invalid);
+    }
+    read_exact(recv, length).await
+}
+
+async fn finalization_send(stream: &mut Stream, record: &[u8]) -> Result<(), HandshakeError> {
+    stream
+        .send
+        .write_all(record)
+        .await
+        .map_err(|_| HandshakeError::Rejected)
+}
+
+#[cfg(test)]
+async fn inject_finalization_extra(
+    connection: &quinn::Connection,
+    fault: Option<FinalizationTestFault>,
+) -> Result<(), HandshakeError> {
+    match fault {
+        Some(FinalizationTestFault::ExtraBi) => {
+            let (mut send, _recv) = connection
+                .open_bi()
+                .await
+                .map_err(|_| HandshakeError::Rejected)?;
+            send.write_all(&[1])
+                .await
+                .map_err(|_| HandshakeError::Rejected)?;
+            // The test fault may not publish PeerAck until the opposite
+            // watcher has rejected this second stream. `stopped` gives a
+            // deterministic cross-endpoint barrier instead of a sleep.
+            let _ = tokio::time::timeout(Duration::from_secs(2), send.stopped())
+                .await
+                .map_err(|_| HandshakeError::Rejected)?;
+            return Err(HandshakeError::Rejected);
+        }
+        Some(FinalizationTestFault::ExtraUni) => {
+            let mut send = connection
+                .open_uni()
+                .await
+                .map_err(|_| HandshakeError::Rejected)?;
+            send.write_all(&[1])
+                .await
+                .map_err(|_| HandshakeError::Rejected)?;
+            let _ = tokio::time::timeout(Duration::from_secs(2), send.stopped())
+                .await
+                .map_err(|_| HandshakeError::Rejected)?;
+            return Err(HandshakeError::Rejected);
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+async fn finalization_quiet(connection: &quinn::Connection) -> Result<(), Invalid> {
+    let observed = tokio::time::timeout(Duration::from_millis(25), async {
+        tokio::select! { biased;
+            extra = connection.accept_bi() => {
+                if let Ok(pair) = extra { drop(Stream::new(pair)); }
+                Err(Invalid)
+            },
+            extra = connection.accept_uni() => {
+                if let Ok(mut recv) = extra { let _ = recv.stop(APPLICATION_ERROR.into()); }
+                Err(Invalid)
+            },
+            _ = connection.closed() => Err(Invalid),
+        }
+    })
+    .await;
+    match observed {
+        Err(_) => Ok(()),
+        Ok(result) => result,
+    }
+}
+
+fn bytes32(value: &Value) -> Result<[u8; 32], Invalid> {
+    match value {
+        Value::Bytes(bytes) => bytes.as_slice().try_into().map_err(|_| Invalid),
+        _ => Err(Invalid),
+    }
+}
+
+fn number(value: &Value) -> Result<u64, Invalid> {
+    match value {
+        Value::Number(value) => Ok(*value),
+        _ => Err(Invalid),
+    }
+}
+
+fn local_values(receipt: &LocalFinalizationReceipt) -> Vec<Value> {
+    vec![
+        Value::Bytes(receipt.transaction_id.as_bytes().to_vec()),
+        Value::Bytes(receipt.receipt_hash.to_vec()),
+        Value::Bytes(receipt.fields.local_identity.to_vec()),
+        Value::Bytes(receipt.fields.peer_identity.to_vec()),
+        Value::Bytes(receipt.fields.local_attempt.to_vec()),
+        Value::Bytes(receipt.fields.peer_attempt.to_vec()),
+        Value::Bytes(receipt.fields.peer_pin.to_vec()),
+        Value::Bytes(receipt.fields.transcript.to_vec()),
+        Value::Number(receipt.identity_generation),
+        Value::Number(receipt.revocation_generation),
+        Value::Number(receipt.policy_revision),
+    ]
+}
+
+fn decode_local_receipt(
+    raw: &[u8],
+    key: &[u8; 32],
+    expected: &LocalFinalizationReceipt,
+) -> Result<[u8; 32], Invalid> {
+    let values = decode(
+        "finalization-local-published",
+        raw,
+        &[2, 2, 2, 2, 2, 2, 2, 2, 1, 1, 1, 2],
+    )?;
+    let mut unsigned = values.clone();
+    let mac = bytes32(&unsigned.pop().ok_or(Invalid)?)?;
+    let body = encode("finalization-local-published", &unsigned)?;
+    if finalization_mac(key, b"finalization-local-published", &body)? != mac {
+        return Err(Invalid);
+    }
+    let remote_transaction =
+        BilateralTransactionId::from_bytes(bytes32(&unsigned[0])?).map_err(|_| Invalid)?;
+    let remote_hash = bytes32(&unsigned[1])?;
+    if remote_transaction != expected.transaction_id
+        || remote_hash == [0; 32]
+        || bytes32(&unsigned[2])? != expected.fields.peer_identity
+        || bytes32(&unsigned[3])? != expected.fields.local_identity
+        || bytes32(&unsigned[4])? != expected.fields.peer_attempt
+        || bytes32(&unsigned[5])? != expected.fields.local_attempt
+        || bytes32(&unsigned[6])? != expected.fields.local_identity
+        || bytes32(&unsigned[7])? != expected.fields.transcript
+        || number(&unsigned[8])? != expected.identity_generation
+        || number(&unsigned[9])? != expected.revocation_generation
+        || number(&unsigned[10])? != expected.policy_revision
+    {
+        return Err(Invalid);
+    }
+    Ok(remote_hash)
+}
+
+fn ack_values(receipt: &LocalFinalizationReceipt, peer_receipt_hash: [u8; 32]) -> Vec<Value> {
+    vec![
+        Value::Bytes(receipt.transaction_id.as_bytes().to_vec()),
+        Value::Bytes(receipt.receipt_hash.to_vec()),
+        Value::Bytes(peer_receipt_hash.to_vec()),
+        Value::Bytes(receipt.fields.transcript.to_vec()),
+        Value::Number(receipt.identity_generation),
+        Value::Number(receipt.revocation_generation),
+        Value::Number(receipt.policy_revision),
+    ]
+}
+
+fn decode_ack(
+    raw: &[u8],
+    key: &[u8; 32],
+    expected: &LocalFinalizationReceipt,
+    peer_hash: [u8; 32],
+) -> Result<(), Invalid> {
+    let values = decode("finalization-peer-ack", raw, &[2, 2, 2, 2, 1, 1, 1, 2])?;
+    let mut unsigned = values.clone();
+    let mac = bytes32(&unsigned.pop().ok_or(Invalid)?)?;
+    let body = encode("finalization-peer-ack", &unsigned)?;
+    if finalization_mac(key, b"finalization-peer-ack", &body)? != mac
+        || BilateralTransactionId::from_bytes(bytes32(&unsigned[0])?).map_err(|_| Invalid)?
+            != expected.transaction_id
+        || bytes32(&unsigned[1])? != peer_hash
+        || bytes32(&unsigned[2])? != expected.receipt_hash
+        || bytes32(&unsigned[3])? != expected.fields.transcript
+        || number(&unsigned[4])? != expected.identity_generation
+        || number(&unsigned[5])? != expected.revocation_generation
+        || number(&unsigned[6])? != expected.policy_revision
+    {
+        return Err(Invalid);
+    }
+    Ok(())
+}
 // A requester's FIN is neither required nor a response-FIN event. Any DATA is
 // forbidden, even if it arrives while the other candidate stream is active.
 async fn watch_request(recv: &mut quinn::RecvStream) -> Invalid {
@@ -646,6 +1250,7 @@ impl ProvisionalChannel {
                 _request: done.request,
                 failed: done.failed,
                 watcher: done.watcher,
+                finalization_complete: false,
             }),
             Ok(Err(HandshakeError::Cancelled)) => Err(HandshakeError::Cancelled),
             _ => {
@@ -921,54 +1526,12 @@ impl ProvisionalChannel {
         let (pending, transcript, certificate_fingerprints) = machine
             .promotion_context()
             .ok_or(HandshakeError::Rejected)?;
-        let (request, mut incoming) = if role == Role::A {
+        let (request, incoming) = if role == Role::A {
             (first, second)
         } else {
             (second, first)
         };
         let failed = Arc::new(AtomicBool::new(false));
-        let signal = failed.clone();
-        let connection = self.connection.clone();
-        let scope = self.scope.clone();
-        let (freeze, mut freeze_request) = oneshot::channel();
-        // Successful control FIN does not forgive DATA on the request half,
-        // extra streams or a later protocol error. Keep this monitor sealed.
-        let task = tokio::spawn(async move {
-            let disposition = tokio::select! {biased;
-                _=watch_request(&mut incoming.recv)=>IngressDisposition::Invalid,
-                extra=connection.accept_bi()=>{if let Ok(pair)=extra{drop(Stream::new(pair));}IngressDisposition::Invalid},
-                extra=connection.accept_uni()=>{if let Ok(mut recv)=extra{let _=recv.stop(APPLICATION_ERROR.into());}IngressDisposition::Invalid},
-                request=&mut freeze_request=>{
-                    let Ok(revoker) = request else {
-                        signal.store(true, Ordering::Release);
-                        return IngressDisposition::Invalid;
-                    };
-                    let handoff = match scope.freeze(revoker) {
-                        Ok(handoff) => handoff,
-                        Err(_) => {
-                            signal.store(true, Ordering::Release);
-                            return IngressDisposition::Invalid;
-                        }
-                    };
-                    connection.close(APPLICATION_ERROR.into(), b"pairing ingress frozen");
-                    IngressDisposition::Frozen(handoff)
-                },
-                _=connection.closed()=>IngressDisposition::Invalid,
-            };
-            match disposition {
-                IngressDisposition::Invalid => {
-                    signal.store(true, Ordering::Release);
-                    incoming.clean = false;
-                    drop(incoming);
-                    connection.close(
-                        APPLICATION_ERROR.into(),
-                        b"post-completion pairing violation",
-                    );
-                    IngressDisposition::Invalid
-                }
-                frozen @ IngressDisposition::Frozen(_) => frozen,
-            }
-        });
         Ok(Completed {
             role,
             durable_fc_hash: fc,
@@ -977,11 +1540,14 @@ impl ProvisionalChannel {
             transcript,
             certificate_fingerprints,
             request,
-            failed,
-            watcher: IngressWatcher {
-                freeze: Some(freeze),
-                task,
-            },
+            failed: failed.clone(),
+            watcher: spawn_ingress_watcher(
+                role,
+                self.connection.clone(),
+                self.scope.clone(),
+                failed.clone(),
+                incoming,
+            ),
         })
     }
 }

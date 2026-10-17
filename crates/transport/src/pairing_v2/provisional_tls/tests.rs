@@ -1,6 +1,7 @@
+use super::handshake_io::FinalizationTestFault;
 use crate::pairing_pending::{BilateralTransactionFields, derive_bilateral_transaction_id};
 use crate::pairing_v2::{
-    SUITE,
+    Role, SUITE,
     codec::{Value, encode},
     operational_binding::BindingInput,
     operational_wire::{ALPN, CandidateRequest, FrameKind, TransportFrame, read_record},
@@ -192,6 +193,182 @@ async fn real_handshake_inverted_perspectives_derive_one_bilateral_transaction_i
         derive_bilateral_transaction_id(&descriptor_a),
         derive_bilateral_transaction_id(&descriptor_b)
     );
+}
+
+#[tokio::test]
+async fn finalization_exchanges_authenticated_peer_proofs_on_real_endpoints() {
+    let (_ea, _eb, a, b, _) = pair().await;
+    let ta = tempfile::tempdir().unwrap();
+    let tb = tempfile::tempdir().unwrap();
+    let sa = crate::pairing_pending::PendingStore::open(ta.path()).unwrap();
+    let sb = crate::pairing_pending::PendingStore::open(tb.path()).unwrap();
+    let (a, b) = tokio::join!(
+        a.handshake(handshake_config(1, 2), &sa, |prompt| async move {
+            prompt.decision(true)
+        }),
+        b.handshake(handshake_config(2, 1), &sb, |prompt| async move {
+            prompt.decision(true)
+        })
+    );
+    let mut a = a.unwrap();
+    let mut b = b.unwrap();
+    let a_receipt = a
+        .local_finalization_receipt(b.test_attempt(), [71; 32])
+        .unwrap();
+    let b_receipt = b
+        .local_finalization_receipt(a.test_attempt(), [72; 32])
+        .unwrap();
+    assert_eq!(
+        a_receipt.test_transaction_id(),
+        b_receipt.test_transaction_id()
+    );
+    let (a_proof, b_proof) = tokio::join!(
+        a.exchange_local_receipt(a_receipt),
+        b.exchange_local_receipt(b_receipt)
+    );
+    assert!(a_proof.is_ok(), "A finalization result: {a_proof:?}");
+    assert!(b_proof.is_ok(), "B finalization result: {b_proof:?}");
+    let a_proof = a_proof.unwrap();
+    let b_proof = b_proof.unwrap();
+    assert_eq!(a_proof.transaction_id(), b_proof.transaction_id());
+    assert_eq!(a_proof.peer_receipt_hash(), [72; 32]);
+    assert_eq!(b_proof.peer_receipt_hash(), [71; 32]);
+    assert_eq!(
+        a_proof.transcript(),
+        b_proof.transcript(),
+        "the proof must remain bound to the frozen bilateral transcript"
+    );
+}
+
+#[tokio::test]
+async fn finalization_rejects_cross_transaction_receipt_on_real_endpoints() {
+    let (_ea, _eb, a, b, _) = pair().await;
+    let ta = tempfile::tempdir().unwrap();
+    let tb = tempfile::tempdir().unwrap();
+    let sa = crate::pairing_pending::PendingStore::open(ta.path()).unwrap();
+    let sb = crate::pairing_pending::PendingStore::open(tb.path()).unwrap();
+    let (a, b) = tokio::join!(
+        a.handshake(handshake_config(3, 4), &sa, |prompt| async move {
+            prompt.decision(true)
+        }),
+        b.handshake(handshake_config(4, 3), &sb, |prompt| async move {
+            prompt.decision(true)
+        })
+    );
+    let mut a = a.unwrap();
+    let mut b = b.unwrap();
+    let mut a_receipt = a
+        .local_finalization_receipt(b.test_attempt(), [73; 32])
+        .unwrap();
+    a_receipt.test_replace_transaction_id([74; 32]);
+    let b_receipt = b
+        .local_finalization_receipt(a.test_attempt(), [75; 32])
+        .unwrap();
+    let (a_result, b_result) = tokio::time::timeout(Duration::from_secs(2), async {
+        tokio::join!(
+            a.exchange_local_receipt(a_receipt),
+            b.exchange_local_receipt(b_receipt)
+        )
+    })
+    .await
+    .expect("cross-transaction rejection must close the peer finalization watcher");
+    assert!(a_result.is_err());
+    assert!(b_result.is_err());
+}
+
+async fn finalization_with_a_fault_is_rejected(fault: FinalizationTestFault) {
+    let (_ea, _eb, a, b, _) = pair().await;
+    let ta = tempfile::tempdir().unwrap();
+    let tb = tempfile::tempdir().unwrap();
+    let sa = crate::pairing_pending::PendingStore::open(ta.path()).unwrap();
+    let sb = crate::pairing_pending::PendingStore::open(tb.path()).unwrap();
+    let (a, b) = tokio::join!(
+        a.handshake(handshake_config(5, 6), &sa, |prompt| async move {
+            prompt.decision(true)
+        }),
+        b.handshake(handshake_config(6, 5), &sb, |prompt| async move {
+            prompt.decision(true)
+        })
+    );
+    let mut a = a.unwrap();
+    let mut b = b.unwrap();
+    let mut a_receipt = a
+        .local_finalization_receipt(b.test_attempt(), [76; 32])
+        .unwrap();
+    let mut b_receipt = b
+        .local_finalization_receipt(a.test_attempt(), [77; 32])
+        .unwrap();
+    match fault {
+        FinalizationTestFault::UnknownFrame => a_receipt.test_fault(fault),
+        FinalizationTestFault::ExtraBi | FinalizationTestFault::ExtraUni => {
+            if a.role() == Role::B {
+                a_receipt.test_fault(fault);
+            } else {
+                b_receipt.test_fault(fault);
+            }
+        }
+    }
+    let (a_result, b_result) = tokio::join!(
+        a.exchange_local_receipt(a_receipt),
+        b.exchange_local_receipt(b_receipt)
+    );
+    assert!(
+        a_result.is_err(),
+        "faulting side accepted a second grammar path: a={a_result:?}, b={b_result:?}"
+    );
+    assert!(
+        b_result.is_err(),
+        "peer accepted a forbidden finalization path: a={a_result:?}, b={b_result:?}"
+    );
+}
+
+#[tokio::test]
+async fn finalization_rejects_unknown_frame_after_transition() {
+    finalization_with_a_fault_is_rejected(FinalizationTestFault::UnknownFrame).await;
+}
+
+#[tokio::test]
+async fn finalization_rejects_extra_bidi_stream_after_transition() {
+    finalization_with_a_fault_is_rejected(FinalizationTestFault::ExtraBi).await;
+}
+
+#[tokio::test]
+async fn finalization_rejects_extra_unidirectional_stream_after_transition() {
+    finalization_with_a_fault_is_rejected(FinalizationTestFault::ExtraUni).await;
+}
+
+#[tokio::test]
+async fn finalization_rejects_duplicate_exchange_after_success() {
+    let (_ea, _eb, a, b, _) = pair().await;
+    let ta = tempfile::tempdir().unwrap();
+    let tb = tempfile::tempdir().unwrap();
+    let sa = crate::pairing_pending::PendingStore::open(ta.path()).unwrap();
+    let sb = crate::pairing_pending::PendingStore::open(tb.path()).unwrap();
+    let (a, b) = tokio::join!(
+        a.handshake(handshake_config(7, 8), &sa, |prompt| async move {
+            prompt.decision(true)
+        }),
+        b.handshake(handshake_config(8, 7), &sb, |prompt| async move {
+            prompt.decision(true)
+        })
+    );
+    let mut a = a.unwrap();
+    let mut b = b.unwrap();
+    let a_receipt = a
+        .local_finalization_receipt(b.test_attempt(), [78; 32])
+        .unwrap();
+    let b_receipt = b
+        .local_finalization_receipt(a.test_attempt(), [79; 32])
+        .unwrap();
+    let (a_result, b_result) = tokio::join!(
+        a.exchange_local_receipt(a_receipt),
+        b.exchange_local_receipt(b_receipt)
+    );
+    assert!(a_result.is_ok() && b_result.is_ok());
+    let replay = a
+        .local_finalization_receipt(b.test_attempt(), [80; 32])
+        .unwrap();
+    assert!(a.exchange_local_receipt(replay).await.is_err());
 }
 
 #[tokio::test]

@@ -454,6 +454,15 @@ impl BilateralTransactionId {
     fn is_valid(self) -> bool {
         self.0 != [0; 32]
     }
+
+    pub(crate) fn as_bytes(self) -> [u8; 32] {
+        self.0
+    }
+
+    pub(crate) fn from_bytes(bytes: [u8; 32]) -> Result<Self, StoreError> {
+        let id = Self(bytes);
+        id.is_valid().then_some(id).ok_or(StoreError::Invalid)
+    }
 }
 
 /// Inputs that determine a bilateral transaction identity and bind the local
