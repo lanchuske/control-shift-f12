@@ -295,9 +295,73 @@ fn advertisement_info(rendezvous: &str, port: u16) -> Result<mdns_sd::ServiceInf
     .map(|info| info.enable_addr_auto())
     .map_err(|_| SetupError::Unavailable)
 }
-struct EngineAdvertisement {
+type DaemonAcknowledgement = Box<dyn FnOnce(Duration) -> Result<(), SetupError> + Send>;
+
+// Keep enqueueing a command distinct from waiting for its completion: mdns-sd
+// can return an API error after a command has already entered its queue.
+trait AdvertisementDriver: Send {
+    fn prepare(&mut self) -> Result<(), SetupError>;
+    fn register(&mut self, info: mdns_sd::ServiceInfo) -> Result<(), SetupError>;
+    fn healthy(&mut self) -> bool;
+    fn unregister(&mut self, name: &str) -> Result<DaemonAcknowledgement, SetupError>;
+    fn shutdown(&mut self) -> Result<DaemonAcknowledgement, SetupError>;
+}
+struct MdnsAdvertisementDriver {
     daemon: mdns_sd::ServiceDaemon,
-    monitor: mdns_sd::Receiver<mdns_sd::DaemonEvent>,
+    monitor: Option<mdns_sd::Receiver<mdns_sd::DaemonEvent>>,
+}
+impl AdvertisementDriver for MdnsAdvertisementDriver {
+    fn prepare(&mut self) -> Result<(), SetupError> {
+        // The listener is IPv4-only; never advertise unusable IPv6 locators.
+        self.daemon
+            .disable_interface(mdns_sd::IfKind::IPv6)
+            .map_err(|_| SetupError::Unavailable)?;
+        self.monitor = Some(self.daemon.monitor().map_err(|_| SetupError::Unavailable)?);
+        Ok(())
+    }
+    fn register(&mut self, info: mdns_sd::ServiceInfo) -> Result<(), SetupError> {
+        self.daemon
+            .register(info)
+            .map_err(|_| SetupError::Unavailable)
+    }
+    fn healthy(&mut self) -> bool {
+        let Some(monitor) = &self.monitor else {
+            return false;
+        };
+        for _ in 0..16 {
+            match monitor.recv_timeout(Duration::ZERO) {
+                Ok(mdns_sd::DaemonEvent::Error(_)) => return false,
+                Ok(_) => {}
+                Err(mdns_sd::RecvTimeoutError::Timeout) => return true,
+                Err(_) => return false,
+            }
+        }
+        true
+    }
+    fn unregister(&mut self, name: &str) -> Result<DaemonAcknowledgement, SetupError> {
+        let ack = self
+            .daemon
+            .unregister(name)
+            .map_err(|_| SetupError::Unavailable)?;
+        Ok(Box::new(move |timeout| {
+            ack.recv_timeout(timeout)
+                .map(|_| ())
+                .map_err(|_| SetupError::Unavailable)
+        }))
+    }
+    fn shutdown(&mut self) -> Result<DaemonAcknowledgement, SetupError> {
+        let ack = self
+            .daemon
+            .shutdown()
+            .map_err(|_| SetupError::Unavailable)?;
+        Ok(Box::new(move |timeout| match ack.recv_timeout(timeout) {
+            Ok(mdns_sd::DaemonStatus::Shutdown) => Ok(()),
+            _ => Err(SetupError::Unavailable),
+        }))
+    }
+}
+struct EngineAdvertisement {
+    driver: Box<dyn AdvertisementDriver>,
     name: String,
     withdrawn: bool,
 }
@@ -309,42 +373,41 @@ impl EngineAdvertisement {
         let rendezvous: String = token.iter().map(|b| format!("{b:02x}")).collect();
         let info = advertisement_info(&rendezvous, port)?;
         let daemon = mdns_sd::ServiceDaemon::new().map_err(|_| SetupError::Unavailable)?;
-        let result = (|| {
-            // The listener is IPv4-only; never advertise unusable IPv6 locators.
-            daemon
-                .disable_interface(mdns_sd::IfKind::IPv6)
-                .map_err(|_| SetupError::Unavailable)?;
-            let monitor = daemon.monitor().map_err(|_| SetupError::Unavailable)?;
-            daemon
-                .register(info.clone())
-                .map_err(|_| SetupError::Unavailable)?;
-            Ok(monitor)
-        })();
-        match result {
-            Ok(monitor) => Ok(Self {
+        Self::start_with_driver(
+            info,
+            Box::new(MdnsAdvertisementDriver {
                 daemon,
-                monitor,
-                name: info.get_fullname().into(),
-                withdrawn: false,
+                monitor: None,
             }),
-            Err(error) => {
-                let _ = daemon.shutdown();
-                Err(error)
-            }
+        )
+    }
+    fn start_with_driver(
+        info: mdns_sd::ServiceInfo,
+        driver: Box<dyn AdvertisementDriver>,
+    ) -> Result<Self, SetupError> {
+        // Acquire cleanup ownership before any command can be enqueued. A
+        // register error can mean only its wakeup failed, not that it was absent.
+        let mut publication = Self {
+            driver,
+            name: info.get_fullname().into(),
+            withdrawn: false,
+        };
+        let result = publication
+            .driver
+            .prepare()
+            .and_then(|_| publication.driver.register(info));
+        if let Err(error) = result {
+            // The endpoint caller cannot resume (and drop its endpoint) until
+            // both bounded acknowledgement waits have completed or failed.
+            publication.withdraw()?;
+            return Err(error);
         }
+        Ok(publication)
     }
 }
 impl Advertisement for EngineAdvertisement {
     fn healthy(&mut self) -> bool {
-        for _ in 0..16 {
-            match self.monitor.recv_timeout(Duration::ZERO) {
-                Ok(mdns_sd::DaemonEvent::Error(_)) => return false,
-                Ok(_) => {}
-                Err(mdns_sd::RecvTimeoutError::Timeout) => return true,
-                Err(_) => return false,
-            }
-        }
-        true
+        self.driver.healthy()
     }
     fn withdraw(&mut self) -> Result<(), SetupError> {
         if self.withdrawn {
@@ -354,17 +417,15 @@ impl Advertisement for EngineAdvertisement {
         // Await command processing before releasing the endpoint. This proves
         // local daemon withdrawal, not remote DNS cache eviction or packet loss.
         let unregistered = self
-            .daemon
+            .driver
             .unregister(&self.name)
-            .ok()
-            .and_then(|ack| ack.recv_timeout(Duration::from_secs(1)).ok())
-            .is_some();
+            .and_then(|ack| ack(Duration::from_secs(1)))
+            .is_ok();
         let stopped = self
-            .daemon
+            .driver
             .shutdown()
-            .ok()
-            .and_then(|ack| ack.recv_timeout(Duration::from_secs(1)).ok())
-            == Some(mdns_sd::DaemonStatus::Shutdown);
+            .and_then(|ack| ack(Duration::from_secs(1)))
+            .is_ok();
         if unregistered && stopped {
             Ok(())
         } else {
@@ -719,5 +780,105 @@ mod tests {
         );
         assert!(advertisement_info("private device name", 57899).is_err());
         assert!(advertisement_info("11111111111111111111111111111111", 0).is_err());
+    }
+
+    #[test]
+    fn register_enqueued_then_error_awaits_withdrawal_before_endpoint_drop() {
+        struct QueuedRegistrationError(Arc<Mutex<Probe>>);
+        impl AdvertisementDriver for QueuedRegistrationError {
+            fn prepare(&mut self) -> Result<(), SetupError> {
+                Ok(())
+            }
+            fn register(&mut self, info: mdns_sd::ServiceInfo) -> Result<(), SetupError> {
+                assert_eq!(
+                    info.get_fullname(),
+                    "11111111111111111111111111111111._seamless-input._udp.local."
+                );
+                let mut state = self.0.lock().unwrap();
+                state.advertising = true;
+                state.events.extend(["register_queued", "register_error"]);
+                Err(SetupError::Unavailable)
+            }
+            fn healthy(&mut self) -> bool {
+                true
+            }
+            fn unregister(&mut self, name: &str) -> Result<DaemonAcknowledgement, SetupError> {
+                assert_eq!(
+                    name,
+                    "11111111111111111111111111111111._seamless-input._udp.local."
+                );
+                self.0.lock().unwrap().events.push("withdraw_queued");
+                let probe = self.0.clone();
+                Ok(Box::new(move |timeout| {
+                    assert_eq!(timeout, Duration::from_secs(1));
+                    let mut state = probe.lock().unwrap();
+                    assert!(
+                        state.listener,
+                        "endpoint released before withdrawal acknowledgement"
+                    );
+                    state.advertising = false;
+                    state.events.push("withdraw_ack");
+                    Ok(())
+                }))
+            }
+            fn shutdown(&mut self) -> Result<DaemonAcknowledgement, SetupError> {
+                self.0.lock().unwrap().events.push("shutdown_queued");
+                let probe = self.0.clone();
+                Ok(Box::new(move |timeout| {
+                    assert_eq!(timeout, Duration::from_secs(1));
+                    let mut state = probe.lock().unwrap();
+                    assert!(
+                        state.listener,
+                        "endpoint released before shutdown acknowledgement"
+                    );
+                    state.advertising = false;
+                    state.events.push("shutdown_ack");
+                    Ok(())
+                }))
+            }
+        }
+        impl Drop for QueuedRegistrationError {
+            fn drop(&mut self) {
+                self.0.lock().unwrap().events.push("publisher_dropped");
+            }
+        }
+
+        let mut fixture = Fixture::new();
+        let generation = fixture.window.open(0).unwrap();
+        let probe = fixture.probe.clone();
+        let result =
+            PairingAdvertisementLease::open_with(&mut fixture.window, generation, 0, || {
+                probe.lock().unwrap().listener = true;
+                let endpoint = Endpoint(probe.clone());
+                let info = advertisement_info("11111111111111111111111111111111", 57899)?;
+                let publication = EngineAdvertisement::start_with_driver(
+                    info,
+                    Box::new(QueuedRegistrationError(probe.clone())),
+                )?;
+                Ok(LeaseResources::new(
+                    Box::new(endpoint),
+                    Box::new(publication),
+                ))
+            });
+        assert!(matches!(result, Err(SetupError::Unavailable)));
+        let state = fixture.probe.lock().unwrap();
+        assert!(
+            !state.advertising,
+            "queued registration was not synchronously withdrawn"
+        );
+        assert!(!state.listener);
+        assert_eq!(
+            state.events,
+            [
+                "register_queued",
+                "register_error",
+                "withdraw_queued",
+                "withdraw_ack",
+                "shutdown_queued",
+                "shutdown_ack",
+                "publisher_dropped",
+                "endpoint_dropped",
+            ]
+        );
     }
 }
