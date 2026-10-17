@@ -702,6 +702,143 @@ async fn endpoint_drop_that_revokes_scope_before_freeze_blocks_publication() {
     );
 }
 
+/// A cancelled admission can still have a frozen endpoint waiting to be
+/// dropped. That endpoint must clean up only its own guard: a later admission
+/// for the same peer is a different durable owner and must survive.
+#[tokio::test]
+async fn stale_endpoint_drop_after_cancel_keeps_replacement_promoted() {
+    let (ea, _eb, a, b, _) = pair().await;
+    let ta = tempfile::tempdir().unwrap();
+    let tb = tempfile::tempdir().unwrap();
+    let sa = crate::pairing_pending::PendingStore::open(ta.path()).unwrap();
+    let sb = crate::pairing_pending::PendingStore::open(tb.path()).unwrap();
+    let (a, b) = tokio::join!(
+        a.handshake(
+            handshake_config(1, 2),
+            &sa,
+            |p| async move { p.decision(true) }
+        ),
+        b.handshake(
+            handshake_config(2, 1),
+            &sb,
+            |p| async move { p.decision(true) }
+        )
+    );
+    let a = a.unwrap();
+    let _b = b.unwrap();
+    let attempt = a.test_attempt();
+    let store =
+        crate::pairing_v2::admission_authority::AdmissionAuthorityStore::open(ta.path()).unwrap();
+    let cancelled = store.pending(attempt).unwrap().unwrap();
+    store
+        .cancel(store.version().unwrap(), cancelled.attempt_id)
+        .unwrap();
+
+    // Freeze after cancellation so the real endpoint owns a stale guard. The
+    // stage fails closed, but the endpoint's Drop still exercises the actual
+    // consent-scope revocation path rather than calling a revoker directly.
+    assert_eq!(
+        store
+            .commit_sealed_foundation(store.version().unwrap(), a)
+            .await,
+        Err(crate::pairing_pending::StoreError::Invalid)
+    );
+
+    let replacement = store
+        .prepare(
+            store.version().unwrap(),
+            [97; 32],
+            cancelled.peer_fingerprint,
+        )
+        .unwrap();
+    store
+        .commit_operational_test_receipt(&replacement, [98; 32])
+        .unwrap();
+
+    drop(ea);
+    assert_eq!(
+        store.reconcile(replacement.attempt_id).unwrap(),
+        crate::pairing_v2::admission_authority::ReconcileAdmission::Promoted
+    );
+}
+
+/// Identity rotation invalidates a staged, live handoff. Endpoint destruction
+/// afterwards must only clear its old guard; reopening must not keep either an
+/// active admission or an orphaned peer reservation.
+#[tokio::test]
+async fn rotation_then_endpoint_drop_recovers_staged_guard_without_reservation() {
+    let (ea, _eb, a, b, _) = pair().await;
+    let ta = tempfile::tempdir().unwrap();
+    let tb = tempfile::tempdir().unwrap();
+    let sa = crate::pairing_pending::PendingStore::open(ta.path()).unwrap();
+    let sb = crate::pairing_pending::PendingStore::open(tb.path()).unwrap();
+    let (a, b) = tokio::join!(
+        a.handshake(
+            handshake_config(1, 2),
+            &sa,
+            |p| async move { p.decision(true) }
+        ),
+        b.handshake(
+            handshake_config(2, 1),
+            &sb,
+            |p| async move { p.decision(true) }
+        )
+    );
+    let a = a.unwrap();
+    let _b = b.unwrap();
+    let sealed = a.seal_for_promotion().await.unwrap();
+    let frozen = sealed.freeze(&sa).await.unwrap();
+    let (fields, handoff) = frozen.into_store_handoff();
+    let record = fields.record.clone();
+    let expected = sa.version().unwrap();
+    let staged_revision = expected.revision.checked_add(1).unwrap();
+    let receipt = crate::pairing_pending::AdmissionReceiptRecord {
+        attempt: record.attempt_id,
+        peer: record.peer_fingerprint,
+        peer_pin: fields.certificate_fingerprints[1 - fields.role.index()],
+        durable_fc_hash: fields.durable_fc_hash,
+        role: fields.role.index() as u8,
+        suite: SUITE.to_owned(),
+        protocol_version: 2,
+        transcript: fields.transcript,
+        binding: fields.local_binding,
+        revision: staged_revision,
+        identity_generation: expected.identity_generation,
+        revocation_generation: record.revocation_generation,
+        policy_revision: 0,
+        ownership: handoff.awaiting_handoff_ownership(staged_revision),
+    };
+    sa.stage_sealed_admission(expected, &record, &receipt)
+        .unwrap();
+    let (pending, staged, active) = sa.admission_state(record.attempt_id).unwrap();
+    assert!(!pending);
+    assert!(matches!(
+        staged.map(|receipt| receipt.ownership),
+        Some(crate::pairing_pending::AdmissionOwnership::AwaitingHandoff { .. })
+    ));
+    assert!(!active);
+
+    sa.rotate_identity(sa.version().unwrap()).unwrap();
+    drop(handoff);
+    drop(ea);
+
+    let reopened =
+        crate::pairing_v2::admission_authority::AdmissionAuthorityStore::open(ta.path()).unwrap();
+    assert_eq!(
+        reopened.reconcile(record.attempt_id).unwrap(),
+        crate::pairing_v2::admission_authority::ReconcileAdmission::Revoked
+    );
+    // A fresh attempt proves rotation cleared the staged reservation rather
+    // than leaving the old peer blocked after restart/recovery.
+    reopened
+        .prepare(
+            reopened.version().unwrap(),
+            [99; 32],
+            record.peer_fingerprint,
+        )
+        .unwrap();
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn freeze_before_endpoint_drop_is_durably_revoked_before_future_authority() {
