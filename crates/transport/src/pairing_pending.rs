@@ -332,6 +332,44 @@ mod bilateral_admission_state_tests {
     }
 
     #[test]
+    fn durable_bilateral_records_require_peer_recovery_after_reopen() {
+        let root = tempfile::tempdir().unwrap();
+        let store = PendingStore::open(root.path()).unwrap();
+        let record = store
+            .prepare(store.version().unwrap(), [54; 32], [55; 32])
+            .unwrap();
+        let receipt = store
+            .publish_local_bilateral_receipt(
+                store.version().unwrap(),
+                &record,
+                prepared_store_owned_receipt(&record, store.version().unwrap()),
+            )
+            .unwrap();
+        assert_eq!(
+            store.recovery_disposition(record.attempt_id).unwrap(),
+            BilateralRecoveryDisposition::NeedsPeerRecovery
+        );
+        store
+            .confirm_bilateral_receipt(
+                store.version().unwrap(),
+                record.attempt_id,
+                receipt.bilateral.transaction_id,
+                receipt.bilateral.local_receipt_hash,
+                [56; 32],
+            )
+            .unwrap();
+        let reopened = PendingStore::open(root.path()).unwrap();
+        assert_eq!(
+            reopened.recovery_disposition(record.attempt_id).unwrap(),
+            BilateralRecoveryDisposition::NeedsPeerRecovery
+        );
+        assert_eq!(
+            reopened.operational_admission_snapshot(record.attempt_id),
+            Err(StoreError::Invalid)
+        );
+    }
+
+    #[test]
     fn delayed_exact_abort_cannot_remove_a_later_same_peer_transaction() {
         let root = tempfile::tempdir().unwrap();
         let store = PendingStore::open(root.path()).unwrap();
@@ -512,6 +550,18 @@ pub(crate) enum BilateralAdmissionState {
     StoreOwnedAwaitingPeer,
     BilateralConfirmed,
     Aborted,
+}
+
+/// A durable local receipt is not enough to resume a bilateral relationship.
+/// This classification is intentionally metadata-only: a later recovery
+/// protocol must obtain authenticated peer evidence before any usable session.
+#[cfg(feature = "pairing-v2-experimental")]
+#[allow(dead_code)] // Consumed by the peer-aware recovery exchange in the next phase.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BilateralRecoveryDisposition {
+    Confirmed,
+    NeedsPeerRecovery,
+    AbortExact,
 }
 
 /// Durable bilateral status attached to every admission receipt. A local
@@ -2756,6 +2806,37 @@ mod unix {
                 receipt,
                 active,
             ))
+        }
+
+        /// Classifies persisted bilateral metadata after reopening storage.
+        /// It deliberately does not create an operational snapshot: even a
+        /// locally confirmed receipt must obtain a fresh authenticated peer
+        /// recovery acknowledgement before it can be used by a later phase.
+        #[cfg(feature = "pairing-v2-experimental")]
+        #[allow(dead_code)] // The recovery transport is intentionally not wired yet.
+        pub(crate) fn recovery_disposition(
+            &self,
+            attempt: [u8; 32],
+        ) -> Result<BilateralRecoveryDisposition, StoreError> {
+            let (pending, receipt, active) = self.admission_state(attempt)?;
+            if pending {
+                return Ok(BilateralRecoveryDisposition::AbortExact);
+            }
+            let Some(receipt) = receipt else {
+                return Ok(BilateralRecoveryDisposition::AbortExact);
+            };
+            if !active {
+                return Ok(BilateralRecoveryDisposition::AbortExact);
+            }
+            match receipt.bilateral.state {
+                BilateralAdmissionState::StoreOwnedAwaitingPeer
+                | BilateralAdmissionState::BilateralConfirmed => {
+                    Ok(BilateralRecoveryDisposition::NeedsPeerRecovery)
+                }
+                BilateralAdmissionState::Prepared | BilateralAdmissionState::Aborted => {
+                    Ok(BilateralRecoveryDisposition::AbortExact)
+                }
+            }
         }
 
         /// Advances the setup epoch. Does not regenerate, read, or write a device private key.
