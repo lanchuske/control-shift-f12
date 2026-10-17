@@ -48,6 +48,11 @@ mod bilateral_admission_state_tests {
             store.operational_admission_snapshot(record.attempt_id),
             Err(StoreError::Invalid)
         );
+        let reopened = PendingStore::open(root.path()).unwrap();
+        assert_eq!(
+            reopened.operational_admission_snapshot(record.attempt_id),
+            Err(StoreError::Invalid)
+        );
     }
 
     #[test]
@@ -199,6 +204,219 @@ mod bilateral_admission_state_tests {
         let mut json = serde_json::to_value(receipt).unwrap();
         json.as_object_mut().unwrap().remove("bilateral");
         assert!(serde_json::from_value::<AdmissionReceiptRecord>(json).is_err());
+    }
+
+    fn prepared_store_owned_receipt(
+        record: &PendingRecord,
+        expected: StoreVersion,
+    ) -> AdmissionReceiptRecord {
+        let revision = expected.revision.checked_add(1).unwrap();
+        let ownership = AdmissionOwnership::StoreOwned {
+            guard_token: [31; 32],
+            staged_revision: expected.revision,
+            handoff_revision: revision,
+        };
+        let fields = BilateralTransactionFields {
+            local_identity: [32; 32],
+            peer_identity: record.peer_fingerprint,
+            local_attempt: record.attempt_id,
+            peer_attempt: [33; 32],
+            peer_pin: [34; 32],
+            transcript: [35; 32],
+            suite: crate::pairing_v2::SUITE.to_owned(),
+            policy_revision: 0,
+        };
+        let mut receipt = AdmissionReceiptRecord {
+            attempt: record.attempt_id,
+            peer: record.peer_fingerprint,
+            peer_pin: fields.peer_pin,
+            durable_fc_hash: [36; 32],
+            role: 0,
+            suite: fields.suite.clone(),
+            protocol_version: 2,
+            transcript: fields.transcript,
+            binding: [37; 32],
+            revision,
+            identity_generation: expected.identity_generation,
+            revocation_generation: record.revocation_generation,
+            policy_revision: 0,
+            ownership,
+            bilateral: BilateralAdmissionRecord::prepared(&fields, [31; 32], 0, 0, 0),
+        };
+        bind_prepared_bilateral_receipt_hash(&mut receipt);
+        receipt
+    }
+
+    #[test]
+    fn local_bilateral_publication_stays_inactive_across_restart() {
+        let root = tempfile::tempdir().unwrap();
+        let store = PendingStore::open(root.path()).unwrap();
+        let record = store
+            .prepare(store.version().unwrap(), [41; 32], [42; 32])
+            .unwrap();
+        let receipt = prepared_store_owned_receipt(&record, store.version().unwrap());
+        let published = store
+            .publish_local_bilateral_receipt(store.version().unwrap(), &record, receipt)
+            .unwrap();
+        assert!(matches!(
+            published.bilateral.state,
+            BilateralAdmissionState::StoreOwnedAwaitingPeer
+        ));
+        assert_eq!(
+            store.operational_admission_snapshot(record.attempt_id),
+            Err(StoreError::Invalid)
+        );
+        let reopened = PendingStore::open(root.path()).unwrap();
+        assert_eq!(
+            reopened.operational_admission_snapshot(record.attempt_id),
+            Err(StoreError::Invalid)
+        );
+    }
+
+    #[test]
+    fn local_bilateral_confirmation_rejects_wrong_transaction_or_receipt_hash() {
+        let root = tempfile::tempdir().unwrap();
+        let store = PendingStore::open(root.path()).unwrap();
+        let record = store
+            .prepare(store.version().unwrap(), [43; 32], [44; 32])
+            .unwrap();
+        let receipt = store
+            .publish_local_bilateral_receipt(
+                store.version().unwrap(),
+                &record,
+                prepared_store_owned_receipt(&record, store.version().unwrap()),
+            )
+            .unwrap();
+        assert_eq!(
+            store.confirm_bilateral_receipt(
+                store.version().unwrap(),
+                record.attempt_id,
+                BilateralTransactionId([45; 32]),
+                receipt.bilateral.local_receipt_hash,
+                [46; 32],
+            ),
+            Err(StoreError::Invalid)
+        );
+        assert_eq!(
+            store.confirm_bilateral_receipt(
+                store.version().unwrap(),
+                record.attempt_id,
+                receipt.bilateral.transaction_id,
+                [47; 32],
+                [46; 32],
+            ),
+            Err(StoreError::Invalid)
+        );
+        let confirmed = store
+            .confirm_bilateral_receipt(
+                store.version().unwrap(),
+                record.attempt_id,
+                receipt.bilateral.transaction_id,
+                receipt.bilateral.local_receipt_hash,
+                [46; 32],
+            )
+            .unwrap();
+        assert!(matches!(
+            confirmed.bilateral.state,
+            BilateralAdmissionState::BilateralConfirmed
+        ));
+        assert_eq!(
+            store.operational_admission_snapshot(record.attempt_id),
+            Err(StoreError::Invalid)
+        );
+        let reopened = PendingStore::open(root.path()).unwrap();
+        assert_eq!(
+            reopened.operational_admission_snapshot(record.attempt_id),
+            Err(StoreError::Invalid)
+        );
+    }
+
+    #[test]
+    fn delayed_exact_abort_cannot_remove_a_later_same_peer_transaction() {
+        let root = tempfile::tempdir().unwrap();
+        let store = PendingStore::open(root.path()).unwrap();
+        let peer = [49; 32];
+        let first = store
+            .prepare(store.version().unwrap(), [48; 32], peer)
+            .unwrap();
+        let first_receipt = store
+            .publish_local_bilateral_receipt(
+                store.version().unwrap(),
+                &first,
+                prepared_store_owned_receipt(&first, store.version().unwrap()),
+            )
+            .unwrap();
+        store
+            .abort_bilateral_transaction(
+                store.version().unwrap(),
+                first.attempt_id,
+                first_receipt.bilateral.transaction_id,
+                first_receipt.bilateral.guard_token,
+            )
+            .unwrap();
+
+        let second = store
+            .prepare(store.version().unwrap(), [50; 32], peer)
+            .unwrap();
+        let second_receipt = store
+            .publish_local_bilateral_receipt(
+                store.version().unwrap(),
+                &second,
+                prepared_store_owned_receipt(&second, store.version().unwrap()),
+            )
+            .unwrap();
+        assert_eq!(
+            store.abort_bilateral_transaction(
+                store.version().unwrap(),
+                first.attempt_id,
+                first_receipt.bilateral.transaction_id,
+                first_receipt.bilateral.guard_token,
+            ),
+            Err(StoreError::Invalid)
+        );
+        let (_, receipt, _) = store.admission_state(second.attempt_id).unwrap();
+        assert_eq!(
+            receipt.unwrap().bilateral.transaction_id,
+            second_receipt.bilateral.transaction_id
+        );
+        assert_eq!(
+            store.operational_admission_snapshot(second.attempt_id),
+            Err(StoreError::Invalid)
+        );
+    }
+
+    #[test]
+    fn timeout_abort_reopens_without_an_operational_admission() {
+        let root = tempfile::tempdir().unwrap();
+        let store = PendingStore::open(root.path()).unwrap();
+        let record = store
+            .prepare(store.version().unwrap(), [51; 32], [52; 32])
+            .unwrap();
+        let receipt = store
+            .publish_local_bilateral_receipt(
+                store.version().unwrap(),
+                &record,
+                prepared_store_owned_receipt(&record, store.version().unwrap()),
+            )
+            .unwrap();
+        store
+            .abort_bilateral_transaction(
+                store.version().unwrap(),
+                record.attempt_id,
+                receipt.bilateral.transaction_id,
+                receipt.bilateral.guard_token,
+            )
+            .unwrap();
+
+        let reopened = PendingStore::open(root.path()).unwrap();
+        assert_eq!(
+            reopened.operational_admission_snapshot(record.attempt_id),
+            Err(StoreError::Invalid)
+        );
+        let (pending, receipt, active) = reopened.admission_state(record.attempt_id).unwrap();
+        assert!(!pending);
+        assert!(receipt.is_none());
+        assert!(!active);
     }
 }
 
@@ -2063,6 +2281,238 @@ mod unix {
                 self.pending_dir.remove(&file)?;
             }
             Ok(receipt.clone())
+        }
+
+        /// Publishes a local bilateral receipt after the local handoff.  The
+        /// active pin is a durable reservation only: Task 1 deliberately
+        /// keeps every bilateral state ineligible for an operational
+        /// snapshot until a later authenticated peer proof exists.
+        #[cfg(feature = "pairing-v2-experimental")]
+        #[allow(dead_code)] // Task 2 storage transition; Task 3 wires authenticated proof.
+        pub(crate) fn publish_local_bilateral_receipt(
+            &self,
+            expected: StoreVersion,
+            record: &PendingRecord,
+            mut receipt: AdmissionReceiptRecord,
+        ) -> Result<AdmissionReceiptRecord, StoreError> {
+            let _lock = self.ledger_dir.lock()?;
+            let mut ledger = self.load_validated_manifest()?;
+            let published_revision = expected.revision.checked_add(1).ok_or(StoreError::Limit)?;
+            if ledger.version != expected
+                || record.version.identity_generation != expected.identity_generation
+                || ledger.policy_revision != receipt.policy_revision
+                || ledger.revocation(record.peer_fingerprint) != receipt.revocation_generation
+                || record.revocation_generation != receipt.revocation_generation
+                || receipt.attempt != record.attempt_id
+                || receipt.peer != record.peer_fingerprint
+                || receipt.revision != published_revision
+                || receipt.identity_generation != expected.identity_generation
+                || !matches!(receipt.ownership, AdmissionOwnership::StoreOwned { .. })
+                || !matches!(receipt.bilateral.state, BilateralAdmissionState::Prepared)
+                || receipt.bilateral.peer_receipt_hash.is_some()
+                || receipt.bilateral.fields.local_attempt != record.attempt_id
+                || receipt.bilateral.fields.peer_identity != record.peer_fingerprint
+                || receipt.bilateral.fields.peer_pin != receipt.peer_pin
+                || receipt.bilateral.fields.transcript != receipt.transcript
+                || receipt.bilateral.fields.suite != receipt.suite
+                || receipt.bilateral.fields.policy_revision != receipt.policy_revision
+                || receipt.bilateral.transaction_id
+                    != derive_bilateral_transaction_id(&receipt.bilateral.fields)
+                || receipt.bilateral.guard_token != receipt.ownership.guard_token()
+                || receipt.bilateral.identity_generation != receipt.identity_generation
+                || receipt.bilateral.revocation_generation != receipt.revocation_generation
+                || receipt.bilateral.policy_revision != receipt.policy_revision
+                || receipt.bilateral.local_receipt_hash != admission_receipt_hash(&receipt)
+            {
+                return Err(StoreError::Conflict);
+            }
+            let pending = ledger
+                .pending
+                .iter()
+                .find(|entry| entry.record.attempt_id == record.attempt_id)
+                .ok_or_else(|| {
+                    if ledger.consumed_attempts.contains(&record.attempt_id) {
+                        StoreError::ConsumedAttempt
+                    } else {
+                        StoreError::Invalid
+                    }
+                })?;
+            if pending.record != *record
+                || ledger.consumed_attempts.contains(&receipt.attempt)
+                || ledger
+                    .admission_receipts
+                    .iter()
+                    .any(|stored| stored.attempt == receipt.attempt)
+                || ledger.tombstones.contains(&receipt.attempt)
+            {
+                return Err(StoreError::ConsumedAttempt);
+            }
+            if !ledger.admission_reservations.iter().any(|reservation| {
+                reservation.attempt == receipt.attempt && reservation.peer == receipt.peer
+            }) {
+                return Err(StoreError::Invalid);
+            }
+            if ledger
+                .active_pins
+                .iter()
+                .any(|pin| pin.peer == receipt.peer)
+            {
+                return Err(StoreError::Conflict);
+            }
+            if ledger.active_pins.len() >= MAX_HISTORY
+                || ledger.consumed_attempts.len() >= MAX_HISTORY
+                || ledger.admission_receipts.len() >= MAX_HISTORY
+            {
+                return Err(StoreError::Limit);
+            }
+            let old_journals: Vec<_> = ledger
+                .journals
+                .iter()
+                .filter(|entry| entry.attempt == receipt.attempt)
+                .map(journal_filename)
+                .collect();
+            receipt
+                .bilateral
+                .transition_to_store_owned(&receipt.ownership)?;
+            if !receipt.bilateral.is_well_formed_for(&receipt) {
+                return Err(StoreError::Invalid);
+            }
+            ledger.advance(expected)?;
+            ledger
+                .pending
+                .retain(|entry| entry.record.attempt_id != receipt.attempt);
+            ledger
+                .journals
+                .retain(|entry| entry.attempt != receipt.attempt);
+            ledger
+                .admission_reservations
+                .retain(|reservation| reservation.attempt != receipt.attempt);
+            ledger.active_pins.push(ActivePin {
+                peer: receipt.peer,
+                pin: receipt.peer_pin,
+                identity_generation: receipt.identity_generation,
+                revocation_generation: receipt.revocation_generation,
+            });
+            ledger.consumed_attempts.push(receipt.attempt);
+            ledger.admission_receipts.push(receipt.clone());
+            self.save(&ledger)?;
+            self.pending_dir.remove(&filename(receipt.attempt))?;
+            for file in old_journals {
+                self.pending_dir.remove(&file)?;
+            }
+            Ok(receipt)
+        }
+
+        /// Persists the local observation of an exact peer receipt.  This is
+        /// bookkeeping only; without Task 3's authenticated proof it cannot
+        /// activate an admission.
+        #[cfg(feature = "pairing-v2-experimental")]
+        #[allow(dead_code)] // Task 2 storage transition; Task 3 wires authenticated proof.
+        pub(crate) fn confirm_bilateral_receipt(
+            &self,
+            expected: StoreVersion,
+            attempt: [u8; 32],
+            transaction_id: BilateralTransactionId,
+            local_receipt_hash: [u8; 32],
+            peer_receipt_hash: [u8; 32],
+        ) -> Result<AdmissionReceiptRecord, StoreError> {
+            if !transaction_id.is_valid()
+                || local_receipt_hash == [0; 32]
+                || peer_receipt_hash == [0; 32]
+            {
+                return Err(StoreError::Invalid);
+            }
+            let _lock = self.ledger_dir.lock()?;
+            let mut ledger = self.load_validated_manifest()?;
+            if ledger.version != expected {
+                return Err(StoreError::Conflict);
+            }
+            let index = ledger
+                .admission_receipts
+                .iter()
+                .position(|receipt| receipt.attempt == attempt)
+                .ok_or(StoreError::Invalid)?;
+            let receipt = &ledger.admission_receipts[index];
+            if !matches!(
+                receipt.bilateral.state,
+                BilateralAdmissionState::StoreOwnedAwaitingPeer
+            ) || receipt.bilateral.transaction_id != transaction_id
+                || receipt.bilateral.local_receipt_hash != local_receipt_hash
+                || receipt.identity_generation != expected.identity_generation
+                || receipt.revocation_generation != ledger.revocation(receipt.peer)
+                || receipt.policy_revision != ledger.policy_revision
+                || !ledger.active_pins.iter().any(|pin| {
+                    pin.peer == receipt.peer
+                        && pin.pin == receipt.peer_pin
+                        && pin.identity_generation == receipt.identity_generation
+                        && pin.revocation_generation == receipt.revocation_generation
+                })
+            {
+                return Err(StoreError::Invalid);
+            }
+            ledger.advance(expected)?;
+            let receipt = &mut ledger.admission_receipts[index];
+            receipt.bilateral.state = BilateralAdmissionState::BilateralConfirmed;
+            receipt.bilateral.peer_receipt_hash = Some(peer_receipt_hash);
+            if !receipt.bilateral.is_well_formed_for(receipt) {
+                return Err(StoreError::Invalid);
+            }
+            let confirmed = receipt.clone();
+            self.save(&ledger)?;
+            Ok(confirmed)
+        }
+
+        /// Aborts only the exact durable transaction.  In particular, an old
+        /// timeout/drop cannot revoke a later attempt for the same peer.
+        #[cfg(feature = "pairing-v2-experimental")]
+        #[allow(dead_code)] // Task 2 storage transition; Task 3 wires authenticated proof.
+        pub(crate) fn abort_bilateral_transaction(
+            &self,
+            expected: StoreVersion,
+            attempt: [u8; 32],
+            transaction_id: BilateralTransactionId,
+            guard_token: [u8; 32],
+        ) -> Result<(), StoreError> {
+            if !transaction_id.is_valid() || guard_token == [0; 32] {
+                return Err(StoreError::Invalid);
+            }
+            let _lock = self.ledger_dir.lock()?;
+            let mut ledger = self.load_validated_manifest()?;
+            if ledger.version != expected {
+                return Err(StoreError::Conflict);
+            }
+            let index = ledger
+                .admission_receipts
+                .iter()
+                .position(|receipt| receipt.attempt == attempt)
+                .ok_or(StoreError::Invalid)?;
+            let receipt = &ledger.admission_receipts[index];
+            if receipt.bilateral.transaction_id != transaction_id
+                || receipt.bilateral.guard_token != guard_token
+                || receipt.ownership.guard_token() != guard_token
+                || receipt.identity_generation != expected.identity_generation
+                || receipt.revocation_generation != ledger.revocation(receipt.peer)
+            {
+                return Err(StoreError::Invalid);
+            }
+            let peer = receipt.peer;
+            let pin = receipt.peer_pin;
+            let identity_generation = receipt.identity_generation;
+            let revocation_generation = receipt.revocation_generation;
+            ledger.advance(expected)?;
+            ledger.admission_receipts.remove(index);
+            ledger.consumed_attempts.retain(|stored| *stored != attempt);
+            ledger.active_pins.retain(|active| {
+                !(active.peer == peer
+                    && active.pin == pin
+                    && active.identity_generation == identity_generation
+                    && active.revocation_generation == revocation_generation)
+            });
+            ledger
+                .admission_reservations
+                .retain(|reservation| reservation.attempt != attempt);
+            ledger.tombstones.push(attempt);
+            self.save(&ledger)
         }
 
         /// Second publication of live admission finalization.  Only an exact
