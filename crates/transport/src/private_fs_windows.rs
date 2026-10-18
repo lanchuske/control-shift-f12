@@ -749,7 +749,7 @@ mod tests {
         let blocker = OpenOptions::new()
             .read(true)
             .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
-            .open(&to)
+            .open(&from)
             .unwrap();
         let source_id = identity(&file_info(source.as_raw_handle().cast()).unwrap());
         let mut blocker = Some(blocker);
@@ -787,7 +787,7 @@ mod tests {
         let blocker = OpenOptions::new()
             .read(true)
             .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
-            .open(&to)
+            .open(&from)
             .unwrap();
         let mut backoffs = 0;
         faults::reset_operations();
