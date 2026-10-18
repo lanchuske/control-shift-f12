@@ -617,35 +617,114 @@ fn deferred_write_permanent_failure_is_returned_without_dedupe_commit() {
 
 #[cfg(target_os = "windows")]
 #[test]
-fn native_clipboard_probe_detects_another_threads_open_clipboard_without_changing_it() {
-    use std::{sync::mpsc, thread, time::Duration};
+fn native_clipboard_holder_process() {
+    use std::{
+        io::{Read, Write},
+        thread,
+        time::Duration,
+    };
     use windows_sys::Win32::System::DataExchange::{CloseClipboard, OpenClipboard};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{CreateWindowExW, DestroyWindow};
 
-    let (opened_tx, opened_rx) = mpsc::channel();
-    let (release_tx, release_rx) = mpsc::channel();
-    let holder = thread::spawn(move || {
-        let opened = (0..100).any(|_| {
-            if unsafe { OpenClipboard(std::ptr::null_mut()) } != 0 {
-                true
-            } else {
-                thread::sleep(Duration::from_millis(5));
-                false
-            }
-        });
-        opened_tx.send(opened).unwrap();
-        if opened {
-            // Dropping the sender also releases the lock if an assertion fails.
-            let _ = release_rx.recv_timeout(Duration::from_secs(5));
-            assert_ne!(unsafe { CloseClipboard() }, 0);
+    if std::env::var_os("CSF12_TEST_HOLD_CLIPBOARD").is_none() {
+        return;
+    }
+    let window = unsafe {
+        CreateWindowExW(
+            0,
+            [
+                b'S' as u16,
+                b'T' as u16,
+                b'A' as u16,
+                b'T' as u16,
+                b'I' as u16,
+                b'C' as u16,
+                0,
+            ]
+            .as_ptr(),
+            std::ptr::null(),
+            0,
+            0,
+            0,
+            0,
+            0,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null(),
+        )
+    };
+    assert!(
+        !window.is_null(),
+        "failed to create clipboard holder window"
+    );
+    let opened = (0..100).any(|_| {
+        if unsafe { OpenClipboard(window) } != 0 {
+            true
+        } else {
+            thread::sleep(Duration::from_millis(5));
+            false
         }
     });
-    assert!(opened_rx.recv_timeout(Duration::from_secs(5)).unwrap());
+    assert!(opened, "clipboard remained busy for the holder process");
+    println!("CSF12_CLIPBOARD_OPEN");
+    std::io::stdout().flush().unwrap();
+    let _ = std::io::stdin().read_exact(&mut [0]);
+    assert_ne!(unsafe { CloseClipboard() }, 0);
+    assert_ne!(unsafe { DestroyWindow(window) }, 0);
+}
+
+#[cfg(target_os = "windows")]
+#[test]
+fn native_clipboard_probe_detects_another_process_open_clipboard_without_changing_it() {
+    use std::{
+        io::{BufRead, BufReader, Write},
+        process::{Command, Stdio},
+        sync::mpsc,
+        thread,
+        time::{Duration, Instant},
+    };
+
+    let mut holder = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "native_clipboard_holder_process", "--nocapture"])
+        .env("CSF12_TEST_HOLD_CLIPBOARD", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let output = holder.stdout.take().unwrap();
+    let (opened_tx, opened_rx) = mpsc::channel();
+    let output_reader = thread::spawn(move || {
+        for line in BufReader::new(output).lines() {
+            if line.unwrap().contains("CSF12_CLIPBOARD_OPEN") {
+                let _ = opened_tx.send(());
+            }
+        }
+    });
+    if opened_rx.recv_timeout(Duration::from_secs(5)).is_err() {
+        let _ = holder.kill();
+        let _ = holder.wait();
+        output_reader.join().unwrap();
+        panic!("clipboard holder did not acquire the clipboard");
+    }
     let mut clipboard = clipboard::WindowsClipboard::new();
     assert_eq!(clipboard.access_state(), AccessState::Denied);
     assert_eq!(clipboard.poll(0), Ok(ClipboardOutcome::Disabled));
     assert_eq!(clipboard.poll(200), Ok(ClipboardOutcome::Disabled));
-    release_tx.send(()).unwrap();
-    holder.join().unwrap();
+    holder.stdin.take().unwrap().write_all(&[0]).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let status = loop {
+        if let Some(status) = holder.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            holder.kill().unwrap();
+            break holder.wait().unwrap();
+        }
+        thread::sleep(Duration::from_millis(10));
+    };
+    output_reader.join().unwrap();
+    assert!(status.success(), "clipboard holder did not exit cleanly");
 }
 
 #[test]
