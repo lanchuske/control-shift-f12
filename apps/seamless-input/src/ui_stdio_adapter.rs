@@ -129,6 +129,8 @@ struct ActiveSas {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum HostCommand {
     Refresh,
+    StartDiscovery,
+    StopDiscovery,
     ConfirmV01 { matches: bool },
 }
 
@@ -249,6 +251,26 @@ impl UiStdioAdapter {
             Ok(HostCommand::Refresh) => {
                 self.publish_snapshot_and_diagnostics();
                 self.accepted(&request.id)
+            }
+            Ok(HostCommand::StartDiscovery) => {
+                let result = self
+                    .controller
+                    .apply_local_at(now_ms, UiCommand::StartDiscovery);
+                self.publish_snapshot_and_diagnostics();
+                match result {
+                    Ok(()) => self.accepted(&request.id),
+                    Err(error) => self.rejected(&request.id, error),
+                }
+            }
+            Ok(HostCommand::StopDiscovery) => {
+                let result = self
+                    .controller
+                    .apply_local_at(now_ms, UiCommand::StopDiscovery);
+                self.publish_snapshot_and_diagnostics();
+                match result {
+                    Ok(()) => self.accepted(&request.id),
+                    Err(error) => self.rejected(&request.id, error),
+                }
             }
             Ok(HostCommand::ConfirmV01 { matches }) => {
                 let result = self
@@ -389,6 +411,8 @@ fn parse_host_command(request: &Request) -> Result<HostCommand, UiError> {
     let object = request.args.as_object().ok_or(UiError::InvalidRequest)?;
     match request.command.as_str() {
         "ui.refresh" if object.is_empty() => Ok(HostCommand::Refresh),
+        "ui.start_discovery" if object.is_empty() => Ok(HostCommand::StartDiscovery),
+        "ui.stop_discovery" if object.is_empty() => Ok(HostCommand::StopDiscovery),
         "ui.confirm_v01" if object.len() == 1 => object
             .get("matches")
             .and_then(Value::as_bool)

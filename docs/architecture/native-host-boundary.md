@@ -2,15 +2,17 @@
 
 ## Status and ownership
 
-This is a non-shipping design boundary for future signed native presentation
-hosts. The Rust `seamless-input` executable remains the sole owner of all
-runtime, pairing, operational-session, inventory, layout, input and clipboard
-state. This document adds no runtime behavior.
+This is a non-shipping native boundary. It admits exactly one macOS AppKit
+diagnostics projection host and its XCTest target; it does not admit a product
+bundle, a Windows host, signing, packaging, or release. The Rust
+`seamless-input` executable remains the sole owner of all runtime, pairing,
+operational-session, inventory, layout, input and clipboard state.
 
-The planned native owner, inherited-pipe lifetime, platform-specific reader
-cancellation, main-thread handoff, and pre-enable test matrix are recorded in
-[the process-pipe adapter design](native-host-process-pipe-adapter.md). That
-record is design-only and does not admit native source or a process launch.
+The admitted AppKit diagnostics owner, inherited-pipe lifetime,
+platform-specific reader cancellation, and main-thread handoff follow [the
+process-pipe adapter design](native-host-process-pipe-adapter.md). Its scope is
+strictly structured diagnostic projection plus `ui.refresh`; all other native
+desktop actions remain fenced.
 
 The current internal control engine is reached only through:
 
@@ -23,17 +25,31 @@ with a required `--stdio` flag. There is no `--control-stdio` flag.
 
 ## Parent-created child process
 
-Each future AppKit or WinForms host starts exactly one engine child using a
+The existing foundations control channel is deliberately separate from the
+reserved native UI channel:
+
+| Channel | Argument vector | Rule |
+| --- | --- | --- |
+| Foundations control | `[absolute path to seamless-input, "control", "--stdio"]` | Preserves its existing control-engine behavior; it is not a native-host fallback. |
+| Native UI projection | `[absolute path to seamless-input, "control", "--ui-stdio"]` | Admitted only for the guarded macOS diagnostics source, which supplies the fixed argument array and inherited pipes. No other native source is admitted. |
+
+Written as documentation commands, those are `seamless-input control --stdio`
+and `seamless-input control --ui-stdio` respectively. The latter is executable
+only for the guarded, non-shipping macOS diagnostics projection target; it is
+not a general native-host authority.
+
+The admitted AppKit diagnostics host starts at most one owned child using this
 platform-native argument vector:
 
 ```text
-[absolute path to seamless-input, "control", "--stdio"]
+[absolute path to seamless-input, "control", "--ui-stdio"]
 ```
 
 The path comes from signed-package resources selected by the local host, not
 from a UI field, discovery record, environment variable, or remote message.
 The host does not use a shell, command string, terminal parser, browser view,
-or secondary launcher.
+or secondary launcher. It cannot fall back to `--stdio`, the TUI, or any other
+argument vector.
 
 The host creates anonymous inherited standard-input and standard-output pipes
 before spawn. It gives the child no inherited listening socket, no named or
@@ -154,5 +170,7 @@ closes. Its exact host-to-child request allowlist remains the separately
 reviewed typed UI commands; it does not use the foundations `shutdown` command.
 
 This boundary does not create a relationship, session, layout, cursor crossing,
-input, clipboard operation, or diagnostic success state. Those require their
-separate reviewed runtime contracts.
+input, clipboard operation, or diagnostic success state. The admitted host
+renders only current structured diagnostics and `Not running` for stale,
+missing, malformed, duplicate, or non-PASS runtime facts. Those other
+capabilities require their separate reviewed runtime contracts.

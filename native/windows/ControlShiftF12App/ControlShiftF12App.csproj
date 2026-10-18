@@ -8,4 +8,7 @@
     <RootNamespace>ControlShiftF12App</RootNamespace>
     <ApplicationId>ai.lanchuske.control-shift-f12.windows-host</ApplicationId>
   </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\ControlShiftF12App.Core\ControlShiftF12App.Core.csproj" />
+  </ItemGroup>
 </Project>

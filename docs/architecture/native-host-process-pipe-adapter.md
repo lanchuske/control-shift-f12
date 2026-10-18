@@ -2,20 +2,42 @@
 
 ## Status, scope, and admission gate
 
-This is a reviewed **design-only** record for Tasks 6 and 7. It does not add
-AppKit, WinForms, process, pipe, network, or product source. In particular, it
-does not make either manifest under `native/` shippable.
+This is a reviewed boundary record for Tasks 6 and 7. The admitted Rust child
+entrypoint, one guarded AppKit diagnostics projection source, one
+presentation-only WinForms shell, and one nonshipping Windows child owner do
+not add a product bundle, network, or product sharing UI. The Windows owner
+can only start the reviewed local engine, send its initial refresh, validate
+the first projection and close/reap that child; it exposes no capability API.
+In particular, these sources do not make either manifest under `native/`
+shippable.
 
-The candidate contains a bounded Rust `UiStdioAdapter` and a
-`TimedRequestReader` abstraction. It does **not** yet contain an implementation
-of an inherited-pipe reader, an AppKit host, or a WinForms host. Moreover,
-`main.rs` currently routes `seamless-input control --stdio` to the foundations
-`control_engine::run_stdio`, not to `ui_stdio_adapter::run_stdio`. A native
-host must therefore remain blocked until a separately reviewed engine-routing
-change selects the typed adapter without changing the process argument vector.
+The candidate contains a bounded Rust `UiStdioAdapter`, a process-owned
+inherited-stdin reader for the Rust child, and a `TimedRequestReader`
+abstraction. It contains the narrowly admitted AppKit diagnostics host, a
+presentation-only WinForms shell, and an initial-projection Windows child
+owner. Moreover,
+`main.rs` routes `seamless-input control --stdio` to the foundations
+`control_engine::run_stdio`, not to `ui_stdio_adapter::run_stdio`. The separate
+`seamless-input control --ui-stdio` entrypoint is admitted for the Rust-only
+adapter while preserving foundations `--stdio` behavior. A native host remains
+blocked until its own target-platform owner/tests are admitted.
 
-No implementation may use this document as authority to launch a process.
-Native source is admitted only after all pre-enable tests in
+The UI entrypoint is admitted. In particular, the guarded AppKit diagnostics
+source and nonshipping Windows initial-projection owner may use this document
+as authority to launch their fixed child process. The admitted WinForms shell is a local presentation-only surface: it
+may render unavailable onboarding, display-map and sharing controls, but it
+cannot launch a child, open a pipe, enable a control, or claim a connection.
+A Windows diagnostics parser/test pair, the target-tested nonshipping initial
+projection child owner, and platform-neutral lifecycle,
+journey-state, fixed child-launch specification, or closed initial-snapshot
+projection may validate redacted frames, terminal projection clearing,
+unavailable product actions, the immutable package-child command/environment
+allowlist, the inert baseline snapshot, and bounded frame parsing, but cannot
+launch a process, open a pipe, or render a host. A test-only Windows target
+probe may start the locally built reviewed child with its fixed argument vector
+to prove initial projection and input-close exit; it is not host source and
+does not create a product process owner. All other native source
+is admitted only after all pre-enable tests in
 [Required evidence before native source](#required-evidence-before-native-source)
 are present and passing on the actual target operating system.
 
@@ -30,7 +52,7 @@ session. Its only launch target is the signed package resource selected by the
 host, with this exact argument array:
 
 ```text
-[absolute path to seamless-input, "control", "--stdio"]
+[absolute path to seamless-input, "control", "--ui-stdio"]
 ```
 
 The host must use its native argument-array process API. It must not invoke a
@@ -39,6 +61,10 @@ path, environment-selected executable, browser view, URL scheme, socket, or
 named/public pipe. The fixed executable path is resolved inside the installed
 package before launching; a missing, non-regular, or out-of-package target is
 a local failure and does not fall back to another executable.
+
+`control --stdio` is not an alternate host launch vector: it remains the
+foundations channel. The TUI is likewise a technical fallback, not a host
+substitute.
 
 The child gets only these three inherited standard streams:
 
@@ -58,6 +84,12 @@ The host owns the process and every parent pipe endpoint. It closes the parent
 end of stdin/stdout/stderr when it stops or faults; it never transfers those
 handles to a second host, helper, or restarted child.
 
+The Rust-only child entrypoint owns its inherited stdin reader. If a stdout
+write fails while that reader is blocked, the child terminates its own process
+rather than returning with a stranded reader. This process-local behavior does
+not substitute for the platform-specific host cancellation and reaping proof
+required below.
+
 ## Framing and direction
 
 Both stdin and stdout use the existing `control_api` frame: a non-zero,
@@ -72,8 +104,15 @@ The typed adapter's direction is closed:
 
 | Direction | Allowed values |
 | --- | --- |
-| Host → child | `ui.refresh` and `ui.confirm_v01` only, using the existing request envelope and idempotent request IDs |
+| Host → child | `ui.refresh`, `ui.start_discovery`, `ui.stop_discovery`, and `ui.confirm_v01` only, using the existing request envelope and idempotent request IDs |
 | Child → host | `ui_snapshot_v1`, `ui_diagnostics_v1`, `ui_response_v1`, and the transient `sas_display_v1` frame only |
+
+`ui.start_discovery` and `ui.stop_discovery` transition only the bounded local
+UI controller between its inert and browsing presentations. They do not create
+a listener, select a locator, expose an address, start a pairing transport, or
+grant an input, clipboard, inventory, layout, or relationship capability. A
+future engine-owned discovery owner must publish current candidates separately
+before the UI can select anything.
 
 Malformed, zero-length, truncated, oversized, unknown-version, unknown-field,
 wrong-direction, or invalid-JSON frames are terminal local pipe failures. The
@@ -106,8 +145,9 @@ Normal close is ordered as follows:
 A write failure, read failure, malformed frame, EOF, child exit, application
 termination, app deactivation that ends the session, or timeout follows the
 same clear-and-reap path. There is no foundations shutdown command on the
-host-to-child path: its exact allowlist remains `ui.refresh` and
-`ui.confirm_v01`. Closing pipes and owning/reaping the child never permits a
+host-to-child path: its exact allowlist remains `ui.refresh`,
+`ui.start_discovery`, `ui.stop_discovery`, and `ui.confirm_v01`. Closing pipes
+and owning/reaping the child never permits a
 detached child, background reader, or a UI that still claims the engine is
 running.
 
@@ -152,7 +192,7 @@ current `PipeSession` and projection generation; the main thread drops an
 update from a closed session, stale generation, or terminal SAS binding. It may
 coalesce ordinary snapshots and diagnostics while preserving their newest
 generation, but it must never coalesce away a terminal SAS invalidation. UI
-events only create the two allowlisted typed requests; they never invoke a
+events only create the four allowlisted typed requests; they never invoke a
 runtime command, process API, shell, socket, clipboard operation, or input
 operation.
 
@@ -204,7 +244,7 @@ simulated pipe never proves the target platform.
 | Engine admission | Test that the exact child vector routes to the reviewed typed adapter, with one shared monotonic epoch; foundations `control_engine` is rejected for a UI host. | Review confirms no argument or environment fallback. |
 | Launch boundary | Mutation tests reject shell text, relative/user/environment paths, extra arguments, inherited handles, named/public pipes, and non-allowlisted environment entries. | Package-resource path failures remain local and launch nothing else. |
 | Framing | Fuzz/mutation tests cover zero, truncated, oversized, invalid JSON, unknown schema, wrong direction, and partial writes/reads at the 256 KiB boundary. | Both platforms close/clear/reap; no retry route. |
-| Host allowlist | Integration tests reject every host request except `ui.refresh` and `ui.confirm_v01`, including recursive SAS shapes and request-ID conflicts/replays. | Host cannot cause input, clipboard, transport, discovery, or layout authority. |
+| Host allowlist | Integration tests reject every host request except `ui.refresh`, `ui.start_discovery`, `ui.stop_discovery`, and `ui.confirm_v01`, including recursive SAS shapes and request-ID conflicts/replays. | Host cannot cause input, clipboard, transport, candidate selection, or layout authority; discovery actions alone only alter the local browsing presentation. |
 | SAS lifetime | Tests cover current display, duplicate/stale frame, terminal invalidation, local expiry without traffic, backward clock, child exit, UI close, and restart. | Code/suffix clears immediately and cannot appear in history, logs, clipboard, notification, title, tooltip, accessibility cache, or next session. |
 | macOS pipe owner | AppKit-targeted test exercises a blocked read, cancellation, child exit, stdout write failure, bounded wait, reaping, and main-thread handoff. | No detached task or descriptor leak; UI is never updated off main. |
 | Windows pipe owner | WinForms/Windows-targeted test exercises the selected cancellable-read strategy, blocked read, child exit, stdout write failure, bounded wait, reaping, and UI-thread handoff. | No blocked worker, handle leak, or UI-thread violation. |
@@ -212,12 +252,16 @@ simulated pipe never proves the target platform.
 | Accessibility | Platform UI tests verify keyboard-only operation, focus order, semantic status, focused SAS exposure, and terminal clearing. | No global SAS announcement/history; documented OS visibility limits remain visible to reviewers. |
 | Physical QA | Signed package tests on a real Mac and a real Windows target measure start/stop/restart, permission loss, process cleanup, memory/CPU, and no-network-endpoint behavior. | Record PASS/FAIL/NOT MEASURED separately; no stable release claim from a harness-only pass. |
 
-Until this evidence exists, manifests remain declarations only; no native host
-source, build, launch, signing, packaging, or release is permitted.
+Until this evidence exists, no additional pipe-owning native host source beyond
+the reviewed Windows initial-projection owner, product build, signing,
+packaging, or release is permitted. The guarded AppKit diagnostics source,
+presentation-only WinForms shell, and Windows owner are non-shipping test
+material only; none satisfies full platform parity or release evidence.
 
 ## Non-goals
 
-This design does not add a GUI, native source, process spawning code, an IPC
-implementation, networking, transport, discovery, pairing, a layout save,
-input sharing, clipboard sharing, a CI workflow, or a publication path. It
-does not resolve the separately paused post-V01 operational-layout protocol.
+This design does not add a capability-owning GUI, an IPC implementation beyond
+the bounded initial Windows projection exchange, networking, transport,
+discovery, pairing, a layout save, input sharing, clipboard sharing, a CI
+workflow, or a publication path. It does not resolve the separately paused
+post-V01 operational-layout protocol.

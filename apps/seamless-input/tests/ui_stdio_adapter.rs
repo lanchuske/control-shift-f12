@@ -1,6 +1,6 @@
 use seamless_input::{
     control_api::{self, Request},
-    ui_contract::{RemainingDuration, SasCode, V01View},
+    ui_contract::{RemainingDuration, SasCode, UiState, V01View},
     ui_stdio_adapter::{
         AuthoritativeUiEvent, ChildFrame, MonotonicClock, StdioReadEvent, TimedRequestReader,
         UiStdioAdapter, run_stdio_with_adapter,
@@ -90,7 +90,7 @@ fn current_sas_is_child_only_and_terminal_cleanup_invalidates_it() {
 }
 
 #[test]
-fn host_accepts_only_refresh_or_boolean_confirm_and_rejects_sas_reexports() {
+fn host_accepts_only_empty_discovery_actions_or_boolean_confirm_and_rejects_sas_reexports() {
     let (mut adapter, _) = adapter_in_v01();
     let rejected = adapter.handle_host_request_at(
         2,
@@ -120,8 +120,10 @@ fn host_accepts_only_refresh_or_boolean_confirm_and_rejects_sas_reexports() {
             .any(|frame| matches!(frame, ChildFrame::Response(response) if !response.ok))
     );
 
-    let rejected =
-        adapter.handle_host_request_at(2, &request("bad2", "ui.start_discovery", json!({})));
+    let rejected = adapter.handle_host_request_at(
+        2,
+        &request("bad2", "ui.start_discovery", json!({"address": "192.0.2.1"})),
+    );
     assert!(
         rejected
             .iter()
@@ -137,6 +139,33 @@ fn host_accepts_only_refresh_or_boolean_confirm_and_rejects_sas_reexports() {
             .iter()
             .any(|frame| matches!(frame, ChildFrame::Response(response) if response.ok))
     );
+}
+
+#[test]
+fn empty_discovery_actions_only_transition_the_local_browsing_projection() {
+    let mut adapter = UiStdioAdapter::new(0);
+
+    let started = adapter.handle_host_request_at(
+        1,
+        &request("start", "ui.start_discovery", json!({})),
+    );
+    assert!(started.iter().any(
+        |frame| matches!(frame, ChildFrame::Response(response) if response.ok)
+    ));
+    assert!(started.iter().any(|frame| {
+        matches!(frame, ChildFrame::Snapshot(snapshot) if snapshot.snapshot.state == UiState::Browsing)
+    }));
+
+    let stopped = adapter.handle_host_request_at(
+        2,
+        &request("stop", "ui.stop_discovery", json!({})),
+    );
+    assert!(stopped.iter().any(
+        |frame| matches!(frame, ChildFrame::Response(response) if response.ok)
+    ));
+    assert!(stopped.iter().any(|frame| {
+        matches!(frame, ChildFrame::Snapshot(snapshot) if snapshot.snapshot.state == UiState::NotStarted)
+    }));
 }
 
 #[test]

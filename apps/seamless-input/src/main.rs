@@ -1,11 +1,13 @@
 use std::{
     fmt,
     io::{self, Write},
-    process::ExitCode,
+    process::{self, ExitCode},
+    sync::mpsc::{self, Receiver, RecvTimeoutError},
+    thread,
     time::{Duration, Instant, SystemTime},
 };
 
-use clap::{Args, Parser, Subcommand};
+use clap::{ArgGroup, Args, Parser, Subcommand};
 use seamless_discovery::{Discovery, manual_address};
 use seamless_input::{
     diagnostics::{RuntimeObservation, compatibility_lines},
@@ -33,9 +35,19 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Commands {
     /// Internal setup foundations; input, clipboard and pairing remain disabled.
+    #[command(group(
+        ArgGroup::new("control_channel")
+            .required(true)
+            .args(["stdio", "ui_stdio"])
+            .multiple(false)
+    ))]
     Control {
-        #[arg(long, required = true)]
+        /// Internal foundations channel; not for the desktop presentation host.
+        #[arg(long)]
         stdio: bool,
+        /// Bounded redacted UI projection channel for a future native host.
+        #[arg(long, hide = true)]
+        ui_stdio: bool,
     },
     /// Start this machine as a Control Shift F12 peer.
     Start,
@@ -117,14 +129,22 @@ impl<E: std::error::Error> From<E> for OperationalError {
 }
 
 async fn run(cli: Cli) -> Result<(), OperationalError> {
+    if matches!(&cli.command, Commands::Control { ui_stdio: true, .. }) {
+        return run_ui_stdio_child();
+    }
+
     let paths = AppPaths::discover()?;
     match cli.command {
-        Commands::Control { stdio: _ } => {
+        Commands::Control {
+            stdio: true,
+            ui_stdio: false,
+        } => {
             let _instance =
                 seamless_transport::setup_lock::SetupInstanceLock::acquire(&paths.root)?;
             seamless_input::control_engine::run_stdio(io::stdin().lock(), io::stdout().lock())?;
             Ok(())
         }
+        Commands::Control { .. } => Err(OperationalError("invalid control channel".into())),
         Commands::Start => start(&paths).await,
         Commands::Status(args) => status(&paths, args),
         Commands::Pair(args) => pair(&paths, &args.code, args.address.as_deref()).await,
@@ -137,6 +157,117 @@ async fn run(cli: Cli) -> Result<(), OperationalError> {
         }
         Commands::Config { command } => config(&paths, command),
     }
+}
+
+enum InheritedRead {
+    Event(seamless_input::ui_stdio_adapter::StdioReadEvent),
+    Invalid,
+}
+
+/// A process-owned inherited stdin reader for the UI projection child.
+///
+/// The only terminal cancellation path is a direct child-process exit. That
+/// deliberately avoids returning from a broken-stdout path while an inherited
+/// stdin read remains blocked; a platform host must still provide its own
+/// cancellable pipe owner before it can be enabled.
+struct InheritedUiStdinReader {
+    receiver: Option<Receiver<InheritedRead>>,
+    worker: Option<thread::JoinHandle<()>>,
+}
+
+impl InheritedUiStdinReader {
+    fn new() -> Self {
+        Self {
+            receiver: None,
+            worker: None,
+        }
+    }
+
+    fn ensure_read(&mut self) {
+        if self.receiver.is_some() {
+            return;
+        }
+
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let worker = thread::spawn(move || {
+            let stdin = io::stdin();
+            let mut stdin = stdin.lock();
+            let result = match seamless_input::control_api::read_request(&mut stdin) {
+                Ok(Some(request)) => InheritedRead::Event(
+                    seamless_input::ui_stdio_adapter::StdioReadEvent::Request(request),
+                ),
+                Ok(None) => {
+                    InheritedRead::Event(seamless_input::ui_stdio_adapter::StdioReadEvent::Eof)
+                }
+                Err(_) => InheritedRead::Invalid,
+            };
+            let _ = sender.send(result);
+        });
+        self.receiver = Some(receiver);
+        self.worker = Some(worker);
+    }
+
+    fn finish_read(&mut self) -> io::Result<()> {
+        self.receiver = None;
+        if let Some(worker) = self.worker.take() {
+            worker
+                .join()
+                .map_err(|_| io::Error::other("ui stdio reader terminated unexpectedly"))?;
+        }
+        Ok(())
+    }
+}
+
+impl seamless_input::ui_stdio_adapter::TimedRequestReader for InheritedUiStdinReader {
+    fn receive_until(
+        &mut self,
+        timeout: Duration,
+    ) -> io::Result<seamless_input::ui_stdio_adapter::StdioReadEvent> {
+        self.ensure_read();
+        let result = self
+            .receiver
+            .as_ref()
+            .expect("reader exists after ensure_read")
+            .recv_timeout(timeout);
+        match result {
+            Ok(InheritedRead::Event(event)) => {
+                self.finish_read()?;
+                Ok(event)
+            }
+            Ok(InheritedRead::Invalid) => {
+                self.finish_read()?;
+                Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invalid ui stdio request",
+                ))
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                Ok(seamless_input::ui_stdio_adapter::StdioReadEvent::Timeout)
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                self.finish_read()?;
+                Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "ui stdio reader disconnected",
+                ))
+            }
+        }
+    }
+
+    fn cancel(&mut self) {
+        // The adapter calls this only after output has already failed. Process
+        // exit releases the blocked inherited read instead of returning a
+        // child with a detached worker.
+        process::exit(EXIT_OPERATIONAL_FAILURE.into());
+    }
+}
+
+fn run_ui_stdio_child() -> Result<(), OperationalError> {
+    let mut reader = InheritedUiStdinReader::new();
+    let mut stdout = io::stdout().lock();
+    seamless_input::ui_stdio_adapter::run_stdio(&mut reader, &mut stdout)?;
+    reader.finish_read()?;
+    Ok(())
 }
 
 async fn start(paths: &AppPaths) -> Result<(), OperationalError> {

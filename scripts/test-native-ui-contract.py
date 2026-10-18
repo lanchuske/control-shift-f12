@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Static boundary checks for the non-shipping native hosts.
+"""Static boundary checks for admitted non-shipping native contracts.
 
-These checks deliberately inspect manifests and design records only.  They do
-not launch a native host or turn the host boundary into a runtime path.
+The checks admit one reviewable AppKit source tree and a Windows-only parser
+plus tests and a presentation-only Windows shell. They do not admit a Windows
+pipe owner, bundles, build output, a network endpoint, or host capabilities.
 """
 
 from pathlib import Path
@@ -18,6 +19,7 @@ NATIVE_README = ROOT / "native/README.md"
 BOUNDARY_RECORD = ROOT / "docs/architecture/native-host-boundary.md"
 SAS_MATRIX = ROOT / "docs/architecture/discovery-sas-security-matrix.md"
 HOST_PIPE_DESIGN = ROOT / "docs/architecture/native-host-process-pipe-adapter.md"
+DESKTOP_PARITY_GATE = ROOT / "docs/architecture/desktop-functional-parity-gate.md"
 SAS_FRAME_FIXTURE = ROOT / "docs/fixtures/sas-display-frame-v1.json"
 NONSHIPPING_NATIVE_PATHS = frozenset(
     {
@@ -26,6 +28,51 @@ NONSHIPPING_NATIVE_PATHS = frozenset(
         "native/macos/ControlShiftF12App/README.md",
         "native/windows/ControlShiftF12App/ControlShiftF12App.csproj",
         "native/windows/ControlShiftF12App/README.md",
+    }
+)
+ADMITTED_MACOS_HOST_PATHS = frozenset(
+    {
+        "native/macos/ControlShiftF12App/Sources/ControlShiftF12App/main.swift",
+        "native/macos/ControlShiftF12App/Tests/ControlShiftF12AppTests/ControlShiftF12AppTests.swift",
+    }
+)
+ADMITTED_WINDOWS_CONTRACT_PATHS = frozenset(
+    {
+        "native/windows/ControlShiftF12App.Core/ControlShiftF12App.Core.csproj",
+        "native/windows/ControlShiftF12App.Core/ChildSessionState.cs",
+        "native/windows/ControlShiftF12App.Core/ChildLaunchSpec.cs",
+        "native/windows/ControlShiftF12App.Core/DesktopJourneyState.cs",
+        "native/windows/ControlShiftF12App.Core/PairingBridgeState.cs",
+        "native/windows/ControlShiftF12App.Core/PairingProjection.cs",
+        "native/windows/ControlShiftF12App.Core/DesktopShellPresentation.cs",
+        "native/windows/ControlShiftF12App.Core/DesktopSnapshotProjection.cs",
+        "native/windows/ControlShiftF12App.Core/UiChildSession.cs",
+        "native/windows/ControlShiftF12App.Core/FramedPayloadReader.cs",
+        "native/windows/ControlShiftF12App.Core/DiagnosticsProjection.cs",
+        "native/windows/ControlShiftF12App.Tests/ControlShiftF12App.Tests.csproj",
+        "native/windows/ControlShiftF12App.Tests/ChildSessionStateTests.cs",
+        "native/windows/ControlShiftF12App.Tests/ChildLaunchSpecTests.cs",
+        "native/windows/ControlShiftF12App.Tests/DesktopJourneyStateTests.cs",
+        "native/windows/ControlShiftF12App.Tests/PairingBridgeStateTests.cs",
+        "native/windows/ControlShiftF12App.Tests/PairingProjectionTests.cs",
+        "native/windows/ControlShiftF12App.Tests/DesktopShellPresentationTests.cs",
+        "native/windows/ControlShiftF12App.Tests/DesktopSnapshotProjectionTests.cs",
+        "native/windows/ControlShiftF12App.Tests/FramedPayloadReaderTests.cs",
+        "native/windows/ControlShiftF12App.Tests/UiStdioChildProbeTests.cs",
+        "native/windows/ControlShiftF12App.Tests/UiChildSessionTests.cs",
+        "native/windows/ControlShiftF12App.Tests/WindowsDiagnosticsProjectionTests.cs",
+    }
+)
+ADMITTED_WINDOWS_SHELL_PATHS = frozenset(
+    {
+        "native/windows/ControlShiftF12App/Program.cs",
+        "native/windows/ControlShiftF12App/DesktopShellForm.cs",
+    }
+)
+ADMITTED_WINDOWS_PIPE_OWNER_PATHS = frozenset(
+    {
+        "native/windows/ControlShiftF12App/WindowsUiChildOwner.cs",
+        "native/windows/ControlShiftF12App.Tests/WindowsUiChildOwnerTests.cs",
     }
 )
 HOST_SOURCE_SUFFIXES = (".swift", ".cs", ".m", ".mm", ".h")
@@ -62,8 +109,14 @@ SAS_HOST_REQUEST_RESERVED_FIELDS = frozenset(
 
 
 def is_nonshipping_native_path(path):
-    """Only reviewable declarations may be tracked before adapter approval."""
-    return path in NONSHIPPING_NATIVE_PATHS
+    """Only reviewed diagnostics contracts may extend native declarations."""
+    return path in (
+        NONSHIPPING_NATIVE_PATHS
+        | ADMITTED_MACOS_HOST_PATHS
+        | ADMITTED_WINDOWS_CONTRACT_PATHS
+        | ADMITTED_WINDOWS_SHELL_PATHS
+        | ADMITTED_WINDOWS_PIPE_OWNER_PATHS
+    )
 
 
 def is_blocked_native_artifact(path):
@@ -72,7 +125,11 @@ def is_blocked_native_artifact(path):
         return True
     if any(part.endswith(HOST_BUNDLE_SUFFIXES) for part in parts):
         return True
-    if path.endswith(HOST_SOURCE_SUFFIXES) and not path.endswith("Package.swift"):
+    if (
+        path.endswith(HOST_SOURCE_SUFFIXES)
+        and not path.endswith("Package.swift")
+        and not is_nonshipping_native_path(path)
+    ):
         return True
     return path.endswith(BUILD_OUTPUT_SUFFIXES)
 
@@ -174,22 +231,29 @@ def host_request_contains_sas(request):
 
 
 class NativeHostBoundaryTests(unittest.TestCase):
-    def test_nonshipping_native_tree_has_only_reviewed_manifests_and_docs(self):
+    def test_native_tree_has_only_reviewed_manifests_docs_and_diagnostics_contracts(self):
         tracked = tracked_native_paths()
-        unexpected = sorted(tracked - NONSHIPPING_NATIVE_PATHS)
+        admitted = (
+            NONSHIPPING_NATIVE_PATHS
+            | ADMITTED_MACOS_HOST_PATHS
+            | ADMITTED_WINDOWS_CONTRACT_PATHS
+            | ADMITTED_WINDOWS_SHELL_PATHS
+            | ADMITTED_WINDOWS_PIPE_OWNER_PATHS
+        )
+        unexpected = sorted(tracked - admitted)
         self.assertEqual(
             unexpected,
             [],
-            "adapter approval is required before tracking native host material",
+            "only approved non-shipping native sources may be tracked",
         )
-        self.assertEqual(tracked, NONSHIPPING_NATIVE_PATHS)
+        self.assertEqual(tracked, admitted)
         blocked = sorted(path for path in tracked if is_blocked_native_artifact(path))
         self.assertEqual(blocked, [], "tracked host source or build output is forbidden")
 
-    def test_nonshipping_gate_rejects_host_sources_bundles_and_build_outputs(self):
+    def test_allowlist_rejects_other_host_sources_bundles_and_build_outputs(self):
         prohibited = (
             "native/macos/ControlShiftF12App/Sources/App.swift",
-            "native/windows/ControlShiftF12App/Program.cs",
+            "native/windows/ControlShiftF12App/UnreviewedHost.cs",
             "native/macos/ControlShiftF12App/ControlShiftF12.app/Contents/MacOS/ControlShiftF12",
             "native/windows/ControlShiftF12App/bin/Release/ControlShiftF12App.exe",
             "native/windows/ControlShiftF12App/obj/Release/ControlShiftF12App.dll",
@@ -200,21 +264,105 @@ class NativeHostBoundaryTests(unittest.TestCase):
             self.assertFalse(is_nonshipping_native_path(path), path)
             self.assertTrue(is_blocked_native_artifact(path), path)
 
+    def test_windows_contract_is_parser_and_tests_only(self):
+        parser = (ROOT / "native/windows/ControlShiftF12App.Core/DiagnosticsProjection.cs").read_text()
+        lifecycle = (ROOT / "native/windows/ControlShiftF12App.Core/ChildSessionState.cs").read_text()
+        launch_spec = (ROOT / "native/windows/ControlShiftF12App.Core/ChildLaunchSpec.cs").read_text()
+        journey = (ROOT / "native/windows/ControlShiftF12App.Core/DesktopJourneyState.cs").read_text()
+        snapshot = (ROOT / "native/windows/ControlShiftF12App.Core/DesktopSnapshotProjection.cs").read_text()
+        reader = (ROOT / "native/windows/ControlShiftF12App.Core/FramedPayloadReader.cs").read_text()
+        tests = (ROOT / "native/windows/ControlShiftF12App.Tests/WindowsDiagnosticsProjectionTests.cs").read_text()
+        for required in ("Encoding.UTF8.GetByteCount", "TryGetUInt64", "EnumerateObject"):
+            self.assertIn(required, parser)
+        for forbidden in (
+            "ProcessStartInfo", "Process.Start", "System.Net", "Pipe", "Socket",
+            "ui.confirm", "ui.refresh", "Windows.Forms",
+        ):
+            self.assertNotIn(forbidden, parser, forbidden)
+            self.assertNotIn(forbidden, lifecycle, forbidden)
+            self.assertNotIn(forbidden, launch_spec, forbidden)
+            self.assertNotIn(forbidden, journey, forbidden)
+            self.assertNotIn(forbidden, snapshot, forbidden)
+            self.assertNotIn(forbidden, reader, forbidden)
+        self.assertIn("ChildSessionPhase.Terminal", lifecycle)
+        self.assertIn("EndOfFile", lifecycle)
+        self.assertIn("Set up another computer", journey)
+        self.assertIn("Not measured", journey)
+        self.assertIn("ui_snapshot_v1", snapshot)
+        self.assertIn("HasExactly", snapshot)
+        self.assertIn("MaxFrameBytes", reader)
+        self.assertIn("CompleteInput", reader)
+        self.assertIn('"--ui-stdio"', launch_spec)
+        self.assertIn("AllowedEnvironmentNames", launch_spec)
+        for expected in (
+            "Duplicate_frame_field_is_rejected", "Frame_larger_than_the_engine_limit",
+            "Negative_generation_is_rejected", "Extra_or_sensitive_frame_field_is_rejected",
+            "Invalid_row_enum_is_rejected", "More_than_32_rows_is_rejected",
+        ):
+            self.assertIn(expected, tests)
+
+    def test_macos_diagnostics_host_is_structurally_limited_to_the_fixed_child_pipe(self):
+        """The sole admitted host cannot grow a shell, listener, or control surface."""
+        source = (
+            ROOT / "native/macos/ControlShiftF12App/Sources/ControlShiftF12App/main.swift"
+        ).read_text()
+        self.assertIn("import AppKit", source)
+        self.assertIn('private static let childArguments = ["control", "--ui-stdio"]', source)
+        self.assertIn("process.executableURL = executableURL", source)
+        self.assertIn("process.arguments = Self.childArguments", source)
+        self.assertIn("process.standardInput = inputPipe", source)
+        self.assertIn("process.standardOutput = outputPipe", source)
+        self.assertIn("process.standardError = errorPipe", source)
+        self.assertIn("process.terminationHandler", source)
+        self.assertIn("case .endOfFile, .pipeFailure, .termination", source)
+        self.assertIn("controller.invalidate()", source)
+        self.assertIn("self.refreshButton.isEnabled = self.diagnostics.presentation.refreshEnabled", source)
+        self.assertEqual(source.count("Process()"), 1)
+        self.assertEqual(source.count("kill(process.processIdentifier, SIGKILL)"), 1)
+        self.assertIn("func refresh()", source)
+        self.assertNotIn("func confirm", source)
+        forbidden = (
+            "ProcessInfo.processInfo.environment",
+            "NSTask",
+            "Task {",
+            "URLSession",
+            "NWConnection",
+            "NWListener",
+            "NWBrowser",
+            "CFSocket",
+            "CFStream",
+            "Socket",
+            "NSPasteboard",
+            "CGEvent",
+            "NSEvent.addGlobalMonitor",
+            "NSEvent.addLocalMonitor",
+            "Process.launchPath",
+            "Process.arguments.append",
+            "popen(",
+            "system(",
+            '"/bin/sh"',
+        )
+        for token in forbidden:
+            self.assertNotIn(token, source, token)
+
     def test_native_hosts_exist_and_do_not_create_a_control_network_endpoint(self):
         self.assertTrue(MACOS_MANIFEST.is_file())
         self.assertTrue(WINDOWS_MANIFEST.is_file())
 
-        native_sources = []
-        for suffix in ("*.swift", "*.cs", "*.csproj", "Package.swift"):
-            native_sources.extend((ROOT / "native").rglob(suffix))
-        native_text = "\n".join(path.read_text() for path in native_sources)
+        native_production_sources = [
+            ROOT / path
+            for path in tracked_native_paths()
+            if path.endswith((".swift", ".cs", ".csproj")) or path.endswith("Package.swift")
+            if "/Tests/" not in path and ".Tests/" not in path
+            if path not in ADMITTED_WINDOWS_PIPE_OWNER_PATHS
+        ]
+        native_text = "\n".join(path.read_text() for path in native_production_sources)
         forbidden = (
             "http://",
             "https://",
             "import Network",
             "import CFNetwork",
             "import WebKit",
-            "import Darwin",
             "using System.Net",
             "System.Net.",
             "using System.IO.Pipes",
@@ -248,7 +396,6 @@ class NativeHostBoundaryTests(unittest.TestCase):
             "CreateProcess",
             "NSTask",
             "Foundation.Process",
-            "Process()",
             "posix_spawn",
             "popen(",
             "system(",
@@ -257,6 +404,69 @@ class NativeHostBoundaryTests(unittest.TestCase):
         )
         for token in forbidden:
             self.assertNotIn(token, native_text, token)
+
+    def test_windows_engine_probe_is_test_only_and_uses_the_reviewed_child_mode(self):
+        probe = (
+            ROOT / "native/windows/ControlShiftF12App.Tests/UiStdioChildProbeTests.cs"
+        ).read_text()
+        for expected in (
+            'ArgumentList.Add("control")',
+            'ArgumentList.Add("--ui-stdio")',
+            "RedirectStandardInput = true",
+            "RedirectStandardOutput = true",
+            "StandardInput.Close()",
+            "target", "debug", "seamless-input.exe",
+        ):
+            self.assertIn(expected, probe)
+        for forbidden in ("cmd.exe", "powershell", "pwsh", "http://", "https://", "Socket"):
+            self.assertNotIn(forbidden, probe, forbidden)
+
+    def test_windows_shell_is_presentation_only_until_a_pipe_owner_is_admitted(self):
+        shell = (ROOT / "native/windows/ControlShiftF12App/DesktopShellForm.cs").read_text()
+        for expected in (
+            "DesktopShellPresentation",
+            "Find nearby computers",
+            "Input sharing",
+            "Clipboard sharing",
+            "Automatic updates",
+            "Not connected",
+        ):
+            self.assertIn(expected, shell)
+        for forbidden in (
+            "ProcessStartInfo",
+            "Process.Start",
+            "System.IO.Pipes",
+            "Socket",
+            "HttpClient",
+            "http://",
+            "https://",
+            "cmd.exe",
+            "powershell",
+            "Clipboard.Set",
+            "SendKeys",
+        ):
+            self.assertNotIn(forbidden, shell, forbidden)
+
+    def test_windows_pipe_owner_has_one_fixed_local_child_boundary(self):
+        owner = (ROOT / "native/windows/ControlShiftF12App/WindowsUiChildOwner.cs").read_text()
+        for expected in (
+            "new ProcessStartInfo(spec.ExecutablePath)",
+            "UseShellExecute = false",
+            "RedirectStandardInput = true",
+            "RedirectStandardOutput = true",
+            "RedirectStandardError = true",
+            "start.Environment.Clear()",
+            "start.ArgumentList.Add(argument)",
+            "UiChildSession.InitialRefreshFrame()",
+            "child.StandardInput.Close()",
+            "child.Kill(entireProcessTree: false)",
+        ):
+            self.assertIn(expected, owner)
+        for forbidden in (
+            "cmd.exe", "powershell", "pwsh", "http://", "https://", "Socket",
+            "System.IO.Pipes", "NamedPipe", "Clipboard", "SendKeys", "UseShellExecute = true",
+        ):
+            self.assertNotIn(forbidden, owner, forbidden)
 
     def test_hosts_are_declared_as_nonshipping_pipe_clients_of_the_existing_engine(self):
         macos_manifest = MACOS_MANIFEST.read_text()
@@ -274,6 +484,7 @@ class NativeHostBoundaryTests(unittest.TestCase):
 
         for text in (native_readme, boundary_record):
             self.assertIn("seamless-input control --stdio", text)
+            self.assertIn("seamless-input control --ui-stdio", text)
             self.assertIn("argument vector", text)
             self.assertIn("anonymous inherited", text)
             self.assertIn("MAX_FRAME_BYTES", text)
@@ -316,20 +527,22 @@ class NativeHostBoundaryTests(unittest.TestCase):
         for request in fixture["invalid_host_requests"]:
             self.assertTrue(host_request_contains_sas(request), request)
 
-    def test_native_host_pipe_design_keeps_native_source_admission_closed(self):
-        """The host plan must retain its adapter and OS-specific safety gates."""
+    def test_native_host_pipe_design_limits_native_source_to_safe_presentations_and_gates(self):
+        """The host plan admits only non-shipping presentations and safety gates."""
         design = HOST_PIPE_DESIGN.read_text()
         required = (
             "control_engine::run_stdio",
             "ui_stdio_adapter::run_stdio",
-            "[absolute path to seamless-input, \"control\", \"--stdio\"]",
+            "[absolute path to seamless-input, \"control\", \"--ui-stdio\"]",
+            "seamless-input control --stdio",
+            "seamless-input control --ui-stdio",
             "MAX_FRAME_BYTES = 256 KiB",
             "ui.refresh",
             "ui.confirm_v01",
             "terminal `sas_display_v1 current:false`",
             "Platform-specific reader cancellation is intentionally not unified",
-            "No implementation may use this document as authority to launch a process.",
-            "no native host\nsource, build, launch, signing, packaging, or release is permitted",
+            "the guarded AppKit diagnostics",
+            "no additional pipe-owning native host source beyond",
         )
         for invariant in required:
             self.assertIn(invariant, design)
@@ -341,8 +554,8 @@ class NativeHostBoundaryTests(unittest.TestCase):
         native_readme = NATIVE_README.read_text()
         host_to_child = design.split("| Host → child |", 1)[1].split("\n", 1)[0]
         self.assertEqual(
-            host_to_child,
-            " `ui.refresh` and `ui.confirm_v01` only, using the existing request envelope and idempotent request IDs |",
+        host_to_child,
+        " `ui.refresh`, `ui.start_discovery`, `ui.stop_discovery`, and `ui.confirm_v01` only, using the existing request envelope and idempotent request IDs |",
         )
         for text in (design, boundary, native_readme):
             self.assertNotIn("send the existing typed shutdown request", text)
@@ -350,6 +563,61 @@ class NativeHostBoundaryTests(unittest.TestCase):
         self.assertIn("no foundations shutdown command", design)
         self.assertIn("no shutdown command on the host-to-child path", boundary)
         self.assertIn("sends no\nfoundations shutdown command", native_readme)
+
+    def test_desktop_parity_plan_reserves_a_separate_ui_stdio_channel(self):
+        """Native UX must not repurpose the foundations control channel or TUI."""
+        plan = DESKTOP_PARITY_GATE.read_text()
+        for invariant in (
+            "`seamless-input control --ui-stdio`",
+            "`seamless-input control --stdio`",
+            "TUI is a technical fallback",
+            "AppKit",
+            "WinForms",
+            "separate authenticated application-session lifecycle",
+            "not a saved topology",
+        ):
+            self.assertIn(invariant, plan)
+
+    def test_desktop_parity_plan_maps_every_user_action_to_a_fenced_gate(self):
+        """Presented desktop states do not themselves authorize user actions."""
+        plan = DESKTOP_PARITY_GATE.read_text()
+        self.assertIn("## Action-gate schema", plan)
+        for column in (
+            "Future typed gate and engine owner",
+            "Required presented state / preconditions",
+            "Allowed effect",
+            "Fail-closed rejection and no fallback",
+            "Current status",
+            "allowlist remains exactly `ui.refresh`, `ui.start_discovery`,",
+        ):
+            self.assertIn(column, plan)
+        for action in (
+            "Find nearby",
+            "Stop looking",
+            "Select nearby computer",
+            "Begin bootstrap",
+            "Confirm bootstrap code",
+            "Begin V01",
+            "Confirm V01 code",
+            "Move display",
+            "Reset layout",
+            "Review layout",
+            "Start sharing",
+            "Stop sharing",
+            "Retry",
+        ):
+            self.assertIn(f"`{action}`", plan)
+
+    def test_ui_stdio_entrypoint_has_only_the_guarded_macos_diagnostics_owner(self):
+        """The child mode cannot admit a general native-host surface."""
+        boundary = BOUNDARY_RECORD.read_text()
+        pipe_design = HOST_PIPE_DESIGN.read_text()
+        for text in (boundary, pipe_design):
+            self.assertIn("`seamless-input control --ui-stdio`", text)
+            self.assertIn("diagnostics", text)
+            self.assertNotIn("WinForms host starts", text)
+        self.assertIn("entrypoint is admitted", pipe_design)
+        self.assertNotIn("`seamless-input control --stdio` is an alternate", boundary)
 
     def test_every_sas_field_and_literal_is_rejected_recursively_from_host_args(self):
         """A partial display shape is still an impermissible host re-export."""
