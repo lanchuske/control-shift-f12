@@ -779,6 +779,42 @@ mod tests {
     }
 
     #[test]
+    fn replacement_keeps_delete_shared_old_target_handle_readable() {
+        let root = tempfile::tempdir().unwrap();
+        let from = root.path().join("replacement");
+        let to = root.path().join("target");
+        std::fs::write(&from, b"new").unwrap();
+        std::fs::write(&to, b"old").unwrap();
+        let source = open_path(&from, false, OPEN_EXISTING).unwrap().unwrap();
+        let source_id = identity(&file_info(source.as_raw_handle().cast()).unwrap());
+        let mut old_target = OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .open(&to)
+            .unwrap();
+        faults::reset_operations();
+
+        let result = rename_open_file(&source, &to, true);
+        let attempts = faults::take_rename_attempts();
+
+        assert_eq!(
+            result,
+            Ok(()),
+            "delete-shared target replacement failed; attempts={attempts:?}"
+        );
+        let mut old_bytes = Vec::new();
+        old_target.read_to_end(&mut old_bytes).unwrap();
+        assert_eq!(old_bytes, b"old");
+        assert_eq!(std::fs::read(&to).unwrap(), b"new");
+        assert!(!from.exists());
+        let target = open_path(&to, false, OPEN_EXISTING).unwrap().unwrap();
+        assert_eq!(
+            identity(&file_info(target.as_raw_handle().cast()).unwrap()),
+            source_id
+        );
+    }
+
+    #[test]
     fn sharing_retry_returns_after_first_success_without_backoff() {
         let mut calls = 0;
         let mut delays = Vec::new();
