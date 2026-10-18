@@ -13,6 +13,7 @@ public sealed record ChildLaunchSpec(
         "TEMP",
         "TMP",
         "LOCALAPPDATA",
+        "APPDATA",
         "USERPROFILE",
         "PATH",
     ];

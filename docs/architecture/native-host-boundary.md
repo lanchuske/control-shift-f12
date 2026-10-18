@@ -60,8 +60,10 @@ The child environment is rebuilt from a fixed allowlist:
 
 | macOS | Windows |
 | --- | --- |
-| `HOME`, `PATH`, `TMPDIR` | `SystemRoot`, `WINDIR`, `TEMP`, `TMP`, `LOCALAPPDATA`, `USERPROFILE`, `PATH` |
+| `HOME`, `PATH`, `TMPDIR` | `SystemRoot`, `WINDIR`, `TEMP`, `TMP`, `LOCALAPPDATA`, `APPDATA`, `USERPROFILE`, `PATH` |
 
+On Windows, `APPDATA` is required only to resolve the engine-owned durable
+configuration directory; it grants no discovery or operational capability.
 Every other variable is omitted. Future work may add a parent-created,
 single-use typed launch authorization only after the Rust control contract
 models and reviews it. It cannot be represented by arbitrary host input.
