@@ -9,12 +9,13 @@ use std::{
         io::{AsRawHandle, FromRawHandle},
     },
     path::{Path, PathBuf},
-    ptr,
+    ptr, thread,
+    time::Duration,
 };
 use windows_sys::Win32::{
     Foundation::{
-        CloseHandle, ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, GENERIC_READ, GENERIC_WRITE,
-        HANDLE, INVALID_HANDLE_VALUE, LocalFree,
+        CloseHandle, ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, ERROR_SHARING_VIOLATION,
+        GENERIC_READ, GENERIC_WRITE, GetLastError, HANDLE, INVALID_HANDLE_VALUE, LocalFree,
     },
     Security::{
         ACCESS_ALLOWED_ACE, ACL, ACL_REVISION, ACL_SIZE_INFORMATION, AclSizeInformation,
@@ -41,6 +42,51 @@ use windows_sys::Win32::{
 };
 
 const ERROR_SUCCESS: u32 = 0;
+const ATOMIC_REPLACE_RETRIES: usize = 100;
+const ATOMIC_REPLACE_RETRY_DELAY: Duration = Duration::from_millis(5);
+
+fn atomic_replace(from: &[u16], to: &[u16], target_exists: bool) -> Result<(), StoreError> {
+    atomic_replace_with_backoff(from, to, target_exists, || {
+        thread::sleep(ATOMIC_REPLACE_RETRY_DELAY);
+    })
+}
+
+fn atomic_replace_with_backoff(
+    from: &[u16],
+    to: &[u16],
+    target_exists: bool,
+    mut backoff: impl FnMut(),
+) -> Result<(), StoreError> {
+    for attempt in 0..=ATOMIC_REPLACE_RETRIES {
+        let ok = unsafe {
+            if target_exists {
+                ReplaceFileW(
+                    to.as_ptr(),
+                    from.as_ptr(),
+                    ptr::null(),
+                    0,
+                    ptr::null(),
+                    ptr::null(),
+                )
+            } else {
+                MoveFileExW(
+                    from.as_ptr(),
+                    to.as_ptr(),
+                    MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+                )
+            }
+        };
+        if ok != 0 {
+            return Ok(());
+        }
+        let error = unsafe { GetLastError() };
+        if error != ERROR_SHARING_VIOLATION || attempt == ATOMIC_REPLACE_RETRIES {
+            return Err(StoreError::Unavailable);
+        }
+        backoff();
+    }
+    unreachable!()
+}
 
 #[cfg(all(test, feature = "pairing-v2-experimental"))]
 pub(crate) mod faults {
@@ -495,27 +541,7 @@ impl PrivateDir {
             let to = wide(self.path.join(value).as_os_str());
             let target_exists = self.open(value, false, false)?.is_some();
             fault_point!(value, "before_rename");
-            let ok = unsafe {
-                if target_exists {
-                    ReplaceFileW(
-                        to.as_ptr(),
-                        from.as_ptr(),
-                        ptr::null(),
-                        0,
-                        ptr::null(),
-                        ptr::null(),
-                    )
-                } else {
-                    MoveFileExW(
-                        from.as_ptr(),
-                        to.as_ptr(),
-                        MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-                    )
-                }
-            };
-            if ok == 0 {
-                return Err(StoreError::Unavailable);
-            }
+            atomic_replace(&from, &to, target_exists)?;
             fault_point!(value, "after_rename");
             let target = self.open(value, false, false)?.ok_or(StoreError::Invalid)?;
             validate(target.as_raw_handle().cast(), false, &self.sid)?;
@@ -553,5 +579,37 @@ impl PrivateDir {
             return Err(StoreError::Unavailable);
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{fs::OpenOptions, os::windows::fs::OpenOptionsExt};
+
+    #[test]
+    fn atomic_replace_retries_transient_sharing_violations() {
+        let root = tempfile::tempdir().unwrap();
+        let from = root.path().join("replacement");
+        let to = root.path().join("target");
+        std::fs::write(&from, b"new").unwrap();
+        std::fs::write(&to, b"old").unwrap();
+        let blocker = OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .open(&to)
+            .unwrap();
+        let mut blocker = Some(blocker);
+        let mut retries = 0;
+
+        atomic_replace_with_backoff(&wide(from.as_os_str()), &wide(to.as_os_str()), true, || {
+            retries += 1;
+            drop(blocker.take());
+            thread::sleep(ATOMIC_REPLACE_RETRY_DELAY);
+        })
+        .unwrap();
+        assert!(retries >= 1);
+        assert_eq!(std::fs::read(&to).unwrap(), b"new");
+        assert!(!from.exists());
     }
 }
