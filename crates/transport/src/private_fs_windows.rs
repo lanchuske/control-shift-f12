@@ -12,12 +12,10 @@ use std::{
     path::{Path, PathBuf},
     ptr,
 };
-#[cfg(test)]
-use windows_sys::Win32::Foundation::GetLastError;
 use windows_sys::Win32::{
     Foundation::{
         CloseHandle, ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, GENERIC_READ, GENERIC_WRITE,
-        HANDLE, INVALID_HANDLE_VALUE, LocalFree,
+        GetLastError, HANDLE, INVALID_HANDLE_VALUE, LocalFree,
     },
     Security::{
         ACCESS_ALLOWED_ACE, ACL, ACL_REVISION, ACL_SIZE_INFORMATION, AclSizeInformation,
@@ -82,20 +80,34 @@ fn rename_info(destination: &Path, replace: bool) -> Result<(Vec<usize>, u32), S
 }
 
 fn rename_open_file(source: &File, destination: &Path, replace: bool) -> Result<(), StoreError> {
+    rename_open_file_with_backoff(source, destination, replace, || {})
+}
+
+fn rename_open_file_with_backoff(
+    source: &File,
+    destination: &Path,
+    replace: bool,
+    _backoff: impl FnMut(),
+) -> Result<(), StoreError> {
     let (info, used) = rename_info(destination, replace)?;
-    if unsafe {
+    let result = unsafe {
         SetFileInformationByHandle(
             source.as_raw_handle().cast(),
             FileRenameInfo,
             info.as_ptr().cast(),
             used,
         )
-    } == 0
-    {
+    };
+    if result == 0 {
+        let error = unsafe { GetLastError() };
         #[cfg(test)]
-        faults::record_failure("rename", Some(unsafe { GetLastError() } as i32));
+        faults::record_rename_attempt(error);
+        #[cfg(test)]
+        faults::record_failure("rename", Some(error as i32));
         Err(StoreError::Unavailable)
     } else {
+        #[cfg(test)]
+        faults::record_rename_attempt(ERROR_SUCCESS);
         Ok(())
     }
 }
@@ -108,6 +120,7 @@ pub(crate) mod faults {
     std::thread_local! {static ARMED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };}
     std::thread_local! {static OPERATIONS: RefCell<Vec<&'static str>> = const { RefCell::new(Vec::new()) };}
     std::thread_local! {static FAILURE: RefCell<Option<(&'static str, Option<i32>)>> = const { RefCell::new(None) };}
+    std::thread_local! {static RENAME_ATTEMPTS: RefCell<Vec<u32>> = const { RefCell::new(Vec::new()) };}
     #[cfg(feature = "pairing-v2-experimental")]
     pub fn arm() {
         ARMED.set(true);
@@ -143,6 +156,7 @@ pub(crate) mod faults {
     pub fn reset_operations() {
         OPERATIONS.with(|operations| operations.borrow_mut().clear());
         FAILURE.with(|failure| *failure.borrow_mut() = None);
+        RENAME_ATTEMPTS.with(|attempts| attempts.borrow_mut().clear());
     }
     pub fn take_operations() -> Vec<&'static str> {
         OPERATIONS.with(|operations| std::mem::take(&mut *operations.borrow_mut()))
@@ -152,6 +166,12 @@ pub(crate) mod faults {
     }
     pub fn take_failure() -> Option<(&'static str, Option<i32>)> {
         FAILURE.with(|failure| failure.borrow_mut().take())
+    }
+    pub fn record_rename_attempt(code: u32) {
+        RENAME_ATTEMPTS.with(|attempts| attempts.borrow_mut().push(code));
+    }
+    pub fn take_rename_attempts() -> Vec<u32> {
+        RENAME_ATTEMPTS.with(|attempts| std::mem::take(&mut *attempts.borrow_mut()))
     }
 }
 
@@ -719,7 +739,7 @@ mod tests {
     }
 
     #[test]
-    fn blocked_destination_fails_closed_then_succeeds_after_release() {
+    fn handle_rename_retries_a_transient_sharing_violation_on_the_same_source_handle() {
         let root = tempfile::tempdir().unwrap();
         let from = root.path().join("replacement");
         let to = root.path().join("target");
@@ -731,16 +751,78 @@ mod tests {
             .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
             .open(&to)
             .unwrap();
+        let source_id = identity(&file_info(source.as_raw_handle().cast()).unwrap());
+        let mut blocker = Some(blocker);
+        let mut backoffs = 0;
+        faults::reset_operations();
+
+        let result = rename_open_file_with_backoff(&source, &to, true, || {
+            backoffs += 1;
+            drop(blocker.take());
+        });
+        let attempts = faults::take_rename_attempts();
+
+        assert_eq!(result, Ok(()));
+        assert_eq!(attempts.first(), Some(&32));
+        assert_eq!(attempts.last(), Some(&ERROR_SUCCESS));
+        assert!(attempts.len() <= 21);
+        assert_eq!(backoffs, attempts.len() - 1);
+        assert_eq!(std::fs::read(&to).unwrap(), b"new");
+        assert!(!from.exists());
+        let target = open_path(&to, false, OPEN_EXISTING).unwrap().unwrap();
         assert_eq!(
-            rename_open_file(&source, &to, true),
-            Err(StoreError::Unavailable)
+            identity(&file_info(target.as_raw_handle().cast()).unwrap()),
+            source_id
         );
+    }
+
+    #[test]
+    fn handle_rename_exhausts_exactly_and_leaves_both_files_unchanged() {
+        let root = tempfile::tempdir().unwrap();
+        let from = root.path().join("replacement");
+        let to = root.path().join("target");
+        std::fs::write(&from, b"new").unwrap();
+        std::fs::write(&to, b"old").unwrap();
+        let source = open_path(&from, false, OPEN_EXISTING).unwrap().unwrap();
+        let blocker = OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .open(&to)
+            .unwrap();
+        let mut backoffs = 0;
+        faults::reset_operations();
+
+        let result = rename_open_file_with_backoff(&source, &to, true, || backoffs += 1);
+        let attempts = faults::take_rename_attempts();
+
+        assert_eq!(result, Err(StoreError::Unavailable));
+        assert_eq!(attempts, vec![32; 21]);
+        assert_eq!(backoffs, 20);
+        assert_eq!(faults::take_failure(), Some(("rename", Some(32))));
         assert_eq!(std::fs::read(&to).unwrap(), b"old");
         assert_eq!(std::fs::read(&from).unwrap(), b"new");
         drop(blocker);
-        rename_open_file(&source, &to, true).unwrap();
-        assert_eq!(std::fs::read(&to).unwrap(), b"new");
-        assert!(!from.exists());
+    }
+
+    #[test]
+    fn handle_rename_does_not_retry_a_non_sharing_error() {
+        let root = tempfile::tempdir().unwrap();
+        let from = root.path().join("replacement");
+        let to = root.path().join("missing-parent").join("target");
+        std::fs::write(&from, b"new").unwrap();
+        let source = open_path(&from, false, OPEN_EXISTING).unwrap().unwrap();
+        let mut backoffs = 0;
+        faults::reset_operations();
+
+        let result = rename_open_file_with_backoff(&source, &to, true, || backoffs += 1);
+        let attempts = faults::take_rename_attempts();
+
+        assert_eq!(result, Err(StoreError::Unavailable));
+        assert_eq!(attempts.len(), 1);
+        assert_ne!(attempts[0], ERROR_SUCCESS);
+        assert_ne!(attempts[0], 32);
+        assert_eq!(backoffs, 0);
+        assert_eq!(std::fs::read(&from).unwrap(), b"new");
     }
 
     #[test]
