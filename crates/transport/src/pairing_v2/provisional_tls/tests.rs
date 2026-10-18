@@ -2958,7 +2958,7 @@ async fn freeze_before_endpoint_drop_is_durably_revoked_before_future_authority(
         crate::pairing_v2::admission_authority::AdmissionAuthorityStore::open(ta.path()).unwrap();
     assert_eq!(
         reopened.reconcile(attempt).unwrap(),
-        crate::pairing_v2::admission_authority::ReconcileAdmission::Revoked
+        crate::pairing_v2::admission_authority::ReconcileAdmission::Absent
     );
 }
 
@@ -3078,7 +3078,7 @@ async fn final_manifest_error_after_claim_is_not_operationally_active() {
         crate::pairing_v2::admission_authority::AdmissionAuthorityStore::open(ta.path()).unwrap();
     assert_eq!(
         store.reconcile(record.attempt_id).unwrap(),
-        crate::pairing_v2::admission_authority::ReconcileAdmission::Revoked
+        crate::pairing_v2::admission_authority::ReconcileAdmission::Absent
     );
     assert!(
         store
@@ -3166,7 +3166,7 @@ fn final_manifest_crash_after_claim_reconciles_durable_boundary() {
     for (stage, expected) in [
         (
             "before_rename",
-            crate::pairing_v2::admission_authority::ReconcileAdmission::Revoked,
+            crate::pairing_v2::admission_authority::ReconcileAdmission::Absent,
         ),
         (
             "after_rename",
