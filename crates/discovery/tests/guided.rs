@@ -86,8 +86,8 @@ fn local_freshness_window_deadline_and_clock_rollback_are_fail_closed() {
     catalog.open(0).unwrap();
     let handle = catalog.observe(advertisement(1), 0).unwrap();
     assert!(catalog.select(handle, 29_999).is_ok());
-    assert_eq!(catalog.select(handle, 30_000), Err(DiscoveryError::Stale));
-    assert!(catalog.candidates(30_000).unwrap().is_empty());
+    assert!(catalog.select(handle, 30_000).is_ok());
+    assert_eq!(catalog.candidates(30_000).unwrap().len(), 1);
     let mut ttl = advertisement(2);
     ttl.ttl = Some(Duration::from_millis(5));
     let short = catalog.observe(ttl, 30_001).unwrap();
@@ -117,8 +117,10 @@ fn duplicate_refresh_is_stable_but_address_drift_removal_and_expiry_revoke_handl
     assert_eq!(catalog.select(first, 12), Err(DiscoveryError::Stale));
     catalog.remove(&advertisement(1).instance, 13).unwrap();
     assert_eq!(catalog.select(next, 14), Err(DiscoveryError::Stale));
-    let expired = catalog.observe(advertisement(1), 15).unwrap();
-    let fresh = catalog.observe(advertisement(1), 30_015).unwrap();
+    let mut bounded = advertisement(1);
+    bounded.ttl = Some(Duration::from_secs(30));
+    let expired = catalog.observe(bounded.clone(), 15).unwrap();
+    let fresh = catalog.observe(bounded, 30_015).unwrap();
     assert_ne!(expired, fresh);
 }
 

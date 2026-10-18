@@ -37,7 +37,7 @@ pub struct SelectedLocator {
 struct Entry {
     advertisement: Advertisement,
     handle: CandidateHandle,
-    expires: u64,
+    expires: Option<u64>,
 }
 
 #[derive(Default)]
@@ -68,7 +68,8 @@ impl ConsentCatalog {
             self.entries.clear();
             return Err(DiscoveryError::Expired);
         }
-        self.entries.retain(|_, e| now < e.expires);
+        self.entries
+            .retain(|_, e| e.expires.is_none_or(|expires| now < expires));
         Ok(())
     }
     pub fn open(&mut self, now: u64) -> Result<(), DiscoveryError> {
@@ -105,13 +106,19 @@ impl ConsentCatalog {
         ad.instance.make_ascii_lowercase();
         ad.addresses.sort();
         ad.addresses.dedup();
-        let ttl = ad
-            .ttl
-            .map_or(30_000, |ttl| ttl.as_millis().min(30_000) as u64);
-        if ttl == 0 {
-            return Err(DiscoveryError::Invalid);
-        }
-        let expires = now.checked_add(ttl).ok_or(DiscoveryError::Limit)?;
+        let expires = match ad.ttl {
+            Some(ttl) => {
+                let ttl = ttl.as_millis().min(30_000) as u64;
+                if ttl == 0 {
+                    return Err(DiscoveryError::Invalid);
+                }
+                Some(now.checked_add(ttl).ok_or(DiscoveryError::Limit)?)
+            }
+            // GuidedMdns receives wire-TTL expiry and goodbye as ServiceRemoved.
+            // None therefore remains current only inside this bounded consent
+            // window and is still revoked immediately by remove().
+            None => None,
+        };
         // Wire TTL is never evidence of local freshness and isn't part of a handle.
         ad.ttl = None;
         if let Some(entry) = self.entries.get_mut(&ad.instance) {
