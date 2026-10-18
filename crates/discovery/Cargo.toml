@@ -10,3 +10,6 @@ pairing-v2-experimental = ["pairing-v2-g4"]
 
 [dependencies]
 mdns-sd = "0.21"
+
+[dev-dependencies]
+flume = "0.12"

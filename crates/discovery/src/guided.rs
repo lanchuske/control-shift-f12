@@ -330,44 +330,56 @@ impl GuidedMdns {
                 Err(_) => return Err(DiscoveryError::Unavailable),
             }
         }
-        let mut events = Vec::new();
-        let mut remaining = 16;
-        if self.pending_started {
-            let old_empty =
-                drain_service_events(&self.receiver, &mut remaining, 16, &mut events)?.0;
-            if old_empty {
-                self.receiver = self.pending_receiver.take().unwrap();
-                self.pending_started = false;
-            }
-            return Ok(events);
-        }
-        drain_service_events(
-            &self.receiver,
-            &mut remaining,
-            if self.pending_receiver.is_some() {
-                8
-            } else {
-                16
-            },
-            &mut events,
-        )?;
-        if let Some(pending) = self.pending_receiver.as_ref() {
-            let (_, started) = drain_service_events(pending, &mut remaining, 8, &mut events)?;
-            self.pending_started |= started;
-        }
-        if self.pending_started && remaining > 0 {
-            // SearchStarted proves the replacement listener is live. Drain the old
-            // receiver once more after that boundary so a queued withdrawal cannot
-            // be lost between the first drain and the listener handoff.
-            let old_empty_after_start =
-                drain_service_events(&self.receiver, &mut remaining, 16, &mut events)?.0;
-            if old_empty_after_start {
-                self.receiver = self.pending_receiver.take().unwrap();
-                self.pending_started = false;
-            }
-        }
-        Ok(events)
+        poll_browse_receivers(
+            &mut self.receiver,
+            &mut self.pending_receiver,
+            &mut self.pending_started,
+        )
     }
+}
+
+fn poll_browse_receivers(
+    receiver: &mut mdns_sd::Receiver<mdns_sd::ServiceEvent>,
+    pending_receiver: &mut Option<mdns_sd::Receiver<mdns_sd::ServiceEvent>>,
+    pending_started: &mut bool,
+) -> Result<Vec<LocatorEvent>, DiscoveryError> {
+    let mut events = Vec::new();
+    let mut remaining = 16;
+    if *pending_started {
+        let old_empty = drain_service_events(receiver, &mut remaining, 16, &mut events)?;
+        if old_empty {
+            *receiver = pending_receiver.take().ok_or(DiscoveryError::Unavailable)?;
+            *pending_started = false;
+        }
+        return Ok(events);
+    }
+    let old_empty = drain_service_events(receiver, &mut remaining, 16, &mut events)?;
+    if !old_empty || pending_receiver.is_none() || remaining == 0 {
+        return Ok(events);
+    }
+
+    // mdns-sd guarantees SearchStarted is the first event from a new browse.
+    // Do not consume any new-generation service event before the old listener
+    // has been drained, or opposed events could be delivered out of order.
+    remaining -= 1;
+    match pending_receiver
+        .as_ref()
+        .ok_or(DiscoveryError::Unavailable)?
+        .recv_timeout(std::time::Duration::ZERO)
+    {
+        Ok(mdns_sd::ServiceEvent::SearchStarted(_)) => *pending_started = true,
+        Err(mdns_sd::RecvTimeoutError::Timeout) => return Ok(events),
+        Ok(_) | Err(_) => return Err(DiscoveryError::Unavailable),
+    }
+
+    // Close the race between the first empty read and SearchStarted. Only
+    // after this second old-generation drain may the replacement take over.
+    let old_empty_after_start = drain_service_events(receiver, &mut remaining, 16, &mut events)?;
+    if old_empty_after_start {
+        *receiver = pending_receiver.take().ok_or(DiscoveryError::Unavailable)?;
+        *pending_started = false;
+    }
+    Ok(events)
 }
 
 fn drain_service_events(
@@ -375,8 +387,7 @@ fn drain_service_events(
     remaining: &mut usize,
     limit: usize,
     events: &mut Vec<LocatorEvent>,
-) -> Result<(bool, bool), DiscoveryError> {
-    let mut started = false;
+) -> Result<bool, DiscoveryError> {
     for _ in 0..limit.min(*remaining) {
         *remaining -= 1;
         match receiver.recv_timeout(std::time::Duration::ZERO) {
@@ -390,16 +401,16 @@ fn drain_service_events(
                     events.push(LocatorEvent::Removed(id.to_ascii_lowercase()));
                 }
             }
-            Ok(mdns_sd::ServiceEvent::SearchStarted(_)) => started = true,
+            Ok(mdns_sd::ServiceEvent::SearchStarted(_)) => {}
             Ok(mdns_sd::ServiceEvent::SearchStopped(_)) => {
                 return Err(DiscoveryError::Unavailable);
             }
             Ok(_) => {}
-            Err(mdns_sd::RecvTimeoutError::Timeout) => return Ok((true, started)),
+            Err(mdns_sd::RecvTimeoutError::Timeout) => return Ok(true),
             Err(_) => return Err(DiscoveryError::Unavailable),
         }
     }
-    Ok((false, started))
+    Ok(false)
 }
 impl Drop for GuidedMdns {
     fn drop(&mut self) {
@@ -528,6 +539,50 @@ mod tests {
         .unwrap()
         .as_resolved_service();
         assert!(decode(&bad).is_none());
+    }
+    #[test]
+    fn browse_handoff_never_reorders_opposed_generations() {
+        fn run(old_tail: mdns_sd::ServiceEvent, new_event: mdns_sd::ServiceEvent) -> bool {
+            let (old_tx, mut receiver) = flume::unbounded();
+            for _ in 0..9 {
+                old_tx
+                    .send(mdns_sd::ServiceEvent::ServiceResolved(Box::new(info(
+                        false,
+                    ))))
+                    .unwrap();
+            }
+            old_tx.send(old_tail).unwrap();
+            let (new_tx, pending) = flume::unbounded();
+            new_tx
+                .send(mdns_sd::ServiceEvent::SearchStarted("replacement".into()))
+                .unwrap();
+            new_tx.send(new_event).unwrap();
+            let mut pending_receiver = Some(pending);
+            let mut pending_started = false;
+            let mut present = false;
+            for _ in 0..4 {
+                for event in poll_browse_receivers(
+                    &mut receiver,
+                    &mut pending_receiver,
+                    &mut pending_started,
+                )
+                .unwrap()
+                {
+                    present = matches!(event, LocatorEvent::Observed(_));
+                }
+            }
+            present
+        }
+
+        let fullname = format!("11111111111111111111111111111111.{SERVICE_TYPE}");
+        assert!(!run(
+            mdns_sd::ServiceEvent::ServiceResolved(Box::new(info(false))),
+            mdns_sd::ServiceEvent::ServiceRemoved(SERVICE_TYPE.into(), fullname.clone()),
+        ));
+        assert!(run(
+            mdns_sd::ServiceEvent::ServiceRemoved(SERVICE_TYPE.into(), fullname),
+            mdns_sd::ServiceEvent::ServiceResolved(Box::new(info(false))),
+        ));
     }
     #[test]
     fn loopback_browse_and_goodbye_are_real_but_browser_never_publishes() {
