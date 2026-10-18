@@ -45,6 +45,24 @@ public sealed class UiChildSessionTests
     }
 
     [Fact]
+    public void Pairing_actions_send_only_opaque_handle_and_bound_decision()
+    {
+        var session = new UiChildSession();
+        using var selected = JsonDocument.Parse(session.SelectCandidateFrame("nearby-7").Skip(4).ToArray());
+        var selectArgs = selected.RootElement.GetProperty("args");
+        Assert.Equal("ui.select_candidate", selected.RootElement.GetProperty("command").GetString());
+        Assert.Equal("nearby-7", selectArgs.GetProperty("handle").GetString());
+        Assert.Single(selectArgs.EnumerateObject());
+
+        using var approved = JsonDocument.Parse(session.ApproveSasFrame(9, false).Skip(4).ToArray());
+        var approveArgs = approved.RootElement.GetProperty("args");
+        Assert.Equal("ui.approve_sas", approved.RootElement.GetProperty("command").GetString());
+        Assert.Equal((ulong)9, approveArgs.GetProperty("generation").GetUInt64());
+        Assert.False(approveArgs.GetProperty("matches").GetBoolean());
+        Assert.Equal(2, approveArgs.EnumerateObject().Count());
+    }
+
+    [Fact]
     public void Discovery_response_is_accepted_only_after_a_current_projection()
     {
         var session = new UiChildSession();

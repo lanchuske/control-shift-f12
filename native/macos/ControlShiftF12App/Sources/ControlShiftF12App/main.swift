@@ -229,13 +229,20 @@ final class ChildRequestTracker {
     private var nextID: UInt64 = 0
     private var pending = Set<String>()
 
-    func frame(command: String) throws -> Data {
-        guard ["ui.refresh", "ui.start_discovery", "ui.stop_discovery"].contains(command),
+    func frame(command: String, args: [String: Any] = [:]) throws -> Data {
+        let empty = ["ui.refresh", "ui.start_discovery", "ui.stop_discovery"].contains(command)
+            && args.isEmpty
+        let select = command == "ui.select_candidate"
+            && args.count == 1 && (args["handle"] as? String).map(Self.validHandle) == true
+        let approval = command == "ui.approve_sas"
+            && args.count == 2 && (args["generation"] as? UInt64).map { $0 > 0 } == true
+            && args["matches"] is Bool
+        guard (empty || select || approval),
               pending.count < 256, nextID < UInt64.max
         else { throw HostError.invalidFrame }
         nextID += 1
         let id = "mac-\(nextID)"
-        let request: [String: Any] = ["v": 1, "id": id, "command": command, "args": [:]]
+        let request: [String: Any] = ["v": 1, "id": id, "command": command, "args": args]
         let payload = try JSONSerialization.data(withJSONObject: request)
         guard payload.count > 0, payload.count <= maximumFrameBytes else { throw HostError.invalidFrame }
         var length = UInt32(payload.count).bigEndian
@@ -246,6 +253,14 @@ final class ChildRequestTracker {
     }
 
     func acknowledge(_ id: String) -> Bool { pending.remove(id) != nil }
+
+    private static func validHandle(_ value: String) -> Bool {
+        !value.isEmpty && value.utf8.count <= 64
+            && value.utf8.allSatisfy { byte in
+                (byte >= 48 && byte <= 57) || (byte >= 65 && byte <= 90)
+                    || (byte >= 97 && byte <= 122) || byte == 45 || byte == 95
+            }
+    }
 }
 
 /// Owns the redacted view state on the AppKit main thread.
@@ -456,6 +471,8 @@ protocol ChildLifecycleChild: AnyObject {
     func sendRefresh() throws
     func sendStartDiscovery() throws
     func sendStopDiscovery() throws
+    func sendSelectCandidate(_ handle: String) throws
+    func sendApproveSas(generation: UInt64, matches: Bool) throws
     func closeInput()
     func closeOutput()
     func closeError()
@@ -498,6 +515,16 @@ final class ChildLifecycle {
     func stopDiscovery() {
         guard !isClosed else { return }
         try? child.sendStopDiscovery()
+    }
+
+    func selectCandidate(_ handle: String) {
+        guard !isClosed else { return }
+        try? child.sendSelectCandidate(handle)
+    }
+
+    func approveSas(generation: UInt64, matches: Bool) {
+        guard !isClosed else { return }
+        try? child.sendApproveSas(generation: generation, matches: matches)
     }
 
     func close() throws {
@@ -649,8 +676,19 @@ final class BundledChild: ChildLifecycleChild {
         try sendRequest(command: "ui.stop_discovery")
     }
 
-    private func sendRequest(command: String) throws {
-        let frame = try requests.frame(command: command)
+    func sendSelectCandidate(_ handle: String) throws {
+        try sendRequest(command: "ui.select_candidate", args: ["handle": handle])
+    }
+
+    func sendApproveSas(generation: UInt64, matches: Bool) throws {
+        try sendRequest(
+            command: "ui.approve_sas",
+            args: ["generation": generation, "matches": matches]
+        )
+    }
+
+    private func sendRequest(command: String, args: [String: Any] = [:]) throws {
+        let frame = try requests.frame(command: command, args: args)
         try inputPipe.fileHandleForWriting.write(contentsOf: frame)
     }
 

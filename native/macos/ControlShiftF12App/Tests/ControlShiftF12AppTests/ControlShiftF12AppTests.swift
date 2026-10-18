@@ -533,6 +533,8 @@ private class RecordingChild: ChildLifecycleChild {
     func sendRefresh() throws {}
     func sendStartDiscovery() throws { startDiscoveryCalls += 1 }
     func sendStopDiscovery() throws { stopDiscoveryCalls += 1 }
+    func sendSelectCandidate(_ handle: String) throws {}
+    func sendApproveSas(generation: UInt64, matches: Bool) throws {}
     func closeInput() { inputClosed = true }
     func closeOutput() { outputClosed = true }
     func closeError() { errorClosed = true }
@@ -572,6 +574,8 @@ private final class LockedRecordingChild: ChildLifecycleChild {
     func sendRefresh() throws {}
     func sendStartDiscovery() throws {}
     func sendStopDiscovery() throws {}
+    func sendSelectCandidate(_ handle: String) throws {}
+    func sendApproveSas(generation: UInt64, matches: Bool) throws {}
     func closeInput() {}
     func closeOutput() {}
     func closeError() {}

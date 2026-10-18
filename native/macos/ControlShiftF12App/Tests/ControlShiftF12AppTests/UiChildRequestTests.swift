@@ -21,6 +21,24 @@ final class UiChildRequestTests: XCTestCase {
         }
     }
 
+    func testPairingActionsContainOnlyOpaqueHandleAndBoundDecision() throws {
+        let requests = ChildRequestTracker()
+        let selected = try object(requests.frame(
+            command: "ui.select_candidate", args: ["handle": "nearby-7"]
+        ))
+        XCTAssertEqual(selected["command"] as? String, "ui.select_candidate")
+        XCTAssertEqual(selected["args"] as? [String: String], ["handle": "nearby-7"])
+
+        let approved = try object(requests.frame(
+            command: "ui.approve_sas", args: ["generation": UInt64(9), "matches": false]
+        ))
+        XCTAssertEqual(approved["command"] as? String, "ui.approve_sas")
+        let args = try XCTUnwrap(approved["args"] as? [String: Any])
+        XCTAssertEqual(args.count, 2)
+        XCTAssertEqual(args["generation"] as? UInt64, 9)
+        XCTAssertEqual(args["matches"] as? Bool, false)
+    }
+
     func testRepeatedRealChildGesturesAdvanceEverySnapshot() throws {
         guard let executable = ProcessInfo.processInfo.environment["CSF12_TEST_ENGINE"] else {
             throw XCTSkip("Set CSF12_TEST_ENGINE to the built local engine")

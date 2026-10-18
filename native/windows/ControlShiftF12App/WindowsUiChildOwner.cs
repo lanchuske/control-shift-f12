@@ -100,6 +100,30 @@ public sealed class WindowsUiChildOwner : IAsyncDisposable
         return await ReadUntilProjectionAsync(previous.Generation, timeout);
     }
 
+    public async Task<UiChildSession> SelectCandidateAsync(string handle, TimeSpan timeout)
+    {
+        ThrowIfClosed();
+        if (Session.State.Phase != ChildSessionPhase.Running
+            || Session.Snapshot is not { State: "browsing" } previous)
+        {
+            throw new InvalidOperationException("Candidate selection requires current discovery.");
+        }
+        await WriteFixedRequestAsync(Session.SelectCandidateFrame(handle), timeout);
+        return await ReadUntilProjectionAsync(previous.Generation, timeout);
+    }
+
+    public async Task<UiChildSession> ApproveSasAsync(ulong generation, bool matches, TimeSpan timeout)
+    {
+        ThrowIfClosed();
+        if (Session.State.Phase != ChildSessionPhase.Running || Session.Pairing is null
+            || Session.Snapshot is not { } previous)
+        {
+            throw new InvalidOperationException("No current pairing comparison is visible.");
+        }
+        await WriteFixedRequestAsync(Session.ApproveSasFrame(generation, matches), timeout);
+        return await ReadUntilProjectionAsync(previous.Generation, timeout);
+    }
+
     public async Task<UiChildSession> RefreshAsync(TimeSpan timeout)
     {
         ThrowIfClosed();
