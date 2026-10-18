@@ -9,6 +9,48 @@ namespace ControlShiftF12App.Tests;
 public sealed class DesktopShellPresentationTests
 {
     [Fact]
+    public void Background_observation_does_not_present_the_controls_as_busy()
+    {
+        Assert.True(DesktopShellForm.ShouldDisableControls(gesturePending: true));
+        Assert.False(DesktopShellForm.ShouldDisableControls(gesturePending: false));
+        Assert.False(DesktopShellForm.ShouldTerminateCommand(new UiGestureRejectedException("stale")));
+        Assert.True(DesktopShellForm.ShouldTerminateCommand(new IOException("transport")));
+    }
+
+    [Fact]
+    public async Task Visible_gesture_waits_for_observation_while_additional_observations_are_dropped()
+    {
+        var gate = new UiCommandGate();
+        var observationEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseObservation = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var gestureRuns = 0;
+
+        var observation = gate.RunAsync(waitForTurn: false, async () =>
+        {
+            observationEntered.SetResult();
+            await releaseObservation.Task;
+        });
+        await observationEntered.Task;
+
+        var gesture = gate.RunAsync(waitForTurn: true, () =>
+        {
+            gestureRuns++;
+            return Task.CompletedTask;
+        });
+        var duplicateGesture = gate.RunAsync(waitForTurn: true, () => Task.CompletedTask);
+        var skippedObservation = await gate.RunAsync(waitForTurn: false, () => Task.CompletedTask);
+        Assert.False(skippedObservation);
+        Assert.False(gesture.IsCompleted);
+        Assert.True(duplicateGesture.IsCompleted);
+        Assert.False(await duplicateGesture);
+
+        releaseObservation.SetResult();
+        Assert.True(await observation);
+        Assert.True(await gesture);
+        Assert.Equal(1, gestureRuns);
+    }
+
+    [Fact]
     public void Initial_shell_invites_setup_but_cannot_pair_or_share_yet()
     {
         var presentation = DesktopShellPresentation.From(DesktopJourneyState.Initial());

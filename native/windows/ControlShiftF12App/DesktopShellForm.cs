@@ -21,8 +21,9 @@ internal sealed class DesktopShellForm : Form
     private Button? findNearbyButton;
     private Label? engineStatus;
     private WindowsPairingControls? pairingControls;
+    private readonly UiCommandGate commandGate = new();
     private readonly Timer refreshTimer = new() { Interval = 1000 };
-    private bool commandInProgress;
+    private bool commandAffectsControls;
     private bool closing;
     private bool closeReady;
 
@@ -57,7 +58,8 @@ internal sealed class DesktopShellForm : Form
         root.Controls.Add(BuildFooter(presentation), 0, 2);
         root.SetColumnSpan(root.GetControlFromPosition(0, 2)!, 2);
         Controls.Add(root);
-        refreshTimer.Tick += async (_, _) => await RunChildCommandAsync(owner => owner.ObserveAsync(TimeSpan.FromMilliseconds(100)));
+        refreshTimer.Tick += async (_, _) => await RunChildCommandAsync(
+            owner => owner.ObserveAsync(TimeSpan.FromMilliseconds(100)), affectsControls: false);
         Shown += async (_, _) => await ConnectLocalEngineAsync();
     }
 
@@ -287,43 +289,72 @@ internal sealed class DesktopShellForm : Form
 
     private async Task StartLocalDiscoveryAsync()
     {
-        if (childOwner?.Session.Pairing is not null) return;
-        await RunChildCommandAsync(owner => owner.Session.Snapshot?.State == "browsing"
+        var currentOwner = childOwner;
+        if (currentOwner is null || currentOwner.Session.Pairing is not null) return;
+        var stopDiscovery = currentOwner.Session.Snapshot?.State == "browsing";
+        await RunChildCommandAsync(owner => stopDiscovery
             ? owner.StopDiscoveryAsync(TimeSpan.FromSeconds(3))
             : owner.StartDiscoveryAsync(TimeSpan.FromSeconds(3)));
     }
 
-    private async Task RunChildCommandAsync(Func<WindowsUiChildOwner, Task<UiChildSession>> command)
+    private async Task RunChildCommandAsync(
+        Func<WindowsUiChildOwner, Task<UiChildSession>> command,
+        bool affectsControls = true)
     {
-        if (closing || commandInProgress || childOwner is not { } owner) return;
-        commandInProgress = true;
-        RenderCurrentState();
+        if (closing || childOwner is null) return;
+        if (affectsControls)
+        {
+            if (commandAffectsControls) return;
+            commandAffectsControls = affectsControls;
+            RenderCurrentState();
+        }
         try
         {
-            await command(owner);
-            if (owner.Session.State.Phase == ChildSessionPhase.Terminal) refreshTimer.Stop();
-        }
-        catch (Exception)
-        {
-            // A timed-out or failed gesture is never replayed automatically.
-            refreshTimer.Stop();
-            owner.Session.CompleteOutput();
+            await commandGate.RunAsync(waitForTurn: affectsControls, async () =>
+            {
+                if (closing || childOwner is not { } owner) return;
+                try
+                {
+                    await command(owner);
+                    if (owner.Session.State.Phase == ChildSessionPhase.Terminal) refreshTimer.Stop();
+                }
+                catch (Exception error)
+                {
+                    // A stale queued gesture is rejected before it writes. Real transport failures
+                    // remain terminal and are never replayed automatically.
+                    if (ShouldTerminateCommand(error))
+                    {
+                        refreshTimer.Stop();
+                        owner.Session.CompleteOutput();
+                    }
+                }
+                if (!closing) RenderCurrentState();
+            });
         }
         finally
         {
-            commandInProgress = false;
-            if (!closing) RenderCurrentState();
+            if (affectsControls)
+            {
+                commandAffectsControls = false;
+                if (!closing) RenderCurrentState();
+            }
         }
     }
 
+    internal static bool ShouldDisableControls(bool gesturePending) => gesturePending;
+
+    internal static bool ShouldTerminateCommand(Exception error) =>
+        error is not UiGestureRejectedException;
+
     private void RenderCurrentState()
     {
-        pairingControls?.Render(commandInProgress);
+        var controlsBusy = ShouldDisableControls(commandAffectsControls);
+        pairingControls?.Render(controlsBusy);
         if (childOwner is not { } owner || findNearbyButton is null) return;
         var session = owner.Session;
         var state = session.Snapshot?.State;
         findNearbyButton.Text = state == "browsing" ? "Stop searching" : "Find nearby computers";
-        findNearbyButton.Enabled = !commandInProgress && session.State.Phase == ChildSessionPhase.Running
+        findNearbyButton.Enabled = !controlsBusy && session.State.Phase == ChildSessionPhase.Running
             && session.Pairing is null && state is "not_started" or "browsing";
         SetEngineStatus(G4PairingPresentation.From(session).Status,
             session.State.Phase == ChildSessionPhase.Running ? Color.FromArgb(0, 103, 80) : Color.Firebrick);
@@ -357,6 +388,46 @@ internal sealed class DesktopShellForm : Form
         refreshTimer.Stop();
         refreshTimer.Dispose();
         base.OnFormClosed(e);
+    }
+}
+
+internal sealed class UiCommandGate
+{
+    private readonly System.Threading.SemaphoreSlim gate = new(1, 1);
+    private int foregroundQueued;
+
+    internal async Task<bool> RunAsync(bool waitForTurn, Func<Task> command)
+    {
+        var ownsForegroundSlot = waitForTurn
+            && System.Threading.Interlocked.CompareExchange(ref foregroundQueued, 1, 0) == 0;
+        if (waitForTurn && !ownsForegroundSlot) return false;
+        try
+        {
+            var entered = waitForTurn
+                ? await WaitForTurnAsync()
+                : await gate.WaitAsync(0);
+            if (!entered) return false;
+            try
+            {
+                await command();
+                return true;
+            }
+            finally
+            {
+                gate.Release();
+            }
+        }
+        finally
+        {
+            if (ownsForegroundSlot)
+                System.Threading.Volatile.Write(ref foregroundQueued, 0);
+        }
+    }
+
+    private async Task<bool> WaitForTurnAsync()
+    {
+        await gate.WaitAsync();
+        return true;
     }
 }
 

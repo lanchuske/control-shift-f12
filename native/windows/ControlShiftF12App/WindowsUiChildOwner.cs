@@ -10,6 +10,8 @@ using ControlShiftF12App.Core;
 
 namespace ControlShiftF12App;
 
+internal sealed class UiGestureRejectedException(string message) : InvalidOperationException(message);
+
 /// <summary>
 /// The sole owner for one local engine child. It has no network, shell or
 /// capability API: it can only request fixed, redacted UI projections.
@@ -82,7 +84,7 @@ public sealed class WindowsUiChildOwner : IAsyncDisposable
         if (Session.State.Phase != ChildSessionPhase.Running
             || Session.Snapshot is not { State: "not_started" } || Session.Pairing is not null)
         {
-            throw new InvalidOperationException("Discovery is unavailable outside the reviewed local starting state.");
+            throw new UiGestureRejectedException("Discovery is unavailable outside the reviewed local starting state.");
         }
 
         return await SendAndReadResponseAsync(Session.StartDiscoveryFrame(), timeout);
@@ -94,7 +96,7 @@ public sealed class WindowsUiChildOwner : IAsyncDisposable
         if (Session.State.Phase != ChildSessionPhase.Running
             || Session.Snapshot is not { State: "browsing" } || Session.Pairing is not null)
         {
-            throw new InvalidOperationException("Discovery is not active.");
+            throw new UiGestureRejectedException("Discovery is not active.");
         }
 
         return await SendAndReadResponseAsync(Session.StopDiscoveryFrame(), timeout);
@@ -107,7 +109,7 @@ public sealed class WindowsUiChildOwner : IAsyncDisposable
             || Session.Snapshot is not { State: "browsing" }
             || Session.Pairing is not null || !Session.Snapshot.Nearby.Contains(handle))
         {
-            throw new InvalidOperationException("Candidate selection requires current discovery.");
+            throw new UiGestureRejectedException("Candidate selection requires current discovery.");
         }
         return await SendAndReadResponseAsync(Session.SelectCandidateFrame(handle), timeout);
     }
@@ -119,7 +121,7 @@ public sealed class WindowsUiChildOwner : IAsyncDisposable
             || Session.Pairing is not { Phase: PairingBridgePhase.AwaitingLocalConfirmation } pairing
             || pairing.Generation != generation)
         {
-            throw new InvalidOperationException("No current pairing comparison is visible.");
+            throw new UiGestureRejectedException("No current pairing comparison is visible.");
         }
         return await SendAndReadResponseAsync(Session.ApproveSasFrame(generation, matches), timeout);
     }
@@ -128,7 +130,7 @@ public sealed class WindowsUiChildOwner : IAsyncDisposable
     {
         ThrowIfClosed();
         if (Session.State.Phase != ChildSessionPhase.Running || Session.Pairing?.Generation != generation)
-            throw new InvalidOperationException("No current pairing comparison is visible.");
+            throw new UiGestureRejectedException("No current pairing comparison is visible.");
         return await SendAndReadResponseAsync(Session.CancelPairingFrame(generation), timeout);
     }
 
