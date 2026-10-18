@@ -1,6 +1,6 @@
 use std::time::{Duration, UNIX_EPOCH};
 
-use seamless_input::runtime_status::{RuntimeStatus, RuntimeStatusStore};
+use seamless_input::runtime_status::{RuntimeStatus, RuntimeStatusRead, RuntimeStatusStore};
 
 fn snapshot(updated_ms: u64, sessions: usize) -> RuntimeStatus {
     RuntimeStatus {
@@ -46,6 +46,18 @@ fn stale_or_malformed_status_fails_closed_as_not_running() {
             .is_err(),
         "a partial snapshot must not be accepted"
     );
+}
+
+#[test]
+fn runtime_read_distinguishes_missing_from_stale_without_reusing_a_success() {
+    let root = tempfile::tempdir().unwrap();
+    let store = RuntimeStatusStore::new(root.path().join("runtime-status.v1"));
+    let now = UNIX_EPOCH + Duration::from_secs(20);
+
+    assert_eq!(store.read_state(now).unwrap(), RuntimeStatusRead::Missing);
+
+    store.publish(&snapshot(10_000, 1)).unwrap();
+    assert_eq!(store.read_state(now).unwrap(), RuntimeStatusRead::Stale);
 }
 
 #[test]

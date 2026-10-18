@@ -14,6 +14,21 @@ pub struct Request {
     pub args: Value,
 }
 
+pub fn typed_request<T: Serialize>(
+    id: impl Into<String>,
+    command: impl Into<String>,
+    args: &T,
+) -> io::Result<Request> {
+    let request = Request {
+        v: 1,
+        id: id.into(),
+        command: command.into(),
+        args: serde_json::to_value(args).map_err(|_| invalid())?,
+    };
+    validate_request(&request)?;
+    Ok(request)
+}
+
 fn invalid() -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidData,
@@ -40,6 +55,11 @@ pub fn read_request(reader: &mut impl Read) -> io::Result<Option<Request>> {
     let mut bytes = vec![0; len];
     reader.read_exact(&mut bytes).map_err(|_| invalid())?;
     let request: Request = serde_json::from_slice(&bytes).map_err(|_| invalid())?;
+    validate_request(&request)?;
+    Ok(Some(request))
+}
+
+pub fn validate_request(request: &Request) -> io::Result<()> {
     if request.id.is_empty()
         || request.id.len() > 64
         || !request
@@ -51,7 +71,7 @@ pub fn read_request(reader: &mut impl Read) -> io::Result<Option<Request>> {
     {
         return Err(invalid());
     }
-    Ok(Some(request))
+    Ok(())
 }
 
 pub fn write_message(writer: &mut impl Write, value: &impl Serialize) -> io::Result<()> {

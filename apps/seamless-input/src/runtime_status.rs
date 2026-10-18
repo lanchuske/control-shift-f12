@@ -18,6 +18,15 @@ pub struct RuntimeStatus {
     pub authenticated_sessions: usize,
 }
 
+/// Freshness of the local runtime heartbeat. Consumers must distinguish a
+/// missing heartbeat from a stale one so that an old success is never reused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeStatusRead {
+    Current(RuntimeStatus),
+    Missing,
+    Stale,
+}
+
 impl RuntimeStatus {
     pub fn live(
         process_id: u32,
@@ -113,9 +122,18 @@ impl RuntimeStatusStore {
         &self,
         now: SystemTime,
     ) -> Result<Option<RuntimeStatus>, RuntimeStatusError> {
+        match self.read_state(now)? {
+            RuntimeStatusRead::Current(status) => Ok(Some(status)),
+            RuntimeStatusRead::Missing | RuntimeStatusRead::Stale => Ok(None),
+        }
+    }
+
+    pub fn read_state(&self, now: SystemTime) -> Result<RuntimeStatusRead, RuntimeStatusError> {
         let text = match fs::read_to_string(&self.path) {
             Ok(text) => text,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok(RuntimeStatusRead::Missing);
+            }
             Err(error) => return Err(error.into()),
         };
         let status = decode(&text)?;
@@ -124,9 +142,54 @@ impl RuntimeStatusStore {
             return Err(RuntimeStatusError::Invalid);
         }
         if now_ms.saturating_sub(status.updated_unix_ms) > MAX_AGE.as_millis() as u64 {
-            return Ok(None);
+            return Ok(RuntimeStatusRead::Stale);
         }
-        Ok(Some(status))
+        Ok(RuntimeStatusRead::Current(status))
+    }
+
+    /// Read the one current owner heartbeat under an application root.
+    ///
+    /// A malformed, mismatched or ambiguous owner record is rejected rather
+    /// than selecting an arbitrary success. A stale record remains distinct
+    /// from an absent record so diagnostics cannot replay an old runtime.
+    pub fn read_owner_state(
+        root: &Path,
+        now: SystemTime,
+    ) -> Result<RuntimeStatusRead, RuntimeStatusError> {
+        let entries = match fs::read_dir(root) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok(RuntimeStatusRead::Missing);
+            }
+            Err(error) => return Err(error.into()),
+        };
+
+        let mut saw_stale = false;
+        let mut current = None;
+        for entry in entries {
+            let entry = entry?;
+            let Some(owner_pid) = owner_pid_from_path(&entry.path()) else {
+                continue;
+            };
+            let store = Self::new(entry.path());
+            match store.read_state(now)? {
+                RuntimeStatusRead::Current(status) if status.process_id == owner_pid => {
+                    if current.replace(status).is_some() {
+                        return Err(RuntimeStatusError::Invalid);
+                    }
+                }
+                RuntimeStatusRead::Current(_) => return Err(RuntimeStatusError::Invalid),
+                RuntimeStatusRead::Stale => saw_stale = true,
+                RuntimeStatusRead::Missing => {}
+            }
+        }
+        if let Some(status) = current {
+            Ok(RuntimeStatusRead::Current(status))
+        } else if saw_stale {
+            Ok(RuntimeStatusRead::Stale)
+        } else {
+            Ok(RuntimeStatusRead::Missing)
+        }
     }
 
     pub fn clear_owned(&self, owner_pid: u32) -> Result<(), RuntimeStatusError> {
@@ -201,6 +264,14 @@ fn temp_path(path: &Path) -> PathBuf {
     let mut name = path.as_os_str().to_owned();
     name.push(".tmp");
     PathBuf::from(name)
+}
+
+fn owner_pid_from_path(path: &Path) -> Option<u32> {
+    let name = path.file_name()?.to_str()?;
+    name.strip_prefix("runtime-status.")?
+        .strip_suffix(".v1")?
+        .parse()
+        .ok()
 }
 
 fn sync_parent(path: &Path) -> Result<(), RuntimeStatusError> {
