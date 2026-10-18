@@ -14,7 +14,7 @@ use std::{
 use windows_sys::Win32::{
     Foundation::{
         CloseHandle, ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, GENERIC_READ, GENERIC_WRITE,
-        GetLastError, HANDLE, INVALID_HANDLE_VALUE, LocalFree,
+        HANDLE, INVALID_HANDLE_VALUE, LocalFree,
     },
     Security::{
         ACCESS_ALLOWED_ACE, ACL, ACL_REVISION, ACL_SIZE_INFORMATION, AclSizeInformation,
@@ -41,20 +41,6 @@ use windows_sys::Win32::{
 };
 
 const ERROR_SUCCESS: u32 = 0;
-
-fn unavailable(stage: &str, code: i64) -> StoreError {
-    if std::env::var_os("CSF12_WINDOWS_STORAGE_DIAGNOSTICS").is_some() {
-        let _ = writeln!(
-            std::io::stderr(),
-            "CSF12_WINDOWS_STORAGE_DIAG stage={stage} code={code}"
-        );
-    }
-    StoreError::Unavailable
-}
-
-fn unavailable_last_error(stage: &str) -> StoreError {
-    unavailable(stage, i64::from(unsafe { GetLastError() }))
-}
 
 #[cfg(all(test, feature = "pairing-v2-experimental"))]
 pub(crate) mod faults {
@@ -123,13 +109,13 @@ impl Drop for Handle {
 fn current_user_sid() -> Result<Vec<u8>, StoreError> {
     let mut token = ptr::null_mut();
     if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
-        return Err(unavailable_last_error("open_process_token"));
+        return Err(StoreError::Unavailable);
     }
     let token = Handle(token);
     let mut needed = 0;
     unsafe { GetTokenInformation(token.0, TokenUser, ptr::null_mut(), 0, &mut needed) };
     if needed == 0 {
-        return Err(unavailable_last_error("token_user_size"));
+        return Err(StoreError::Unavailable);
     }
     // Token information contains pointer-aligned structs; a byte vector does not
     // promise sufficient alignment even though the Windows allocator usually does.
@@ -145,16 +131,16 @@ fn current_user_sid() -> Result<Vec<u8>, StoreError> {
         )
     } == 0
     {
-        return Err(unavailable_last_error("token_user_read"));
+        return Err(StoreError::Unavailable);
     }
     let source = unsafe { (*(info.as_ptr().cast::<TOKEN_USER>())).User.Sid };
     let length = unsafe { GetLengthSid(source) };
     if length == 0 {
-        return Err(unavailable("sid_length", -1));
+        return Err(StoreError::Unavailable);
     }
     let mut sid = vec![0u8; length as usize];
     if unsafe { CopySid(length, sid.as_mut_ptr().cast(), source) } == 0 {
-        return Err(unavailable_last_error("sid_copy"));
+        return Err(StoreError::Unavailable);
     }
     Ok(sid)
 }
@@ -162,7 +148,7 @@ fn current_user_sid() -> Result<Vec<u8>, StoreError> {
 fn file_info(handle: HANDLE) -> Result<BY_HANDLE_FILE_INFORMATION, StoreError> {
     let mut info = BY_HANDLE_FILE_INFORMATION::default();
     if unsafe { GetFileInformationByHandle(handle, &mut info) } == 0 {
-        return Err(unavailable_last_error("file_info"));
+        return Err(StoreError::Unavailable);
     }
     Ok(info)
 }
@@ -181,7 +167,7 @@ fn build_acl(sid: &[u8], directory: bool) -> Result<Vec<u32>, StoreError> {
     let mut bytes = vec![0u32; byte_len.div_ceil(std::mem::size_of::<u32>())];
     let acl = bytes.as_mut_ptr().cast::<ACL>();
     if unsafe { InitializeAcl(acl, byte_len as u32, ACL_REVISION) } == 0 {
-        return Err(unavailable_last_error("acl_initialize"));
+        return Err(StoreError::Unavailable);
     }
     let flags = if directory {
         CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE
@@ -198,7 +184,7 @@ fn build_acl(sid: &[u8], directory: bool) -> Result<Vec<u32>, StoreError> {
         )
     } == 0
     {
-        return Err(unavailable_last_error("acl_add_owner_ace"));
+        return Err(StoreError::Unavailable);
     }
     Ok(bytes)
 }
@@ -221,7 +207,7 @@ fn harden(handle: HANDLE, directory: bool, sid: &[u8]) -> Result<(), StoreError>
     if status == ERROR_SUCCESS {
         Ok(())
     } else {
-        Err(unavailable("set_owner_dacl", i64::from(status)))
+        Err(StoreError::Unavailable)
     }
 }
 
@@ -336,12 +322,7 @@ impl PrivateDir {
     #[cfg(feature = "pairing-v2-experimental")]
     pub(crate) fn try_clone(&self) -> Result<Self, StoreError> {
         self.validate_self()?;
-        let file = self.file.try_clone().map_err(|error| {
-            unavailable(
-                "clone_directory_handle",
-                error.raw_os_error().unwrap_or(-1).into(),
-            )
-        })?;
+        let file = self.file.try_clone().map_err(|_| StoreError::Unavailable)?;
         let handle = file.as_raw_handle().cast();
         validate(handle, true, &self.sid)?;
         if identity(&file_info(handle)?) != self.id {
@@ -359,9 +340,7 @@ impl PrivateDir {
         if !path.is_absolute() {
             return Err(StoreError::Invalid);
         }
-        std::fs::create_dir_all(path).map_err(|error| {
-            unavailable("create_root", error.raw_os_error().unwrap_or(-1).into())
-        })?;
+        std::fs::create_dir_all(path).map_err(|_| StoreError::Unavailable)?;
         let file = open_path(path, true, OPEN_EXISTING)?.ok_or(StoreError::Invalid)?;
         let sid = current_user_sid()?;
         let handle = file.as_raw_handle().cast();
@@ -398,12 +377,7 @@ impl PrivateDir {
         let created = match std::fs::create_dir(&path) {
             Ok(()) => true,
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => false,
-            Err(error) => {
-                return Err(unavailable(
-                    "create_child",
-                    error.raw_os_error().unwrap_or(-1).into(),
-                ));
-            }
+            Err(_) => return Err(StoreError::Unavailable),
         };
         let file = open_path(&path, true, OPEN_EXISTING)?.ok_or(StoreError::Invalid)?;
         let handle = file.as_raw_handle().cast();
@@ -451,8 +425,7 @@ impl PrivateDir {
         let file = match self.open("writer.lock", false, false)? {
             Some(file) => file,
             None => {
-                let file = open_path(&path, false, CREATE_NEW)?
-                    .ok_or_else(|| unavailable("create_lock", 0))?;
+                let file = open_path(&path, false, CREATE_NEW)?.ok_or(StoreError::Unavailable)?;
                 harden(file.as_raw_handle().cast(), false, &self.sid)?;
                 validate(file.as_raw_handle().cast(), false, &self.sid)?;
                 file
@@ -470,7 +443,7 @@ impl PrivateDir {
             )
         } == 0
         {
-            return Err(unavailable_last_error("lock_file"));
+            return Err(StoreError::Unavailable);
         }
         Ok(file)
     }
@@ -479,20 +452,13 @@ impl PrivateDir {
         let Some(file) = self.open(value, false, false)? else {
             return Ok(None);
         };
-        if file
-            .metadata()
-            .map_err(|error| {
-                unavailable("read_metadata", error.raw_os_error().unwrap_or(-1).into())
-            })?
-            .len()
-            > limit as u64
-        {
+        if file.metadata().map_err(|_| StoreError::Unavailable)?.len() > limit as u64 {
             return Err(StoreError::Limit);
         }
         let mut bytes = Vec::new();
         file.take(limit as u64 + 1)
             .read_to_end(&mut bytes)
-            .map_err(|error| unavailable("read_file", error.raw_os_error().unwrap_or(-1).into()))?;
+            .map_err(|_| StoreError::Unavailable)?;
         if bytes.len() > limit {
             return Err(StoreError::Limit);
         }
@@ -517,15 +483,11 @@ impl PrivateDir {
             fault_point!(value, "before_write");
             let mut file = self
                 .open(&tmp, true, true)?
-                .ok_or_else(|| unavailable("create_temporary_file", 0))?;
-            file.write_all(bytes).map_err(|error| {
-                unavailable("write_file", error.raw_os_error().unwrap_or(-1).into())
-            })?;
+                .ok_or(StoreError::Unavailable)?;
+            file.write_all(bytes).map_err(|_| StoreError::Unavailable)?;
             fault_point!(value, "after_write");
             fault_point!(value, "before_file_sync");
-            file.sync_all().map_err(|error| {
-                unavailable("sync_file", error.raw_os_error().unwrap_or(-1).into())
-            })?;
+            file.sync_all().map_err(|_| StoreError::Unavailable)?;
             fault_point!(value, "after_file_sync");
             drop(file);
             self.validate_self()?;
@@ -552,7 +514,7 @@ impl PrivateDir {
                 }
             };
             if ok == 0 {
-                return Err(unavailable_last_error("replace_file"));
+                return Err(StoreError::Unavailable);
             }
             fault_point!(value, "after_rename");
             let target = self.open(value, false, false)?.ok_or(StoreError::Invalid)?;
@@ -581,16 +543,14 @@ impl PrivateDir {
         if self.open(value, false, false)?.is_none() {
             return self.flush();
         }
-        std::fs::remove_file(self.path.join(value)).map_err(|error| {
-            unavailable("remove_file", error.raw_os_error().unwrap_or(-1).into())
-        })?;
+        std::fs::remove_file(self.path.join(value)).map_err(|_| StoreError::Unavailable)?;
         self.flush()
     }
 
     fn flush(&self) -> Result<(), StoreError> {
         self.validate_self()?;
         if unsafe { FlushFileBuffers(self.file.as_raw_handle().cast()) } == 0 {
-            return Err(unavailable_last_error("flush_directory"));
+            return Err(StoreError::Unavailable);
         }
         Ok(())
     }
