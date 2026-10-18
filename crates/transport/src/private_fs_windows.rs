@@ -22,9 +22,10 @@ use windows_sys::Win32::{
         AddAccessAllowedAceEx,
         Authorization::{GetSecurityInfo, SE_FILE_OBJECT, SetSecurityInfo},
         CONTAINER_INHERIT_ACE, CopySid, DACL_SECURITY_INFORMATION, EqualSid, GetAce,
-        GetAclInformation, GetLengthSid, GetTokenInformation, InitializeAcl, OBJECT_INHERIT_ACE,
-        OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, PSID, TOKEN_QUERY,
-        TOKEN_USER, TokenUser,
+        GetAclInformation, GetLengthSid, GetSecurityDescriptorControl, GetTokenInformation,
+        InitializeAcl, OBJECT_INHERIT_ACE, OWNER_SECURITY_INFORMATION,
+        PROTECTED_DACL_SECURITY_INFORMATION, PSID, SE_DACL_PROTECTED, TOKEN_QUERY, TOKEN_USER,
+        TokenUser,
     },
     Storage::FileSystem::{
         BY_HANDLE_FILE_INFORMATION, CREATE_ALWAYS, CREATE_NEW, CreateFileW, DELETE,
@@ -40,6 +41,9 @@ use windows_sys::Win32::{
         Threading::{GetCurrentProcess, OpenProcessToken},
     },
 };
+
+#[cfg(test)]
+use windows_sys::Win32::Security::UNPROTECTED_DACL_SECURITY_INFORMATION;
 
 const ERROR_SUCCESS: u32 = 0;
 const FILE_RENAME_FLAG_REPLACE_IF_EXISTS: u32 = 0x0000_0001;
@@ -387,6 +391,13 @@ fn validate(handle: HANDLE, directory: bool, sid: &[u8]) -> Result<(), StoreErro
         return Err(StoreError::Invalid);
     }
     let result = (|| {
+        let mut control = 0;
+        let mut revision = 0;
+        if unsafe { GetSecurityDescriptorControl(descriptor, &mut control, &mut revision) } == 0
+            || control & SE_DACL_PROTECTED == 0
+        {
+            return Err(StoreError::Invalid);
+        }
         if unsafe { EqualSid(owner, sid.as_ptr().cast_mut().cast()) } == 0 {
             return Err(StoreError::Invalid);
         }
@@ -867,6 +878,60 @@ mod tests {
         thread.join().unwrap();
         assert_eq!(result, Ok(()));
         assert_eq!(private.read("target", 3).unwrap().as_deref(), Some(b"new"));
+    }
+
+    #[test]
+    fn root_reprotects_an_exact_but_inheritable_dacl() {
+        let root = tempfile::tempdir().unwrap();
+        let private = PrivateDir::root(root.path()).unwrap();
+        let sid = private.sid.clone();
+        drop(private);
+        let administrative = open_path(root.path(), true, OPEN_EXISTING)
+            .unwrap()
+            .unwrap();
+        let mut dacl = ptr::null_mut();
+        let mut descriptor = ptr::null_mut();
+        let status = unsafe {
+            GetSecurityInfo(
+                administrative.as_raw_handle().cast(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                ptr::null_mut(),
+                ptr::null_mut(),
+                &mut dacl,
+                ptr::null_mut(),
+                &mut descriptor,
+            )
+        };
+        assert_eq!(status, ERROR_SUCCESS);
+        assert!(!dacl.is_null());
+        assert!(!descriptor.is_null());
+        let status = unsafe {
+            SetSecurityInfo(
+                administrative.as_raw_handle().cast(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION | UNPROTECTED_DACL_SECURITY_INFORMATION,
+                ptr::null_mut(),
+                ptr::null_mut(),
+                dacl,
+                ptr::null(),
+            )
+        };
+        unsafe { LocalFree(descriptor) };
+        assert_eq!(status, ERROR_SUCCESS);
+        drop(administrative);
+        let unprotected = open_retained_directory(root.path()).unwrap();
+        assert_eq!(
+            validate(unprotected.as_raw_handle().cast(), true, &sid),
+            Err(StoreError::Invalid)
+        );
+        drop(unprotected);
+
+        let repaired = PrivateDir::root(root.path()).unwrap();
+        assert_eq!(
+            validate(repaired.file.as_raw_handle().cast(), true, &sid),
+            Ok(())
+        );
     }
 
     #[test]
