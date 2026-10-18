@@ -103,7 +103,12 @@ public sealed class WindowsUiChildOwnerTests
                 key => key.ToString()!,
                 key => Environment.GetEnvironmentVariable(key.ToString()!)
             );
-        var spec = ChildLaunchSpec.Create(root, executable, environment);
+        var isolatedHome = Path.Combine(Path.GetTempPath(), "csf12-g4-owner-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(isolatedHome);
+        var productSpec = ChildLaunchSpec.Create(root, executable, environment);
+        var isolatedEnvironment = productSpec.Environment.ToDictionary(entry => entry.Key, entry => entry.Value);
+        isolatedEnvironment["SEAMLESS_INPUT_HOME"] = isolatedHome;
+        var spec = productSpec with { Environment = isolatedEnvironment };
         await using var owner = await WindowsUiChildOwner.StartAsync(spec);
 
         var session = await owner.ReadInitialProjectionAsync(TimeSpan.FromSeconds(5));
@@ -136,6 +141,7 @@ public sealed class WindowsUiChildOwnerTests
         await owner.CloseAsync();
         Assert.True(owner.HasExited);
         Assert.Equal(ChildSessionPhase.Terminal, owner.Session.State.Phase);
+        Directory.Delete(isolatedHome, recursive: true);
     }
 
     private static string FindEngineExecutable()
