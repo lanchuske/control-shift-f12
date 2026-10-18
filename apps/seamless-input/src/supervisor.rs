@@ -21,13 +21,139 @@ use seamless_transport::{
     EndpointOptions, IdentityStore, PairingError, PeerEndpoint, PeerSession, ReconnectPolicy,
 };
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, VecDeque},
+    future::Future,
     net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 use tokio::{sync::mpsc, task::JoinHandle};
+
+pub const INPUT_SERVICE_INTERVAL: Duration = Duration::from_millis(5);
+const CAPTURE_DRAIN_BUDGET: usize = 64;
+const OUTBOUND_QUEUE_CAPACITY: usize = 256;
+const OUTBOUND_SEND_DEADLINE: Duration = Duration::from_millis(250);
+const DIAL_ATTEMPTS_PER_TICK: usize = 1;
+const DIAL_ATTEMPT_DEADLINE: Duration = Duration::from_millis(250);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OutboundEnqueueError {
+    Full,
+    Closed,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct OutboundFailure {
+    peer: NodeId,
+    generation: u64,
+}
+
+struct OutboundWriter {
+    sender: mpsc::Sender<Vec<u8>>,
+    task: JoinHandle<()>,
+    generation: u64,
+}
+
+impl OutboundWriter {
+    /// Own the only network sender for a peer. The supervisor remains the
+    /// single runtime authority and can only enqueue in FIFO order; a full or
+    /// failed queue is therefore an explicit peer-isolation boundary rather
+    /// than a place where critical transitions can be dropped silently.
+    fn spawn<F, Fut>(
+        capacity: usize,
+        peer: NodeId,
+        generation: u64,
+        failure_tx: mpsc::UnboundedSender<OutboundFailure>,
+        mut deliver: F,
+    ) -> Self
+    where
+        F: FnMut(Vec<u8>) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<(), String>> + Send + 'static,
+    {
+        let (sender, mut receiver) = mpsc::channel(capacity);
+        let task = tokio::spawn(async move {
+            while let Some(packet) = receiver.recv().await {
+                if deliver(packet).await.is_err() {
+                    let _ = failure_tx.send(OutboundFailure { peer, generation });
+                    break;
+                }
+            }
+        });
+        Self {
+            sender,
+            task,
+            generation,
+        }
+    }
+
+    fn try_send(&self, packet: Vec<u8>) -> Result<(), OutboundEnqueueError> {
+        self.sender.try_send(packet).map_err(|error| match error {
+            mpsc::error::TrySendError::Full(_) => OutboundEnqueueError::Full,
+            mpsc::error::TrySendError::Closed(_) => OutboundEnqueueError::Closed,
+        })
+    }
+}
+
+impl Drop for OutboundWriter {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+fn spawn_deadlined_writer<F, Fut>(
+    capacity: usize,
+    peer: NodeId,
+    generation: u64,
+    failure_tx: mpsc::UnboundedSender<OutboundFailure>,
+    deadline: Duration,
+    mut deliver: F,
+) -> OutboundWriter
+where
+    F: FnMut(Vec<u8>) -> Fut + Send + 'static,
+    Fut: Future<Output = Result<(), String>> + Send + 'static,
+{
+    OutboundWriter::spawn(capacity, peer, generation, failure_tx, move |packet| {
+        let delivery = deliver(packet);
+        async move {
+            tokio::time::timeout(deadline, delivery)
+                .await
+                .map_err(|_| "peer send timed out".to_owned())?
+        }
+    })
+}
+
+fn rotating_batch<T: Clone>(items: &[T], cursor: usize, budget: usize) -> (Vec<T>, usize) {
+    if items.is_empty() || budget == 0 {
+        return (Vec::new(), 0);
+    }
+    let count = budget.min(items.len());
+    let batch = (0..count)
+        .map(|offset| items[(cursor + offset) % items.len()].clone())
+        .collect();
+    (batch, (cursor + count) % items.len())
+}
+
+async fn interleave_maintenance<T, E, F, S>(
+    maintenance: F,
+    cadence: Duration,
+    mut service: S,
+) -> Result<T, E>
+where
+    F: Future<Output = T>,
+    S: AsyncFnMut() -> Result<(), E>,
+{
+    let mut maintenance = std::pin::pin!(maintenance);
+    let mut interval = tokio::time::interval(cadence);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    interval.reset();
+    loop {
+        tokio::select! {
+            result = &mut maintenance => return Ok(result),
+            _ = interval.tick() => service().await?,
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct AppPaths {
@@ -77,6 +203,34 @@ pub struct CapabilityReport {
     pub identity: &'static str,
 }
 
+fn clipboard_diagnostic_label(
+    initial: AccessState,
+    probe_succeeded: bool,
+    probe_disabled: bool,
+    final_state: AccessState,
+) -> &'static str {
+    if initial == AccessState::Denied || probe_disabled {
+        "FAIL (clipboard unavailable or busy)"
+    } else if !probe_succeeded {
+        "FAIL (clipboard read failed)"
+    } else if final_state != AccessState::Granted {
+        "FAIL (clipboard content unavailable)"
+    } else {
+        "PASS"
+    }
+}
+
+fn clipboard_probe_unavailable<E>(
+    first: &Result<ClipboardOutcome, E>,
+    second: &Result<ClipboardOutcome, E>,
+) -> bool {
+    matches!(first, Ok(ClipboardOutcome::Disabled))
+        || matches!(
+            second,
+            Ok(ClipboardOutcome::Disabled | ClipboardOutcome::Pending)
+        )
+}
+
 impl CapabilityReport {
     pub fn measure(paths: &AppPaths) -> Self {
         let config = paths
@@ -98,7 +252,21 @@ impl CapabilityReport {
             .unwrap_or("FAIL");
         let mut platform = NativePlatform::new();
         let input = access_label(platform.input_access());
-        let clipboard = access_label(platform.clipboard_access());
+        let clipboard_initial = platform.clipboard_access();
+        let first_probe = platform.poll_clipboard(0);
+        let second_probe = platform.poll_clipboard(200);
+        let probe_succeeded = first_probe.is_ok() && second_probe.is_ok();
+        let probe_disabled = clipboard_probe_unavailable(&first_probe, &second_probe);
+        let clipboard = if clipboard_initial == AccessState::NotDetermined {
+            "FAIL (clipboard access not determined)"
+        } else {
+            clipboard_diagnostic_label(
+                clipboard_initial,
+                probe_succeeded,
+                probe_disabled,
+                platform.clipboard_access(),
+            )
+        };
         let displays = match platform.displays() {
             Ok(displays) if !displays.is_empty() => format!("PASS ({})", displays.len()),
             Ok(_) => "FAIL (none found)".into(),
@@ -140,7 +308,7 @@ pub enum SupervisorError {
 
 struct PeerLink {
     peer: NodeId,
-    endpoint: PeerEndpoint,
+    endpoint: Arc<PeerEndpoint>,
     instance: String,
 }
 
@@ -183,6 +351,10 @@ pub struct NativeSupervisor {
     links: Vec<PeerLink>,
     sessions: BTreeMap<NodeId, PeerSession>,
     readers: BTreeMap<NodeId, JoinHandle<()>>,
+    writers: BTreeMap<NodeId, OutboundWriter>,
+    outbound_failure_tx: mpsc::UnboundedSender<OutboundFailure>,
+    outbound_failure_rx: mpsc::UnboundedReceiver<OutboundFailure>,
+    next_writer_generation: u64,
     inbound_tx: mpsc::UnboundedSender<InboundPacket>,
     inbound_rx: mpsc::UnboundedReceiver<InboundPacket>,
     runtime: Runtime,
@@ -190,6 +362,7 @@ pub struct NativeSupervisor {
     admitted: BTreeSet<NodeId>,
     started: Instant,
     last_heartbeat_ms: u64,
+    dial_cursor: usize,
     local_displays: Vec<LogicalDisplay>,
     remote_displays: BTreeMap<NodeId, Vec<RemoteDisplay>>,
     cursor: CursorContinuity,
@@ -198,6 +371,8 @@ pub struct NativeSupervisor {
     suppress_native_apply: bool,
     #[cfg(test)]
     observed_received: Vec<crate::runtime::RuntimeReceive>,
+    #[cfg(test)]
+    observed_recovery: Vec<RuntimeEffect>,
 }
 
 impl NativeSupervisor {
@@ -239,6 +414,7 @@ impl NativeSupervisor {
             links.push(create_peer_link(&identity, &mut discovery, peer)?);
         }
         let (inbound_tx, inbound_rx) = mpsc::unbounded_channel();
+        let (outbound_failure_tx, outbound_failure_rx) = mpsc::unbounded_channel();
         let capture = NativeCapture::install()
             .map_err(|error| SupervisorError::Capture(error.to_string()))?;
 
@@ -250,6 +426,10 @@ impl NativeSupervisor {
             links,
             sessions: BTreeMap::new(),
             readers: BTreeMap::new(),
+            writers: BTreeMap::new(),
+            outbound_failure_tx,
+            outbound_failure_rx,
+            next_writer_generation: 1,
             inbound_tx,
             inbound_rx,
             runtime,
@@ -257,6 +437,7 @@ impl NativeSupervisor {
             admitted: BTreeSet::new(),
             started: Instant::now(),
             last_heartbeat_ms: 0,
+            dial_cursor: 0,
             local_displays: displays,
             remote_displays,
             cursor,
@@ -265,10 +446,13 @@ impl NativeSupervisor {
             suppress_native_apply: false,
             #[cfg(test)]
             observed_received: Vec::new(),
+            #[cfg(test)]
+            observed_recovery: Vec::new(),
         })
     }
 
     pub async fn tick(&mut self) -> Result<SupervisorStatus, SupervisorError> {
+        self.drain_outbound_failures()?;
         self.refresh_peer_membership().await?;
         if let Ok(Some(config)) = self.live_config.poll() {
             let displays = self.platform.displays()?;
@@ -294,10 +478,7 @@ impl NativeSupervisor {
                 self.execute_effects(effects).await?;
             }
         }
-        let discovered_peers = self
-            .discovery
-            .browse(Duration::from_millis(25))
-            .map_err(SupervisorError::Discovery)?;
+        let discovered_peers = self.discovery.poll().map_err(SupervisorError::Discovery)?;
         let discovered = discovered_peers.len();
         let local_displays = self.platform.displays()?;
         self.local_displays = local_displays.clone();
@@ -332,7 +513,7 @@ impl NativeSupervisor {
                 .await?;
         }
 
-        self.dial_discovered(&discovered_peers).await;
+        self.dial_discovered(&discovered_peers).await?;
 
         let available: Vec<_> = self
             .links
@@ -360,6 +541,7 @@ impl NativeSupervisor {
                 })?;
             self.admitted.insert(session.peer());
             self.sessions.insert(session.peer(), session.clone());
+            self.spawn_writer(session.clone());
             newly_admitted.push(session.peer());
             self.spawn_reader(session);
         }
@@ -395,9 +577,6 @@ impl NativeSupervisor {
         }
 
         self.drain_inbound(now_ms).await?;
-        self.drain_capture(now_ms).await?;
-        self.capture
-            .set_remote(self.runtime.active_peer() != self.identity.node_id());
 
         Ok(SupervisorStatus {
             discovered,
@@ -409,6 +588,15 @@ impl NativeSupervisor {
 
     pub fn input_access(&self) -> AccessState {
         self.platform.input_access()
+    }
+
+    pub async fn service_input(&mut self) -> Result<(), SupervisorError> {
+        self.drain_outbound_failures()?;
+        let now_ms = self.started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+        self.drain_capture(now_ms, CAPTURE_DRAIN_BUDGET).await?;
+        self.capture
+            .set_remote(self.runtime.active_peer() != self.identity.node_id());
+        Ok(())
     }
 
     async fn refresh_peer_membership(&mut self) -> Result<(), SupervisorError> {
@@ -423,11 +611,7 @@ impl NativeSupervisor {
             for link in &self.links {
                 link.endpoint.revoke(peer);
             }
-            self.sessions.remove(&peer);
-            self.admitted.remove(&peer);
-            if let Some(task) = self.readers.remove(&peer) {
-                task.abort();
-            }
+            self.drop_peer_resources(peer, b"peer unpaired");
             let effects = self.runtime.disconnect(peer);
             self.execute_effects(effects).await?;
         }
@@ -452,41 +636,134 @@ impl NativeSupervisor {
         Ok(())
     }
 
-    async fn dial_discovered(&mut self, discovered: &[seamless_discovery::DiscoveredPeer]) {
-        let policy = ReconnectPolicy {
-            initial_delay: Duration::from_millis(50),
-            max_delay: Duration::from_millis(50),
-            max_attempts: 1,
-        };
-        for link in &self.links {
+    async fn dial_discovered(
+        &mut self,
+        discovered: &[seamless_discovery::DiscoveredPeer],
+    ) -> Result<(), SupervisorError> {
+        let links = self
+            .links
+            .iter()
+            .map(|link| (link.peer, Arc::clone(&link.endpoint)))
+            .collect::<Vec<_>>();
+        let mut candidates = Vec::new();
+        for (peer_id, endpoint) in links {
             if self
                 .sessions
-                .get(&link.peer)
+                .get(&peer_id)
                 .is_some_and(|session| !session.is_closed())
             {
                 continue;
             }
-            'candidate: for peer in discovered
+            for peer in discovered
                 .iter()
                 .filter(|peer| peer.compatible && !peer.advertisement.pairable)
             {
                 for address in &peer.advertisement.addresses {
-                    let attempt = tokio::time::timeout(
-                        Duration::from_millis(250),
-                        link.endpoint.reconnect(
-                            *address,
-                            "seamless-input.local",
-                            Some(link.peer),
-                            &policy,
-                        ),
-                    )
-                    .await;
-                    if let Ok(Ok(_)) = attempt {
-                        break 'candidate;
-                    }
+                    candidates.push((peer_id, Arc::clone(&endpoint), *address));
                 }
             }
         }
+        let (batch, next_cursor) =
+            rotating_batch(&candidates, self.dial_cursor, DIAL_ATTEMPTS_PER_TICK);
+        // One bounded dial per supervisor tick prevents the Cartesian product
+        // of links, advertisements and addresses from consuming the runtime's
+        // five-second heartbeat freshness window. Rotation preserves fairness.
+        self.dial_cursor = next_cursor;
+        for (peer_id, endpoint, address) in batch {
+            let reconnect = async move {
+                let policy = ReconnectPolicy {
+                    initial_delay: Duration::from_millis(50),
+                    max_delay: Duration::from_millis(50),
+                    max_attempts: 1,
+                };
+                tokio::time::timeout(
+                    DIAL_ATTEMPT_DEADLINE,
+                    endpoint.reconnect(address, "seamless-input.local", Some(peer_id), &policy),
+                )
+                .await
+            };
+            let attempt = interleave_maintenance(reconnect, INPUT_SERVICE_INTERVAL, async || {
+                self.service_input().await
+            })
+            .await?;
+            let _ = attempt;
+        }
+        Ok(())
+    }
+
+    fn spawn_writer(&mut self, session: PeerSession) {
+        let peer = session.peer();
+        let generation = self.next_writer_generation;
+        self.next_writer_generation = self.next_writer_generation.wrapping_add(1).max(1);
+        let failure_tx = self.outbound_failure_tx.clone();
+        let writer = spawn_deadlined_writer(
+            OUTBOUND_QUEUE_CAPACITY,
+            peer,
+            generation,
+            failure_tx,
+            OUTBOUND_SEND_DEADLINE,
+            move |packet| {
+                let session = session.clone();
+                async move {
+                    session
+                        .send_packet(&packet)
+                        .await
+                        .map_err(|error| error.to_string())
+                }
+            },
+        );
+        self.writers.insert(peer, writer);
+    }
+
+    fn drain_outbound_failures(&mut self) -> Result<(), SupervisorError> {
+        while let Ok(failure) = self.outbound_failure_rx.try_recv() {
+            if self
+                .writers
+                .get(&failure.peer)
+                .is_some_and(|writer| writer.generation == failure.generation)
+            {
+                self.isolate_peer(failure.peer)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn isolate_peer(&mut self, peer: NodeId) -> Result<(), SupervisorError> {
+        self.drop_peer_resources(peer, b"peer isolated");
+        let recovery = self.runtime.disconnect(peer);
+        self.apply_recovery(recovery)
+    }
+
+    fn drop_peer_resources(&mut self, peer: NodeId, reason: &'static [u8]) {
+        if let Some(session) = self.sessions.get(&peer) {
+            session.close(reason);
+        }
+        self.sessions.remove(&peer);
+        self.writers.remove(&peer);
+        self.admitted.remove(&peer);
+        if let Some(task) = self.readers.remove(&peer) {
+            task.abort();
+        }
+    }
+
+    fn apply_recovery(&mut self, recovery: Vec<RuntimeEffect>) -> Result<(), SupervisorError> {
+        #[cfg(test)]
+        self.observed_recovery.extend(recovery.iter().cloned());
+        for recovery in recovery {
+            match recovery {
+                RuntimeEffect::ReleaseLocal => self
+                    .platform
+                    .input
+                    .release_all()
+                    .map_err(|e| SupervisorError::DataPlane(e.to_string()))?,
+                RuntimeEffect::WarpLocal { point, .. } => self
+                    .platform
+                    .warp_local(point)
+                    .map_err(SupervisorError::DataPlane)?,
+                RuntimeEffect::Local(_) | RuntimeEffect::Send { .. } => {}
+            }
+        }
+        Ok(())
     }
 
     fn spawn_reader(&mut self, session: PeerSession) {
@@ -572,23 +849,18 @@ impl NativeSupervisor {
                     }
                 }
                 PeerPacketOutcome::Isolated { recovery } => {
-                    if let Some(session) = self.sessions.remove(&inbound.peer) {
-                        session.close(b"peer packet rejected");
-                    }
-                    self.admitted.remove(&inbound.peer);
-                    if let Some(task) = self.readers.remove(&inbound.peer) {
-                        task.abort();
-                    }
-                    self.execute_effects(recovery).await?;
+                    self.drop_peer_resources(inbound.peer, b"peer packet rejected");
+                    self.apply_recovery(recovery)?;
                 }
             }
         }
         Ok(())
     }
 
-    async fn drain_capture(&mut self, now_ms: u64) -> Result<(), SupervisorError> {
-        let captured = self.capture.drain();
+    async fn drain_capture(&mut self, now_ms: u64, budget: usize) -> Result<(), SupervisorError> {
+        let captured = self.capture.drain(budget);
         for captured in captured {
+            let recovery_pending = captured.emergency;
             let effects = if captured.emergency {
                 self.runtime.emergency_return()
             } else if let Some(event) = captured.event {
@@ -657,7 +929,13 @@ impl NativeSupervisor {
             } else {
                 Vec::new()
             };
-            self.execute_effects(effects).await?;
+            if recovery_pending {
+                acknowledge_recovery_after(self.execute_effects(effects).await, || {
+                    self.capture.acknowledge_local_recovery()
+                })?;
+            } else {
+                self.execute_effects(effects).await?;
+            }
         }
         Ok(())
     }
@@ -681,11 +959,14 @@ impl NativeSupervisor {
                 RuntimeEffect::WarpLocal { point, .. } => self.platform.warp_local(point),
                 RuntimeEffect::Send { peer, message } => {
                     let packet = encode_peer_message(&message);
-                    let result = match (self.sessions.get(&peer), packet) {
-                        (Some(session), Ok(packet)) => session
-                            .send_packet(&packet)
-                            .await
-                            .map_err(|error| error.to_string()),
+                    let result = match (self.writers.get(&peer), packet) {
+                        (Some(writer), Ok(packet)) => writer.try_send(packet).map_err(|error| {
+                            match error {
+                                OutboundEnqueueError::Full => "peer outbound queue is full",
+                                OutboundEnqueueError::Closed => "peer outbound writer is closed",
+                            }
+                            .to_owned()
+                        }),
                         (None, _) => Err("peer session is unavailable".into()),
                         (_, Err(error)) => Err(error),
                     };
@@ -703,28 +984,19 @@ impl NativeSupervisor {
             return Err(SupervisorError::DataPlane(error));
         }
         for peer in failed_peers {
-            self.sessions.remove(&peer);
-            self.admitted.remove(&peer);
-            if let Some(task) = self.readers.remove(&peer) {
-                task.abort();
-            }
-            for recovery in self.runtime.disconnect(peer) {
-                match recovery {
-                    RuntimeEffect::ReleaseLocal => self
-                        .platform
-                        .input
-                        .release_all()
-                        .map_err(|error| SupervisorError::DataPlane(error.to_string()))?,
-                    RuntimeEffect::WarpLocal { point, .. } => self
-                        .platform
-                        .warp_local(point)
-                        .map_err(SupervisorError::DataPlane)?,
-                    RuntimeEffect::Local(_) | RuntimeEffect::Send { .. } => {}
-                }
-            }
+            self.isolate_peer(peer)?;
         }
         Ok(())
     }
+}
+
+fn acknowledge_recovery_after<T, E>(
+    result: Result<T, E>,
+    acknowledge: impl FnOnce(),
+) -> Result<T, E> {
+    let value = result?;
+    acknowledge();
+    Ok(value)
 }
 
 fn create_peer_link(
@@ -750,7 +1022,7 @@ fn create_peer_link(
         .map_err(SupervisorError::Discovery)?;
     Ok(PeerLink {
         peer: peer.node_id,
-        endpoint,
+        endpoint: Arc::new(endpoint),
         instance,
     })
 }
@@ -984,45 +1256,488 @@ fn capture_point_to_logical(point: Point, displays: &[LogicalDisplay]) -> Option
     crate::cursor::physical_to_logical(point, displays)
 }
 
+#[derive(Clone, Debug, PartialEq)]
 struct CapturedInput {
     event: Option<seamless_input_protocol::InputEvent>,
     emergency: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CaptureEnqueueAction {
+    Continue,
+    RecoverLocal,
+}
+
+struct CaptureBufferState {
+    emergency: bool,
+    ordered: VecDeque<CapturedInput>,
+}
+
+#[derive(Clone)]
+struct CaptureBuffer {
+    capacity: usize,
+    state: Arc<Mutex<CaptureBufferState>>,
+}
+
+impl CaptureBuffer {
+    fn new(capacity: usize) -> Self {
+        assert!(capacity > 0, "capture capacity must be non-zero");
+        Self {
+            capacity,
+            state: Arc::new(Mutex::new(CaptureBufferState {
+                emergency: false,
+                ordered: VecDeque::with_capacity(capacity),
+            })),
+        }
+    }
+
+    fn push(&self, captured: CapturedInput) -> CaptureEnqueueAction {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if captured.emergency {
+            state.ordered.clear();
+            state.emergency = true;
+            return CaptureEnqueueAction::RecoverLocal;
+        }
+        let pointer = matches!(
+            captured.event,
+            Some(seamless_input_protocol::InputEvent::Pointer { .. })
+        );
+        if pointer
+            && let Some(last) = state.ordered.back_mut()
+            && matches!(
+                last.event,
+                Some(seamless_input_protocol::InputEvent::Pointer { .. })
+            )
+        {
+            *last = captured;
+            return CaptureEnqueueAction::Continue;
+        }
+        if state.ordered.len() == self.capacity {
+            state.ordered.clear();
+            state.emergency = true;
+            return CaptureEnqueueAction::RecoverLocal;
+        }
+        state.ordered.push_back(captured);
+        CaptureEnqueueAction::Continue
+    }
+
+    fn drain(&self, budget: usize) -> Vec<CapturedInput> {
+        if budget == 0 {
+            return Vec::new();
+        }
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let mut drained = Vec::with_capacity(budget.min(state.ordered.len() + 1));
+        if std::mem::take(&mut state.emergency) {
+            drained.push(CapturedInput {
+                event: None,
+                emergency: true,
+            });
+            return drained;
+        }
+        while drained.len() < budget {
+            let Some(captured) = state.ordered.pop_front() else {
+                break;
+            };
+            drained.push(captured);
+        }
+        drained
+    }
+}
+
+#[cfg(test)]
+mod capture_buffer_tests {
+    use super::{
+        CAPTURE_DRAIN_BUDGET, CaptureBuffer, CaptureEnqueueAction, CapturedInput,
+        DIAL_ATTEMPT_DEADLINE, DIAL_ATTEMPTS_PER_TICK, INPUT_SERVICE_INTERVAL,
+        OutboundEnqueueError, OutboundWriter, acknowledge_recovery_after, interleave_maintenance,
+        rotating_batch,
+    };
+    use seamless_input_protocol::{Button, InputEvent, Modifier};
+    use std::{
+        sync::{
+            Arc,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+        },
+        time::{Duration, Instant},
+    };
+
+    fn captured(event: InputEvent) -> CapturedInput {
+        CapturedInput {
+            event: Some(event),
+            emergency: false,
+        }
+    }
+
+    #[test]
+    fn pointer_motion_is_latest_wins_and_drain_respects_budget() {
+        let queue = CaptureBuffer::new(4);
+        for value in 0..10_000 {
+            assert_eq!(
+                queue.push(captured(InputEvent::Pointer {
+                    x: value as f64,
+                    y: value as f64,
+                })),
+                CaptureEnqueueAction::Continue
+            );
+        }
+
+        let drained = queue.drain(1);
+        assert_eq!(drained.len(), 1);
+        assert_eq!(
+            drained[0].event,
+            Some(InputEvent::Pointer {
+                x: 9_999.0,
+                y: 9_999.0,
+            })
+        );
+        assert!(queue.drain(1).is_empty());
+    }
+
+    #[test]
+    fn critical_transition_is_a_barrier_after_pointer_motion() {
+        let queue = CaptureBuffer::new(4);
+        let pointer = InputEvent::Pointer { x: 10.0, y: 20.0 };
+        let down = InputEvent::Button {
+            button: Button::Left,
+            pressed: true,
+        };
+        queue.push(captured(pointer.clone()));
+        queue.push(captured(down.clone()));
+
+        assert_eq!(
+            queue
+                .drain(4)
+                .into_iter()
+                .map(|captured| captured.event.unwrap())
+                .collect::<Vec<_>>(),
+            vec![pointer, down]
+        );
+    }
+
+    #[test]
+    fn pointers_coalesce_only_inside_segments_between_critical_transitions() {
+        let queue = CaptureBuffer::new(8);
+        let first = InputEvent::Pointer { x: 10.0, y: 20.0 };
+        let down = InputEvent::Button {
+            button: Button::Left,
+            pressed: true,
+        };
+        let second = InputEvent::Pointer { x: 30.0, y: 40.0 };
+        let up = InputEvent::Button {
+            button: Button::Left,
+            pressed: false,
+        };
+        for event in [first.clone(), down.clone(), second.clone(), up.clone()] {
+            queue.push(captured(event));
+        }
+
+        assert_eq!(
+            queue
+                .drain(8)
+                .into_iter()
+                .map(|captured| captured.event.unwrap())
+                .collect::<Vec<_>>(),
+            vec![first, down, second, up]
+        );
+    }
+
+    #[test]
+    fn key_modifier_and_button_transitions_remain_fifo_across_budgeted_drains() {
+        let queue = CaptureBuffer::new(4);
+        let events = [
+            InputEvent::Key {
+                code: 4,
+                pressed: true,
+            },
+            InputEvent::Modifier {
+                modifier: Modifier::Shift,
+                pressed: true,
+            },
+            InputEvent::Button {
+                button: Button::Left,
+                pressed: false,
+            },
+        ];
+        for event in events.clone() {
+            assert_eq!(queue.push(captured(event)), CaptureEnqueueAction::Continue);
+        }
+
+        assert_eq!(
+            queue
+                .drain(2)
+                .into_iter()
+                .map(|captured| captured.event.unwrap())
+                .collect::<Vec<_>>(),
+            events[..2]
+        );
+        assert_eq!(queue.drain(1)[0].event, Some(events[2].clone()));
+    }
+
+    #[test]
+    fn emergency_is_out_of_band_and_discards_stale_bulk_input() {
+        let queue = CaptureBuffer::new(4);
+        queue.push(captured(InputEvent::Key {
+            code: 4,
+            pressed: true,
+        }));
+        queue.push(captured(InputEvent::Pointer { x: 1.0, y: 2.0 }));
+
+        assert_eq!(
+            queue.push(CapturedInput {
+                event: None,
+                emergency: true,
+            }),
+            CaptureEnqueueAction::RecoverLocal
+        );
+        assert_eq!(
+            queue.drain(64),
+            vec![CapturedInput {
+                event: None,
+                emergency: true,
+            }]
+        );
+        assert!(queue.drain(64).is_empty());
+    }
+
+    #[test]
+    fn critical_overflow_forces_recovery_instead_of_silently_losing_an_up() {
+        let queue = CaptureBuffer::new(2);
+        queue.push(captured(InputEvent::Key {
+            code: 4,
+            pressed: true,
+        }));
+        queue.push(captured(InputEvent::Button {
+            button: Button::Left,
+            pressed: true,
+        }));
+
+        assert_eq!(
+            queue.push(captured(InputEvent::Button {
+                button: Button::Left,
+                pressed: false,
+            })),
+            CaptureEnqueueAction::RecoverLocal
+        );
+        assert_eq!(
+            queue.drain(64),
+            vec![CapturedInput {
+                event: None,
+                emergency: true,
+            }]
+        );
+    }
+
+    #[test]
+    fn input_service_has_a_small_fixed_time_and_work_budget() {
+        assert!(INPUT_SERVICE_INTERVAL < std::time::Duration::from_millis(250));
+        assert!((1..=64).contains(&CAPTURE_DRAIN_BUDGET));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn slow_maintenance_does_not_block_input_service_cadence() {
+        let serviced = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&serviced);
+        let started = Instant::now();
+
+        interleave_maintenance(
+            async { tokio::time::sleep(Duration::from_millis(45)).await },
+            Duration::from_millis(5),
+            async || {
+                observed.fetch_add(1, Ordering::SeqCst);
+                Ok::<(), ()>(())
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(started.elapsed() >= Duration::from_millis(40));
+        assert!(
+            serviced.load(Ordering::SeqCst) >= 6,
+            "input service did not interleave with slow maintenance"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pending_network_send_does_not_block_input_heartbeat_or_shutdown() {
+        let (failure_tx, mut failure_rx) = tokio::sync::mpsc::unbounded_channel();
+        let writer = OutboundWriter::spawn(
+            2,
+            seamless_input_core::NodeId([7; 16]),
+            1,
+            failure_tx,
+            |_| async { std::future::pending::<Result<(), String>>().await },
+        );
+        writer.try_send(vec![1]).unwrap();
+        tokio::task::yield_now().await;
+
+        let mut input = tokio::time::interval(Duration::from_millis(5));
+        let mut heartbeat = tokio::time::interval(Duration::from_millis(10));
+        input.reset();
+        heartbeat.reset();
+        let shutdown = tokio::time::sleep(Duration::from_millis(35));
+        tokio::pin!(shutdown);
+        let mut inputs = 0;
+        let mut heartbeats = 0;
+        loop {
+            tokio::select! {
+                _ = input.tick() => inputs += 1,
+                _ = heartbeat.tick() => heartbeats += 1,
+                _ = &mut shutdown => break,
+            }
+        }
+        assert!(inputs >= 5, "input cadence stalled behind a pending send");
+        assert!(heartbeats >= 2, "heartbeat stalled behind a pending send");
+        assert!(failure_rx.try_recv().is_err());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn outbound_queue_is_fifo_and_backpressure_is_explicit() {
+        let delivered = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed = Arc::clone(&delivered);
+        let (failure_tx, _) = tokio::sync::mpsc::unbounded_channel();
+        let writer = OutboundWriter::spawn(
+            4,
+            seamless_input_core::NodeId([8; 16]),
+            1,
+            failure_tx,
+            move |packet| {
+                let observed = Arc::clone(&observed);
+                async move {
+                    observed.lock().unwrap().push(packet);
+                    Ok(())
+                }
+            },
+        );
+        for packet in [vec![1], vec![2], vec![3]] {
+            writer.try_send(packet).unwrap();
+        }
+        for _ in 0..20 {
+            if delivered.lock().unwrap().len() == 3 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(*delivered.lock().unwrap(), vec![vec![1], vec![2], vec![3]]);
+
+        let (failure_tx, _) = tokio::sync::mpsc::unbounded_channel();
+        let blocked = OutboundWriter::spawn(
+            1,
+            seamless_input_core::NodeId([9; 16]),
+            1,
+            failure_tx,
+            |_| async { std::future::pending::<Result<(), String>>().await },
+        );
+        blocked.try_send(vec![1]).unwrap();
+        tokio::task::yield_now().await;
+        blocked.try_send(vec![2]).unwrap();
+        assert_eq!(blocked.try_send(vec![3]), Err(OutboundEnqueueError::Full));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn dropping_writer_aborts_an_inflight_delivery_task() {
+        struct PendingGuard(Arc<AtomicBool>);
+        impl Drop for PendingGuard {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let observed = Arc::clone(&cancelled);
+        let (failure_tx, _) = tokio::sync::mpsc::unbounded_channel();
+        let writer = OutboundWriter::spawn(
+            1,
+            seamless_input_core::NodeId([10; 16]),
+            1,
+            failure_tx,
+            move |_| {
+                let guard = PendingGuard(Arc::clone(&observed));
+                async move {
+                    let _guard = guard;
+                    std::future::pending::<Result<(), String>>().await
+                }
+            },
+        );
+        writer.try_send(vec![1]).unwrap();
+        tokio::task::yield_now().await;
+        assert!(!cancelled.load(Ordering::SeqCst));
+
+        drop(writer);
+        tokio::task::yield_now().await;
+        assert!(cancelled.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn dial_batch_is_bounded_and_rotates_across_the_whole_matrix() {
+        let candidates: Vec<_> = (0..128).collect();
+        let (first, cursor) = rotating_batch(&candidates, 0, 1);
+        let (second, cursor) = rotating_batch(&candidates, cursor, 1);
+        assert_eq!(first, vec![0]);
+        assert_eq!(second, vec![1]);
+        assert_eq!(cursor, 2);
+        assert_eq!(DIAL_ATTEMPTS_PER_TICK, 1);
+        assert!(DIAL_ATTEMPT_DEADLINE < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn recovery_is_acknowledged_only_after_successful_release() {
+        let mut acknowledged = false;
+        let result: Result<(), &str> = acknowledge_recovery_after(Err("release failed"), || {
+            acknowledged = true;
+        });
+        assert_eq!(result, Err("release failed"));
+        assert!(!acknowledged);
+
+        assert_eq!(
+            acknowledge_recovery_after(Ok::<_, &str>(()), || acknowledged = true),
+            Ok(())
+        );
+        assert!(acknowledged);
+    }
+}
+
 #[cfg(all(target_os = "macos", not(test)))]
 struct NativeCapture {
     tap: seamless_input_platform_macos::input::MacEventTap,
-    receiver: std::sync::mpsc::Receiver<seamless_input_platform_macos::input::CaptureOutcome>,
+    buffer: CaptureBuffer,
 }
 
 #[cfg(all(target_os = "macos", not(test)))]
 impl NativeCapture {
     fn install() -> Result<Self, seamless_input_platform_macos::input::InputError> {
-        let (sender, receiver) = std::sync::mpsc::channel();
+        const CRITICAL_CAPTURE_CAPACITY: usize = 256;
+        let buffer = CaptureBuffer::new(CRITICAL_CAPTURE_CAPACITY);
+        let callback_buffer = buffer.clone();
         let tap = seamless_input_platform_macos::input::MacEventTap::install(
             seamless_input_core::platform::CaptureMode::Local,
-            move |event| {
-                let _ = sender.send(event);
+            move |event| match callback_buffer.push(CapturedInput {
+                event: event.event,
+                emergency: event.emergency,
+            }) {
+                CaptureEnqueueAction::Continue => {
+                    seamless_input_platform_macos::input::CaptureCallbackAction::Continue
+                }
+                CaptureEnqueueAction::RecoverLocal => {
+                    seamless_input_platform_macos::input::CaptureCallbackAction::RecoverLocal
+                }
             },
         )?;
-        Ok(Self { tap, receiver })
+        Ok(Self { tap, buffer })
     }
-    fn drain(&self) -> Vec<CapturedInput> {
-        self.tap.poll();
-        self.receiver
-            .try_iter()
-            .map(|outcome| CapturedInput {
-                event: outcome.event,
-                emergency: outcome.emergency,
-            })
-            .collect()
+    fn drain(&self, budget: usize) -> Vec<CapturedInput> {
+        self.buffer.drain(budget)
     }
     fn set_remote(&self, remote: bool) {
-        self.tap.set_mode(if remote {
-            seamless_input_core::platform::CaptureMode::Remote
-        } else {
-            seamless_input_core::platform::CaptureMode::Local
-        });
+        let _ = self.tap.set_remote(remote);
+    }
+    fn acknowledge_local_recovery(&self) {
+        let _ = self.tap.acknowledge_local_recovery();
     }
 }
 
@@ -1038,9 +1753,10 @@ impl NativeCapture {
         let (hooks, receiver) = seamless_input_platform_windows::input::WindowsHooks::install()?;
         Ok(Self { hooks, receiver })
     }
-    fn drain(&self) -> Vec<CapturedInput> {
+    fn drain(&self, budget: usize) -> Vec<CapturedInput> {
         self.receiver
             .try_iter()
+            .take(budget)
             .map(|outcome| CapturedInput {
                 event: outcome.event,
                 emergency: outcome.emergency,
@@ -1050,6 +1766,7 @@ impl NativeCapture {
     fn set_remote(&self, remote: bool) {
         self.hooks.set_remote_capture(remote);
     }
+    fn acknowledge_local_recovery(&self) {}
 }
 
 // Supervisor unit tests exercise orchestration, topology, and the peer data
@@ -1067,11 +1784,13 @@ impl NativeCapture {
         Ok(Self)
     }
 
-    fn drain(&self) -> Vec<CapturedInput> {
+    fn drain(&self, _budget: usize) -> Vec<CapturedInput> {
         Vec::new()
     }
 
     fn set_remote(&self, _remote: bool) {}
+
+    fn acknowledge_local_recovery(&self) {}
 }
 
 fn display(node: NodeId, value: &LogicalDisplay) -> Display {
@@ -1532,6 +2251,25 @@ mod tests {
     use super::*;
     use seamless_transport::PinnedPeer;
 
+    #[test]
+    fn clipboard_diagnostic_never_passes_without_a_real_read() {
+        let first_probe: Result<ClipboardOutcome, ()> = Ok(ClipboardOutcome::Pending);
+        let second_probe: Result<ClipboardOutcome, ()> = Ok(ClipboardOutcome::Pending);
+        assert!(clipboard_probe_unavailable(&first_probe, &second_probe));
+        assert_eq!(
+            clipboard_diagnostic_label(AccessState::Granted, true, false, AccessState::Denied,),
+            "FAIL (clipboard content unavailable)"
+        );
+        assert_eq!(
+            clipboard_diagnostic_label(AccessState::Denied, true, true, AccessState::Denied,),
+            "FAIL (clipboard unavailable or busy)"
+        );
+        assert_eq!(
+            clipboard_diagnostic_label(AccessState::Granted, true, false, AccessState::Granted,),
+            "PASS"
+        );
+    }
+
     fn test_paths(root: &Path, name: &str) -> AppPaths {
         let root = root.join(name);
         AppPaths {
@@ -1885,5 +2623,170 @@ mod tests {
         connect_supervisors(&mut a, &mut b).await;
         assert_eq!(a.admitted, BTreeSet::from([b_id]));
         assert_eq!(b.admitted, BTreeSet::from([a_id]));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn current_writer_failure_closes_session_cleans_tasks_and_recovers_before_readmission() {
+        let root = tempfile::tempdir().unwrap();
+        let a_paths = test_paths(root.path(), "a");
+        let b_paths = test_paths(root.path(), "b");
+        let (a_id, b_id) = pin_each_other(&a_paths, &b_paths);
+        let mut a = NativeSupervisor::bootstrap(&a_paths).unwrap();
+        let mut b = NativeSupervisor::bootstrap(&b_paths).unwrap();
+        a.suppress_native_apply = true;
+        b.suppress_native_apply = true;
+        let a_display = a.platform.displays().unwrap()[0].index;
+        let b_display = b.platform.displays().unwrap()[0].index;
+        place_remote(&a_paths, b_id, b_display, 1);
+        place_remote(&b_paths, a_id, a_display, -1);
+        a.tick().await.unwrap();
+        b.tick().await.unwrap();
+        connect_supervisors(&mut a, &mut b).await;
+
+        let session = a.sessions.get(&b_id).unwrap().clone();
+        let local_display = a.runtime.active_display();
+        let mut topology = Topology::new(Display {
+            id: local_display,
+            origin: Point { x: 0.0, y: 0.0 },
+            width: 100.0,
+            height: 100.0,
+            scale: 1.0,
+        })
+        .unwrap();
+        topology
+            .place(
+                local_display,
+                seamless_input_core::Edge::Right,
+                Display {
+                    id: DisplayId {
+                        node: b_id,
+                        index: 0,
+                    },
+                    origin: Point { x: 0.0, y: 0.0 },
+                    width: 100.0,
+                    height: 100.0,
+                    scale: 1.0,
+                },
+            )
+            .unwrap();
+        let effects = a
+            .runtime
+            .reconfigure(local_display, topology, 8_000)
+            .unwrap();
+        a.execute_effects(effects).await.unwrap();
+        let now_ms = a.started.elapsed().as_millis() as u64 + 1;
+        let effects = a
+            .runtime
+            .cross(
+                seamless_input_core::Edge::Right,
+                Point { x: 100.0, y: 50.0 },
+                now_ms,
+            )
+            .unwrap();
+        a.execute_effects(effects).await.unwrap();
+        assert_eq!(a.runtime.active_peer(), b_id);
+
+        let generation = a.next_writer_generation;
+        a.next_writer_generation += 1;
+        let timeout_writer = spawn_deadlined_writer(
+            1,
+            b_id,
+            generation,
+            a.outbound_failure_tx.clone(),
+            Duration::from_millis(10),
+            |_| async { std::future::pending::<Result<(), String>>().await },
+        );
+        timeout_writer.try_send(vec![1]).unwrap();
+        a.writers.insert(b_id, timeout_writer);
+
+        for _ in 0..20 {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+            a.drain_outbound_failures().unwrap();
+            if !a.admitted.contains(&b_id) {
+                break;
+            }
+        }
+
+        assert!(session.is_closed(), "isolated session was not closed");
+        assert!(!a.sessions.contains_key(&b_id));
+        assert!(!a.writers.contains_key(&b_id));
+        assert!(!a.readers.contains_key(&b_id));
+        assert!(!a.admitted.contains(&b_id));
+        assert_eq!(a.runtime.active_peer(), a_id);
+        assert!(
+            a.observed_recovery
+                .iter()
+                .any(|effect| matches!(effect, RuntimeEffect::ReleaseLocal))
+        );
+        assert!(
+            a.observed_recovery
+                .iter()
+                .any(|effect| matches!(effect, RuntimeEffect::WarpLocal { .. }))
+        );
+        assert!(
+            a.links[0]
+                .endpoint
+                .sessions()
+                .iter()
+                .all(|candidate| candidate.peer() != b_id),
+            "closed endpoint session was readmitted without a new connection"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stale_writer_failure_cannot_isolate_replacement_generation() {
+        let root = tempfile::tempdir().unwrap();
+        let a_paths = test_paths(root.path(), "a");
+        let b_paths = test_paths(root.path(), "b");
+        let (_, b_id) = pin_each_other(&a_paths, &b_paths);
+        let mut a = NativeSupervisor::bootstrap(&a_paths).unwrap();
+        let mut b = NativeSupervisor::bootstrap(&b_paths).unwrap();
+        connect_supervisors(&mut a, &mut b).await;
+
+        let stale_generation = a.writers.get(&b_id).unwrap().generation;
+        let replacement = a.sessions.get(&b_id).unwrap().clone();
+        a.spawn_writer(replacement);
+        let current_generation = a.writers.get(&b_id).unwrap().generation;
+        assert_ne!(stale_generation, current_generation);
+
+        a.outbound_failure_tx
+            .send(OutboundFailure {
+                peer: b_id,
+                generation: stale_generation,
+            })
+            .unwrap();
+        a.drain_outbound_failures().unwrap();
+
+        assert!(a.admitted.contains(&b_id));
+        assert!(a.sessions.contains_key(&b_id));
+        assert_eq!(a.writers.get(&b_id).unwrap().generation, current_generation);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn rejected_peer_packet_closes_session_reader_and_writer_together() {
+        let root = tempfile::tempdir().unwrap();
+        let a_paths = test_paths(root.path(), "a");
+        let b_paths = test_paths(root.path(), "b");
+        let (_, b_id) = pin_each_other(&a_paths, &b_paths);
+        let mut a = NativeSupervisor::bootstrap(&a_paths).unwrap();
+        let mut b = NativeSupervisor::bootstrap(&b_paths).unwrap();
+        connect_supervisors(&mut a, &mut b).await;
+        let session = a.sessions.get(&b_id).unwrap().clone();
+
+        a.inbound_tx
+            .send(InboundPacket {
+                peer: b_id,
+                packet: Ok(vec![0xc1]),
+            })
+            .unwrap();
+        a.drain_inbound(a.started.elapsed().as_millis() as u64 + 1)
+            .await
+            .unwrap();
+
+        assert!(session.is_closed());
+        assert!(!a.sessions.contains_key(&b_id));
+        assert!(!a.readers.contains_key(&b_id));
+        assert!(!a.writers.contains_key(&b_id));
+        assert!(!a.admitted.contains(&b_id));
     }
 }

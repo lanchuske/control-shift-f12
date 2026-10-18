@@ -145,3 +145,16 @@ fn real_mdns_publish_browse_preserves_udp_address_and_version() {
         );
     }
 }
+
+#[test]
+fn discovery_poll_is_a_nonblocking_maintenance_operation() {
+    let mut discovery = Discovery::new(1).unwrap();
+    let started = std::time::Instant::now();
+    let peers = discovery.poll().unwrap();
+
+    assert!(peers.is_empty());
+    assert!(
+        started.elapsed() < Duration::from_millis(20),
+        "poll waited for discovery traffic instead of draining ready events"
+    );
+}

@@ -16,6 +16,8 @@ pub trait ClipboardBackend {
 
 #[derive(Debug, thiserror::Error, Clone, PartialEq, Eq)]
 pub enum ClipboardError {
+    #[error("clipboard is temporarily held by another process")]
+    Busy,
     #[error("clipboard access is unavailable")]
     AccessUnavailable,
     #[error("clipboard content exceeds the protocol limit")]
@@ -34,6 +36,8 @@ pub struct WindowsClipboard {
     pending_since: Option<u64>,
     last_now: u64,
     last_hash: Option<[u8; 32]>,
+    pending_remote: Option<ClipboardContent>,
+    local_readable: bool,
 }
 
 impl WindowsClipboard {
@@ -44,6 +48,8 @@ impl WindowsClipboard {
             pending_since: None,
             last_now: 0,
             last_hash: None,
+            pending_remote: None,
+            local_readable: true,
         }
     }
 
@@ -85,7 +91,7 @@ impl PlatformClipboard for WindowsClipboard {
     type Error = ClipboardError;
 
     fn access_state(&self) -> AccessState {
-        if self.backend.available() {
+        if self.local_readable && self.backend.available() {
             AccessState::Granted
         } else {
             AccessState::Denied
@@ -97,6 +103,16 @@ impl PlatformClipboard for WindowsClipboard {
             return Err(ClipboardError::ClockWentBackwards);
         }
         self.last_now = now_ms;
+        if let Some(content) = self.pending_remote.take() {
+            match self.backend.write(&content) {
+                Ok(()) => self.last_hash = Some(Self::hash(&content)),
+                Err(ClipboardError::Busy) => {
+                    self.pending_remote = Some(content);
+                    return Ok(ClipboardOutcome::Pending);
+                }
+                Err(error) => return Err(error),
+            }
+        }
         if !self.backend.available() {
             return Ok(ClipboardOutcome::Disabled);
         }
@@ -112,11 +128,33 @@ impl PlatformClipboard for WindowsClipboard {
         if now_ms - since < DEBOUNCE_MS {
             return Ok(ClipboardOutcome::Pending);
         }
+        let content = match self.backend.read() {
+            // Another process may acquire the clipboard after available() succeeds.
+            // Keep this sequence pending so a later tick can retry it.
+            Err(ClipboardError::Busy | ClipboardError::AccessUnavailable) => {
+                self.pending_since = Some(now_ms);
+                return Ok(ClipboardOutcome::Pending);
+            }
+            Err(ClipboardError::Conversion) => {
+                self.pending_since = None;
+                self.local_readable = false;
+                return Ok(ClipboardOutcome::Unchanged);
+            }
+            result => result?,
+        };
         self.pending_since = None;
-        let Some(content) = self.backend.read()? else {
+        self.local_readable = true;
+        let Some(content) = content else {
             return Ok(ClipboardOutcome::Unchanged);
         };
-        Self::validate(&content)?;
+        match Self::validate(&content) {
+            Ok(()) => {}
+            Err(ClipboardError::Conversion) => {
+                self.local_readable = false;
+                return Ok(ClipboardOutcome::Unchanged);
+            }
+            Err(error) => return Err(error),
+        }
         let hash = Self::hash(&content);
         if self.last_hash == Some(hash) {
             return Ok(ClipboardOutcome::Unchanged);
@@ -126,13 +164,22 @@ impl PlatformClipboard for WindowsClipboard {
     }
 
     fn write_remote(&mut self, content: &ClipboardContent) -> Result<(), Self::Error> {
-        if !self.backend.available() {
-            return Err(ClipboardError::AccessUnavailable);
-        }
         Self::validate(content)?;
-        self.backend.write(content)?;
-        self.last_hash = Some(Self::hash(content));
-        Ok(())
+        // The read-only access probe is a snapshot; the native write must get
+        // its own bounded open attempts. Retain only the latest validated update
+        // if those attempts encounter contention, without committing its hash.
+        self.pending_remote = None;
+        match self.backend.write(content) {
+            Ok(()) => {
+                self.last_hash = Some(Self::hash(content));
+                Ok(())
+            }
+            Err(ClipboardError::Busy) => {
+                self.pending_remote = Some(content.clone());
+                Ok(())
+            }
+            Err(error) => Err(error),
+        }
     }
 }
 
@@ -142,7 +189,18 @@ mod native {
     use arboard::{Clipboard, ImageData};
     use image::{DynamicImage, ImageFormat, RgbaImage};
     use std::{borrow::Cow, io::Cursor, sync::Mutex};
-    use windows_sys::Win32::System::DataExchange::GetClipboardSequenceNumber;
+    use windows_sys::Win32::System::DataExchange::{
+        CloseClipboard, GetClipboardSequenceNumber, OpenClipboard,
+    };
+
+    fn backend_error(error: arboard::Error) -> ClipboardError {
+        match error {
+            arboard::Error::ClipboardOccupied => ClipboardError::Busy,
+            arboard::Error::ClipboardNotSupported => ClipboardError::AccessUnavailable,
+            arboard::Error::ConversionFailure => ClipboardError::Conversion,
+            _ => ClipboardError::Backend,
+        }
+    }
 
     pub struct Win32Clipboard {
         clipboard: Mutex<Option<Clipboard>>,
@@ -163,10 +221,20 @@ mod native {
 
     impl ClipboardBackend for Win32Clipboard {
         fn available(&self) -> bool {
-            self.clipboard
-                .lock()
-                .map(|guard| guard.is_some())
-                .unwrap_or(false)
+            let Ok(guard) = self.clipboard.lock() else {
+                return false;
+            };
+            if guard.is_none() {
+                return false;
+            }
+            // arboard's Windows constructor does not open the clipboard. Probe
+            // actual current-session access without reading or changing content.
+            unsafe {
+                if OpenClipboard(std::ptr::null_mut()) == 0 {
+                    return false;
+                }
+                CloseClipboard() != 0
+            }
         }
         fn sequence_number(&self) -> Result<u64, ClipboardError> {
             Ok(u64::from(unsafe { GetClipboardSequenceNumber() }))
@@ -177,7 +245,7 @@ mod native {
             match clipboard.get_text() {
                 Ok(text) => return Ok(Some(ClipboardContent::Text(text))),
                 Err(arboard::Error::ContentNotAvailable) => {}
-                Err(_) => return Err(ClipboardError::Backend),
+                Err(error) => return Err(backend_error(error)),
             }
             match clipboard.get_image() {
                 Ok(image) => {
@@ -194,7 +262,7 @@ mod native {
                     Ok(Some(ClipboardContent::Png(encoded.into_inner())))
                 }
                 Err(arboard::Error::ContentNotAvailable) => Ok(None),
-                Err(_) => Err(ClipboardError::Backend),
+                Err(error) => Err(backend_error(error)),
             }
         }
         fn write(&mut self, content: &ClipboardContent) -> Result<(), ClipboardError> {
@@ -202,9 +270,7 @@ mod native {
             let mut guard = self.clipboard.lock().map_err(|_| ClipboardError::Backend)?;
             let clipboard = guard.as_mut().ok_or(ClipboardError::AccessUnavailable)?;
             match content {
-                ClipboardContent::Text(text) => clipboard
-                    .set_text(text)
-                    .map_err(|_| ClipboardError::Backend),
+                ClipboardContent::Text(text) => clipboard.set_text(text).map_err(backend_error),
                 ClipboardContent::Png(bytes) => {
                     let image = image::load_from_memory_with_format(bytes, ImageFormat::Png)
                         .map_err(|_| ClipboardError::Conversion)?
@@ -216,9 +282,32 @@ mod native {
                             height: height as usize,
                             bytes: Cow::Owned(image.into_raw()),
                         })
-                        .map_err(|_| ClipboardError::Backend)
+                        .map_err(backend_error)
                 }
             }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn native_busy_error_is_retryable_but_conversion_and_unknown_errors_are_not() {
+            assert_eq!(
+                backend_error(arboard::Error::ClipboardOccupied),
+                ClipboardError::Busy
+            );
+            assert_eq!(
+                backend_error(arboard::Error::ConversionFailure),
+                ClipboardError::Conversion
+            );
+            assert_eq!(
+                backend_error(arboard::Error::Unknown {
+                    description: "must not expose native details".into(),
+                }),
+                ClipboardError::Backend
+            );
         }
     }
 }

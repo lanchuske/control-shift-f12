@@ -6,6 +6,45 @@ use std::{
 
 pub const SERVICE_TYPE: &str = "_seamless-input._udp.local.";
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PollBudget {
+    max_events: usize,
+    max_elapsed: Duration,
+}
+
+impl PollBudget {
+    pub fn new(max_events: usize, max_elapsed: Duration) -> Result<Self, String> {
+        if max_events == 0 || max_elapsed.is_zero() {
+            return Err("discovery poll budget must be non-zero".into());
+        }
+        Ok(Self {
+            max_events,
+            max_elapsed,
+        })
+    }
+}
+
+struct PollAllowance {
+    remaining: usize,
+    deadline: Instant,
+}
+
+impl PollAllowance {
+    fn new(budget: PollBudget, started: Instant) -> Self {
+        Self {
+            remaining: budget.max_events,
+            deadline: started.checked_add(budget.max_elapsed).unwrap_or(started),
+        }
+    }
+    fn take(&mut self, now: Instant) -> bool {
+        if self.remaining == 0 || now >= self.deadline {
+            return false;
+        }
+        self.remaining -= 1;
+        true
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Advertisement {
     pub instance: String,
@@ -162,9 +201,8 @@ impl Discovery {
         self.published.push(name.clone());
         Ok(name)
     }
-    /// Poll discovery for at most `wait`. Wire TTL and goodbye expiry are owned
-    /// by mdns-sd, which emits ServiceRemoved; ResolvedService exposes no TTL.
-    pub fn browse(&mut self, wait: Duration) -> Result<Vec<DiscoveredPeer>, String> {
+
+    fn ensure_browser(&mut self) -> Result<mdns_sd::Receiver<mdns_sd::ServiceEvent>, String> {
         if self.receiver.is_none() {
             self.receiver = Some(
                 self.daemon
@@ -172,7 +210,90 @@ impl Discovery {
                     .map_err(|_| "mDNS browse unavailable; use a manual address")?,
             );
         }
-        let receiver = self.receiver.as_ref().unwrap().clone();
+        Ok(self.receiver.as_ref().unwrap().clone())
+    }
+
+    fn observe_event(&mut self, event: mdns_sd::ServiceEvent) {
+        match event {
+            mdns_sd::ServiceEvent::ServiceResolved(info) => {
+                let Some(instance) = info
+                    .get_fullname()
+                    .strip_suffix(&format!(".{SERVICE_TYPE}"))
+                else {
+                    return;
+                };
+                if instance.len() != 32 || !instance.bytes().all(|b| b.is_ascii_hexdigit()) {
+                    return;
+                }
+                if self
+                    .published
+                    .iter()
+                    .any(|name| name == info.get_fullname())
+                {
+                    return;
+                }
+                let Some(version) = info
+                    .get_property_val_str("v")
+                    .and_then(|s| s.parse::<u16>().ok())
+                else {
+                    return;
+                };
+                let pairable = match info.get_property_val_str("pairable") {
+                    Some("1") => true,
+                    Some("0") => false,
+                    _ => return,
+                };
+                let addresses = resolved_addresses(&info);
+                if addresses.is_empty() {
+                    return;
+                }
+                self.live.observe(
+                    Advertisement {
+                        instance: instance.to_owned(),
+                        version,
+                        pairable,
+                        addresses,
+                        ttl: None,
+                    },
+                    Instant::now(),
+                );
+            }
+            mdns_sd::ServiceEvent::ServiceRemoved(_, name) => {
+                if let Some(instance) = name.strip_suffix(&format!(".{SERVICE_TYPE}")) {
+                    self.live.remove(instance);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Drain only mDNS events that are already available. This method never
+    /// waits for network traffic and is suitable for latency-sensitive loops.
+    pub fn poll(&mut self) -> Result<Vec<DiscoveredPeer>, String> {
+        self.poll_with_budget(PollBudget::new(64, Duration::from_millis(2))?)
+    }
+
+    /// Drain ready events within both a count and wall-clock budget so a
+    /// continuously replenished daemon backlog cannot monopolize its caller.
+    pub fn poll_with_budget(&mut self, budget: PollBudget) -> Result<Vec<DiscoveredPeer>, String> {
+        let receiver = self.ensure_browser()?;
+        let mut allowance = PollAllowance::new(budget, Instant::now());
+        while allowance.take(Instant::now()) {
+            let Ok(event) = receiver.try_recv() else {
+                break;
+            };
+            self.observe_event(event);
+        }
+        if receiver.is_disconnected() {
+            return Err("mDNS browser stopped".into());
+        }
+        Ok(self.live.peers(Instant::now()))
+    }
+
+    /// Poll discovery for at most `wait`. Wire TTL and goodbye expiry are owned
+    /// by mdns-sd, which emits ServiceRemoved; ResolvedService exposes no TTL.
+    pub fn browse(&mut self, wait: Duration) -> Result<Vec<DiscoveredPeer>, String> {
+        let receiver = self.ensure_browser()?;
         let deadline = Instant::now()
             .checked_add(wait)
             .unwrap_or_else(Instant::now);
@@ -183,57 +304,7 @@ impl Discovery {
                     Err(mdns_sd::RecvTimeoutError::Timeout) => break,
                     Err(_) => return Err("mDNS browser stopped".into()),
                 };
-            match event {
-                mdns_sd::ServiceEvent::ServiceResolved(info) => {
-                    let Some(instance) = info
-                        .get_fullname()
-                        .strip_suffix(&format!(".{SERVICE_TYPE}"))
-                    else {
-                        continue;
-                    };
-                    if instance.len() != 32 || !instance.bytes().all(|b| b.is_ascii_hexdigit()) {
-                        continue;
-                    }
-                    if self
-                        .published
-                        .iter()
-                        .any(|name| name == info.get_fullname())
-                    {
-                        continue;
-                    }
-                    let Some(version) = info
-                        .get_property_val_str("v")
-                        .and_then(|s| s.parse::<u16>().ok())
-                    else {
-                        continue;
-                    };
-                    let pairable = match info.get_property_val_str("pairable") {
-                        Some("1") => true,
-                        Some("0") => false,
-                        _ => continue,
-                    };
-                    let addresses = resolved_addresses(&info);
-                    if addresses.is_empty() {
-                        continue;
-                    }
-                    self.live.observe(
-                        Advertisement {
-                            instance: instance.to_owned(),
-                            version,
-                            pairable,
-                            addresses,
-                            ttl: None,
-                        },
-                        Instant::now(),
-                    );
-                }
-                mdns_sd::ServiceEvent::ServiceRemoved(_, name) => {
-                    if let Some(instance) = name.strip_suffix(&format!(".{SERVICE_TYPE}")) {
-                        self.live.remove(instance);
-                    }
-                }
-                _ => {}
-            }
+            self.observe_event(event);
             if Instant::now() >= deadline {
                 break;
             }
@@ -268,6 +339,22 @@ impl Drop for Discovery {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn polling_allowance_stops_on_count_or_elapsed_budget() {
+        let started = Instant::now();
+        let mut count =
+            PollAllowance::new(PollBudget::new(2, Duration::from_secs(1)).unwrap(), started);
+        assert!(count.take(started));
+        assert!(count.take(started));
+        assert!(!count.take(started));
+
+        let mut elapsed = PollAllowance::new(
+            PollBudget::new(10, Duration::from_millis(1)).unwrap(),
+            started,
+        );
+        assert!(!elapsed.take(started + Duration::from_millis(2)));
+    }
 
     #[test]
     fn browse_rejects_broadcast_and_keeps_valid_unicast_from_resolved_service() {

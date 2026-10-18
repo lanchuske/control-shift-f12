@@ -2,13 +2,14 @@ use std::{
     fmt,
     io::{self, Write},
     process::ExitCode,
-    time::{Duration, SystemTime},
+    time::{Duration, Instant, SystemTime},
 };
 
 use clap::{Args, Parser, Subcommand};
 use seamless_discovery::{Discovery, manual_address};
 use seamless_input::{
-    supervisor::{AppPaths, CapabilityReport, NativeSupervisor},
+    runtime_status::{RuntimeStatus, RuntimeStatusStore},
+    supervisor::{AppPaths, CapabilityReport, INPUT_SERVICE_INTERVAL, NativeSupervisor},
     tui,
 };
 use seamless_input_protocol::{NodeId, VERSION};
@@ -32,6 +33,8 @@ struct Cli {
 enum Commands {
     /// Start this machine as a Control Shift F12 peer.
     Start,
+    /// Report the currently running peer and authenticated session count.
+    Status(StatusArgs),
     /// Pair this machine with another peer.
     Pair(PairArgs),
     /// List paired and discovered peers.
@@ -61,6 +64,16 @@ struct PairArgs {
     /// Connect directly when mDNS discovery is unavailable.
     #[arg(long, value_name = "HOST:PORT")]
     address: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct StatusArgs {
+    /// Read only the heartbeat owned by this process id.
+    #[arg(long, value_name = "PID")]
+    pid: u32,
+    /// Print a stable tab-separated record for native launchers.
+    #[arg(long)]
+    machine: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -101,6 +114,7 @@ async fn run(cli: Cli) -> Result<(), OperationalError> {
     let paths = AppPaths::discover()?;
     match cli.command {
         Commands::Start => start(&paths).await,
+        Commands::Status(args) => status(&paths, args),
         Commands::Pair(args) => pair(&paths, &args.code, args.address.as_deref()).await,
         Commands::Peers => peers(&paths),
         Commands::Unpair { peer } => unpair(&paths, &peer),
@@ -114,8 +128,24 @@ async fn run(cli: Cli) -> Result<(), OperationalError> {
 }
 
 async fn start(paths: &AppPaths) -> Result<(), OperationalError> {
+    let process_id = std::process::id();
+    let status_store = RuntimeStatusStore::within(&paths.root, process_id);
+    if let Err(error) = status_store.clear_owned(process_id) {
+        eprintln!("runtime status cleanup unavailable: {error}");
+    }
+    let _status_lease = RuntimeStatusLease {
+        store: status_store.clone(),
+        owner_pid: process_id,
+    };
     let mut supervisor = NativeSupervisor::bootstrap(paths)?;
-    let state = supervisor.tick().await?;
+    let mut state = supervisor.tick().await?;
+    let mut heartbeat_failed = match publish_status(&status_store, process_id, &state) {
+        Ok(()) => false,
+        Err(error) => {
+            eprintln!("runtime status heartbeat unavailable: {error}");
+            true
+        }
+    };
     println!(
         "Control Shift F12 running: {} display(s), {} authenticated session(s)",
         state.displays, state.authenticated_sessions
@@ -124,15 +154,84 @@ async fn start(paths: &AppPaths) -> Result<(), OperationalError> {
         .flush()
         .map_err(|error| OperationalError(error.to_string()))?;
     let mut interval = tokio::time::interval(Duration::from_millis(250));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut input_interval = tokio::time::interval(INPUT_SERVICE_INTERVAL);
+    input_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut last_heartbeat = Instant::now();
     loop {
         tokio::select! {
-            _ = interval.tick() => { supervisor.tick().await?; }
+            _ = interval.tick() => {
+                let next = supervisor.tick().await?;
+                let changed = next.displays != state.displays
+                    || next.authenticated_sessions != state.authenticated_sessions;
+                if changed || last_heartbeat.elapsed() >= Duration::from_secs(2) {
+                    match publish_status(&status_store, process_id, &next) {
+                        Ok(()) if heartbeat_failed => {
+                            eprintln!("runtime status heartbeat recovered");
+                            heartbeat_failed = false;
+                        }
+                        Ok(()) => heartbeat_failed = false,
+                        Err(error) if !heartbeat_failed => {
+                            eprintln!("runtime status heartbeat unavailable: {error}");
+                            heartbeat_failed = true;
+                        }
+                        Err(_) => {}
+                    }
+                    last_heartbeat = Instant::now();
+                }
+                state = next;
+            }
+            _ = input_interval.tick() => { supervisor.service_input().await?; }
             result = tokio::signal::ctrl_c() => {
                 result.map_err(|error| OperationalError(error.to_string()))?;
                 return Ok(());
             }
         }
     }
+}
+
+fn publish_status(
+    store: &RuntimeStatusStore,
+    process_id: u32,
+    state: &seamless_input::supervisor::SupervisorStatus,
+) -> Result<(), seamless_input::runtime_status::RuntimeStatusError> {
+    RuntimeStatus::live(process_id, state.displays, state.authenticated_sessions)
+        .and_then(|status| store.publish(&status))
+}
+
+struct RuntimeStatusLease {
+    store: RuntimeStatusStore,
+    owner_pid: u32,
+}
+
+impl Drop for RuntimeStatusLease {
+    fn drop(&mut self) {
+        let _ = self.store.clear_owned(self.owner_pid);
+    }
+}
+
+fn status(paths: &AppPaths, args: StatusArgs) -> Result<(), OperationalError> {
+    let store = RuntimeStatusStore::within(&paths.root, args.pid);
+    if let Some(status) = store.read_current(SystemTime::now())? {
+        if args.machine {
+            println!(
+                "state=running\tprocess_id={}\tdisplays={}\tauthenticated_sessions={}",
+                status.process_id, status.displays, status.authenticated_sessions
+            );
+        } else {
+            println!("{}", status.display_line());
+        }
+    } else {
+        if args.machine {
+            println!(
+                "state=stopped\tprocess_id={}\tdisplays=0\tauthenticated_sessions=0",
+                args.pid
+            );
+        } else {
+            println!("Control Shift F12 stopped: 0 authenticated session(s)");
+        }
+    }
+    Ok(())
 }
 
 async fn pair(
