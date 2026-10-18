@@ -37,8 +37,13 @@ pub struct SelectedLocator {
 struct Entry {
     advertisement: Advertisement,
     handle: CandidateHandle,
-    expires: Option<u64>,
+    expires: u64,
 }
+
+// mdns-sd's shortest default required-record TTL is 120 seconds (SRV/A).
+// Keep an independent local bound while allowing its refresh cycle to renew
+// a candidate before this deadline. The consent window remains the hard cap.
+const DAEMON_MANAGED_FRESHNESS_MS: u64 = 120_000;
 
 #[derive(Default)]
 pub struct ConsentCatalog {
@@ -68,8 +73,7 @@ impl ConsentCatalog {
             self.entries.clear();
             return Err(DiscoveryError::Expired);
         }
-        self.entries
-            .retain(|_, e| e.expires.is_none_or(|expires| now < expires));
+        self.entries.retain(|_, e| now < e.expires);
         Ok(())
     }
     pub fn open(&mut self, now: u64) -> Result<(), DiscoveryError> {
@@ -106,19 +110,14 @@ impl ConsentCatalog {
         ad.instance.make_ascii_lowercase();
         ad.addresses.sort();
         ad.addresses.dedup();
-        let expires = match ad.ttl {
-            Some(ttl) => {
-                let ttl = ttl.as_millis().min(30_000) as u64;
-                if ttl == 0 {
-                    return Err(DiscoveryError::Invalid);
-                }
-                Some(now.checked_add(ttl).ok_or(DiscoveryError::Limit)?)
-            }
-            // GuidedMdns receives wire-TTL expiry and goodbye as ServiceRemoved.
-            // None therefore remains current only inside this bounded consent
-            // window and is still revoked immediately by remove().
-            None => None,
+        let ttl = match ad.ttl {
+            Some(ttl) => ttl.as_millis().min(30_000) as u64,
+            None => DAEMON_MANAGED_FRESHNESS_MS,
         };
+        if ttl == 0 {
+            return Err(DiscoveryError::Invalid);
+        }
+        let expires = now.checked_add(ttl).ok_or(DiscoveryError::Limit)?;
         // Wire TTL is never evidence of local freshness and isn't part of a handle.
         ad.ttl = None;
         if let Some(entry) = self.entries.get_mut(&ad.instance) {
@@ -297,8 +296,8 @@ impl GuidedMdns {
         for _ in 0..16 {
             match self.receiver.recv_timeout(std::time::Duration::ZERO) {
                 Ok(mdns_sd::ServiceEvent::ServiceResolved(info)) => {
-                    if let Some(ad) = decode(&info) {
-                        events.push(LocatorEvent::Observed(ad));
+                    if let Some(event) = resolved_event(&info) {
+                        events.push(event);
                     }
                 }
                 Ok(mdns_sd::ServiceEvent::ServiceRemoved(_, name)) => {
@@ -328,6 +327,15 @@ impl Drop for GuidedMdns {
 fn instance(name: &str) -> Option<&str> {
     name.strip_suffix(&format!(".{}", crate::mdns::SERVICE_TYPE))
         .filter(|id| opaque(id))
+}
+fn resolved_event(info: &mdns_sd::ResolvedService) -> Option<LocatorEvent> {
+    let id = instance(info.get_fullname())?.to_ascii_lowercase();
+    Some(match decode(info) {
+        Some(advertisement) => LocatorEvent::Observed(advertisement),
+        // A previously valid service that loses required metadata must not
+        // leave its earlier selectable projection in the consent catalogue.
+        None => LocatorEvent::Removed(id),
+    })
 }
 fn decode(info: &mdns_sd::ResolvedService) -> Option<Advertisement> {
     let id = instance(info.get_fullname())?;
@@ -418,6 +426,10 @@ mod tests {
     fn parser_accepts_only_minimal_metadata_and_opaque_hostname() {
         assert!(decode(&info(false)).is_some());
         assert!(decode(&info(true)).is_none());
+        assert!(matches!(
+            resolved_event(&info(true)),
+            Some(LocatorEvent::Removed(id)) if id == "11111111111111111111111111111111"
+        ));
         let bad = mdns_sd::ServiceInfo::new(
             SERVICE_TYPE,
             "11111111111111111111111111111111",

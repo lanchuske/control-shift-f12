@@ -86,12 +86,13 @@ fn local_freshness_window_deadline_and_clock_rollback_are_fail_closed() {
     catalog.open(0).unwrap();
     let handle = catalog.observe(advertisement(1), 0).unwrap();
     assert!(catalog.select(handle, 29_999).is_ok());
-    assert!(catalog.select(handle, 30_000).is_ok());
-    assert_eq!(catalog.candidates(30_000).unwrap().len(), 1);
+    assert!(catalog.select(handle, 119_999).is_ok());
+    assert_eq!(catalog.select(handle, 120_000), Err(DiscoveryError::Stale));
+    assert!(catalog.candidates(120_000).unwrap().is_empty());
     let mut ttl = advertisement(2);
     ttl.ttl = Some(Duration::from_millis(5));
-    let short = catalog.observe(ttl, 30_001).unwrap();
-    assert_eq!(catalog.select(short, 30_006), Err(DiscoveryError::Stale));
+    let short = catalog.observe(ttl, 120_001).unwrap();
+    assert_eq!(catalog.select(short, 120_006), Err(DiscoveryError::Stale));
     assert_eq!(catalog.candidates(300_000), Err(DiscoveryError::Expired));
     catalog.open(300_001).unwrap();
     assert_eq!(
