@@ -269,6 +269,22 @@ final class ControlShiftF12AppTests: XCTestCase {
         XCTAssertEqual(controller.presentation, current)
     }
 
+    func testProjectionGenerationIsGlobalAndStaleSnapshotsCannotRegressDiscovery() throws {
+        let controller = DiagnosticsFrameController()
+        try controller.consume(lengthPrefixed: frame(snapshotPayload(generation: 10, state: "browsing", candidate: "current-peer")))
+        try controller.consume(lengthPrefixed: frame(diagnosticsPayload(generation: 11)))
+
+        try controller.consume(lengthPrefixed: frame(snapshotPayload(generation: 10, state: "not_started")))
+        try controller.consume(lengthPrefixed: frame(snapshotPayload(generation: 11, state: "not_started")))
+
+        XCTAssertEqual(controller.shell, .browsing)
+        XCTAssertEqual(controller.nearbyCandidates.map(\.handle), ["current-peer"])
+
+        try controller.consume(lengthPrefixed: frame(snapshotPayload(generation: 12, state: "not_started")))
+        XCTAssertEqual(controller.shell, .readyToDiscover)
+        XCTAssertTrue(controller.nearbyCandidates.isEmpty)
+    }
+
     func testCloseCancelsClosesAndReapsChildWithoutChangingGeneration() {
         let child = RecordingChild()
         let session = ChildLifecycle(child: child)
@@ -363,6 +379,21 @@ final class ControlShiftF12AppTests: XCTestCase {
           {"id":"runtime","label":"runtime","state":"pass","detail":"ready","action":null,"failure_code":null},
           {"id":"displays","label":"displays","state":"pass","detail":"ready","action":null,"failure_code":null}
         ]}
+        """.data(using: .utf8)!
+    }
+
+    private func snapshotPayload(generation: Int, state: String, candidate: String? = nil) -> Data {
+        let candidates = candidate.map {
+            "[{\"handle\":\"\($0)\",\"compatibility\":\"compatible\",\"freshness\":\"current\"}]"
+        } ?? "[]"
+        return """
+        {"v":1,"kind":"ui_snapshot_v1","snapshot":{
+          "schema_version":1,"generation":\(generation),"state":"\(state)",
+          "candidates":\(candidates),"confirmed":[],"inventory":null,
+          "layout":{"state":"not_configured"},
+          "capabilities":{"input_enabled":false,"clipboard_enabled":false},
+          "diagnostics":[]
+        }}
         """.data(using: .utf8)!
     }
 }

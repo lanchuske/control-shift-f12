@@ -130,6 +130,25 @@ public sealed class UiChildSessionTests
         Assert.Null(session.Diagnostics);
     }
 
+    [Fact]
+    public void Projection_generation_is_global_and_stale_snapshots_cannot_regress_discovery()
+    {
+        var session = new UiChildSession();
+        session.ReceiveOutput(Frame(Snapshot(10, "browsing", "current-peer")));
+        session.ReceiveOutput(Frame("""{"v":1,"kind":"ui_diagnostics_v1","generation":11,"rows":[]}"""));
+
+        session.ReceiveOutput(Frame(Snapshot(10, "not_started")));
+        session.ReceiveOutput(Frame(Snapshot(11, "not_started")));
+
+        Assert.Equal(ChildSessionPhase.Running, session.State.Phase);
+        Assert.Equal("browsing", session.Snapshot!.State);
+        Assert.Equal(["current-peer"], session.Snapshot.Nearby);
+
+        session.ReceiveOutput(Frame(Snapshot(12, "not_started")));
+        Assert.Equal("not_started", session.Snapshot!.State);
+        Assert.Empty(session.Snapshot.Nearby);
+    }
+
     private static string RequestId(byte[] frame)
     {
         using var document = JsonDocument.Parse(frame.AsMemory(4));
@@ -147,5 +166,17 @@ public sealed class UiChildSessionTests
         frame[3] = (byte)length;
         payload.CopyTo(frame, sizeof(uint));
         return frame;
+    }
+
+    private static string Snapshot(ulong generation, string state, string? candidate = null)
+    {
+        var candidates = candidate is null
+            ? "[]"
+            : $$"""[{"handle":"{{candidate}}","compatibility":"compatible","freshness":"current"}]""";
+        return $"{{\"v\":1,\"kind\":\"ui_snapshot_v1\",\"snapshot\":{{"
+            + $"\"schema_version\":1,\"generation\":{generation},\"state\":\"{state}\","
+            + $"\"diagnostics\":[],\"candidates\":{candidates},\"confirmed\":[],\"inventory\":null,"
+            + "\"layout\":{\"state\":\"not_configured\"},"
+            + "\"capabilities\":{\"input_enabled\":false,\"clipboard_enabled\":false}}}";
     }
 }
