@@ -361,6 +361,15 @@ fn harden(handle: HANDLE, directory: bool, sid: &[u8]) -> Result<(), StoreError>
 }
 
 fn validate(handle: HANDLE, directory: bool, sid: &[u8]) -> Result<(), StoreError> {
+    validate_with_protection(handle, directory, sid, true)
+}
+
+fn validate_with_protection(
+    handle: HANDLE,
+    directory: bool,
+    sid: &[u8],
+    require_protected: bool,
+) -> Result<(), StoreError> {
     let info = file_info(handle)?;
     let is_dir = info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0;
     if info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
@@ -394,7 +403,7 @@ fn validate(handle: HANDLE, directory: bool, sid: &[u8]) -> Result<(), StoreErro
         let mut control = 0;
         let mut revision = 0;
         if unsafe { GetSecurityDescriptorControl(descriptor, &mut control, &mut revision) } == 0
-            || control & SE_DACL_PROTECTED == 0
+            || (require_protected && control & SE_DACL_PROTECTED == 0)
         {
             return Err(StoreError::Invalid);
         }
@@ -881,14 +890,18 @@ mod tests {
     }
 
     #[test]
-    fn root_reprotects_an_exact_but_inheritable_dacl() {
-        let root = tempfile::tempdir().unwrap();
-        let private = PrivateDir::root(root.path()).unwrap();
-        let sid = private.sid.clone();
-        drop(private);
-        let administrative = open_path(root.path(), true, OPEN_EXISTING)
+    fn root_reprotects_an_exact_dacl_without_inheritance() {
+        let container = tempfile::tempdir().unwrap();
+        let sid = current_user_sid().unwrap();
+        let parent = open_path(container.path(), true, OPEN_EXISTING)
             .unwrap()
             .unwrap();
+        harden(parent.as_raw_handle().cast(), false, &sid).unwrap();
+        drop(parent);
+        let root = container.path().join("root");
+        let private = PrivateDir::root(&root).unwrap();
+        drop(private);
+        let administrative = open_path(&root, true, OPEN_EXISTING).unwrap().unwrap();
         let mut dacl = ptr::null_mut();
         let mut descriptor = ptr::null_mut();
         let status = unsafe {
@@ -920,14 +933,41 @@ mod tests {
         unsafe { LocalFree(descriptor) };
         assert_eq!(status, ERROR_SUCCESS);
         drop(administrative);
-        let unprotected = open_retained_directory(root.path()).unwrap();
+        let unprotected = open_retained_directory(&root).unwrap();
+        assert_eq!(
+            validate_with_protection(unprotected.as_raw_handle().cast(), true, &sid, false),
+            Ok(())
+        );
+        let mut descriptor = ptr::null_mut();
+        let status = unsafe {
+            GetSecurityInfo(
+                unprotected.as_raw_handle().cast(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+                &mut descriptor,
+            )
+        };
+        assert_eq!(status, ERROR_SUCCESS);
+        assert!(!descriptor.is_null());
+        let mut control = 0;
+        let mut revision = 0;
+        assert_ne!(
+            unsafe { GetSecurityDescriptorControl(descriptor, &mut control, &mut revision) },
+            0
+        );
+        unsafe { LocalFree(descriptor) };
+        assert_eq!(control & SE_DACL_PROTECTED, 0);
         assert_eq!(
             validate(unprotected.as_raw_handle().cast(), true, &sid),
             Err(StoreError::Invalid)
         );
         drop(unprotected);
 
-        let repaired = PrivateDir::root(root.path()).unwrap();
+        let repaired = PrivateDir::root(&root).unwrap();
         assert_eq!(
             validate(repaired.file.as_raw_handle().cast(), true, &sid),
             Ok(())
