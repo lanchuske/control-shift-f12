@@ -14,6 +14,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 ALLOWED_ROOT_ENTRIES = {
     ".github",
+    ".gitattributes",
     ".gitignore",
     "CODE_OF_CONDUCT.md",
     "CONTRIBUTING.md",
@@ -26,6 +27,7 @@ ALLOWED_ROOT_ENTRIES = {
     "crates",
     "deny.toml",
     "docs",
+    "native",
     "scripts",
 }
 

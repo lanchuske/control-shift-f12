@@ -247,10 +247,27 @@ fn windows_storage_source_retains_the_reviewed_durability_and_security_primitive
         "LockFileEx",
         "file.sync_all()",
         "if unsafe { FlushFileBuffers",
-        "ReplaceFileW",
-        "MOVEFILE_WRITE_THROUGH",
+        "SetFileInformationByHandle",
+        "FileRenameInfo",
+        "FILE_FLAG_WRITE_THROUGH",
         "PROTECTED_DACL_SECURITY_INFORMATION",
     ] {
         assert!(source.contains(required), "missing contract: {required}");
+    }
+    assert_eq!(
+        source.matches("file.sync_all()").count(),
+        2,
+        "replacement requires distinct pre-rename and post-rename file flushes"
+    );
+    for operation in [
+        "flush_before_rename(&file, value)?",
+        "publish_renamed_file(&file, &self.path.join(value), target_exists, value)?",
+        "flush_after_rename(&file)?",
+        "self.flush_for_replace(value)?",
+    ] {
+        assert!(
+            source.contains(operation),
+            "missing replacement operation: {operation}"
+        );
     }
 }

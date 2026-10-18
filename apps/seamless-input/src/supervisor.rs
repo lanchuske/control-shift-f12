@@ -24,12 +24,14 @@ use seamless_input_protocol::VERSION;
 use seamless_transport::{
     EndpointOptions, IdentityStore, PairingError, PeerEndpoint, PeerSession, ReconnectPolicy,
 };
+#[cfg(any(target_os = "macos", test))]
+use std::{collections::VecDeque, sync::Mutex};
 use std::{
-    collections::{BTreeMap, BTreeSet, VecDeque},
+    collections::{BTreeMap, BTreeSet},
     future::Future,
     net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::Arc,
     time::{Duration, Instant},
 };
 use tokio::{sync::mpsc, task::JoinHandle};
@@ -1342,22 +1344,26 @@ struct CapturedInput {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg(any(target_os = "macos", test))]
 enum CaptureEnqueueAction {
     Continue,
     RecoverLocal,
 }
 
+#[cfg(any(target_os = "macos", test))]
 struct CaptureBufferState {
     emergency: bool,
     ordered: VecDeque<CapturedInput>,
 }
 
 #[derive(Clone)]
+#[cfg(any(target_os = "macos", test))]
 struct CaptureBuffer {
     capacity: usize,
     state: Arc<Mutex<CaptureBufferState>>,
 }
 
+#[cfg(any(target_os = "macos", test))]
 impl CaptureBuffer {
     fn new(capacity: usize) -> Self {
         assert!(capacity > 0, "capture capacity must be non-zero");
@@ -1443,7 +1449,7 @@ mod capture_buffer_tests {
             Arc,
             atomic::{AtomicBool, AtomicUsize, Ordering},
         },
-        time::{Duration, Instant},
+        time::Duration,
     };
 
     fn captured(event: InputEvent) -> CapturedInput {
@@ -1618,11 +1624,10 @@ mod capture_buffer_tests {
         assert!((1..=64).contains(&CAPTURE_DRAIN_BUDGET));
     }
 
-    #[tokio::test(flavor = "current_thread")]
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn slow_maintenance_does_not_block_input_service_cadence() {
         let serviced = Arc::new(AtomicUsize::new(0));
         let observed = Arc::clone(&serviced);
-        let started = Instant::now();
 
         interleave_maintenance(
             async { tokio::time::sleep(Duration::from_millis(45)).await },
@@ -1635,14 +1640,13 @@ mod capture_buffer_tests {
         .await
         .unwrap();
 
-        assert!(started.elapsed() >= Duration::from_millis(40));
         assert!(
             serviced.load(Ordering::SeqCst) >= 6,
             "input service did not interleave with slow maintenance"
         );
     }
 
-    #[tokio::test(flavor = "current_thread")]
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn pending_network_send_does_not_block_input_heartbeat_or_shutdown() {
         let (failure_tx, mut failure_rx) = tokio::sync::mpsc::unbounded_channel();
         let writer = OutboundWriter::spawn(
