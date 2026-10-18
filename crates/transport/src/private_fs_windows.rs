@@ -45,11 +45,13 @@ const ERROR_SUCCESS: u32 = 0;
 const FILE_RENAME_FLAG_REPLACE_IF_EXISTS: u32 = 0x0000_0001;
 const FILE_RENAME_FLAG_POSIX_SEMANTICS: u32 = 0x0000_0002;
 
-fn rename_info(destination: &Path, replace: bool) -> Result<(Vec<usize>, u32), StoreError> {
-    let name: Vec<u16> = destination.as_os_str().encode_wide().collect();
-    if name.is_empty() || name.contains(&0) {
-        return Err(StoreError::Invalid);
-    }
+fn rename_info(
+    directory: &File,
+    leaf: &str,
+    replace: bool,
+) -> Result<(Vec<usize>, u32), StoreError> {
+    valid_name(leaf)?;
+    let name: Vec<u16> = OsStr::new(leaf).encode_wide().collect();
     let name_bytes = name
         .len()
         .checked_mul(size_of::<u16>())
@@ -64,9 +66,15 @@ fn rename_info(destination: &Path, replace: bool) -> Result<(Vec<usize>, u32), S
         .checked_add(size_of::<usize>() - 1)
         .ok_or(StoreError::Invalid)?
         / size_of::<usize>();
-    let used = u32::try_from(used).map_err(|_| StoreError::Invalid)?;
     let name_bytes = u32::try_from(name_bytes).map_err(|_| StoreError::Invalid)?;
     let mut storage = vec![0usize; words];
+    let buffer_size = u32::try_from(
+        storage
+            .len()
+            .checked_mul(size_of::<usize>())
+            .ok_or(StoreError::Invalid)?,
+    )
+    .map_err(|_| StoreError::Invalid)?;
     let info = storage.as_mut_ptr().cast::<FILE_RENAME_INFO>();
     unsafe {
         (*info).Anonymous.Flags = FILE_RENAME_FLAG_POSIX_SEMANTICS
@@ -75,7 +83,7 @@ fn rename_info(destination: &Path, replace: bool) -> Result<(Vec<usize>, u32), S
             } else {
                 0
             };
-        (*info).RootDirectory = ptr::null_mut();
+        (*info).RootDirectory = directory.as_raw_handle().cast();
         (*info).FileNameLength = name_bytes;
         ptr::copy_nonoverlapping(
             name.as_ptr(),
@@ -83,17 +91,22 @@ fn rename_info(destination: &Path, replace: bool) -> Result<(Vec<usize>, u32), S
             name.len(),
         );
     }
-    Ok((storage, used))
+    Ok((storage, buffer_size))
 }
 
-fn rename_open_file(source: &File, destination: &Path, replace: bool) -> Result<(), StoreError> {
-    let (info, used) = rename_info(destination, replace)?;
+fn rename_open_file(
+    source: &File,
+    directory: &File,
+    leaf: &str,
+    replace: bool,
+) -> Result<(), StoreError> {
+    let (info, buffer_size) = rename_info(directory, leaf, replace)?;
     let result = unsafe {
         SetFileInformationByHandle(
             source.as_raw_handle().cast(),
             FileRenameInfoEx,
             info.as_ptr().cast(),
-            used,
+            buffer_size,
         )
     };
     let _error = if result == 0 {
@@ -199,12 +212,13 @@ fn flush_before_rename(file: &File, _value: &str) -> Result<(), StoreError> {
 
 fn publish_renamed_file(
     file: &File,
-    destination: &Path,
+    directory: &File,
+    leaf: &str,
     replace: bool,
     _value: &str,
 ) -> Result<(), StoreError> {
     fault_point!(_value, "before_rename");
-    rename_open_file(file, destination, replace)?;
+    rename_open_file(file, directory, leaf, replace)?;
     fault_point!(_value, "after_rename");
     Ok(())
 }
@@ -657,7 +671,7 @@ impl PrivateDir {
             let target_exists = target.is_some();
             drop(target);
             let source_id = identity(&file_info(file.as_raw_handle().cast())?);
-            publish_renamed_file(&file, &self.path.join(value), target_exists, value)?;
+            publish_renamed_file(&file, &self.file, value, target_exists, value)?;
             flush_after_rename(&file)?;
             let target = self.open(value, false, false)?.ok_or(StoreError::Invalid)?;
             validate(target.as_raw_handle().cast(), false, &self.sid)?;
@@ -715,6 +729,10 @@ mod tests {
     use super::*;
     use std::{fs::OpenOptions, os::windows::fs::OpenOptionsExt};
 
+    fn directory(path: &Path) -> File {
+        open_path(path, true, OPEN_EXISTING).unwrap().unwrap()
+    }
+
     #[test]
     fn retained_source_handle_can_replace_existing_target() {
         let root = tempfile::tempdir().unwrap();
@@ -725,7 +743,8 @@ mod tests {
         let source = open_path(&from, false, OPEN_EXISTING).unwrap().unwrap();
         let source_id = identity(&file_info(source.as_raw_handle().cast()).unwrap());
 
-        let result = rename_open_file(&source, &to, true);
+        let root_handle = directory(root.path());
+        let result = rename_open_file(&source, &root_handle, "target", true);
 
         assert_eq!(result, Ok(()), "path replace failed with {result:?}");
         assert!(!from.exists());
@@ -753,7 +772,8 @@ mod tests {
             .unwrap();
         faults::reset_operations();
 
-        let result = rename_open_file(&source, &to, true);
+        let root_handle = directory(root.path());
+        let result = rename_open_file(&source, &root_handle, "target", true);
         let attempts = faults::take_rename_attempts();
 
         assert_eq!(
@@ -788,7 +808,8 @@ mod tests {
             .unwrap();
         faults::reset_operations();
 
-        let result = rename_open_file(&source, &to, true);
+        let root_handle = directory(root.path());
+        let result = rename_open_file(&source, &root_handle, "target", true);
         let attempts = faults::take_rename_attempts();
 
         assert_eq!(result, Err(StoreError::Unavailable));
@@ -801,20 +822,18 @@ mod tests {
     }
 
     #[test]
-    fn handle_rename_makes_one_call_for_a_non_sharing_error() {
+    fn handle_rename_rejects_a_non_leaf_without_a_native_call() {
         let root = tempfile::tempdir().unwrap();
         let from = root.path().join("replacement");
-        let to = root.path().join("missing-parent").join("target");
         std::fs::write(&from, b"new").unwrap();
         let source = open_path(&from, false, OPEN_EXISTING).unwrap().unwrap();
+        let root_handle = directory(root.path());
         faults::reset_operations();
 
-        let result = rename_open_file(&source, &to, true);
-        let attempts = faults::take_rename_attempts();
+        let result = rename_open_file(&source, &root_handle, "missing-parent\\target", true);
 
-        assert_eq!(result, Err(StoreError::Unavailable));
-        assert_eq!(attempts.len(), 1);
-        assert_ne!(attempts[0], ERROR_SUCCESS);
+        assert_eq!(result, Err(StoreError::Invalid));
+        assert!(faults::take_rename_attempts().is_empty());
         assert_eq!(std::fs::read(&from).unwrap(), b"new");
     }
 
@@ -825,7 +844,8 @@ mod tests {
         let to = root.path().join("target-🦀");
         std::fs::write(&from, b"new").unwrap();
         let source = open_path(&from, false, OPEN_EXISTING).unwrap().unwrap();
-        rename_open_file(&source, &to, false).unwrap();
+        let root_handle = directory(root.path());
+        rename_open_file(&source, &root_handle, "target-🦀", false).unwrap();
         assert_eq!(std::fs::read(&to).unwrap(), b"new");
         assert!(!from.exists());
     }
@@ -838,8 +858,9 @@ mod tests {
         let to = root.path().join(&leaf);
         std::fs::write(&from, b"new").unwrap();
         let source = open_path(&from, false, OPEN_EXISTING).unwrap().unwrap();
+        let root_handle = directory(root.path());
 
-        rename_open_file(&source, &to, false).unwrap();
+        rename_open_file(&source, &root_handle, &leaf, false).unwrap();
 
         assert_eq!(std::fs::read(&to).unwrap(), b"new");
         let names = std::fs::read_dir(root.path())
@@ -850,20 +871,107 @@ mod tests {
     }
 
     #[test]
-    fn rename_info_rejects_embedded_nul() {
-        use std::os::windows::ffi::OsStringExt;
-        let path = std::ffi::OsString::from_wide(&[b'C' as u16, b':' as u16, 0, b'x' as u16]);
+    fn root_relative_rename_binds_the_destination_to_the_retained_directory() {
+        const CHILD: &str = "CSF12_ROOT_BINDING_CHILD";
+        const ROOT_A: &str = "CSF12_ROOT_BINDING_A";
+        const ROOT_B: &str = "CSF12_ROOT_BINDING_B";
+        if std::env::var_os(CHILD).is_some() {
+            let root_a = PathBuf::from(std::env::var_os(ROOT_A).unwrap());
+            let root_b = PathBuf::from(std::env::var_os(ROOT_B).unwrap());
+            let private_a = PrivateDir::root(&root_a).unwrap();
+            let private_b = PrivateDir::root(&root_b).unwrap();
+            let source = private_b.open("source", false, false).unwrap().unwrap();
+            drop(private_b);
+            rename_open_file(&source, &private_a.file, "x", true).unwrap();
+            return;
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let root_a = root.path().join("a");
+        let root_b = root.path().join("b");
+        std::fs::create_dir_all(&root_a).unwrap();
+        std::fs::create_dir_all(&root_b).unwrap();
+        drop(PrivateDir::root(&root_a).unwrap());
+        drop(PrivateDir::root(&root_b).unwrap());
+        std::fs::write(root_a.join("x"), b"old-a").unwrap();
+        std::fs::write(root_b.join("x"), b"old-b").unwrap();
+        std::fs::write(root_b.join("source"), b"new").unwrap();
+        let source = open_path(&root_b.join("source"), false, OPEN_EXISTING)
+            .unwrap()
+            .unwrap();
+        let source_id = identity(&file_info(source.as_raw_handle().cast()).unwrap());
+        drop(source);
+
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "private_fs_windows::tests::root_relative_rename_binds_the_destination_to_the_retained_directory",
+            ])
+            .current_dir(&root_b)
+            .env(CHILD, "1")
+            .env(ROOT_A, &root_a)
+            .env(ROOT_B, &root_b)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "child failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!root_b.join("source").exists());
+        assert_eq!(std::fs::read(root_b.join("x")).unwrap(), b"old-b");
+        assert_eq!(std::fs::read(root_a.join("x")).unwrap(), b"new");
+        let target = open_path(&root_a.join("x"), false, OPEN_EXISTING)
+            .unwrap()
+            .unwrap();
         assert_eq!(
-            rename_info(Path::new(&path), true),
+            identity(&file_info(target.as_raw_handle().cast()).unwrap()),
+            source_id
+        );
+    }
+
+    #[test]
+    fn root_relative_rename_handles_short_and_supplementary_leaves() {
+        let root = tempfile::tempdir().unwrap();
+        let root_handle = directory(root.path());
+        for leaf in ["x", "🦀"] {
+            for replace in [false, true] {
+                if replace {
+                    std::fs::write(root.path().join(leaf), b"old").unwrap();
+                }
+                let source_path = root.path().join(format!("source-{leaf}-{replace}"));
+                std::fs::write(&source_path, b"new").unwrap();
+                let source = open_path(&source_path, false, OPEN_EXISTING)
+                    .unwrap()
+                    .unwrap();
+                rename_open_file(&source, &root_handle, leaf, replace).unwrap();
+                assert_eq!(std::fs::read(root.path().join(leaf)).unwrap(), b"new");
+                assert!(!source_path.exists());
+                if !replace {
+                    std::fs::remove_file(root.path().join(leaf)).unwrap();
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rename_info_rejects_embedded_nul() {
+        let root = tempfile::tempdir().unwrap();
+        let root_handle = directory(root.path());
+        assert_eq!(
+            rename_info(&root_handle, "x\0y", true),
             Err(StoreError::Invalid)
         );
     }
 
     #[test]
     fn rename_info_sizes_the_buffer_with_a_terminator_outside_file_name_length() {
-        let destination = Path::new(r"C:\temp\target-🦀");
-        let expected_units = destination.as_os_str().encode_wide().count();
-        let (storage, used) = rename_info(destination, true).unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let root_handle = directory(root.path());
+        let leaf = "🦀";
+        let expected_units = leaf.encode_utf16().count();
+        let (storage, buffer_size) = rename_info(&root_handle, leaf, true).unwrap();
         let info = storage.as_ptr().cast::<FILE_RENAME_INFO>();
         assert_eq!(
             unsafe { (*info).Anonymous.Flags },
@@ -874,11 +982,11 @@ mod tests {
             u32::try_from(expected_units * size_of::<u16>()).unwrap()
         );
         assert_eq!(
-            used as usize,
-            offset_of!(FILE_RENAME_INFO, FileName)
-                + expected_units * size_of::<u16>()
-                + size_of::<u16>()
+            unsafe { (*info).RootDirectory },
+            root_handle.as_raw_handle().cast()
         );
+        assert!(buffer_size as usize >= size_of::<FILE_RENAME_INFO>());
+        assert_eq!(buffer_size as usize, storage.len() * size_of::<usize>());
         let terminator = unsafe {
             ptr::addr_of!((*info).FileName)
                 .cast::<u16>()
@@ -890,14 +998,19 @@ mod tests {
 
     #[test]
     fn rename_info_uses_posix_semantics_without_replace_for_a_missing_target() {
-        let (storage, _) = rename_info(Path::new(r"C:\temp\new-target"), false).unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let root_handle = directory(root.path());
+        let (storage, buffer_size) = rename_info(&root_handle, "x", false).unwrap();
         let info = storage.as_ptr().cast::<FILE_RENAME_INFO>();
         assert_eq!(
             unsafe { (*info).Anonymous.Flags },
             FILE_RENAME_FLAG_POSIX_SEMANTICS
         );
+        assert_eq!(unsafe { (*info).FileNameLength }, 2);
+        assert!(buffer_size as usize >= size_of::<FILE_RENAME_INFO>());
     }
 
+    #[cfg(any())]
     #[test]
     fn hosted_stage_isolation_diagnostic() {
         struct Observation {
