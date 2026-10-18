@@ -380,6 +380,7 @@ internal sealed class WindowsPairingControls : FlowLayoutPanel
     private ulong? cancelledGeneration;
     private ulong? submittedSnapshotGeneration;
     private bool busy;
+    private Control? observedParent;
 
     internal WindowsPairingControls(Func<UiChildSession?> session, Action<string> select,
         Action<ulong, bool> approve, Action<ulong> cancel)
@@ -417,9 +418,11 @@ internal sealed class WindowsPairingControls : FlowLayoutPanel
         SelectButton.Enabled = !busy && presentation?.CanSelect == true
             && displayedSnapshotGeneration != submittedSnapshotGeneration;
         Candidates.Enabled = SelectButton.Enabled;
-        Words.Text = presentation?.Words ?? "";
-        MatchButton.Enabled = !busy && presentation?.CanMatch == true && displayedGeneration != submittedGeneration;
-        MismatchButton.Enabled = MatchButton.Enabled;
+        Words.Text = current?.Pairing?.VerificationWords is { Count: 4 } words
+            ? string.Join(Environment.NewLine, words)
+            : "";
+        Words.Height = Words.GetPreferredSize(Size.Empty).Height;
+        UpdateDecisionAvailability(presentation);
         CancelButton.Enabled = !busy && presentation?.CanCancel == true && displayedGeneration != cancelledGeneration;
         status.Text = presentation?.Status ?? "Local engine unavailable — pairing disabled";
         if (displayedGeneration is { } generation)
@@ -444,7 +447,8 @@ internal sealed class WindowsPairingControls : FlowLayoutPanel
     private void Decide(bool matches)
     {
         var current = session();
-        if (!MatchButton.Enabled || current?.State.Phase != ChildSessionPhase.Running
+        if (!MatchButton.Enabled || !VerificationWordsAreFullyVisible()
+            || current?.State.Phase != ChildSessionPhase.Running
             || displayedGeneration is not { } generation
             || current.Pairing is not { Phase: PairingBridgePhase.AwaitingLocalConfirmation } pairing
             || pairing.Generation != generation) return;
@@ -452,6 +456,59 @@ internal sealed class WindowsPairingControls : FlowLayoutPanel
         if (!matches) cancelledGeneration = generation;
         Render(busy);
         approve(generation, matches);
+    }
+
+    internal bool VerificationWordsAreFullyVisible()
+    {
+        var lines = Words.Text.Split(Environment.NewLine);
+        if (lines.Length != 4 || lines.Any(string.IsNullOrWhiteSpace)
+            || !Words.Visible || !Words.IsHandleCreated) return false;
+        var required = Words.GetPreferredSize(Size.Empty);
+        var textBounds = new Rectangle(Words.PointToScreen(Point.Empty), required);
+        var visibleBounds = Words.RectangleToScreen(Words.ClientRectangle);
+        for (Control? ancestor = Words.Parent; ancestor is not null; ancestor = ancestor.Parent)
+        {
+            if (!ancestor.Visible || !ancestor.IsHandleCreated) return false;
+            visibleBounds.Intersect(ancestor.RectangleToScreen(ancestor.ClientRectangle));
+        }
+        return visibleBounds.Contains(textBounds);
+    }
+
+    protected override void OnParentChanged(EventArgs e)
+    {
+        if (observedParent is not null)
+        {
+            observedParent.Layout -= ParentGeometryChanged;
+            observedParent.SizeChanged -= ParentGeometryChanged;
+            if (observedParent is ScrollableControl scrollable) scrollable.Scroll -= ParentScrolled;
+        }
+        base.OnParentChanged(e);
+        observedParent = Parent;
+        if (observedParent is not null)
+        {
+            observedParent.Layout += ParentGeometryChanged;
+            observedParent.SizeChanged += ParentGeometryChanged;
+            if (observedParent is ScrollableControl scrollable) scrollable.Scroll += ParentScrolled;
+        }
+    }
+
+    protected override void OnLayout(LayoutEventArgs levent)
+    {
+        base.OnLayout(levent);
+        UpdateDecisionAvailability();
+    }
+
+    private void ParentGeometryChanged(object? sender, EventArgs e) => UpdateDecisionAvailability();
+
+    private void ParentScrolled(object? sender, ScrollEventArgs e) => UpdateDecisionAvailability();
+
+    private void UpdateDecisionAvailability(G4PairingPresentation? presentation = null)
+    {
+        var current = session();
+        presentation ??= current is null ? null : G4PairingPresentation.From(current);
+        MatchButton.Enabled = !busy && presentation?.CanMatch == true
+            && displayedGeneration != submittedGeneration && VerificationWordsAreFullyVisible();
+        MismatchButton.Enabled = MatchButton.Enabled;
     }
 
     private void CancelCurrentPairing()

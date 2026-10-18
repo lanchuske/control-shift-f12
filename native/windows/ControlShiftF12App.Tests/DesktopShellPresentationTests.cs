@@ -94,7 +94,7 @@ public sealed class DesktopShellPresentationTests
 
                 session.ReceiveOutput(Frame(Pairing(7)));
                 controls.Render();
-                Assert.Equal("ember  ocean  violet  copper", controls.Words.Text);
+                Assert.Equal(string.Join(Environment.NewLine, "ember", "ocean", "violet", "copper"), controls.Words.Text);
                 session.ReceiveOutput(Frame(Pairing(8)));
                 controls.MatchButton.PerformClick();
                 Assert.Empty(decisions); // Stale rendered generation cannot approve the newer phrase.
@@ -132,19 +132,136 @@ public sealed class DesktopShellPresentationTests
         if (failure is not null) System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(failure).Throw();
     }
 
-    private static string Pairing(ulong generation) => JsonSerializer.Serialize(new
+    [Fact]
+    public void Native_controls_require_all_four_verification_words_to_be_visibly_laid_out()
     {
-        v = 1, kind = "ui_pairing_v1", generation, phase = "awaiting_local_confirmation",
-        candidate_handle = "peer-1", verification_words = new[] { "ember", "ocean", "violet", "copper" },
+        Exception? failure = null;
+        var thread = new Thread(() =>
+        {
+            try
+            {
+                var session = new UiChildSession();
+                var decisions = new List<(ulong Generation, bool Matches)>();
+                using var controls = new WindowsPairingControls(() => session,
+                    _ => { }, (generation, matches) => decisions.Add((generation, matches)), _ => { });
+                using var setupGroup = new System.Windows.Forms.GroupBox
+                {
+                    Width = 300,
+                    Height = 600,
+                    Padding = new System.Windows.Forms.Padding(0),
+                };
+                using var setupColumn = new System.Windows.Forms.FlowLayoutPanel
+                {
+                    FlowDirection = System.Windows.Forms.FlowDirection.TopDown,
+                    WrapContents = false,
+                    Dock = System.Windows.Forms.DockStyle.Fill,
+                    Padding = new System.Windows.Forms.Padding(14),
+                    AutoScroll = true,
+                };
+                using var host = new System.Windows.Forms.Form
+                {
+                    ClientSize = new System.Drawing.Size(1024, 680),
+                };
+                setupColumn.Controls.Add(controls);
+                setupGroup.Controls.Add(setupColumn);
+                host.Controls.Add(setupGroup);
+                host.Show();
+
+                session.ReceiveOutput(Frame(Snapshot(11, "browsing",
+                    "[{\"handle\":\"peer-1\",\"compatibility\":\"compatible\",\"freshness\":\"current\"}]")));
+                session.ReceiveOutput(Frame(Pairing(12,
+                    ["abcdefghijklmnop", "qrstuvwxyzabcdef", "ghijklmnopqrstuv", "wxyzabcdefghijkl"])));
+                Assert.NotNull(session.Pairing);
+                Assert.Equal(4, session.Pairing!.VerificationWords.Count);
+                controls.Render();
+                host.PerformLayout();
+
+                Assert.Equal(4, controls.Words.Text.Split(Environment.NewLine).Length);
+                Assert.True(controls.VerificationWordsAreFullyVisible());
+                Assert.True(controls.MatchButton.Enabled);
+
+                foreach (var emSize in new[] { 12F, 18F, 24F })
+                {
+                    var scale = emSize / 12F;
+                    setupGroup.Width = (int)Math.Round(300 * scale);
+                    controls.Words.Width = (int)Math.Round(244 * scale);
+                    controls.Words.Font = new System.Drawing.Font("Segoe UI Semibold", emSize);
+                    controls.Render();
+                    host.PerformLayout();
+                    Assert.Equal(controls.Words.GetPreferredSize(System.Drawing.Size.Empty).Height,
+                        controls.Words.ClientSize.Height);
+                    Assert.True(controls.VerificationWordsAreFullyVisible());
+                    Assert.True(controls.MatchButton.Enabled);
+                }
+                setupGroup.Width = 300;
+                controls.Words.Width = 244;
+                controls.Words.Font = new System.Drawing.Font("Segoe UI Semibold", 12F);
+                controls.Render();
+                host.PerformLayout();
+
+                setupGroup.Height = 150;
+                setupColumn.AutoScrollPosition = new System.Drawing.Point(0, controls.Words.Bottom);
+                host.PerformLayout();
+                Assert.Equal(244, controls.Words.ClientSize.Width);
+                Assert.False(controls.VerificationWordsAreFullyVisible());
+                Assert.False(controls.MatchButton.Enabled);
+                setupGroup.Height = 600;
+                setupColumn.AutoScrollPosition = System.Drawing.Point.Empty;
+                host.PerformLayout();
+                controls.Render();
+                Assert.True(controls.MatchButton.Enabled);
+
+                setupGroup.Width = 120;
+                host.PerformLayout();
+                Assert.Equal(244, controls.Words.ClientSize.Width);
+                Assert.False(controls.VerificationWordsAreFullyVisible());
+                Assert.False(controls.MatchButton.Enabled);
+
+                setupGroup.Width = 300;
+                host.PerformLayout();
+                controls.Render();
+                Assert.True(controls.MatchButton.Enabled);
+                setupGroup.Width = 120;
+                host.PerformLayout();
+                controls.MatchButton.Enabled = true; // falsifies stale visual state; dispatch must re-check geometry.
+                controls.MatchButton.PerformClick();
+                Assert.Empty(decisions);
+            }
+            catch (Exception error) { failure = error; }
+        });
+        thread.IsBackground = true;
+        thread.SetApartmentState(ApartmentState.STA);
+        thread.Start();
+        Assert.True(thread.Join(TimeSpan.FromSeconds(10)), "Native layout assertions did not finish.");
+        if (failure is not null) System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(failure).Throw();
+    }
+
+    private static string Pairing(ulong generation) => Pairing(generation, ["ember", "ocean", "violet", "copper"]);
+
+    private static string Pairing(ulong generation, string[] words) => JsonSerializer.Serialize(new
+    {
+        v = 1,
+        kind = "ui_pairing_v1",
+        generation,
+        phase = "awaiting_local_confirmation",
+        candidate_handle = "peer-1",
+        verification_words = words,
     });
 
     private static string Snapshot(ulong generation, string state, string candidates = "[]") => JsonSerializer.Serialize(new
     {
-        v = 1, kind = "ui_snapshot_v1", snapshot = new
+        v = 1,
+        kind = "ui_snapshot_v1",
+        snapshot = new
         {
-            schema_version = 1, generation, state, diagnostics = Array.Empty<object>(),
-            candidates = JsonSerializer.Deserialize<JsonElement>(candidates), confirmed = Array.Empty<object>(),
-            inventory = (object?)null, layout = new { state = "not_configured" },
+            schema_version = 1,
+            generation,
+            state,
+            diagnostics = Array.Empty<object>(),
+            candidates = JsonSerializer.Deserialize<JsonElement>(candidates),
+            confirmed = Array.Empty<object>(),
+            inventory = (object?)null,
+            layout = new { state = "not_configured" },
             capabilities = new { input_enabled = false, clipboard_enabled = false },
         },
     });
@@ -157,4 +274,5 @@ public sealed class DesktopShellPresentationTests
         payload.CopyTo(frame, 4);
         return frame;
     }
+
 }
