@@ -42,7 +42,7 @@ use windows_sys::Win32::{
 };
 
 const ERROR_SUCCESS: u32 = 0;
-const ATOMIC_REPLACE_RETRIES: usize = 100;
+const ATOMIC_REPLACE_RETRIES: usize = 1_000;
 const ATOMIC_REPLACE_RETRY_DELAY: Duration = Duration::from_millis(5);
 
 fn atomic_replace(from: &[u16], to: &[u16], target_exists: bool) -> Result<(), StoreError> {
@@ -514,7 +514,7 @@ impl PrivateDir {
     pub fn replace(&self, value: &str, bytes: &[u8]) -> Result<(), StoreError> {
         valid_name(value)?;
         self.validate_self()?;
-        let _ = self.open(value, false, false)?;
+        drop(self.open(value, false, false)?);
         use rand::RngCore;
         let mut random = [0u8; 16];
         rand::rngs::OsRng.fill_bytes(&mut random);
@@ -539,7 +539,9 @@ impl PrivateDir {
             self.validate_self()?;
             let from = wide(self.path.join(&tmp).as_os_str());
             let to = wide(self.path.join(value).as_os_str());
-            let target_exists = self.open(value, false, false)?.is_some();
+            let target = self.open(value, false, false)?;
+            let target_exists = target.is_some();
+            drop(target);
             fault_point!(value, "before_rename");
             atomic_replace(&from, &to, target_exists)?;
             fault_point!(value, "after_rename");
@@ -611,5 +613,51 @@ mod tests {
         assert!(retries >= 1);
         assert_eq!(std::fs::read(&to).unwrap(), b"new");
         assert!(!from.exists());
+    }
+
+    #[test]
+    fn atomic_replace_exhaustion_fails_closed_without_changing_files() {
+        let root = tempfile::tempdir().unwrap();
+        let from = root.path().join("replacement");
+        let to = root.path().join("target");
+        std::fs::write(&from, b"new").unwrap();
+        std::fs::write(&to, b"old").unwrap();
+        let blocker = OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .open(&to)
+            .unwrap();
+        let mut retries = 0;
+
+        let result = atomic_replace_with_backoff(
+            &wide(from.as_os_str()),
+            &wide(to.as_os_str()),
+            true,
+            || retries += 1,
+        );
+        assert_eq!(result, Err(StoreError::Unavailable));
+        assert_eq!(retries, ATOMIC_REPLACE_RETRIES);
+        drop(blocker);
+        assert_eq!(std::fs::read(&to).unwrap(), b"old");
+        assert_eq!(std::fs::read(&from).unwrap(), b"new");
+    }
+
+    #[test]
+    fn atomic_replace_does_not_retry_non_sharing_errors() {
+        let root = tempfile::tempdir().unwrap();
+        let from = root.path().join("missing-replacement");
+        let to = root.path().join("target");
+        std::fs::write(&to, b"old").unwrap();
+        let mut retries = 0;
+
+        let result = atomic_replace_with_backoff(
+            &wide(from.as_os_str()),
+            &wide(to.as_os_str()),
+            true,
+            || retries += 1,
+        );
+        assert_eq!(result, Err(StoreError::Unavailable));
+        assert_eq!(retries, 0);
+        assert_eq!(std::fs::read(&to).unwrap(), b"old");
     }
 }
