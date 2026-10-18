@@ -285,6 +285,41 @@ final class ControlShiftF12AppTests: XCTestCase {
         XCTAssertTrue(controller.nearbyCandidates.isEmpty)
     }
 
+    func testMalformedStaleSnapshotStillTerminatesInsteadOfHidingBehindGeneration() throws {
+        let child = RecordingChild()
+        let session = DiagnosticsSession(lifecycle: ChildLifecycle(child: child))
+        try session.receive(.data(frame(snapshotPayload(generation: 10, state: "not_started"))))
+        let unsafeStale = """
+        {"v":1,"kind":"ui_snapshot_v1","snapshot":{
+          "schema_version":1,"generation":9,"state":"not_started",
+          "candidates":[],"confirmed":[],"inventory":null,
+          "layout":{"state":"not_configured"},
+          "capabilities":{"input_enabled":true,"clipboard_enabled":false},
+          "diagnostics":[]
+        }}
+        """.data(using: .utf8)!
+
+        try session.receive(.data(frame(unsafeStale)))
+
+        XCTAssertTrue(session.isTerminal)
+        XCTAssertEqual(child.terminateCalls, 1)
+    }
+
+    func testConcurrentCloseIsIdempotentAndReapsExactlyOnce() {
+        let child = LockedRecordingChild()
+        let lifecycle = ChildLifecycle(child: child)
+        let group = DispatchGroup()
+        for _ in 0..<8 {
+            group.enter()
+            DispatchQueue.global().async {
+                lifecycle.close()
+                group.leave()
+            }
+        }
+        XCTAssertEqual(group.wait(timeout: .now() + 2), .success)
+        XCTAssertEqual(child.counts, LockedRecordingChild.Counts(terminate: 1, reap: 1))
+    }
+
     func testCloseCancelsClosesAndReapsChildWithoutChangingGeneration() {
         let child = RecordingChild()
         let session = ChildLifecycle(child: child)
@@ -309,6 +344,34 @@ final class ControlShiftF12AppTests: XCTestCase {
 
         XCTAssertEqual(child.reapAttempts, 2)
         XCTAssertTrue(child.forceTerminated)
+    }
+
+    func testBundledChildDrainsMoreThanTwoMebibytesOfStderrBeforeStdout() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let payload = snapshotPayload(generation: 1, state: "not_started")
+        let framed = frame(payload)
+        let output = root.appendingPathComponent("projection.frame")
+        try framed.write(to: output)
+        let script = "head -c 2105344 /dev/zero >&2; cat '\(output.path)'; cat >/dev/null"
+        let child = BundledChild(
+            executableURL: URL(fileURLWithPath: "/bin/sh"),
+            arguments: ["-c", script],
+            requests: ChildRequestTracker()
+        )
+        let projection = expectation(description: "stdout projection after bounded stderr drain")
+        child.observeOutput { event in
+            if case .data(let data) = event, !data.isEmpty { projection.fulfill() }
+        }
+
+        try child.start()
+        wait(for: [projection], timeout: 5)
+
+        let lifecycle = ChildLifecycle(child: child)
+        lifecycle.close()
+        XCTAssertTrue(lifecycle.isClosed)
     }
 
     func testStdoutEOFAfterPassInvalidatesProjectionAndClosesChildExactlyOnce() throws {
@@ -435,5 +498,28 @@ private final class SlowRecordingChild: RecordingChild {
     override func reap(timeout: TimeInterval) -> Bool {
         reapAttempts += 1
         return reapAttempts > 1
+    }
+}
+
+private final class LockedRecordingChild: ChildLifecycleChild {
+    struct Counts: Equatable { let terminate: Int; let reap: Int }
+    private let lock = NSLock()
+    private var terminateCount = 0
+    private var reapCount = 0
+    var counts: Counts {
+        lock.lock(); defer { lock.unlock() }
+        return Counts(terminate: terminateCount, reap: reapCount)
+    }
+    func sendRefresh() throws {}
+    func sendStartDiscovery() throws {}
+    func sendStopDiscovery() throws {}
+    func closeInput() {}
+    func closeOutput() {}
+    func closeError() {}
+    func terminate() { lock.lock(); terminateCount += 1; lock.unlock() }
+    func forceTerminate() {}
+    func reap(timeout: TimeInterval) -> Bool {
+        lock.lock(); reapCount += 1; lock.unlock()
+        return true
     }
 }

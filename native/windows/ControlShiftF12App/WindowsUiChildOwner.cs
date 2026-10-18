@@ -14,15 +14,22 @@ namespace ControlShiftF12App;
 public sealed class WindowsUiChildOwner : IAsyncDisposable
 {
     private readonly Process child;
+    private readonly Task stderrDrain;
+    private readonly SemaphoreSlim stdoutGate = new(1, 1);
+    private readonly object closeSync = new();
+    private Task? closeTask;
+    private long stderrBytesDiscarded;
     private bool closed;
 
     private WindowsUiChildOwner(Process child)
     {
         this.child = child;
+        stderrDrain = DrainStderrAsync(child.StandardError.BaseStream);
     }
 
     public UiChildSession Session { get; } = new();
     public bool HasExited => child.HasExited;
+    public long StderrBytesDiscarded => Interlocked.Read(ref stderrBytesDiscarded);
 
     public static Task<WindowsUiChildOwner> StartAsync(ChildLaunchSpec spec)
     {
@@ -112,37 +119,46 @@ public sealed class WindowsUiChildOwner : IAsyncDisposable
 
     private async Task<UiChildSession> ReadUntilProjectionAsync(ulong? previousGeneration, TimeSpan timeout)
     {
-        using var cancellation = new CancellationTokenSource(timeout);
-        var buffer = new byte[8192];
-        while (Session.State.Phase != ChildSessionPhase.Terminal)
+        await stdoutGate.WaitAsync();
+        try
         {
-            var read = await child.StandardOutput.BaseStream.ReadAsync(buffer, cancellation.Token);
-            if (read == 0)
+            using var cancellation = new CancellationTokenSource(timeout);
+            var buffer = new byte[8192];
+            while (Session.State.Phase != ChildSessionPhase.Terminal)
             {
-                Session.CompleteOutput();
-                return Session;
+                var read = await child.StandardOutput.BaseStream.ReadAsync(buffer, cancellation.Token);
+                if (read == 0)
+                {
+                    Session.CompleteOutput();
+                    return Session;
+                }
+                Session.ReceiveOutput(buffer.AsSpan(0, read).ToArray());
+                if (Session.Snapshot is { } snapshot
+                    && (previousGeneration is null || snapshot.Generation > previousGeneration))
+                {
+                    return Session;
+                }
             }
-            Session.ReceiveOutput(buffer.AsSpan(0, read).ToArray());
-            if (Session.Snapshot is { } snapshot
-                && (previousGeneration is null || snapshot.Generation > previousGeneration))
-            {
-                return Session;
-            }
+            return Session;
         }
-        return Session;
+        finally
+        {
+            stdoutGate.Release();
+        }
     }
 
-    public async Task CloseAsync()
+    public Task CloseAsync()
     {
-        if (closed)
+        lock (closeSync)
         {
-            return;
+            return closeTask ??= CloseCoreAsync();
         }
+    }
+
+    private async Task CloseCoreAsync()
+    {
         closed = true;
         child.StandardInput.Close();
-        child.StandardOutput.Close();
-        child.StandardError.Close();
-        Session.CompleteOutput();
 
         using var cancellation = new CancellationTokenSource(TimeSpan.FromMilliseconds(250));
         try
@@ -154,12 +170,37 @@ public sealed class WindowsUiChildOwner : IAsyncDisposable
             child.Kill(entireProcessTree: false);
             await child.WaitForExitAsync();
         }
+
+        await stdoutGate.WaitAsync();
+        try
+        {
+            Session.CompleteOutput();
+        }
+        finally
+        {
+            stdoutGate.Release();
+        }
+        await stderrDrain;
+        child.StandardOutput.Close();
+        child.StandardError.Close();
+    }
+
+    private async Task DrainStderrAsync(Stream stream)
+    {
+        var buffer = new byte[8192];
+        while (true)
+        {
+            var read = await stream.ReadAsync(buffer);
+            if (read == 0) return;
+            Interlocked.Add(ref stderrBytesDiscarded, read);
+        }
     }
 
     public async ValueTask DisposeAsync()
     {
         await CloseAsync();
         child.Dispose();
+        stdoutGate.Dispose();
     }
 
     private void ThrowIfClosed()

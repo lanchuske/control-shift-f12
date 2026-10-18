@@ -474,6 +474,7 @@ enum ChildOutputEvent {
 /// an AppKit view. The host has no commands other than a redacted refresh.
 final class ChildLifecycle {
     private let child: ChildLifecycleChild
+    private let closeLock = NSLock()
     private(set) var generation: UInt64 = 1
     private(set) var isClosed = false
 
@@ -497,17 +498,22 @@ final class ChildLifecycle {
     }
 
     func close() {
-        guard !isClosed else { return }
+        closeLock.lock()
+        guard !isClosed else {
+            closeLock.unlock()
+            return
+        }
         isClosed = true
         generation &+= 1
+        closeLock.unlock()
         child.closeInput()
-        child.closeOutput()
-        child.closeError()
         child.terminate()
         if !child.reap(timeout: 0.25) {
             child.forceTerminate()
             _ = child.reap(timeout: 0.25)
         }
+        child.closeOutput()
+        child.closeError()
     }
 }
 
@@ -572,6 +578,9 @@ final class BundledChild: ChildLifecycleChild {
     private let errorPipe = Pipe()
     private let process: Process
     private let requests: ChildRequestTracker
+    private let outputDrainQueue = DispatchQueue(label: "control-shift-f12.stdout")
+    private let errorDrainQueue = DispatchQueue(label: "control-shift-f12.stderr")
+    private var discardedErrorBytes: UInt64 = 0
 
     init?(bundle: Bundle = .main, requests: ChildRequestTracker) {
         self.requests = requests
@@ -590,7 +599,26 @@ final class BundledChild: ChildLifecycleChild {
         process.standardError = errorPipe
     }
 
+    init(executableURL: URL, arguments: [String], requests: ChildRequestTracker) {
+        self.executableURL = executableURL
+        self.requests = requests
+        process = Process()
+        process.executableURL = executableURL
+        process.arguments = arguments
+        process.standardInput = inputPipe
+        process.standardOutput = outputPipe
+        process.standardError = errorPipe
+    }
+
     func start() throws {
+        errorPipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
+            guard let self else { return }
+            self.errorDrainQueue.async { [weak self] in
+                guard let self else { return }
+                let data = handle.availableData
+                self.countDiscardedErrorBytes(data.count)
+            }
+        }
         try process.run()
     }
 
@@ -612,8 +640,19 @@ final class BundledChild: ChildLifecycleChild {
     }
 
     func closeInput() { try? inputPipe.fileHandleForWriting.close() }
-    func closeOutput() { try? outputPipe.fileHandleForReading.close() }
-    func closeError() { try? errorPipe.fileHandleForReading.close() }
+    func closeOutput() {
+        outputPipe.fileHandleForReading.readabilityHandler = nil
+        outputDrainQueue.sync {}
+        try? outputPipe.fileHandleForReading.close()
+    }
+    func closeError() {
+        errorPipe.fileHandleForReading.readabilityHandler = nil
+        errorDrainQueue.sync {
+            let final = errorPipe.fileHandleForReading.availableData
+            countDiscardedErrorBytes(final.count)
+        }
+        try? errorPipe.fileHandleForReading.close()
+    }
     func terminate() {
         if process.isRunning { process.terminate() }
     }
@@ -629,14 +668,21 @@ final class BundledChild: ChildLifecycleChild {
     }
 
     func observeOutput(_ handler: @escaping (ChildOutputEvent) -> Void) {
-        outputPipe.fileHandleForReading.readabilityHandler = { handle in
-            let data = handle.availableData
-            handler(data.isEmpty ? .endOfFile : .data(data))
+        outputPipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
+            self?.outputDrainQueue.async {
+                let data = handle.availableData
+                handler(data.isEmpty ? .endOfFile : .data(data))
+            }
         }
     }
 
     func observeTermination(_ handler: @escaping () -> Void) {
         process.terminationHandler = { _ in handler() }
+    }
+
+    private func countDiscardedErrorBytes(_ count: Int) {
+        let (sum, overflow) = discardedErrorBytes.addingReportingOverflow(UInt64(count))
+        discardedErrorBytes = overflow ? .max : sum
     }
 }
 

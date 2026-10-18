@@ -149,6 +149,24 @@ public sealed class UiChildSessionTests
         Assert.Empty(session.Snapshot.Nearby);
     }
 
+    [Fact]
+    public void Malformed_stale_snapshot_is_terminal_instead_of_hidden_by_generation()
+    {
+        var session = new UiChildSession();
+        session.ReceiveOutput(Frame(Snapshot(10, "not_started")));
+        session.ReceiveOutput(Frame("""
+        {"v":1,"kind":"ui_snapshot_v1","snapshot":{
+          "schema_version":1,"generation":9,"state":"not_started",
+          "diagnostics":[],"candidates":[],"confirmed":[],"inventory":null,
+          "layout":{"state":"not_configured"},
+          "capabilities":{"input_enabled":true,"clipboard_enabled":false}
+        }}
+        """));
+
+        Assert.Equal(ChildSessionPhase.Terminal, session.State.Phase);
+        Assert.Null(session.Snapshot);
+    }
+
     private static string RequestId(byte[] frame)
     {
         using var document = JsonDocument.Parse(frame.AsMemory(4));

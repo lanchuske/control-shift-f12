@@ -28,6 +28,27 @@ public sealed class WindowsUiChildOwnerTests
     }
 
     [Fact]
+    public async Task Concurrent_close_is_idempotent_and_finishes_the_stderr_reader()
+    {
+        var executable = FindProbeExecutable();
+        var environment = Environment.GetEnvironmentVariables()
+            .Keys.Cast<object>()
+            .ToDictionary(
+                key => key.ToString()!,
+                key => Environment.GetEnvironmentVariable(key.ToString()!)
+            );
+        var spec = new ChildLaunchSpec(executable, [], environment!);
+        await using var owner = await WindowsUiChildOwner.StartAsync(spec);
+        await owner.ReadInitialProjectionAsync(TimeSpan.FromSeconds(5));
+
+        await Task.WhenAll(Enumerable.Range(0, 8).Select(_ => owner.CloseAsync()));
+
+        Assert.True(owner.HasExited);
+        Assert.True(owner.StderrBytesDiscarded > 2 * 1024 * 1024);
+        Assert.Equal(ChildSessionPhase.Terminal, owner.Session.State.Phase);
+    }
+
+    [Fact]
     public async Task Owned_child_returns_a_valid_initial_projection_and_is_reaped_on_close()
     {
         var executable = FindEngineExecutable();
