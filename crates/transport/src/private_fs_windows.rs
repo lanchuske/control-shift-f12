@@ -4,18 +4,18 @@ use std::{
     ffi::OsStr,
     fs::File,
     io::{Read, Write},
+    mem::{offset_of, size_of},
     os::windows::{
         ffi::OsStrExt,
         io::{AsRawHandle, FromRawHandle},
     },
     path::{Path, PathBuf},
-    ptr, thread,
-    time::Duration,
+    ptr,
 };
 use windows_sys::Win32::{
     Foundation::{
-        CloseHandle, ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, ERROR_SHARING_VIOLATION,
-        GENERIC_READ, GENERIC_WRITE, GetLastError, HANDLE, INVALID_HANDLE_VALUE, LocalFree,
+        CloseHandle, ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, GENERIC_READ, GENERIC_WRITE,
+        HANDLE, INVALID_HANDLE_VALUE, LocalFree,
     },
     Security::{
         ACCESS_ALLOWED_ACE, ACL, ACL_REVISION, ACL_SIZE_INFORMATION, AclSizeInformation,
@@ -30,10 +30,10 @@ use windows_sys::Win32::{
         BY_HANDLE_FILE_INFORMATION, CREATE_ALWAYS, CREATE_NEW, CreateFileW, DELETE,
         FILE_ALL_ACCESS, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL,
         FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
-        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FlushFileBuffers,
-        GetFileInformationByHandle, LOCKFILE_EXCLUSIVE_LOCK, LockFileEx, MOVEFILE_REPLACE_EXISTING,
-        MOVEFILE_WRITE_THROUGH, MoveFileExW, OPEN_EXISTING, READ_CONTROL, ReplaceFileW, WRITE_DAC,
-        WRITE_OWNER,
+        FILE_FLAG_WRITE_THROUGH, FILE_RENAME_INFO, FILE_SHARE_DELETE, FILE_SHARE_READ,
+        FILE_SHARE_WRITE, FileRenameInfo, FlushFileBuffers, GetFileInformationByHandle,
+        LOCKFILE_EXCLUSIVE_LOCK, LockFileEx, OPEN_EXISTING, READ_CONTROL,
+        SetFileInformationByHandle, WRITE_DAC, WRITE_OWNER,
     },
     System::{
         IO::OVERLAPPED,
@@ -42,59 +42,72 @@ use windows_sys::Win32::{
 };
 
 const ERROR_SUCCESS: u32 = 0;
-const ATOMIC_REPLACE_RETRIES: usize = 1_000;
-const ATOMIC_REPLACE_RETRY_DELAY: Duration = Duration::from_millis(5);
 
-fn atomic_replace(from: &[u16], to: &[u16], target_exists: bool) -> Result<(), StoreError> {
-    atomic_replace_with_backoff(from, to, target_exists, || {
-        thread::sleep(ATOMIC_REPLACE_RETRY_DELAY);
-    })
-}
-
-fn atomic_replace_with_backoff(
-    from: &[u16],
-    to: &[u16],
-    target_exists: bool,
-    mut backoff: impl FnMut(),
-) -> Result<(), StoreError> {
-    for attempt in 0..=ATOMIC_REPLACE_RETRIES {
-        let ok = unsafe {
-            if target_exists {
-                ReplaceFileW(
-                    to.as_ptr(),
-                    from.as_ptr(),
-                    ptr::null(),
-                    0,
-                    ptr::null(),
-                    ptr::null(),
-                )
-            } else {
-                MoveFileExW(
-                    from.as_ptr(),
-                    to.as_ptr(),
-                    MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-                )
-            }
-        };
-        if ok != 0 {
-            return Ok(());
-        }
-        let error = unsafe { GetLastError() };
-        if error != ERROR_SHARING_VIOLATION || attempt == ATOMIC_REPLACE_RETRIES {
-            return Err(StoreError::Unavailable);
-        }
-        backoff();
+fn rename_info(destination: &Path, replace: bool) -> Result<(Vec<usize>, u32), StoreError> {
+    let name: Vec<u16> = destination.as_os_str().encode_wide().collect();
+    if name.is_empty() || name.contains(&0) {
+        return Err(StoreError::Invalid);
     }
-    unreachable!()
+    let name_bytes = name
+        .len()
+        .checked_mul(size_of::<u16>())
+        .ok_or(StoreError::Invalid)?;
+    let header = offset_of!(FILE_RENAME_INFO, FileName);
+    let used = header
+        .checked_add(name_bytes)
+        .and_then(|size| size.checked_add(size_of::<u16>()))
+        .ok_or(StoreError::Invalid)?;
+    let allocation = used.max(size_of::<FILE_RENAME_INFO>());
+    let words = allocation
+        .checked_add(size_of::<usize>() - 1)
+        .ok_or(StoreError::Invalid)?
+        / size_of::<usize>();
+    let used = u32::try_from(used).map_err(|_| StoreError::Invalid)?;
+    let name_bytes = u32::try_from(name_bytes).map_err(|_| StoreError::Invalid)?;
+    let mut storage = vec![0usize; words];
+    let info = storage.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+    unsafe {
+        (*info).Anonymous.ReplaceIfExists = replace;
+        (*info).RootDirectory = ptr::null_mut();
+        (*info).FileNameLength = name_bytes;
+        ptr::copy_nonoverlapping(
+            name.as_ptr(),
+            ptr::addr_of_mut!((*info).FileName).cast::<u16>(),
+            name.len(),
+        );
+    }
+    Ok((storage, used))
 }
 
-#[cfg(all(test, feature = "pairing-v2-experimental"))]
+fn rename_open_file(source: &File, destination: &Path, replace: bool) -> Result<(), StoreError> {
+    let (info, used) = rename_info(destination, replace)?;
+    if unsafe {
+        SetFileInformationByHandle(
+            source.as_raw_handle().cast(),
+            FileRenameInfo,
+            info.as_ptr().cast(),
+            used,
+        )
+    } == 0
+    {
+        Err(StoreError::Unavailable)
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(test)]
 pub(crate) mod faults {
+    #[cfg(feature = "pairing-v2-experimental")]
     use super::StoreError;
+    use std::cell::RefCell;
     std::thread_local! {static ARMED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };}
+    std::thread_local! {static OPERATIONS: RefCell<Vec<&'static str>> = const { RefCell::new(Vec::new()) };}
+    #[cfg(feature = "pairing-v2-experimental")]
     pub fn arm() {
         ARMED.set(true);
     }
+    #[cfg(feature = "pairing-v2-experimental")]
     pub fn point(file: &str, stage: &str) -> Result<(), StoreError> {
         if !ARMED.get() {
             return Ok(());
@@ -119,6 +132,15 @@ pub(crate) mod faults {
         }
         Ok(())
     }
+    pub fn record(operation: &'static str) {
+        OPERATIONS.with(|operations| operations.borrow_mut().push(operation));
+    }
+    pub fn reset_operations() {
+        OPERATIONS.with(|operations| operations.borrow_mut().clear());
+    }
+    pub fn take_operations() -> Vec<&'static str> {
+        OPERATIONS.with(|operations| std::mem::take(&mut *operations.borrow_mut()))
+    }
 }
 
 macro_rules! fault_point {
@@ -126,6 +148,36 @@ macro_rules! fault_point {
         #[cfg(all(test, feature = "pairing-v2-experimental"))]
         faults::point($file, $stage)?;
     };
+}
+
+fn flush_before_rename(file: &File, _value: &str) -> Result<(), StoreError> {
+    fault_point!(_value, "before_file_sync");
+    file.sync_all().map_err(|_| StoreError::Unavailable)?;
+    #[cfg(test)]
+    faults::record("pre-file-flush");
+    fault_point!(_value, "after_file_sync");
+    Ok(())
+}
+
+fn publish_renamed_file(
+    file: &File,
+    destination: &Path,
+    replace: bool,
+    _value: &str,
+) -> Result<(), StoreError> {
+    fault_point!(_value, "before_rename");
+    rename_open_file(file, destination, replace)?;
+    #[cfg(test)]
+    faults::record("rename");
+    fault_point!(_value, "after_rename");
+    Ok(())
+}
+
+fn flush_after_rename(file: &File) -> Result<(), StoreError> {
+    file.sync_all().map_err(|_| StoreError::Unavailable)?;
+    #[cfg(test)]
+    faults::record("post-file-flush");
+    Ok(())
 }
 
 fn wide(value: &OsStr) -> Vec<u16> {
@@ -328,7 +380,12 @@ fn validate(handle: HANDLE, directory: bool, sid: &[u8]) -> Result<(), StoreErro
     result
 }
 
-fn open_path(path: &Path, directory: bool, disposition: u32) -> Result<Option<File>, StoreError> {
+fn open_path_with_flags(
+    path: &Path,
+    directory: bool,
+    disposition: u32,
+    additional_flags: u32,
+) -> Result<Option<File>, StoreError> {
     let flags = if directory {
         FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT
     } else {
@@ -341,7 +398,7 @@ fn open_path(path: &Path, directory: bool, disposition: u32) -> Result<Option<Fi
             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
             ptr::null(),
             disposition,
-            flags,
+            flags | additional_flags,
             ptr::null_mut(),
         )
     };
@@ -355,6 +412,10 @@ fn open_path(path: &Path, directory: bool, disposition: u32) -> Result<Option<Fi
         };
     }
     Ok(Some(unsafe { File::from_raw_handle(handle.cast()) }))
+}
+
+fn open_path(path: &Path, directory: bool, disposition: u32) -> Result<Option<File>, StoreError> {
+    open_path_with_flags(path, directory, disposition, 0)
 }
 
 pub(crate) struct PrivateDir {
@@ -445,6 +506,16 @@ impl PrivateDir {
     }
 
     fn open(&self, value: &str, create: bool, exclusive: bool) -> Result<Option<File>, StoreError> {
+        self.open_with_flags(value, create, exclusive, 0)
+    }
+
+    fn open_with_flags(
+        &self,
+        value: &str,
+        create: bool,
+        exclusive: bool,
+        additional_flags: u32,
+    ) -> Result<Option<File>, StoreError> {
         valid_name(value)?;
         self.validate_self()?;
         let disposition = if exclusive {
@@ -454,7 +525,12 @@ impl PrivateDir {
         } else {
             OPEN_EXISTING
         };
-        let Some(file) = open_path(&self.path.join(value), false, disposition)? else {
+        let Some(file) = open_path_with_flags(
+            &self.path.join(value),
+            false,
+            disposition,
+            additional_flags,
+        )? else {
             return Ok(None);
         };
         let handle = file.as_raw_handle().cast();
@@ -528,28 +604,24 @@ impl PrivateDir {
         let result = (|| {
             fault_point!(value, "before_write");
             let mut file = self
-                .open(&tmp, true, true)?
+                .open_with_flags(&tmp, true, true, FILE_FLAG_WRITE_THROUGH)?
                 .ok_or(StoreError::Unavailable)?;
             file.write_all(bytes).map_err(|_| StoreError::Unavailable)?;
             fault_point!(value, "after_write");
-            fault_point!(value, "before_file_sync");
-            file.sync_all().map_err(|_| StoreError::Unavailable)?;
-            fault_point!(value, "after_file_sync");
-            drop(file);
+            flush_before_rename(&file, value)?;
             self.validate_self()?;
-            let from = wide(self.path.join(&tmp).as_os_str());
-            let to = wide(self.path.join(value).as_os_str());
             let target = self.open(value, false, false)?;
             let target_exists = target.is_some();
             drop(target);
-            fault_point!(value, "before_rename");
-            atomic_replace(&from, &to, target_exists)?;
-            fault_point!(value, "after_rename");
+            let source_id = identity(&file_info(file.as_raw_handle().cast())?);
+            publish_renamed_file(&file, &self.path.join(value), target_exists, value)?;
+            flush_after_rename(&file)?;
             let target = self.open(value, false, false)?.ok_or(StoreError::Invalid)?;
             validate(target.as_raw_handle().cast(), false, &self.sid)?;
-            fault_point!(value, "before_dir_sync");
-            self.flush()?;
-            fault_point!(value, "after_dir_sync");
+            if identity(&file_info(target.as_raw_handle().cast())?) != source_id {
+                return Err(StoreError::Invalid);
+            }
+            self.flush_for_replace(value)?;
             fault_point!(value, "before_readback");
             if self.read(value, bytes.len())?.as_deref() != Some(bytes) {
                 return Err(StoreError::Invalid);
@@ -557,6 +629,8 @@ impl PrivateDir {
             fault_point!(value, "after_readback");
             fault_point!(value, "before_cleanup");
             fault_point!(value, "after_cleanup");
+            #[cfg(test)]
+            faults::record("success");
             Ok(())
         })();
         if result.is_err() {
@@ -582,36 +656,21 @@ impl PrivateDir {
         }
         Ok(())
     }
+
+    fn flush_for_replace(&self, _value: &str) -> Result<(), StoreError> {
+        fault_point!(_value, "before_dir_sync");
+        self.flush()?;
+        #[cfg(test)]
+        faults::record("directory-flush");
+        fault_point!(_value, "after_dir_sync");
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::{fs::OpenOptions, os::windows::fs::OpenOptionsExt};
-
-    fn path_replace_with_retained_source(
-        _source: &File,
-        from: &Path,
-        to: &Path,
-    ) -> Result<(), u32> {
-        let from = wide(from.as_os_str());
-        let to = wide(to.as_os_str());
-        if unsafe {
-            ReplaceFileW(
-                to.as_ptr(),
-                from.as_ptr(),
-                ptr::null(),
-                0,
-                ptr::null(),
-                ptr::null(),
-            )
-        } != 0
-        {
-            Ok(())
-        } else {
-            Err(unsafe { GetLastError() })
-        }
-    }
 
     #[test]
     fn retained_source_handle_can_replace_existing_target() {
@@ -623,7 +682,7 @@ mod tests {
         let source = open_path(&from, false, OPEN_EXISTING).unwrap().unwrap();
         let source_id = identity(&file_info(source.as_raw_handle().cast()).unwrap());
 
-        let result = path_replace_with_retained_source(&source, &from, &to);
+        let result = rename_open_file(&source, &to, true);
 
         assert_eq!(result, Ok(()), "path replace failed with {result:?}");
         assert!(!from.exists());
@@ -636,74 +695,111 @@ mod tests {
     }
 
     #[test]
-    fn atomic_replace_retries_transient_sharing_violations() {
+    fn blocked_destination_fails_closed_then_succeeds_after_release() {
         let root = tempfile::tempdir().unwrap();
         let from = root.path().join("replacement");
         let to = root.path().join("target");
         std::fs::write(&from, b"new").unwrap();
         std::fs::write(&to, b"old").unwrap();
+        let source = open_path(&from, false, OPEN_EXISTING).unwrap().unwrap();
         let blocker = OpenOptions::new()
             .read(true)
             .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
             .open(&to)
             .unwrap();
-        let mut blocker = Some(blocker);
-        let mut retries = 0;
-
-        atomic_replace_with_backoff(&wide(from.as_os_str()), &wide(to.as_os_str()), true, || {
-            retries += 1;
-            drop(blocker.take());
-            thread::sleep(ATOMIC_REPLACE_RETRY_DELAY);
-        })
-        .unwrap();
-        assert!(retries >= 1);
+        assert_eq!(
+            rename_open_file(&source, &to, true),
+            Err(StoreError::Unavailable)
+        );
+        assert_eq!(std::fs::read(&to).unwrap(), b"old");
+        assert_eq!(std::fs::read(&from).unwrap(), b"new");
+        drop(blocker);
+        rename_open_file(&source, &to, true).unwrap();
         assert_eq!(std::fs::read(&to).unwrap(), b"new");
         assert!(!from.exists());
     }
 
     #[test]
-    fn atomic_replace_exhaustion_fails_closed_without_changing_files() {
+    fn handle_rename_supports_missing_target_and_supplementary_unicode_leaf() {
         let root = tempfile::tempdir().unwrap();
         let from = root.path().join("replacement");
-        let to = root.path().join("target");
+        let to = root.path().join("target-🦀");
         std::fs::write(&from, b"new").unwrap();
-        std::fs::write(&to, b"old").unwrap();
-        let blocker = OpenOptions::new()
-            .read(true)
-            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
-            .open(&to)
-            .unwrap();
-        let mut retries = 0;
-
-        let result = atomic_replace_with_backoff(
-            &wide(from.as_os_str()),
-            &wide(to.as_os_str()),
-            true,
-            || retries += 1,
-        );
-        assert_eq!(result, Err(StoreError::Unavailable));
-        assert_eq!(retries, ATOMIC_REPLACE_RETRIES);
-        drop(blocker);
-        assert_eq!(std::fs::read(&to).unwrap(), b"old");
-        assert_eq!(std::fs::read(&from).unwrap(), b"new");
+        let source = open_path(&from, false, OPEN_EXISTING).unwrap().unwrap();
+        rename_open_file(&source, &to, false).unwrap();
+        assert_eq!(std::fs::read(&to).unwrap(), b"new");
+        assert!(!from.exists());
     }
 
     #[test]
-    fn atomic_replace_does_not_retry_non_sharing_errors() {
+    fn handle_rename_preserves_a_long_manifest_leaf_exactly() {
         let root = tempfile::tempdir().unwrap();
-        let from = root.path().join("missing-replacement");
-        let to = root.path().join("target");
-        std::fs::write(&to, b"old").unwrap();
-        let mut retries = 0;
+        let from = root.path().join("replacement");
+        let leaf = format!("journal-{}.json", "01".repeat(32));
+        let to = root.path().join(&leaf);
+        std::fs::write(&from, b"new").unwrap();
+        let source = open_path(&from, false, OPEN_EXISTING).unwrap().unwrap();
 
-        let result = atomic_replace_with_backoff(
-            &wide(from.as_os_str()),
-            &wide(to.as_os_str()),
-            true,
-            || retries += 1,
+        rename_open_file(&source, &to, false).unwrap();
+
+        assert_eq!(std::fs::read(&to).unwrap(), b"new");
+        let names = std::fs::read_dir(root.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(names, [std::ffi::OsString::from(leaf)]);
+    }
+
+    #[test]
+    fn rename_info_rejects_embedded_nul() {
+        use std::os::windows::ffi::OsStringExt;
+        let path = std::ffi::OsString::from_wide(&[b'C' as u16, b':' as u16, 0, b'x' as u16]);
+        assert_eq!(rename_info(Path::new(&path), true), Err(StoreError::Invalid));
+    }
+
+    #[test]
+    fn rename_info_sizes_the_buffer_with_a_terminator_outside_file_name_length() {
+        let destination = Path::new(r"C:\temp\target-🦀");
+        let expected_units = destination.as_os_str().encode_wide().count();
+        let (storage, used) = rename_info(destination, true).unwrap();
+        let info = storage.as_ptr().cast::<FILE_RENAME_INFO>();
+        assert_eq!(
+            unsafe { (*info).FileNameLength },
+            u32::try_from(expected_units * size_of::<u16>()).unwrap()
         );
-        assert_eq!(result, Err(StoreError::Unavailable));
-        assert_eq!(retries, 0);
-        assert_eq!(std::fs::read(&to).unwrap(), b"old");
+        assert_eq!(
+            used as usize,
+            offset_of!(FILE_RENAME_INFO, FileName)
+                + expected_units * size_of::<u16>()
+                + size_of::<u16>()
+        );
+        let terminator = unsafe {
+            ptr::addr_of!((*info).FileName)
+                .cast::<u16>()
+                .add(expected_units)
+                .read()
+        };
+        assert_eq!(terminator, 0);
+    }
+
+    #[test]
+    fn replacement_operations_run_in_durable_order() {
+        let root = tempfile::tempdir().unwrap();
+        let private = PrivateDir::root(root.path()).unwrap();
+        private.replace("target", b"old").unwrap();
+        faults::reset_operations();
+
+        private.replace("target", b"new").unwrap();
+
+        assert_eq!(
+            faults::take_operations(),
+            [
+                "pre-file-flush",
+                "rename",
+                "post-file-flush",
+                "directory-flush",
+                "success",
+            ]
+        );
     }
 }
