@@ -10,13 +10,13 @@ use std::{
         io::{AsRawHandle, FromRawHandle},
     },
     path::{Path, PathBuf},
-    ptr,
+    ptr, thread,
     time::Duration,
 };
 use windows_sys::Win32::{
     Foundation::{
-        CloseHandle, ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, GENERIC_READ, GENERIC_WRITE,
-        GetLastError, HANDLE, INVALID_HANDLE_VALUE, LocalFree,
+        CloseHandle, ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, ERROR_SHARING_VIOLATION,
+        GENERIC_READ, GENERIC_WRITE, GetLastError, HANDLE, INVALID_HANDLE_VALUE, LocalFree,
     },
     Security::{
         ACCESS_ALLOWED_ACE, ACL, ACL_REVISION, ACL_SIZE_INFORMATION, AclSizeInformation,
@@ -43,12 +43,25 @@ use windows_sys::Win32::{
 };
 
 const ERROR_SUCCESS: u32 = 0;
+const HANDLE_RENAME_RETRIES: usize = 20;
+const HANDLE_RENAME_RETRY_DELAY: Duration = Duration::from_millis(25);
 
 fn retry_sharing_violation(
     mut operation: impl FnMut() -> Result<(), u32>,
-    _backoff: impl FnMut(Duration),
+    mut backoff: impl FnMut(Duration),
 ) -> Result<(), u32> {
-    operation()
+    for attempt in 0..=HANDLE_RENAME_RETRIES {
+        match operation() {
+            Ok(()) => return Ok(()),
+            Err(error)
+                if error == ERROR_SHARING_VIOLATION && attempt < HANDLE_RENAME_RETRIES =>
+            {
+                backoff(HANDLE_RENAME_RETRY_DELAY);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    unreachable!()
 }
 
 fn rename_info(destination: &Path, replace: bool) -> Result<(Vec<usize>, u32), StoreError> {
@@ -88,7 +101,7 @@ fn rename_info(destination: &Path, replace: bool) -> Result<(Vec<usize>, u32), S
 }
 
 fn rename_open_file(source: &File, destination: &Path, replace: bool) -> Result<(), StoreError> {
-    rename_open_file_with_backoff(source, destination, replace, |_| {})
+    rename_open_file_with_backoff(source, destination, replace, thread::sleep)
 }
 
 fn rename_open_file_with_backoff(
@@ -121,9 +134,9 @@ fn rename_open_file_with_backoff(
         },
         backoff,
     )
-    .map_err(|error| {
+    .map_err(|_error| {
         #[cfg(test)]
-        faults::record_failure("rename", Some(error as i32));
+        faults::record_failure("rename", Some(_error as i32));
         StoreError::Unavailable
     })
 }
