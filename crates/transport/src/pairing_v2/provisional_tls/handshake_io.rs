@@ -423,9 +423,12 @@ struct IngressWatcher {
 }
 
 enum FinalizationAccess {
-    Initiator,
+    Initiator(Stream),
     Responder(Stream),
 }
+
+const FINALIZATION_READY: u8 = 0x47;
+const FINALIZATION_OPEN: u8 = 0x46;
 
 enum IngressDisposition {
     Frozen(super::FrozenAdmissionHandoff),
@@ -450,14 +453,6 @@ fn spawn_ingress_watcher(
         let mut incoming = Some(incoming);
         let disposition = tokio::select! { biased;
             _ = watch_request(&mut incoming.as_mut().expect("ingress present").recv) => IngressDisposition::Invalid,
-            extra = connection.accept_bi() => {
-                if let Ok(pair) = extra { drop(Stream::new(pair)); }
-                IngressDisposition::Invalid
-            },
-            extra = connection.accept_uni() => {
-                if let Ok(mut recv) = extra { let _ = recv.stop(APPLICATION_ERROR.into()); }
-                IngressDisposition::Invalid
-            },
             request = &mut freeze_request => {
                 let Ok(revoker) = request else {
                     failed.store(true, Ordering::Release);
@@ -483,13 +478,47 @@ fn spawn_ingress_watcher(
                 // reset the peer before it can open/accept finalization.
                 incoming.as_mut().expect("ingress present").clean = true;
                 let access = if role == Role::A {
-                    Ok(FinalizationAccess::Initiator)
+                    async {
+                        let pair = connection.open_bi().await.map_err(|_| Invalid)?;
+                        let mut stream = Stream::new(pair);
+                        stream
+                            .send
+                            .write_all(&[FINALIZATION_OPEN])
+                            .await
+                            .map_err(|_| Invalid)?;
+                        let ready = tokio::time::timeout(
+                            FINALIZATION_DEADLINE,
+                            read_exact(&mut stream.recv, 1),
+                        )
+                        .await
+                        .map_err(|_| Invalid)??;
+                        if ready != [FINALIZATION_READY] {
+                            return Err(Invalid);
+                        }
+                        Ok(FinalizationAccess::Initiator(stream))
+                    }
+                    .await
                 } else {
                     tokio::select! { biased;
-                        pair = connection.accept_bi() => pair
-                            .map(Stream::new)
-                            .map(FinalizationAccess::Responder)
-                            .map_err(|_| Invalid),
+                        pair = connection.accept_bi() => match pair {
+                            Ok(pair) => {
+                                let mut stream = Stream::new(pair);
+                                let opened = read_exact(&mut stream.recv, 1).await;
+                                if opened.as_deref() != Ok(&[FINALIZATION_OPEN]) {
+                                    failed.store(true, Ordering::Release);
+                                    connection.close(
+                                        APPLICATION_ERROR.into(),
+                                        b"invalid finalization opener",
+                                    );
+                                    return IngressDisposition::Invalid;
+                                }
+                                match stream.send.write_all(&[FINALIZATION_READY]).await {
+                                    Ok(()) => Ok(FinalizationAccess::Responder(stream)),
+                                    Err(_) => Err(Invalid),
+                                }
+                            }
+                            Err(_) => Err(Invalid),
+                        },
                         extra = connection.accept_uni() => {
                             if let Ok(mut recv) = extra { let _ = recv.stop(APPLICATION_ERROR.into()); }
                             Err(Invalid)
@@ -502,6 +531,119 @@ fn spawn_ingress_watcher(
                     return IngressDisposition::Invalid;
                 }
                 IngressDisposition::FinalizationReady(incoming.take().expect("ingress present"))
+            },
+            // A legitimate initiator may open the one finalization stream as
+            // soon as its own handoff completes. Prefer the already-issued
+            // local handoff request when both it and that stream are ready;
+            // the responder branch above then accepts exactly one stream.
+            // Without this ordering, the valid stream is intermittently
+            // classified as unsolicited ingress before the request is polled.
+            extra = connection.accept_bi() => {
+                match (role, extra) {
+                    // The initiator can reach open_bi immediately after its
+                    // durable stage while the responder is still scheduling
+                    // the matching local handoff request. Retain that single
+                    // authenticated stream for at most the protocol deadline;
+                    // it becomes usable only if the local owner independently
+                    // requests finalization. Any data is still authenticated
+                    // by the finalization grammar, and a second stream fails.
+                    (Role::B, Ok(pair)) => {
+                        let mut stream = Stream::new(pair);
+                        let deadline = tokio::time::sleep(FINALIZATION_DEADLINE);
+                        tokio::pin!(deadline);
+                        let opened = tokio::select! { biased;
+                            opened = read_exact(&mut stream.recv, 1) => opened,
+                            request = &mut freeze_request => {
+                                let Ok(revoker) = request else {
+                                    failed.store(true, Ordering::Release);
+                                    connection.close(APPLICATION_ERROR.into(), b"finalization owner dropped");
+                                    return IngressDisposition::Invalid;
+                                };
+                                match scope.freeze(revoker) {
+                                    Ok(handoff) => {
+                                        connection.close(APPLICATION_ERROR.into(), b"pairing ingress frozen");
+                                        return IngressDisposition::Frozen(handoff);
+                                    }
+                                    Err(_) => {
+                                        failed.store(true, Ordering::Release);
+                                        connection.close(APPLICATION_ERROR.into(), b"finalization freeze rejected");
+                                        return IngressDisposition::Invalid;
+                                    }
+                                }
+                            },
+                            extra = connection.accept_bi() => {
+                                if let Ok(pair) = extra { drop(Stream::new(pair)); }
+                                failed.store(true, Ordering::Release);
+                                connection.close(APPLICATION_ERROR.into(), b"extra finalization stream");
+                                return IngressDisposition::Invalid;
+                            },
+                            extra = connection.accept_uni() => {
+                                if let Ok(mut recv) = extra { let _ = recv.stop(APPLICATION_ERROR.into()); }
+                                failed.store(true, Ordering::Release);
+                                connection.close(APPLICATION_ERROR.into(), b"extra finalization stream");
+                                return IngressDisposition::Invalid;
+                            },
+                            _ = connection.closed() => return IngressDisposition::Invalid,
+                            _ = &mut deadline => Err(Invalid),
+                        };
+                        if opened.as_deref() != Ok(&[FINALIZATION_OPEN]) {
+                            failed.store(true, Ordering::Release);
+                            connection.close(
+                                APPLICATION_ERROR.into(),
+                                b"invalid finalization opener",
+                            );
+                            return IngressDisposition::Invalid;
+                        }
+                        tokio::select! { biased;
+                            request = &mut finalization_request => {
+                                let Ok(reply) = request else {
+                                    failed.store(true, Ordering::Release);
+                                    return IngressDisposition::Invalid;
+                                };
+                                incoming.as_mut().expect("ingress present").clean = true;
+                                if stream.send.write_all(&[FINALIZATION_READY]).await.is_err()
+                                    || reply.send(Ok(FinalizationAccess::Responder(stream))).is_err() {
+                                    failed.store(true, Ordering::Release);
+                                    return IngressDisposition::Invalid;
+                                }
+                                IngressDisposition::FinalizationReady(incoming.take().expect("ingress present"))
+                            },
+                            request = &mut freeze_request => {
+                                let Ok(revoker) = request else {
+                                    failed.store(true, Ordering::Release);
+                                    return IngressDisposition::Invalid;
+                                };
+                                match scope.freeze(revoker) {
+                                    Ok(handoff) => {
+                                        connection.close(APPLICATION_ERROR.into(), b"pairing ingress frozen");
+                                        IngressDisposition::Frozen(handoff)
+                                    }
+                                    Err(_) => IngressDisposition::Invalid,
+                                }
+                            },
+                            _ = watch_request(&mut incoming.as_mut().expect("ingress present").recv) => IngressDisposition::Invalid,
+                            extra = connection.accept_bi() => {
+                                if let Ok(pair) = extra { drop(Stream::new(pair)); }
+                                IngressDisposition::Invalid
+                            },
+                            extra = connection.accept_uni() => {
+                                if let Ok(mut recv) = extra { let _ = recv.stop(APPLICATION_ERROR.into()); }
+                                IngressDisposition::Invalid
+                            },
+                            _ = connection.closed() => IngressDisposition::Invalid,
+                            _ = &mut deadline => IngressDisposition::Invalid,
+                        }
+                    }
+                    (_, Ok(pair)) => {
+                        drop(Stream::new(pair));
+                        IngressDisposition::Invalid
+                    }
+                    (_, Err(_)) => IngressDisposition::Invalid,
+                }
+            },
+            extra = connection.accept_uni() => {
+                if let Ok(mut recv) = extra { let _ = recv.stop(APPLICATION_ERROR.into()); }
+                IngressDisposition::Invalid
             },
             _ = connection.closed() => IngressDisposition::Invalid,
         };
@@ -557,6 +699,17 @@ impl HandshakeCompletePendingAuthority {
     pub(super) async fn test_late_extra(&self) {
         let (mut send, _recv) = self._channel.connection.open_bi().await.unwrap();
         send.write_all(&[1]).await.unwrap();
+    }
+    #[cfg(test)]
+    pub(super) async fn test_silent_finalization_opener(&self) {
+        let (_send, _recv) = self._channel.connection.open_bi().await.unwrap();
+        tokio::time::sleep(FINALIZATION_DEADLINE + Duration::from_millis(250)).await;
+    }
+    #[cfg(test)]
+    pub(super) async fn test_unowned_finalization_opener(&self) {
+        let (mut send, _recv) = self._channel.connection.open_bi().await.unwrap();
+        send.write_all(&[FINALIZATION_OPEN]).await.unwrap();
+        tokio::time::sleep(FINALIZATION_DEADLINE + Duration::from_millis(250)).await;
     }
     #[cfg(test)]
     pub(super) async fn test_try_late_extra(&self) -> bool {
@@ -720,18 +873,12 @@ impl HandshakeCompletePendingAuthority {
             _ => return Err(HandshakeError::Rejected),
         };
         let mut stream = match access {
-            FinalizationAccess::Initiator => {
+            FinalizationAccess::Initiator(stream) => {
                 #[cfg(test)]
                 if matches!(receipt.test_fault, Some(FinalizationTestFault::NoBidi)) {
                     std::future::pending::<()>().await;
                 }
-                Stream::new(
-                    self._channel
-                        .connection
-                        .open_bi()
-                        .await
-                        .map_err(|_| HandshakeError::Rejected)?,
-                )
+                stream
             }
             FinalizationAccess::Responder(stream) => stream,
         };
@@ -952,13 +1099,7 @@ impl HandshakeCompletePendingAuthority {
             _ => return Err(HandshakeError::Rejected),
         };
         let mut stream = match access {
-            FinalizationAccess::Initiator => Stream::new(
-                self._channel
-                    .connection
-                    .open_bi()
-                    .await
-                    .map_err(|_| HandshakeError::Rejected)?,
-            ),
+            FinalizationAccess::Initiator(stream) => stream,
             FinalizationAccess::Responder(stream) => stream,
         };
         let key = finalization_key(
@@ -2165,5 +2306,160 @@ impl ProvisionalChannel {
                 incoming,
             ),
         })
+    }
+}
+
+#[cfg(test)]
+mod durable_complete_tests {
+    use super::*;
+
+    fn statement() -> LocalDurableCommit {
+        LocalDurableCommit::new(
+            BilateralTransactionId::from_bytes([7; 32]).unwrap(),
+            [11; 32],
+            [13; 32],
+            [17; 32],
+            19,
+            23,
+            29,
+            31,
+            0,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn durable_commit_complete_rejects_mac_and_every_bound_field_change() {
+        let sender = statement();
+        let expected = LocalDurableCommit::new(
+            sender.transaction_id,
+            sender.peer_receipt_hash,
+            sender.local_receipt_hash,
+            sender.transcript,
+            sender.peer_identity_generation,
+            sender.peer_revocation_generation,
+            sender.identity_generation,
+            sender.revocation_generation,
+            sender.policy_revision,
+        )
+        .unwrap();
+        let key = [37; 32];
+        let framed = finalization_record(
+            "durable-commit-complete",
+            &durable_commit_values(&sender),
+            &key,
+        )
+        .unwrap();
+        let payload = &framed[4..];
+        assert!(decode_durable_commit_complete(payload, &key, &expected).is_ok());
+
+        let mut corrupted_mac = payload.to_vec();
+        *corrupted_mac.last_mut().unwrap() ^= 1;
+        assert!(decode_durable_commit_complete(&corrupted_mac, &key, &expected).is_err());
+
+        let changed = [
+            LocalDurableCommit::new(
+                BilateralTransactionId::from_bytes([43; 32]).unwrap(),
+                expected.local_receipt_hash,
+                expected.peer_receipt_hash,
+                expected.transcript,
+                expected.identity_generation,
+                expected.revocation_generation,
+                expected.peer_identity_generation,
+                expected.peer_revocation_generation,
+                expected.policy_revision,
+            ),
+            LocalDurableCommit::new(
+                expected.transaction_id,
+                [41; 32],
+                expected.peer_receipt_hash,
+                expected.transcript,
+                expected.identity_generation,
+                expected.revocation_generation,
+                expected.peer_identity_generation,
+                expected.peer_revocation_generation,
+                expected.policy_revision,
+            ),
+            LocalDurableCommit::new(
+                expected.transaction_id,
+                expected.local_receipt_hash,
+                [47; 32],
+                expected.transcript,
+                expected.identity_generation,
+                expected.revocation_generation,
+                expected.peer_identity_generation,
+                expected.peer_revocation_generation,
+                expected.policy_revision,
+            ),
+            LocalDurableCommit::new(
+                expected.transaction_id,
+                expected.local_receipt_hash,
+                expected.peer_receipt_hash,
+                [53; 32],
+                expected.identity_generation,
+                expected.revocation_generation,
+                expected.peer_identity_generation,
+                expected.peer_revocation_generation,
+                expected.policy_revision,
+            ),
+            LocalDurableCommit::new(
+                expected.transaction_id,
+                expected.local_receipt_hash,
+                expected.peer_receipt_hash,
+                expected.transcript,
+                59,
+                expected.revocation_generation,
+                expected.peer_identity_generation,
+                expected.peer_revocation_generation,
+                expected.policy_revision,
+            ),
+            LocalDurableCommit::new(
+                expected.transaction_id,
+                expected.local_receipt_hash,
+                expected.peer_receipt_hash,
+                expected.transcript,
+                expected.identity_generation,
+                61,
+                expected.peer_identity_generation,
+                expected.peer_revocation_generation,
+                expected.policy_revision,
+            ),
+            LocalDurableCommit::new(
+                expected.transaction_id,
+                expected.local_receipt_hash,
+                expected.peer_receipt_hash,
+                expected.transcript,
+                expected.identity_generation,
+                expected.revocation_generation,
+                67,
+                expected.peer_revocation_generation,
+                expected.policy_revision,
+            ),
+            LocalDurableCommit::new(
+                expected.transaction_id,
+                expected.local_receipt_hash,
+                expected.peer_receipt_hash,
+                expected.transcript,
+                expected.identity_generation,
+                expected.revocation_generation,
+                expected.peer_identity_generation,
+                71,
+                expected.policy_revision,
+            ),
+            LocalDurableCommit::new(
+                expected.transaction_id,
+                expected.local_receipt_hash,
+                expected.peer_receipt_hash,
+                expected.transcript,
+                expected.identity_generation,
+                expected.revocation_generation,
+                expected.peer_identity_generation,
+                expected.peer_revocation_generation,
+                1,
+            ),
+        ];
+        for changed in changed {
+            assert!(decode_durable_commit_complete(payload, &key, &changed.unwrap()).is_err());
+        }
     }
 }

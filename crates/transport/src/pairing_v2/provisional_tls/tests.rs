@@ -2038,11 +2038,90 @@ async fn bilateral_completed_capability_is_invalidated_by_late_extra_stream() {
     let b = b.unwrap();
     assert!(a.is_protocol_valid());
     b.test_late_extra().await;
-    let deadline = std::time::Instant::now() + Duration::from_secs(1);
+    // A syntactically plausible early finalization stream is retained only
+    // until the fixed finalization deadline so a legitimate cross-process
+    // handoff cannot race its local durable stage. It never gains authority.
+    let deadline = std::time::Instant::now() + Duration::from_secs(6);
     while a.is_protocol_valid() && std::time::Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
     assert!(!a.is_protocol_valid());
+}
+
+#[tokio::test]
+async fn silent_early_finalization_stream_is_bounded_and_invalidates() {
+    let (_ea, _eb, a, b, _) = pair().await;
+    let ta = tempfile::tempdir().unwrap();
+    let tb = tempfile::tempdir().unwrap();
+    let sa = crate::pairing_pending::PendingStore::open(ta.path()).unwrap();
+    let sb = crate::pairing_pending::PendingStore::open(tb.path()).unwrap();
+    let (a, b) = tokio::join!(
+        a.handshake(
+            handshake_config(1, 2),
+            &sa,
+            |p| async move { p.decision(true) }
+        ),
+        b.handshake(
+            handshake_config(2, 1),
+            &sb,
+            |p| async move { p.decision(true) }
+        )
+    );
+    let a = a.unwrap();
+    let b = b.unwrap();
+    if a.role() == crate::pairing_v2::Role::B {
+        b.test_silent_finalization_opener().await;
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while a.is_protocol_valid() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(!a.is_protocol_valid());
+    } else {
+        a.test_silent_finalization_opener().await;
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while b.is_protocol_valid() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(!b.is_protocol_valid());
+    }
+}
+
+#[tokio::test]
+async fn valid_open_without_local_handoff_expires_and_invalidates() {
+    let (_ea, _eb, a, b, _) = pair().await;
+    let ta = tempfile::tempdir().unwrap();
+    let tb = tempfile::tempdir().unwrap();
+    let sa = crate::pairing_pending::PendingStore::open(ta.path()).unwrap();
+    let sb = crate::pairing_pending::PendingStore::open(tb.path()).unwrap();
+    let (a, b) = tokio::join!(
+        a.handshake(
+            handshake_config(1, 2),
+            &sa,
+            |p| async move { p.decision(true) }
+        ),
+        b.handshake(
+            handshake_config(2, 1),
+            &sb,
+            |p| async move { p.decision(true) }
+        )
+    );
+    let a = a.unwrap();
+    let b = b.unwrap();
+    if a.role() == crate::pairing_v2::Role::B {
+        b.test_unowned_finalization_opener().await;
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while a.is_protocol_valid() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(!a.is_protocol_valid());
+    } else {
+        a.test_unowned_finalization_opener().await;
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while b.is_protocol_valid() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(!b.is_protocol_valid());
+    }
 }
 #[tokio::test]
 async fn bilateral_completed_capability_rejects_late_candidate_data() {
@@ -3711,10 +3790,9 @@ async fn bilateral_two_process_distributed_commit_reopens_confirmed() {
     let store =
         crate::pairing_v2::admission_authority::AdmissionAuthorityStore::open(parent_root.path())
             .unwrap();
-    let authority = endpoint
-        .accept()
-        .await
-        .unwrap()
+    let channel = endpoint.accept().await.unwrap();
+    let retained_connection = channel.connection.clone();
+    let authority = channel
         .handshake(
             handshake_config(212, 211),
             store.pending_store_for_handshake(),
@@ -3751,6 +3829,12 @@ async fn bilateral_two_process_distributed_commit_reopens_confirmed() {
         reopened.reconcile(attempt).unwrap(),
         crate::pairing_v2::admission_authority::ReconcileAdmission::Promoted
     );
+
+    assert!(retained_connection.close_reason().is_none());
+    drop(summary);
+    tokio::time::timeout(Duration::from_secs(2), retained_connection.closed())
+        .await
+        .expect("dropping the opaque confirmed summary must close its retained connection");
 
     if let Err(error) =
         std::io::Write::write_all(child.0.as_mut().unwrap().stdin.as_mut().unwrap(), b"exit\n")
