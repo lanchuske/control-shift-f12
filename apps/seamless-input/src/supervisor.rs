@@ -24,12 +24,14 @@ use seamless_input_protocol::VERSION;
 use seamless_transport::{
     EndpointOptions, IdentityStore, PairingError, PeerEndpoint, PeerSession, ReconnectPolicy,
 };
+#[cfg(any(target_os = "macos", test))]
+use std::{collections::VecDeque, sync::Mutex};
 use std::{
-    collections::{BTreeMap, BTreeSet, VecDeque},
+    collections::{BTreeMap, BTreeSet},
     future::Future,
     net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::Arc,
     time::{Duration, Instant},
 };
 use tokio::{sync::mpsc, task::JoinHandle};
@@ -1342,22 +1344,26 @@ struct CapturedInput {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg(any(target_os = "macos", test))]
 enum CaptureEnqueueAction {
     Continue,
     RecoverLocal,
 }
 
+#[cfg(any(target_os = "macos", test))]
 struct CaptureBufferState {
     emergency: bool,
     ordered: VecDeque<CapturedInput>,
 }
 
 #[derive(Clone)]
+#[cfg(any(target_os = "macos", test))]
 struct CaptureBuffer {
     capacity: usize,
     state: Arc<Mutex<CaptureBufferState>>,
 }
 
+#[cfg(any(target_os = "macos", test))]
 impl CaptureBuffer {
     fn new(capacity: usize) -> Self {
         assert!(capacity > 0, "capture capacity must be non-zero");
