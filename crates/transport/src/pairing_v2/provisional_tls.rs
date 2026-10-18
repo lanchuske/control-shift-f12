@@ -23,7 +23,10 @@ mod handshake_io;
 #[cfg(test)]
 mod tests;
 #[allow(unused_imports)] // Constructed through the sealed handoff boundary.
-pub(crate) use handshake_io::FrozenPromotionEvidence;
+pub(crate) use handshake_io::{
+    FrozenPromotionEvidence, LocalFinalizationReceipt, PeerFinalizationReceipt,
+    PreparedHandshakeAuthority,
+};
 pub use handshake_io::{
     HandshakeCompletePendingAuthority, HandshakeConfig, HandshakeError, VerificationDecision,
     VerificationPrompt,
@@ -312,6 +315,11 @@ pub struct ProvisionalEndpoint {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ConsentPhase {
     Active,
+    Reserved,
+    /// A bilateral receipt was durably staged while the endpoint remains
+    /// live.  Endpoint loss may abort only this exact staged transaction;
+    /// it must not run the legacy peer-wide revocation path.
+    Staged,
     Frozen,
     /// The exact revocation guard has left the provisional endpoint.  Only the
     /// durable-store transaction may hold it now; endpoint destruction closes
@@ -332,6 +340,48 @@ struct ConsentScope(std::sync::Mutex<ConsentState>);
 pub(crate) struct FrozenAdmissionHandoff {
     scope: Arc<ConsentScope>,
     token: [u8; 32],
+}
+
+/// Private, move-only bridge between a live pairing authority and durable
+/// staging. It deliberately exposes no token or revoker: the only callers
+/// that can use it are the sealed bilateral-commit phases.
+pub(in crate::pairing_v2) struct PreparedAdmissionHandoff {
+    scope: Arc<ConsentScope>,
+    token: [u8; 32],
+}
+
+impl PreparedAdmissionHandoff {
+    pub(in crate::pairing_v2) fn awaiting_handoff_ownership(
+        &self,
+        staged_revision: u64,
+    ) -> crate::pairing_pending::AdmissionOwnership {
+        crate::pairing_pending::AdmissionOwnership::AwaitingHandoff {
+            guard_token: self.token,
+            staged_revision,
+        }
+    }
+
+    pub(in crate::pairing_v2) fn freeze(self) -> Result<FrozenAdmissionHandoff, Invalid> {
+        self.scope.freeze_reserved(self.token)
+    }
+
+    pub(in crate::pairing_v2) fn mark_staged(&self) -> Result<(), Invalid> {
+        self.scope.mark_staged(self.token)
+    }
+
+    pub(in crate::pairing_v2) fn abort_exact(
+        self,
+    ) -> Result<(), crate::pairing_pending::StoreError> {
+        self.scope.abort_live(self.token)
+    }
+
+    #[cfg(test)]
+    pub(in crate::pairing_v2) fn test_matches_ownership(
+        &self,
+        ownership: &crate::pairing_pending::AdmissionOwnership,
+    ) -> bool {
+        matches!(ownership, crate::pairing_pending::AdmissionOwnership::AwaitingHandoff { guard_token, .. } if *guard_token == self.token)
+    }
 }
 
 impl FrozenAdmissionHandoff {
@@ -360,6 +410,12 @@ impl FrozenAdmissionHandoff {
         }
         state.phase = ConsentPhase::TransferredToStore;
         Ok(revoker)
+    }
+
+    pub(in crate::pairing_v2) fn abort_exact(
+        self,
+    ) -> Result<(), crate::pairing_pending::StoreError> {
+        self.scope.abort_frozen(self.token)
     }
 
     pub(in crate::pairing_v2) fn awaiting_handoff_ownership(
@@ -400,18 +456,133 @@ impl ConsentScope {
             token,
         })
     }
-    fn revoke(&self) -> Option<crate::pairing_pending::AdmissionRevoker> {
+    fn reserve_live(
+        self: &Arc<Self>,
+        mut revoker: crate::pairing_pending::AdmissionRevoker,
+    ) -> Result<PreparedAdmissionHandoff, Invalid> {
+        let mut state = self.0.lock().map_err(|_| Invalid)?;
+        if state.phase != ConsentPhase::Active {
+            return Err(Invalid);
+        }
+        revoker.arm();
+        let token = revoker.handoff_token();
+        state.phase = ConsentPhase::Reserved;
+        state.revoker = Some(revoker);
+        Ok(PreparedAdmissionHandoff {
+            scope: self.clone(),
+            token,
+        })
+    }
+    fn freeze_reserved(
+        self: &Arc<Self>,
+        token: [u8; 32],
+    ) -> Result<FrozenAdmissionHandoff, Invalid> {
+        let mut state = self.0.lock().map_err(|_| Invalid)?;
+        if state.phase != ConsentPhase::Staged {
+            return Err(Invalid);
+        }
+        let revoker = state.revoker.as_ref().ok_or(Invalid)?;
+        if !revoker.matches_handoff_token(token) {
+            return Err(Invalid);
+        }
+        state.phase = ConsentPhase::Frozen;
+        Ok(FrozenAdmissionHandoff {
+            scope: self.clone(),
+            token,
+        })
+    }
+    fn mark_staged(&self, token: [u8; 32]) -> Result<(), Invalid> {
+        let mut state = self.0.lock().map_err(|_| Invalid)?;
+        if state.phase != ConsentPhase::Reserved {
+            return Err(Invalid);
+        }
+        let revoker = state.revoker.as_ref().ok_or(Invalid)?;
+        if !revoker.matches_handoff_token(token) {
+            return Err(Invalid);
+        }
+        state.phase = ConsentPhase::Staged;
+        Ok(())
+    }
+
+    fn abort_live(&self, token: [u8; 32]) -> Result<(), crate::pairing_pending::StoreError> {
+        let (revoker, phase) = self.take_live_revoker_for_abort(token)?;
+        let mut revoker = revoker;
+        match phase {
+            ConsentPhase::Reserved => revoker.cancel_exact(),
+            ConsentPhase::Staged => revoker.abort_staged_exact(),
+            _ => Err(crate::pairing_pending::StoreError::Invalid),
+        }
+    }
+
+    fn abort_frozen(&self, token: [u8; 32]) -> Result<(), crate::pairing_pending::StoreError> {
+        let revoker = self.take_revoker_for_abort(token, ConsentPhase::Frozen)?;
+        let mut revoker = revoker;
+        revoker.abort_staged_exact()
+    }
+
+    fn take_live_revoker_for_abort(
+        &self,
+        token: [u8; 32],
+    ) -> Result<
+        (crate::pairing_pending::AdmissionRevoker, ConsentPhase),
+        crate::pairing_pending::StoreError,
+    > {
+        let mut state = self
+            .0
+            .lock()
+            .map_err(|_| crate::pairing_pending::StoreError::Invalid)?;
+        if !matches!(state.phase, ConsentPhase::Reserved | ConsentPhase::Staged) {
+            return Err(crate::pairing_pending::StoreError::Invalid);
+        }
+        let phase = state.phase;
+        let revoker = state
+            .revoker
+            .take()
+            .ok_or(crate::pairing_pending::StoreError::Invalid)?;
+        if !revoker.matches_handoff_token(token) {
+            state.revoker = Some(revoker);
+            return Err(crate::pairing_pending::StoreError::Invalid);
+        }
+        state.phase = ConsentPhase::Revoked;
+        Ok((revoker, phase))
+    }
+
+    fn take_revoker_for_abort(
+        &self,
+        token: [u8; 32],
+        expected_phase: ConsentPhase,
+    ) -> Result<crate::pairing_pending::AdmissionRevoker, crate::pairing_pending::StoreError> {
+        let mut state = self
+            .0
+            .lock()
+            .map_err(|_| crate::pairing_pending::StoreError::Invalid)?;
+        if state.phase != expected_phase {
+            return Err(crate::pairing_pending::StoreError::Invalid);
+        }
+        let revoker = state
+            .revoker
+            .take()
+            .ok_or(crate::pairing_pending::StoreError::Invalid)?;
+        if !revoker.matches_handoff_token(token) {
+            state.revoker = Some(revoker);
+            return Err(crate::pairing_pending::StoreError::Invalid);
+        }
+        state.phase = ConsentPhase::Revoked;
+        Ok(revoker)
+    }
+    fn revoke(&self) -> Option<(crate::pairing_pending::AdmissionRevoker, ConsentPhase)> {
         let Ok(mut state) = self.0.lock() else {
             return None;
         };
         if state.phase == ConsentPhase::TransferredToStore {
             return None;
         }
+        let prior_phase = state.phase;
         if let Some(revoker) = state.revoker.as_mut() {
             revoker.mark_revoking();
         }
         state.phase = ConsentPhase::Revoked;
-        state.revoker.take()
+        state.revoker.take().map(|revoker| (revoker, prior_phase))
     }
 }
 #[cfg(test)]
@@ -509,8 +680,22 @@ impl Drop for ProvisionalEndpoint {
             pause.reached.wait();
             pause.release.wait();
         }
-        if let Some(mut revoker) = revoker {
-            let _revocation_result = revoker.revoke();
+        if let Some((mut revoker, phase)) = revoker {
+            let _revocation_result = match phase {
+                // Before the transaction is staged, cleanup is an exact
+                // cancellation. A failed preflight must not leave a revoked
+                // receipt or alter another attempt for the same peer.
+                ConsentPhase::Reserved => revoker.cancel_exact(),
+                // Once staged, endpoint loss aborts only the exact
+                // transaction/guard; the legacy peer-wide revoker is not
+                // permitted on the Task 4 path.
+                ConsentPhase::Staged | ConsentPhase::Frozen => revoker.abort_staged_exact(),
+                // Only an unreserved legacy endpoint may revoke the current
+                // peer. Once Task 4 owns an exact reservation, even a frozen
+                // endpoint loss must be confined to that attempt/token.
+                ConsentPhase::Active => revoker.revoke(),
+                ConsentPhase::TransferredToStore | ConsentPhase::Revoked => Ok(()),
+            };
         }
         self.endpoint.close(0u32.into(), b"consent scope closed");
     }
