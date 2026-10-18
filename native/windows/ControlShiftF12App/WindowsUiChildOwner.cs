@@ -17,7 +17,7 @@ public sealed class WindowsUiChildOwner : IAsyncDisposable
     private readonly Task stderrDrain;
     private readonly SemaphoreSlim stdoutGate = new(1, 1);
     private readonly object closeSync = new();
-    private Task? closeTask;
+    private Task closeTask = null!;
     private long stderrBytesDiscarded;
     private bool closed;
 
