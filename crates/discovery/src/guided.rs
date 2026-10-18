@@ -223,8 +223,11 @@ pub enum LocatorEvent {
 /// Construction requires an explicit local discovery gesture. The watchdog
 /// closes sockets after five minutes even when the UI stops polling.
 pub struct GuidedMdns {
+    daemon: mdns_sd::ServiceDaemon,
     receiver: mdns_sd::Receiver<mdns_sd::ServiceEvent>,
     monitor: mdns_sd::Receiver<mdns_sd::DaemonEvent>,
+    refresh_every: std::time::Duration,
+    refresh_at: std::time::Instant,
     stop: std::sync::mpsc::Sender<()>,
     worker: Option<std::thread::JoinHandle<()>>,
 }
@@ -239,12 +242,27 @@ impl GuidedMdns {
         Self::from_daemon(daemon)
     }
     fn from_daemon(daemon: mdns_sd::ServiceDaemon) -> Result<Self, DiscoveryError> {
-        Self::from_daemon_with_duration(daemon, std::time::Duration::from_secs(300))
+        Self::from_daemon_with_timing(
+            daemon,
+            std::time::Duration::from_secs(300),
+            std::time::Duration::from_secs(60),
+        )
     }
+    #[cfg(test)]
     fn from_daemon_with_duration(
         daemon: mdns_sd::ServiceDaemon,
         duration: std::time::Duration,
     ) -> Result<Self, DiscoveryError> {
+        Self::from_daemon_with_timing(daemon, duration, duration / 2)
+    }
+    fn from_daemon_with_timing(
+        daemon: mdns_sd::ServiceDaemon,
+        duration: std::time::Duration,
+        refresh_every: std::time::Duration,
+    ) -> Result<Self, DiscoveryError> {
+        if refresh_every.is_zero() || refresh_every >= duration {
+            return Err(DiscoveryError::Invalid);
+        }
         let result = (|| {
             let monitor = daemon.monitor().map_err(|_| DiscoveryError::Unavailable)?;
             let receiver = daemon
@@ -270,8 +288,13 @@ impl GuidedMdns {
             });
         match worker {
             Ok(worker) => Ok(Self {
+                daemon,
                 receiver,
                 monitor,
+                refresh_every,
+                refresh_at: std::time::Instant::now()
+                    .checked_add(refresh_every)
+                    .ok_or(DiscoveryError::Limit)?,
                 stop,
                 worker: Some(worker),
             }),
@@ -282,6 +305,16 @@ impl GuidedMdns {
         }
     }
     pub fn poll(&mut self) -> Result<Vec<LocatorEvent>, DiscoveryError> {
+        let now = std::time::Instant::now();
+        if now >= self.refresh_at {
+            self.receiver = self
+                .daemon
+                .browse(crate::mdns::SERVICE_TYPE)
+                .map_err(|_| DiscoveryError::Unavailable)?;
+            self.refresh_at = now
+                .checked_add(self.refresh_every)
+                .ok_or(DiscoveryError::Limit)?;
+        }
         // At most 16 monitor + 16 browse events per call; never drain an
         // attacker-controlled queue to exhaustion on the UI/control thread.
         for _ in 0..16 {
@@ -461,7 +494,12 @@ mod tests {
         daemon
             .enable_interface(mdns_sd::IfKind::LoopbackV4)
             .unwrap();
-        let mut browser = GuidedMdns::from_daemon(daemon).unwrap();
+        let mut browser = GuidedMdns::from_daemon_with_timing(
+            daemon,
+            Duration::from_secs(300),
+            Duration::from_millis(250),
+        )
+        .unwrap();
         let props = crate::mdns::txt_records(2, true)
             .into_iter()
             .collect::<std::collections::HashMap<_, _>>();
@@ -477,14 +515,20 @@ mod tests {
         let name = service.get_fullname().to_owned();
         publisher.register(service).unwrap();
         let start = Instant::now();
-        let mut observed = false;
+        let mut observations = 0;
         while start.elapsed() < Duration::from_secs(12) {
             let events = browser.poll().unwrap();
             assert!(events.len() <= 32);
-            if events.iter().any(|e|matches!(e,LocatorEvent::Observed(a) if a.instance=="22222222222222222222222222222222")){observed=true;break;}
+            observations += events
+                .iter()
+                .filter(|e|matches!(e,LocatorEvent::Observed(a) if a.instance=="22222222222222222222222222222222"))
+                .count();
+            if observations >= 2 {
+                break;
+            }
             std::thread::sleep(Duration::from_millis(20));
         }
-        assert!(observed, "real loopback resolution");
+        assert!(observations >= 2, "stable service is actively re-resolved");
         publisher.unregister(&name).unwrap();
         let start = Instant::now();
         let mut removed = false;
