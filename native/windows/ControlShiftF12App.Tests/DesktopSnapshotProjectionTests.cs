@@ -73,7 +73,7 @@ public sealed class DesktopSnapshotProjectionTests
     [InlineData("needs_update", "current")]
     public void Noncurrent_or_incompatible_candidates_cannot_be_selected(string compatibility, string freshness)
     {
-        var snapshot = $$"""{"v":1,"kind":"ui_snapshot_v1","snapshot":{"schema_version":1,"generation":2,"state":"browsing","diagnostics":[],"candidates":[{"handle":"peer-1","compatibility":"{{compatibility}}","freshness":"{{freshness}}"}],"confirmed":[],"inventory":null,"layout":{"state":"not_configured"},"capabilities":{"input_enabled":false,"clipboard_enabled":false}}}""";
+        var snapshot = $$$"""{"v":1,"kind":"ui_snapshot_v1","snapshot":{"schema_version":1,"generation":2,"state":"browsing","diagnostics":[],"candidates":[{"handle":"peer-1","compatibility":"{{{compatibility}}}","freshness":"{{{freshness}}}"}],"confirmed":[],"inventory":null,"layout":{"state":"not_configured"},"capabilities":{"input_enabled":false,"clipboard_enabled":false}}}""";
         Assert.True(DesktopSnapshotProjection.TryParse(snapshot, out var projection));
         Assert.Empty(projection!.Nearby);
     }
