@@ -225,6 +225,8 @@ pub enum LocatorEvent {
 pub struct GuidedMdns {
     daemon: mdns_sd::ServiceDaemon,
     receiver: mdns_sd::Receiver<mdns_sd::ServiceEvent>,
+    pending_receiver: Option<mdns_sd::Receiver<mdns_sd::ServiceEvent>>,
+    pending_started: bool,
     monitor: mdns_sd::Receiver<mdns_sd::DaemonEvent>,
     refresh_every: std::time::Duration,
     refresh_at: std::time::Instant,
@@ -290,6 +292,8 @@ impl GuidedMdns {
             Ok(worker) => Ok(Self {
                 daemon,
                 receiver,
+                pending_receiver: None,
+                pending_started: false,
                 monitor,
                 refresh_every,
                 refresh_at: std::time::Instant::now()
@@ -306,11 +310,12 @@ impl GuidedMdns {
     }
     pub fn poll(&mut self) -> Result<Vec<LocatorEvent>, DiscoveryError> {
         let now = std::time::Instant::now();
-        if now >= self.refresh_at {
-            self.receiver = self
-                .daemon
-                .browse(crate::mdns::SERVICE_TYPE)
-                .map_err(|_| DiscoveryError::Unavailable)?;
+        if now >= self.refresh_at && self.pending_receiver.is_none() {
+            self.pending_receiver = Some(
+                self.daemon
+                    .browse(crate::mdns::SERVICE_TYPE)
+                    .map_err(|_| DiscoveryError::Unavailable)?,
+            );
             self.refresh_at = now
                 .checked_add(self.refresh_every)
                 .ok_or(DiscoveryError::Limit)?;
@@ -326,28 +331,75 @@ impl GuidedMdns {
             }
         }
         let mut events = Vec::new();
-        for _ in 0..16 {
-            match self.receiver.recv_timeout(std::time::Duration::ZERO) {
-                Ok(mdns_sd::ServiceEvent::ServiceResolved(info)) => {
-                    if let Some(event) = resolved_event(&info) {
-                        events.push(event);
-                    }
-                }
-                Ok(mdns_sd::ServiceEvent::ServiceRemoved(_, name)) => {
-                    if let Some(id) = instance(&name) {
-                        events.push(LocatorEvent::Removed(id.to_ascii_lowercase()));
-                    }
-                }
-                Ok(mdns_sd::ServiceEvent::SearchStopped(_)) => {
-                    return Err(DiscoveryError::Unavailable);
-                }
-                Ok(_) => {}
-                Err(mdns_sd::RecvTimeoutError::Timeout) => break,
-                Err(_) => return Err(DiscoveryError::Unavailable),
+        let mut remaining = 16;
+        if self.pending_started {
+            let old_empty =
+                drain_service_events(&self.receiver, &mut remaining, 16, &mut events)?.0;
+            if old_empty {
+                self.receiver = self.pending_receiver.take().unwrap();
+                self.pending_started = false;
+            }
+            return Ok(events);
+        }
+        drain_service_events(
+            &self.receiver,
+            &mut remaining,
+            if self.pending_receiver.is_some() {
+                8
+            } else {
+                16
+            },
+            &mut events,
+        )?;
+        if let Some(pending) = self.pending_receiver.as_ref() {
+            let (_, started) = drain_service_events(pending, &mut remaining, 8, &mut events)?;
+            self.pending_started |= started;
+        }
+        if self.pending_started && remaining > 0 {
+            // SearchStarted proves the replacement listener is live. Drain the old
+            // receiver once more after that boundary so a queued withdrawal cannot
+            // be lost between the first drain and the listener handoff.
+            let old_empty_after_start =
+                drain_service_events(&self.receiver, &mut remaining, 16, &mut events)?.0;
+            if old_empty_after_start {
+                self.receiver = self.pending_receiver.take().unwrap();
+                self.pending_started = false;
             }
         }
         Ok(events)
     }
+}
+
+fn drain_service_events(
+    receiver: &mdns_sd::Receiver<mdns_sd::ServiceEvent>,
+    remaining: &mut usize,
+    limit: usize,
+    events: &mut Vec<LocatorEvent>,
+) -> Result<(bool, bool), DiscoveryError> {
+    let mut started = false;
+    for _ in 0..limit.min(*remaining) {
+        *remaining -= 1;
+        match receiver.recv_timeout(std::time::Duration::ZERO) {
+            Ok(mdns_sd::ServiceEvent::ServiceResolved(info)) => {
+                if let Some(event) = resolved_event(&info) {
+                    events.push(event);
+                }
+            }
+            Ok(mdns_sd::ServiceEvent::ServiceRemoved(_, name)) => {
+                if let Some(id) = instance(&name) {
+                    events.push(LocatorEvent::Removed(id.to_ascii_lowercase()));
+                }
+            }
+            Ok(mdns_sd::ServiceEvent::SearchStarted(_)) => started = true,
+            Ok(mdns_sd::ServiceEvent::SearchStopped(_)) => {
+                return Err(DiscoveryError::Unavailable);
+            }
+            Ok(_) => {}
+            Err(mdns_sd::RecvTimeoutError::Timeout) => return Ok((true, started)),
+            Err(_) => return Err(DiscoveryError::Unavailable),
+        }
+    }
+    Ok((false, started))
 }
 impl Drop for GuidedMdns {
     fn drop(&mut self) {
@@ -529,7 +581,9 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         }
         assert!(observations >= 2, "stable service is actively re-resolved");
+        browser.refresh_at = Instant::now();
         publisher.unregister(&name).unwrap();
+        std::thread::sleep(Duration::from_millis(100));
         let start = Instant::now();
         let mut removed = false;
         while start.elapsed() < Duration::from_secs(5) {
