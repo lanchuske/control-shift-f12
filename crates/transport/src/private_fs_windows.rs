@@ -733,6 +733,33 @@ mod tests {
         open_path(path, true, OPEN_EXISTING).unwrap().unwrap()
     }
 
+    fn directory_with_access(path: &Path, access: u32) -> Result<File, u32> {
+        let handle = unsafe {
+            CreateFileW(
+                wide(path.as_os_str()).as_ptr(),
+                access,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                ptr::null(),
+                OPEN_EXISTING,
+                FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+                ptr::null_mut(),
+            )
+        };
+        if handle == INVALID_HANDLE_VALUE {
+            Err(unsafe { GetLastError() })
+        } else {
+            Ok(unsafe { File::from_raw_handle(handle.cast()) })
+        }
+    }
+
+    fn flush_code(file: &File) -> u32 {
+        if unsafe { FlushFileBuffers(file.as_raw_handle().cast()) } == 0 {
+            unsafe { GetLastError() }
+        } else {
+            ERROR_SUCCESS
+        }
+    }
+
     #[test]
     fn retained_source_handle_can_replace_existing_target() {
         let root = tempfile::tempdir().unwrap();
@@ -882,7 +909,12 @@ mod tests {
             let private_b = PrivateDir::root(&root_b).unwrap();
             let source = private_b.open("source", false, false).unwrap().unwrap();
             drop(private_b);
-            rename_open_file(&source, &private_a.file, "x", true).unwrap();
+            faults::reset_operations();
+            let result = rename_open_file(&source, &private_a.file, "x", true);
+            let attempts = faults::take_rename_attempts();
+            eprintln!("CSF12_ROOT_BIND result={result:?} attempts={attempts:?}");
+            assert_eq!(attempts.len(), 1, "expected exactly one native rename call");
+            result.unwrap();
             return;
         }
 
@@ -891,21 +923,29 @@ mod tests {
         let root_b = root.path().join("b");
         std::fs::create_dir_all(&root_a).unwrap();
         std::fs::create_dir_all(&root_b).unwrap();
-        drop(PrivateDir::root(&root_a).unwrap());
-        drop(PrivateDir::root(&root_b).unwrap());
-        std::fs::write(root_a.join("x"), b"old-a").unwrap();
-        std::fs::write(root_b.join("x"), b"old-b").unwrap();
-        std::fs::write(root_b.join("source"), b"new").unwrap();
-        let source = open_path(&root_b.join("source"), false, OPEN_EXISTING)
-            .unwrap()
-            .unwrap();
+        let private_a = PrivateDir::root(&root_a).unwrap();
+        let private_b = PrivateDir::root(&root_b).unwrap();
+        let mut target_a = private_a.open("x", true, true).unwrap().unwrap();
+        target_a.write_all(b"old-a").unwrap();
+        target_a.sync_all().unwrap();
+        let mut target_b = private_b.open("x", true, true).unwrap().unwrap();
+        target_b.write_all(b"old-b").unwrap();
+        target_b.sync_all().unwrap();
+        let mut source = private_b.open("source", true, true).unwrap().unwrap();
+        source.write_all(b"new").unwrap();
+        source.sync_all().unwrap();
         let source_id = identity(&file_info(source.as_raw_handle().cast()).unwrap());
+        drop(target_a);
+        drop(target_b);
         drop(source);
+        drop(private_a);
+        drop(private_b);
 
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
-                "private_fs_windows::tests::root_relative_rename_binds_the_destination_to_the_retained_directory",
+                "private_fs::tests::root_relative_rename_binds_the_destination_to_the_retained_directory",
+                "--nocapture",
             ])
             .current_dir(&root_b)
             .env(CHILD, "1")
@@ -917,6 +957,17 @@ mod tests {
             output.status.success(),
             "child failed: stdout={} stderr={}",
             String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("running 1 test"),
+            "child selector did not execute exactly one test: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("CSF12_ROOT_BIND result="),
+            "child did not emit native-stage evidence: stderr={}",
             String::from_utf8_lossy(&output.stderr)
         );
         assert!(!root_b.join("source").exists());
@@ -953,6 +1004,80 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn retained_directory_rights_diagnostic_matrix() {
+        let candidate = GENERIC_READ | GENERIC_WRITE | READ_CONTROL;
+        let rows = [
+            ("broad", candidate | DELETE | WRITE_DAC | WRITE_OWNER, false),
+            ("candidate", candidate, true),
+            ("candidate_plus_delete", candidate | DELETE, false),
+            (
+                "candidate_plus_security_write",
+                candidate | WRITE_DAC | WRITE_OWNER,
+                false,
+            ),
+            ("read_control_only", GENERIC_READ | READ_CONTROL, false),
+        ];
+        let mut candidate_passed = false;
+        let mut observed = 0;
+
+        for (label, access, is_candidate) in rows {
+            let root = tempfile::tempdir().unwrap();
+            let private = PrivateDir::root(root.path()).unwrap();
+            let mut target = private.open("x", true, true).unwrap().unwrap();
+            target.write_all(b"old").unwrap();
+            target.sync_all().unwrap();
+            drop(target);
+            let mut source = private.open("source", true, true).unwrap().unwrap();
+            source.write_all(b"new").unwrap();
+            source.sync_all().unwrap();
+            let admin_id = identity(&file_info(private.file.as_raw_handle().cast()).unwrap());
+            let retained = match directory_with_access(root.path(), access) {
+                Ok(file) => file,
+                Err(code) => {
+                    writeln!(
+                        std::io::stderr(),
+                        "CSF12_RIGHTS label={label} access=0x{access:08x} open_error={code}"
+                    )
+                    .unwrap();
+                    continue;
+                }
+            };
+            let validation = validate(retained.as_raw_handle().cast(), true, &private.sid);
+            let identity_matches = file_info(retained.as_raw_handle().cast())
+                .map(|info| identity(&info) == admin_id)
+                .unwrap_or(false);
+            drop(private);
+
+            let flush_before = flush_code(&retained);
+            faults::reset_operations();
+            let rename = rename_open_file(&source, &retained, "x", true);
+            let attempts = faults::take_rename_attempts();
+            let flush_after = flush_code(&retained);
+            writeln!(
+                std::io::stderr(),
+                "CSF12_RIGHTS label={label} access=0x{access:08x} validation={validation:?} identity={identity_matches} flush_before={flush_before} rename={rename:?} attempts={attempts:?} flush_after={flush_after}"
+            )
+            .unwrap();
+            assert_eq!(attempts.len(), 1, "{label} must make one native call");
+            observed += 1;
+            if is_candidate {
+                candidate_passed = validation == Ok(())
+                    && identity_matches
+                    && flush_before == ERROR_SUCCESS
+                    && rename == Ok(())
+                    && attempts == [ERROR_SUCCESS]
+                    && flush_after == ERROR_SUCCESS;
+            }
+        }
+
+        assert_eq!(observed, rows.len(), "every rights row must reach rename");
+        assert!(
+            candidate_passed,
+            "candidate retained-directory rights did not preserve the full contract"
+        );
     }
 
     #[test]
