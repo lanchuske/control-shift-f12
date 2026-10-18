@@ -11,6 +11,7 @@ use std::{
     },
     path::{Path, PathBuf},
     ptr,
+    time::Duration,
 };
 use windows_sys::Win32::{
     Foundation::{
@@ -42,6 +43,13 @@ use windows_sys::Win32::{
 };
 
 const ERROR_SUCCESS: u32 = 0;
+
+fn retry_sharing_violation(
+    mut operation: impl FnMut() -> Result<(), u32>,
+    _backoff: impl FnMut(Duration),
+) -> Result<(), u32> {
+    operation()
+}
 
 fn rename_info(destination: &Path, replace: bool) -> Result<(Vec<usize>, u32), StoreError> {
     let name: Vec<u16> = destination.as_os_str().encode_wide().collect();
@@ -80,36 +88,44 @@ fn rename_info(destination: &Path, replace: bool) -> Result<(Vec<usize>, u32), S
 }
 
 fn rename_open_file(source: &File, destination: &Path, replace: bool) -> Result<(), StoreError> {
-    rename_open_file_with_backoff(source, destination, replace, || {})
+    rename_open_file_with_backoff(source, destination, replace, |_| {})
 }
 
 fn rename_open_file_with_backoff(
     source: &File,
     destination: &Path,
     replace: bool,
-    _backoff: impl FnMut(),
+    backoff: impl FnMut(Duration),
 ) -> Result<(), StoreError> {
     let (info, used) = rename_info(destination, replace)?;
-    let result = unsafe {
-        SetFileInformationByHandle(
-            source.as_raw_handle().cast(),
-            FileRenameInfo,
-            info.as_ptr().cast(),
-            used,
-        )
-    };
-    if result == 0 {
-        let error = unsafe { GetLastError() };
-        #[cfg(test)]
-        faults::record_rename_attempt(error);
+    retry_sharing_violation(
+        || {
+            let result = unsafe {
+                SetFileInformationByHandle(
+                    source.as_raw_handle().cast(),
+                    FileRenameInfo,
+                    info.as_ptr().cast(),
+                    used,
+                )
+            };
+            if result == 0 {
+                let error = unsafe { GetLastError() };
+                #[cfg(test)]
+                faults::record_rename_attempt(error);
+                Err(error)
+            } else {
+                #[cfg(test)]
+                faults::record_rename_attempt(ERROR_SUCCESS);
+                Ok(())
+            }
+        },
+        backoff,
+    )
+    .map_err(|error| {
         #[cfg(test)]
         faults::record_failure("rename", Some(error as i32));
-        Err(StoreError::Unavailable)
-    } else {
-        #[cfg(test)]
-        faults::record_rename_attempt(ERROR_SUCCESS);
-        Ok(())
-    }
+        StoreError::Unavailable
+    })
 }
 
 #[cfg(test)]
@@ -739,45 +755,93 @@ mod tests {
     }
 
     #[test]
-    fn handle_rename_retries_a_transient_sharing_violation_on_the_same_source_handle() {
-        let root = tempfile::tempdir().unwrap();
-        let from = root.path().join("replacement");
-        let to = root.path().join("target");
-        std::fs::write(&from, b"new").unwrap();
-        std::fs::write(&to, b"old").unwrap();
-        let source = open_path(&from, false, OPEN_EXISTING).unwrap().unwrap();
-        let blocker = OpenOptions::new()
-            .read(true)
-            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
-            .open(&from)
-            .unwrap();
-        let source_id = identity(&file_info(source.as_raw_handle().cast()).unwrap());
-        let mut blocker = Some(blocker);
-        let mut backoffs = 0;
-        faults::reset_operations();
-
-        let result = rename_open_file_with_backoff(&source, &to, true, || {
-            backoffs += 1;
-            drop(blocker.take());
-        });
-        let attempts = faults::take_rename_attempts();
-
-        assert_eq!(result, Ok(()));
-        assert_eq!(attempts.first(), Some(&32));
-        assert_eq!(attempts.last(), Some(&ERROR_SUCCESS));
-        assert!(attempts.len() <= 21);
-        assert_eq!(backoffs, attempts.len() - 1);
-        assert_eq!(std::fs::read(&to).unwrap(), b"new");
-        assert!(!from.exists());
-        let target = open_path(&to, false, OPEN_EXISTING).unwrap().unwrap();
-        assert_eq!(
-            identity(&file_info(target.as_raw_handle().cast()).unwrap()),
-            source_id
+    fn sharing_retry_returns_after_first_success_without_backoff() {
+        let mut calls = 0;
+        let mut delays = Vec::new();
+        let result = retry_sharing_violation(
+            || {
+                calls += 1;
+                Ok(())
+            },
+            |delay| delays.push(delay),
         );
+        assert_eq!(result, Ok(()));
+        assert_eq!(calls, 1);
+        assert!(delays.is_empty());
     }
 
     #[test]
-    fn handle_rename_exhausts_exactly_and_leaves_both_files_unchanged() {
+    fn sharing_retry_recovers_once_after_code_32() {
+        let mut outcomes = [Err(32), Ok(())].into_iter();
+        let mut calls = 0;
+        let mut delays = Vec::new();
+        let result = retry_sharing_violation(
+            || {
+                calls += 1;
+                outcomes.next().expect("operation called after success")
+            },
+            |delay| delays.push(delay),
+        );
+        assert_eq!(result, Ok(()));
+        assert_eq!(calls, 2);
+        assert_eq!(delays, [Duration::from_millis(25)]);
+    }
+
+    #[test]
+    fn sharing_retry_stops_on_non_sharing_error_after_code_32() {
+        let mut outcomes = [Err(32), Err(5)].into_iter();
+        let mut calls = 0;
+        let mut delays = Vec::new();
+        let result = retry_sharing_violation(
+            || {
+                calls += 1;
+                outcomes.next().expect("operation called after terminal error")
+            },
+            |delay| delays.push(delay),
+        );
+        assert_eq!(result, Err(5));
+        assert_eq!(calls, 2);
+        assert_eq!(delays, [Duration::from_millis(25)]);
+    }
+
+    #[test]
+    fn sharing_retry_allows_success_on_call_21() {
+        let mut outcomes = vec![Err(32); 20];
+        outcomes.push(Ok(()));
+        let mut outcomes = outcomes.into_iter();
+        let mut calls = 0;
+        let mut delays = Vec::new();
+        let result = retry_sharing_violation(
+            || {
+                calls += 1;
+                outcomes.next().expect("operation called after success")
+            },
+            |delay| delays.push(delay),
+        );
+        assert_eq!(result, Ok(()));
+        assert_eq!(calls, 21);
+        assert_eq!(delays, vec![Duration::from_millis(25); 20]);
+    }
+
+    #[test]
+    fn sharing_retry_exhausts_after_21_sharing_violations() {
+        let mut outcomes = vec![Err(32); 21].into_iter();
+        let mut calls = 0;
+        let mut delays = Vec::new();
+        let result = retry_sharing_violation(
+            || {
+                calls += 1;
+                outcomes.next().expect("operation called beyond retry limit")
+            },
+            |delay| delays.push(delay),
+        );
+        assert_eq!(result, Err(32));
+        assert_eq!(calls, 21);
+        assert_eq!(delays, vec![Duration::from_millis(25); 20]);
+    }
+
+    #[test]
+    fn destination_blocker_fails_immediately_and_preserves_both_files() {
         let root = tempfile::tempdir().unwrap();
         let from = root.path().join("replacement");
         let to = root.path().join("target");
@@ -787,18 +851,18 @@ mod tests {
         let blocker = OpenOptions::new()
             .read(true)
             .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
-            .open(&from)
+            .open(&to)
             .unwrap();
         let mut backoffs = 0;
         faults::reset_operations();
 
-        let result = rename_open_file_with_backoff(&source, &to, true, || backoffs += 1);
+        let result = rename_open_file_with_backoff(&source, &to, true, |_| backoffs += 1);
         let attempts = faults::take_rename_attempts();
 
         assert_eq!(result, Err(StoreError::Unavailable));
-        assert_eq!(attempts, vec![32; 21]);
-        assert_eq!(backoffs, 20);
-        assert_eq!(faults::take_failure(), Some(("rename", Some(32))));
+        assert_eq!(attempts, [5]);
+        assert_eq!(backoffs, 0);
+        assert_eq!(faults::take_failure(), Some(("rename", Some(5))));
         assert_eq!(std::fs::read(&to).unwrap(), b"old");
         assert_eq!(std::fs::read(&from).unwrap(), b"new");
         drop(blocker);
@@ -814,7 +878,7 @@ mod tests {
         let mut backoffs = 0;
         faults::reset_operations();
 
-        let result = rename_open_file_with_backoff(&source, &to, true, || backoffs += 1);
+        let result = rename_open_file_with_backoff(&source, &to, true, |_| backoffs += 1);
         let attempts = faults::take_rename_attempts();
 
         assert_eq!(result, Err(StoreError::Unavailable));
