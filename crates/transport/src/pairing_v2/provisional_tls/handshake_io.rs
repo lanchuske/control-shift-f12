@@ -890,7 +890,25 @@ impl HandshakeCompletePendingAuthority {
         .await;
         match result {
             Ok(Ok(())) => Ok(()),
-            Ok(Err(_)) | Err(_) => {
+            Ok(Err(_)) => {
+                #[cfg(test)]
+                eprintln!(
+                    "distributed durable exchange rejected for role {:?}",
+                    self.role
+                );
+                self.failed.store(true, Ordering::Release);
+                self._channel.connection.close(
+                    APPLICATION_ERROR.into(),
+                    b"durable commit proof rejected or timed out",
+                );
+                Err(HandshakeError::Rejected)
+            }
+            Err(_) => {
+                #[cfg(test)]
+                eprintln!(
+                    "distributed durable exchange timed out for role {:?}",
+                    self.role
+                );
                 self.failed.store(true, Ordering::Release);
                 self._channel.connection.close(
                     APPLICATION_ERROR.into(),
@@ -986,6 +1004,12 @@ impl HandshakeCompletePendingAuthority {
                     .map_err(|_| HandshakeError::Rejected)?;
                 decode_durable_commit_ack(&remote_ack, &key, &statement, local_commit_hash)
                     .map_err(|_| HandshakeError::Rejected)?;
+                stream.send.finish().map_err(|_| HandshakeError::Rejected)?;
+                let complete = finalization_read(&mut stream.recv)
+                    .await
+                    .map_err(|_| HandshakeError::Rejected)?;
+                decode_durable_commit_complete(&complete, &key, &statement)
+                    .map_err(|_| HandshakeError::Rejected)?;
             } else {
                 let remote_ack = finalization_read(&mut stream.recv)
                     .await
@@ -1006,8 +1030,15 @@ impl HandshakeCompletePendingAuthority {
                 {
                     return Err(HandshakeError::Rejected);
                 }
+                let complete = finalization_record(
+                    "durable-commit-complete",
+                    &durable_commit_values(&statement),
+                    &key,
+                )
+                .map_err(|_| HandshakeError::Rejected)?;
+                finalization_send(&mut stream, &complete).await?;
+                stream.send.finish().map_err(|_| HandshakeError::Rejected)?;
             }
-            stream.send.finish().map_err(|_| HandshakeError::Rejected)?;
             stream.clean = true;
             Ok::<_, HandshakeError>(())
         };
@@ -1553,6 +1584,36 @@ fn decode_durable_commit(
         return Err(Invalid);
     }
     Ok(Sha256::digest(raw).into())
+}
+
+fn decode_durable_commit_complete(
+    raw: &[u8],
+    key: &[u8; 32],
+    expected: &LocalDurableCommit,
+) -> Result<(), Invalid> {
+    let values = decode(
+        "durable-commit-complete",
+        raw,
+        &[2, 2, 2, 2, 1, 1, 1, 1, 1, 2],
+    )?;
+    let mut unsigned = values.clone();
+    let mac = bytes32(&unsigned.pop().ok_or(Invalid)?)?;
+    let body = encode("durable-commit-complete", &unsigned)?;
+    if finalization_mac(key, b"durable-commit-complete", &body)? != mac
+        || BilateralTransactionId::from_bytes(bytes32(&unsigned[0])?).map_err(|_| Invalid)?
+            != expected.transaction_id
+        || bytes32(&unsigned[1])? != expected.peer_receipt_hash
+        || bytes32(&unsigned[2])? != expected.local_receipt_hash
+        || bytes32(&unsigned[3])? != expected.transcript
+        || number(&unsigned[4])? != expected.peer_identity_generation
+        || number(&unsigned[5])? != expected.peer_revocation_generation
+        || number(&unsigned[6])? != expected.identity_generation
+        || number(&unsigned[7])? != expected.revocation_generation
+        || number(&unsigned[8])? != expected.policy_revision
+    {
+        return Err(Invalid);
+    }
+    Ok(())
 }
 
 fn durable_commit_ack_values(

@@ -3698,8 +3698,10 @@ async fn bilateral_two_process_distributed_commit_reopens_confirmed() {
             endpoint.local_addr().unwrap().to_string(),
         )
         .env("CSF12_DISTRIBUTED_COMMIT_STORE", child_root.path())
+        .env("CSF12_DISTRIBUTED_COMMIT_HOLD_AFTER", "1")
         .env("CSF12_DISTRIBUTED_LOCAL_RENDEZVOUS", "211")
         .env("CSF12_DISTRIBUTED_PEER_RENDEZVOUS", "212")
+        .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
@@ -3749,6 +3751,17 @@ async fn bilateral_two_process_distributed_commit_reopens_confirmed() {
         reopened.reconcile(attempt).unwrap(),
         crate::pairing_v2::admission_authority::ReconcileAdmission::Promoted
     );
+
+    if let Err(error) =
+        std::io::Write::write_all(child.0.as_mut().unwrap().stdin.as_mut().unwrap(), b"exit\n")
+    {
+        let output = child.0.take().unwrap().wait_with_output().unwrap();
+        panic!(
+            "child exited before release: {error}; status {:?}; stderr {}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     while child.0.as_mut().unwrap().try_wait().unwrap().is_none() {
@@ -3946,6 +3959,15 @@ fn distributed_commit_process_worker() {
                 crate::pairing_v2::admission_authority::ReconcileAdmission::Promoted
             );
             println!("DISTRIBUTED_CONFIRMED");
+            if std::env::var_os("CSF12_DISTRIBUTED_COMMIT_HOLD_AFTER").is_some() {
+                tokio::task::spawn_blocking(|| {
+                    let mut line = String::new();
+                    std::io::stdin().read_line(&mut line).unwrap();
+                    assert_eq!(line, "exit\n");
+                })
+                .await
+                .unwrap();
+            }
         });
 }
 

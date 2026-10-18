@@ -45,10 +45,28 @@ pub enum ReconcileAdmission {
 
 /// Opaque metadata result for G4. It is deliberately not a transport, input,
 /// clipboard, layout or operational-session capability.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DistributedAdmissionSummary {
     attempt: [u8; 32],
     state: ReconcileAdmission,
+    completion: Option<super::provisional_tls::DistributedFrozenHandshakeAuthority>,
+}
+
+impl std::fmt::Debug for DistributedAdmissionSummary {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DistributedAdmissionSummary")
+            .field("attempt", &self.attempt)
+            .field("state", &self.state)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for DistributedAdmissionSummary {
+    fn drop(&mut self) {
+        if let Some(completion) = self.completion.take() {
+            completion.close_confirmed();
+        }
+    }
 }
 
 /// Public G4 boundary for a UI: it exposes only user verification and the
@@ -374,10 +392,16 @@ impl<'a> PreparedBilateralCommit<'a> {
         )?;
         self.receipt = Some(confirmed);
         self.phase = BilateralCommitPhase::Confirmed;
-        if let Some(frozen) = self.distributed_frozen.take() {
-            frozen.close_confirmed();
-        }
         Ok(())
+    }
+
+    fn take_completion_lease(
+        &mut self,
+    ) -> Result<super::provisional_tls::DistributedFrozenHandshakeAuthority, StoreError> {
+        if self.phase != BilateralCommitPhase::Confirmed {
+            return Err(StoreError::Invalid);
+        }
+        self.distributed_frozen.take().ok_or(StoreError::Invalid)
     }
 
     fn quarantine(&mut self) {
@@ -1012,6 +1036,7 @@ impl AdmissionAuthorityStore {
             Ok(DistributedAdmissionSummary {
                 attempt,
                 state: ReconcileAdmission::Promoted,
+                completion: Some(commit.take_completion_lease()?),
             })
         }
         .await;
@@ -1029,6 +1054,7 @@ impl AdmissionAuthorityStore {
                 return Ok(DistributedAdmissionSummary {
                     attempt,
                     state: ReconcileAdmission::RemoteOutcomeUnknown,
+                    completion: None,
                 });
             } else {
                 let _ = commit.abort_exact();
