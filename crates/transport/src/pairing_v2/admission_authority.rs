@@ -970,7 +970,7 @@ impl AdmissionAuthorityStore {
         })
     }
 
-    pub fn version(&self) -> Result<StoreVersion, StoreError> {
+    pub(crate) fn version(&self) -> Result<StoreVersion, StoreError> {
         self.store.version()
     }
 
@@ -978,7 +978,7 @@ impl AdmissionAuthorityStore {
         &self.store
     }
 
-    pub async fn commit_distributed(
+    pub(crate) async fn commit_distributed(
         &self,
         authority: super::provisional_tls::HandshakeCompletePendingAuthority,
     ) -> Result<DistributedAdmissionSummary, StoreError> {
@@ -1035,7 +1035,7 @@ impl AdmissionAuthorityStore {
         outcome
     }
 
-    pub fn prepare(
+    pub(crate) fn prepare(
         &self,
         expected: StoreVersion,
         attempt: [u8; 32],
@@ -1044,11 +1044,11 @@ impl AdmissionAuthorityStore {
         self.store.prepare(expected, attempt, peer)
     }
 
-    pub fn pending(&self, attempt: [u8; 32]) -> Result<Option<PendingRecord>, StoreError> {
+    pub(crate) fn pending(&self, attempt: [u8; 32]) -> Result<Option<PendingRecord>, StoreError> {
         self.store.pending(attempt)
     }
 
-    pub fn revoke_candidate(
+    pub(crate) fn revoke_candidate(
         &self,
         expected: StoreVersion,
         peer: [u8; 32],
@@ -1056,11 +1056,15 @@ impl AdmissionAuthorityStore {
         self.store.revoke_candidate(expected, peer)
     }
 
-    pub fn cancel(&self, expected: StoreVersion, attempt: [u8; 32]) -> Result<(), StoreError> {
+    pub(crate) fn cancel(
+        &self,
+        expected: StoreVersion,
+        attempt: [u8; 32],
+    ) -> Result<(), StoreError> {
         self.store.cancel(expected, attempt)
     }
 
-    pub fn reconcile(&self, attempt: [u8; 32]) -> Result<ReconcileAdmission, StoreError> {
+    pub(crate) fn reconcile(&self, attempt: [u8; 32]) -> Result<ReconcileAdmission, StoreError> {
         let observation = self.store.resolve_admission_guard(attempt)?;
         let mut state = self.store.admission_state(attempt)?;
         if observation

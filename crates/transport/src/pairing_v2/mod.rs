@@ -6,6 +6,21 @@
 #[allow(dead_code)] // Internal foundation remains deliberately unwired and default-off.
 pub(crate) mod admission_authority;
 #[cfg(feature = "pairing-v2-g4")]
+/// Opaque G4 admission boundary. Legacy/local-only mutation and reconciliation
+/// methods are intentionally unavailable to external consumers.
+///
+/// ```compile_fail
+/// use seamless_transport::pairing_v2::AdmissionAuthorityStore;
+/// fn bypass(store: &AdmissionAuthorityStore) {
+///     let _ = store.reconcile([0; 32]);
+/// }
+/// ```
+/// ```compile_fail
+/// use seamless_transport::pairing_v2::AdmissionAuthorityStore;
+/// fn bypass(store: &AdmissionAuthorityStore) {
+///     let _ = store.prepare(store.version().unwrap(), [1; 32], [2; 32]);
+/// }
+/// ```
 pub use admission_authority::{
     AdmissionAuthorityStore, DistributedAdmissionSummary, DistributedPairingError,
     ReconcileAdmission, handshake_and_commit_distributed,
