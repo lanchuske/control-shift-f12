@@ -7,6 +7,8 @@ pub mod cursor;
 pub mod diagnostics;
 pub mod display_inventory;
 #[cfg(feature = "pairing-v2-g4")]
+pub mod g4_pairing;
+#[cfg(feature = "pairing-v2-g4")]
 pub mod guided_setup;
 pub mod peer;
 #[cfg(feature = "pairing-v2-g4")]

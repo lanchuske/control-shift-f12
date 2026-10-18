@@ -451,6 +451,249 @@ fn handshake_config(local: u8, remote: u8) -> super::HandshakeConfig {
 }
 
 #[tokio::test]
+async fn g4_pre_admission_ephemeral_endpoint_keeps_identity_private() {
+    let a = ProvisionalEndpoint::bind_ephemeral("127.0.0.1:0".parse().unwrap()).unwrap();
+    let b = ProvisionalEndpoint::bind_ephemeral("127.0.0.1:0".parse().unwrap()).unwrap();
+    let (outgoing, incoming) = tokio::join!(a.connect(b.local_addr().unwrap()), b.accept());
+    let (left, right) = tokio::join!(
+        outgoing
+            .unwrap()
+            .prepare_pre_admission(handshake_config(1, 2)),
+        incoming
+            .unwrap()
+            .prepare_pre_admission(handshake_config(2, 1)),
+    );
+    let (left, right) = tokio::join!(
+        left.unwrap().select_after_window(),
+        right.unwrap().select_after_window()
+    );
+    drop((left.unwrap(), right.unwrap()));
+}
+
+#[tokio::test]
+async fn g4_pre_admission_sole_candidate_can_select_after_bounded_wait() {
+    let (_ea, _eb, a, b, _) = pair().await;
+    let (a, b) = tokio::join!(
+        a.prepare_pre_admission(handshake_config(1, 2)),
+        b.prepare_incoming(
+            super::IncomingHandshakeConfig {
+                device_name: "Incoming peer".into(),
+                os: "macos".into(),
+                local_rendezvous: [2; 16],
+            },
+            |remote| remote == [1; 16]
+        ),
+    );
+    let (a, b) = (a.unwrap(), b.unwrap());
+    let deadline = a.selection_deadline().max(b.selection_deadline());
+    assert!(deadline <= tokio::time::Instant::now() + super::PRE_ADMISSION_SELECTION_WINDOW);
+    let (a, b) = tokio::join!(a.select_after_window(), b.select_after_window());
+    let (a, b) = (a.unwrap(), b.unwrap());
+    assert!(tokio::time::Instant::now() >= deadline);
+    let ta = tempfile::tempdir().unwrap();
+    let tb = tempfile::tempdir().unwrap();
+    let sa = crate::pairing_v2::AdmissionAuthorityStore::open(ta.path()).unwrap();
+    let sb = crate::pairing_v2::AdmissionAuthorityStore::open(tb.path()).unwrap();
+    let (left, right) = tokio::join!(
+        crate::pairing_v2::handshake_selected_and_commit_distributed(&sa, a, |p| async move {
+            p.decision(true)
+        }),
+        crate::pairing_v2::handshake_selected_and_commit_distributed(&sb, b, |p| async move {
+            p.decision(true)
+        }),
+    );
+    assert!(left.unwrap().is_confirmed());
+    assert!(right.unwrap().is_confirmed());
+}
+
+#[tokio::test]
+async fn g4_pre_admission_incoming_unknown_or_stale_catalog_rendezvous_fails_before_sas() {
+    for stale_local in [false, true] {
+        let (_ea, _eb, a, b, _) = pair().await;
+        let validated = std::sync::atomic::AtomicBool::new(false);
+        let (left, right) = tokio::join!(
+            a.prepare_pre_admission(handshake_config(1, 2)),
+            b.prepare_incoming(
+                super::IncomingHandshakeConfig {
+                    device_name: "Incoming peer".into(),
+                    os: "macos".into(),
+                    local_rendezvous: if stale_local { [3; 16] } else { [2; 16] },
+                },
+                |remote| {
+                    validated.store(true, std::sync::atomic::Ordering::SeqCst);
+                    assert_eq!(remote, [1; 16]);
+                    stale_local // unknown remote is not currently in the allowlist
+                }
+            ),
+        );
+        assert!(left.is_err());
+        assert!(right.is_err());
+        assert_eq!(
+            validated.load(std::sync::atomic::Ordering::SeqCst),
+            !stale_local
+        );
+    }
+}
+
+#[tokio::test]
+async fn g4_pre_admission_incoming_malformed_prelude_fails_before_catalog_or_sas() {
+    for mode in 0..5 {
+        let (_ea, _eb, attacker, incoming, _) = pair().await;
+        let exercise = async {
+            let (mut send, _recv) = attacker.connection.open_bi().await.unwrap();
+            let mut offer = b"CSF12-G4-SELECT\0".to_vec();
+            offer.extend_from_slice(&[1; 16]);
+            offer.extend_from_slice(&[2; 16]);
+            match mode {
+                0 => offer[0] ^= 1,
+                1 => offer.push(1),
+                2 => {
+                    offer.pop();
+                }
+                3 => offer[16..32].fill(0),
+                _ => offer[16..32].fill(2),
+            }
+            let _ = send.write_all(&offer).await;
+            let _ = send.finish();
+            tokio::time::timeout(Duration::from_secs(2), attacker.connection.closed())
+                .await
+                .unwrap();
+        };
+        let (result, ()) = tokio::join!(
+            incoming.prepare_incoming(
+                super::IncomingHandshakeConfig {
+                    device_name: "Incoming peer".into(),
+                    os: "macos".into(),
+                    local_rendezvous: [2; 16],
+                },
+                |_| panic!("malformed prelude reached catalog validation")
+            ),
+            exercise,
+        );
+        assert!(result.is_err(), "mode {mode}");
+    }
+}
+
+#[tokio::test]
+async fn g4_pre_admission_rejects_either_rendezvous_mismatch_before_store_or_sas() {
+    for mismatch_local in [false, true] {
+        let (_ea, _eb, a, b, _) = pair().await;
+        let config = if mismatch_local {
+            handshake_config(3, 2)
+        } else {
+            handshake_config(1, 3)
+        };
+        let (left, right) = tokio::join!(
+            a.prepare_pre_admission(config),
+            b.prepare_pre_admission(handshake_config(2, 1)),
+        );
+        assert!(left.is_err());
+        assert!(right.is_err());
+    }
+}
+
+#[tokio::test]
+async fn g4_pre_admission_simultaneous_election_both_orders_closes_loser_before_sas() {
+    for reverse_arrival in [false, true] {
+        // Make TLS-fingerprint A be the *larger* rendezvous, so a fingerprint
+        // election cannot accidentally satisfy this test.
+        let (mut ac, mut ak) = identity(true);
+        let (mut bc, mut bk) = identity(true);
+        if Sha256::digest(&ac).as_slice() < Sha256::digest(&bc).as_slice() {
+            std::mem::swap(&mut ac, &mut bc);
+            std::mem::swap(&mut ak, &mut bk);
+        }
+        let ea = ProvisionalEndpoint::bind("127.0.0.1:0".parse().unwrap(), ac, ak).unwrap();
+        let eb = ProvisionalEndpoint::bind("127.0.0.1:0".parse().unwrap(), bc, bk).unwrap();
+        let (a_out, b_in, b_out, a_in) = tokio::join!(
+            ea.connect(eb.local_addr().unwrap()),
+            eb.accept(),
+            eb.connect(ea.local_addr().unwrap()),
+            ea.accept(),
+        );
+        let (a_out, b_in, b_out, a_in) =
+            (a_out.unwrap(), b_in.unwrap(), b_out.unwrap(), a_in.unwrap());
+        let a_winner = a_out.connection.clone();
+        let b_winner = b_in.connection.clone();
+        let a_loser = a_in.connection.clone();
+        let b_loser = b_out.connection.clone();
+        let ta = tempfile::tempdir().unwrap();
+        let tb = tempfile::tempdir().unwrap();
+        let sa = crate::pairing_v2::AdmissionAuthorityStore::open(ta.path()).unwrap();
+        let sb = crate::pairing_v2::AdmissionAuthorityStore::open(tb.path()).unwrap();
+        let va = sa.version().unwrap();
+        let vb = sb.version().unwrap();
+        let (a_out, b_in, b_out, a_in) = tokio::join!(
+            a_out.prepare_pre_admission(handshake_config(1, 2)),
+            b_in.prepare_pre_admission(handshake_config(2, 1)),
+            b_out.prepare_pre_admission(handshake_config(2, 1)),
+            a_in.prepare_pre_admission(handshake_config(1, 2)),
+        );
+        let (a_out, b_in, b_out, a_in) =
+            (a_out.unwrap(), b_in.unwrap(), b_out.unwrap(), a_in.unwrap());
+        assert!(
+            a_out.selection_deadline()
+                <= tokio::time::Instant::now() + super::PRE_ADMISSION_SELECTION_WINDOW
+        );
+        assert_eq!(sa.version().unwrap(), va);
+        assert_eq!(sb.version().unwrap(), vb);
+        assert!(matches!(
+            ea.scope.0.lock().unwrap().phase,
+            super::ConsentPhase::Active
+        ));
+        assert!(matches!(
+            eb.scope.0.lock().unwrap().phase,
+            super::ConsentPhase::Active
+        ));
+        let (a, b) = if reverse_arrival {
+            (
+                a_in.select(Some(a_out)).unwrap(),
+                b_in.select(Some(b_out)).unwrap(),
+            )
+        } else {
+            (
+                a_out.select(Some(a_in)).unwrap(),
+                b_out.select(Some(b_in)).unwrap(),
+            )
+        };
+        tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::join!(a_loser.closed(), b_loser.closed());
+        })
+        .await
+        .unwrap();
+        assert!(a_winner.close_reason().is_none());
+        assert!(b_winner.close_reason().is_none());
+        assert_eq!(sa.version().unwrap(), va);
+        assert_eq!(sb.version().unwrap(), vb);
+        assert!(matches!(
+            ea.scope.0.lock().unwrap().phase,
+            super::ConsentPhase::Active
+        ));
+        assert!(matches!(
+            eb.scope.0.lock().unwrap().phase,
+            super::ConsentPhase::Active
+        ));
+        let prompts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let left_prompts = prompts.clone();
+        let right_prompts = prompts.clone();
+        assert_eq!(prompts.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let (left, right) = tokio::join!(
+            crate::pairing_v2::handshake_selected_and_commit_distributed(&sa, a, |p| async move {
+                left_prompts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                p.decision(false)
+            }),
+            crate::pairing_v2::handshake_selected_and_commit_distributed(&sb, b, |p| async move {
+                right_prompts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                p.decision(false)
+            }),
+        );
+        assert!(left.is_err());
+        assert!(right.is_err());
+        assert!(prompts.load(std::sync::atomic::Ordering::SeqCst) > 0);
+    }
+}
+
+#[tokio::test]
 async fn one_local_sas_approval_never_commits_a_relationship() {
     let (_ea, _eb, a, b, _) = pair().await;
     let ta = tempfile::tempdir().unwrap();

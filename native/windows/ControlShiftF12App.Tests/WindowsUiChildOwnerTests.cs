@@ -81,7 +81,7 @@ public sealed class WindowsUiChildOwnerTests
         var spec = new ChildLaunchSpec(executable, [], environment!);
         await using var owner = await WindowsUiChildOwner.StartAsync(spec);
         await owner.ReadInitialProjectionAsync(TimeSpan.FromSeconds(5));
-        var blockedRead = owner.RefreshAsync(TimeSpan.FromSeconds(30));
+        var blockedRead = owner.ObserveAsync(TimeSpan.FromSeconds(30));
         await Task.Delay(50);
 
         var close = owner.CloseAsync();
@@ -129,7 +129,7 @@ public sealed class WindowsUiChildOwnerTests
         for (var refresh = 0; refresh < 2; refresh++)
         {
             previousGeneration = owner.Session.Snapshot!.Generation;
-            var refreshed = await owner.RefreshAsync(TimeSpan.FromSeconds(5));
+            var refreshed = await owner.ObserveAsync(TimeSpan.FromSeconds(5));
             Assert.True(refreshed.Snapshot!.Generation > previousGeneration);
             Assert.Equal("browsing", refreshed.Snapshot.State);
         }

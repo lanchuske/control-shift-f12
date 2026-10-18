@@ -744,6 +744,25 @@ pub(crate) enum BilateralRecoveryDisposition {
     AbortExact,
 }
 
+#[cfg(feature = "pairing-v2-g4")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum DurableAdmissionClass {
+    Confirmed,
+    Quarantined,
+}
+
+/// Minimal internal projection used to derive a public opaque catalog handle.
+/// It is never serialized and deliberately carries no receipt or runtime lease.
+#[cfg(feature = "pairing-v2-g4")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct DurableAdmissionTuple {
+    pub(crate) attempt: [u8; 32],
+    pub(crate) peer: [u8; 32],
+    pub(crate) peer_pin: [u8; 32],
+    pub(crate) transaction: [u8; 32],
+    pub(crate) class: DurableAdmissionClass,
+}
+
 /// Durable bilateral status attached to every admission receipt. A local
 /// receipt starts prepared, then can become store-owned but remains inactive
 /// until a later authenticated peer confirmation changes it to confirmed.
@@ -2991,6 +3010,50 @@ mod unix {
             ))
         }
 
+        #[cfg(feature = "pairing-v2-g4")]
+        pub(crate) fn durable_admissions(&self) -> Result<Vec<DurableAdmissionTuple>, StoreError> {
+            let _lock = self.ledger_dir.lock()?;
+            let ledger = self.load_validated_manifest()?;
+            let mut entries = BTreeSet::new();
+            for receipt in &ledger.admission_receipts {
+                let active = receipt.identity_generation == ledger.version.identity_generation
+                    && receipt.revocation_generation == ledger.revocation(receipt.peer)
+                    && receipt.policy_revision == ledger.policy_revision
+                    && receipt.ownership.is_store_owned()
+                    && ledger.active_pins.iter().any(|pin| {
+                        pin.peer == receipt.peer
+                            && pin.pin == receipt.peer_pin
+                            && pin.identity_generation == receipt.identity_generation
+                            && pin.revocation_generation == receipt.revocation_generation
+                    });
+                if !active {
+                    continue;
+                }
+                let class = match receipt.bilateral.state {
+                    BilateralAdmissionState::BilateralConfirmed => DurableAdmissionClass::Confirmed,
+                    BilateralAdmissionState::StoreOwnedAwaitingPeer => {
+                        DurableAdmissionClass::Quarantined
+                    }
+                    BilateralAdmissionState::Prepared | BilateralAdmissionState::Aborted => {
+                        continue;
+                    }
+                };
+                if !entries.insert(DurableAdmissionTuple {
+                    attempt: receipt.attempt,
+                    peer: receipt.peer,
+                    peer_pin: receipt.peer_pin,
+                    transaction: receipt.bilateral.transaction_id.as_bytes(),
+                    class,
+                }) {
+                    return Err(StoreError::Invalid);
+                }
+                if entries.len() > MAX_HISTORY {
+                    return Err(StoreError::Limit);
+                }
+            }
+            Ok(entries.into_iter().collect())
+        }
+
         /// Classifies persisted bilateral metadata after reopening storage.
         /// It deliberately does not create an operational snapshot: even a
         /// locally confirmed receipt must obtain a fresh authenticated peer
@@ -3266,6 +3329,10 @@ impl PendingStore {
         &self,
         _proof: crate::pairing_v2::VerifiedRecoveryUse,
     ) -> Result<(), StoreError> {
+        Err(StoreError::UnsupportedPlatform)
+    }
+    #[cfg(feature = "pairing-v2-g4")]
+    pub(crate) fn durable_admissions(&self) -> Result<Vec<DurableAdmissionTuple>, StoreError> {
         Err(StoreError::UnsupportedPlatform)
     }
     /// Windows must acquire tested owner-only ACL/reparse-point storage before writes are enabled.

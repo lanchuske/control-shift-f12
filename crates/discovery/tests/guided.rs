@@ -38,20 +38,46 @@ fn consent_window_and_current_handle_are_required_without_implicit_retry() {
 fn capacity_and_address_bounds_precede_untrusted_catalogue_storage() {
     let mut catalog = ConsentCatalog::default();
     catalog.open(0).unwrap();
-    for n in 1..=20 {
+    for n in 1..=32 {
         catalog.observe(advertisement(n), 1).unwrap();
     }
     assert_eq!(
-        catalog.observe(advertisement(21), 1),
+        catalog.observe(advertisement(33), 1),
         Err(DiscoveryError::Limit)
     );
-    assert_eq!(catalog.candidates(1).unwrap().len(), 20);
+    assert_eq!(catalog.candidates(1).unwrap().len(), 32);
     let mut peer = advertisement(1);
     peer.addresses = (1..=9)
         .map(|n| format!("127.0.0.1:{}", 7000 + n).parse().unwrap())
         .collect();
     assert_eq!(catalog.observe(peer, 1), Err(DiscoveryError::Invalid));
-    assert_eq!(catalog.candidates(1).unwrap().len(), 20);
+    assert_eq!(catalog.candidates(1).unwrap().len(), 32);
+}
+
+#[test]
+fn g4_select_is_current_atomic_single_use_and_bounded() {
+    let mut catalog = ConsentCatalog::default();
+    catalog.open(0).unwrap();
+    let mut handles = Vec::new();
+    for n in 1..=32 {
+        handles.push(catalog.observe(advertisement(n), 1).unwrap());
+    }
+    assert_eq!(catalog.candidates(1).unwrap().len(), 32);
+    assert_eq!(
+        catalog.observe(advertisement(33), 1),
+        Err(DiscoveryError::Limit)
+    );
+
+    let selected = catalog.select_once(handles[0], 2).unwrap();
+    assert_eq!(selected.handle, handles[0]);
+    assert_eq!(
+        catalog.select_once(handles[0], 3),
+        Err(DiscoveryError::Closed)
+    );
+    assert_eq!(
+        catalog.select_once(handles[1], 3),
+        Err(DiscoveryError::Closed)
+    );
 }
 
 #[test]

@@ -43,6 +43,31 @@ pub enum ReconcileAdmission {
     Absent,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DurableAdmissionState {
+    Confirmed,
+    Quarantined,
+}
+
+/// Bounded durable catalog entry for G4 presentation. The identifier is a
+/// domain-separated digest of the exact durable tuple; it exposes no peer key,
+/// pin, attempt, path, receipt, transport, or runtime authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DurableAdmission {
+    opaque_id: [u8; 32],
+    state: DurableAdmissionState,
+}
+
+impl DurableAdmission {
+    pub fn opaque_id(&self) -> [u8; 32] {
+        self.opaque_id
+    }
+
+    pub fn state(&self) -> DurableAdmissionState {
+        self.state
+    }
+}
+
 /// Opaque metadata result for G4. It is deliberately not a transport, input,
 /// clipboard, layout or operational-session capability.
 pub struct DistributedAdmissionSummary {
@@ -93,6 +118,37 @@ where
 {
     let authority = channel
         .handshake(config, &store.store, confirm)
+        .await
+        .map_err(|error| match error {
+            super::provisional_tls::HandshakeError::Cancelled => DistributedPairingError::Cancelled,
+            super::provisional_tls::HandshakeError::Rejected => DistributedPairingError::Rejected,
+        })?;
+    store
+        .commit_distributed(authority)
+        .await
+        .map_err(|_| DistributedPairingError::Storage)
+}
+
+/// Explicit product G4 entry: only a transport-elected, move-only winner can
+/// reach replay consumption, SAS, reservation and durable admission here.
+/// ```compile_fail
+/// use seamless_transport::pairing_v2::{AdmissionAuthorityStore, handshake_selected_and_commit_distributed};
+/// use seamless_transport::pairing_v2::provisional_tls::ProvisionalChannel;
+/// async fn bypass(store: &AdmissionAuthorityStore, channel: ProvisionalChannel) {
+///     let _ = handshake_selected_and_commit_distributed(store, channel, |p| async move { p.decision(true) }).await;
+/// }
+/// ```
+pub async fn handshake_selected_and_commit_distributed<F, Fut>(
+    store: &AdmissionAuthorityStore,
+    winner: super::provisional_tls::SelectedPreAdmission,
+    confirm: F,
+) -> Result<DistributedAdmissionSummary, DistributedPairingError>
+where
+    F: FnOnce(super::provisional_tls::VerificationPrompt) -> Fut,
+    Fut: std::future::Future<Output = super::provisional_tls::VerificationDecision>,
+{
+    let authority = winner
+        .handshake(&store.store, confirm)
         .await
         .map_err(|error| match error {
             super::provisional_tls::HandshakeError::Cancelled => DistributedPairingError::Cancelled,
@@ -1074,6 +1130,38 @@ impl AdmissionAuthorityStore {
 
     pub(crate) fn pending(&self, attempt: [u8; 32]) -> Result<Option<PendingRecord>, StoreError> {
         self.store.pending(attempt)
+    }
+
+    /// Enumerates only active durable G4 admissions. This read grants no
+    /// operational lease and never reconstructs authority outside PendingStore.
+    pub fn durable_admissions(&self) -> Result<Vec<DurableAdmission>, StoreError> {
+        use crate::pairing_pending::DurableAdmissionClass;
+        use sha2::{Digest, Sha256};
+        use std::collections::BTreeSet;
+
+        let mut opaque_ids = BTreeSet::new();
+        let mut entries = Vec::new();
+        for tuple in self.store.durable_admissions()? {
+            let mut digest = Sha256::new();
+            digest.update(b"control-shift-f12/g4-durable-admission-opaque-v1\0");
+            digest.update(tuple.attempt);
+            digest.update(tuple.peer);
+            digest.update(tuple.peer_pin);
+            digest.update(tuple.transaction);
+            let opaque_id: [u8; 32] = digest.finalize().into();
+            if opaque_id == [0; 32] || !opaque_ids.insert(opaque_id) {
+                return Err(StoreError::Invalid);
+            }
+            entries.push(DurableAdmission {
+                opaque_id,
+                state: match tuple.class {
+                    DurableAdmissionClass::Confirmed => DurableAdmissionState::Confirmed,
+                    DurableAdmissionClass::Quarantined => DurableAdmissionState::Quarantined,
+                },
+            });
+        }
+        entries.sort_unstable_by_key(DurableAdmission::opaque_id);
+        Ok(entries)
     }
 
     pub(crate) fn revoke_candidate(
@@ -2146,6 +2234,129 @@ mod tests {
         .unwrap();
         assert_eq!(store.version(), Err(StoreError::Invalid));
         assert!(AdmissionAuthorityStore::open(root.path()).is_err());
+    }
+
+    #[test]
+    fn durable_catalog_lists_only_confirmed_and_quarantined_as_stable_opaque_entries() {
+        let root = tempfile::tempdir().unwrap();
+        let store = AdmissionAuthorityStore::open(root.path()).unwrap();
+
+        let quarantined = store
+            .prepare(store.version().unwrap(), [211; 32], [212; 32])
+            .unwrap();
+        store
+            .commit_metadata(
+                store.version().unwrap(),
+                quarantined.revocation_generation,
+                &quarantined,
+                evidence(&quarantined),
+            )
+            .unwrap();
+
+        let confirmed = store
+            .prepare(store.version().unwrap(), [213; 32], [214; 32])
+            .unwrap();
+        store
+            .commit_metadata(
+                store.version().unwrap(),
+                confirmed.revocation_generation,
+                &confirmed,
+                evidence(&confirmed),
+            )
+            .unwrap();
+        let confirmed_receipt = store
+            .test_bilateral_receipt(confirmed.attempt_id)
+            .unwrap()
+            .unwrap();
+        store
+            .store
+            .confirm_bilateral_receipt(
+                store.version().unwrap(),
+                confirmed.attempt_id,
+                confirmed_receipt.bilateral.transaction_id,
+                confirmed_receipt.bilateral.local_receipt_hash,
+                [215; 32],
+            )
+            .unwrap();
+
+        let staged = store
+            .prepare(store.version().unwrap(), [216; 32], [217; 32])
+            .unwrap();
+        let staged_version = store.version().unwrap();
+        store
+            .store
+            .stage_sealed_admission(
+                staged_version,
+                &staged,
+                &awaiting_receipt(&staged, staged_version),
+            )
+            .unwrap();
+
+        let revoked = store
+            .prepare(store.version().unwrap(), [218; 32], [219; 32])
+            .unwrap();
+        store
+            .commit_metadata(
+                store.version().unwrap(),
+                revoked.revocation_generation,
+                &revoked,
+                evidence(&revoked),
+            )
+            .unwrap();
+        store
+            .revoke_candidate(store.version().unwrap(), revoked.peer_fingerprint)
+            .unwrap();
+
+        let catalog = store.durable_admissions().unwrap();
+        assert_eq!(catalog.len(), 2);
+        assert_eq!(
+            catalog
+                .iter()
+                .filter(|entry| entry.state() == DurableAdmissionState::Confirmed)
+                .count(),
+            1
+        );
+        assert_eq!(
+            catalog
+                .iter()
+                .filter(|entry| entry.state() == DurableAdmissionState::Quarantined)
+                .count(),
+            1
+        );
+        assert!(catalog.iter().all(|entry| entry.opaque_id() != [0; 32]));
+        assert_ne!(catalog[0].opaque_id(), catalog[1].opaque_id());
+
+        let reopened = AdmissionAuthorityStore::open(root.path()).unwrap();
+        assert_eq!(reopened.durable_admissions().unwrap(), catalog);
+    }
+
+    #[test]
+    fn durable_catalog_fails_closed_on_duplicate_or_corrupt_receipt() {
+        let root = tempfile::tempdir().unwrap();
+        let store = AdmissionAuthorityStore::open(root.path()).unwrap();
+        let record = store
+            .prepare(store.version().unwrap(), [220; 32], [221; 32])
+            .unwrap();
+        store
+            .commit_metadata(
+                store.version().unwrap(),
+                record.revocation_generation,
+                &record,
+                evidence(&record),
+            )
+            .unwrap();
+
+        let ledger_path = root.path().join("pairing-tombstones/ledger.json");
+        let mut ledger: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&ledger_path).unwrap()).unwrap();
+        let duplicate = ledger["admission_receipts"][0].clone();
+        ledger["admission_receipts"]
+            .as_array_mut()
+            .unwrap()
+            .push(duplicate);
+        std::fs::write(&ledger_path, serde_json::to_vec(&ledger).unwrap()).unwrap();
+
+        assert_eq!(store.durable_admissions(), Err(StoreError::Invalid));
     }
 
     #[test]

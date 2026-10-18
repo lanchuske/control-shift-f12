@@ -28,8 +28,9 @@ pub(crate) use handshake_io::{
     LocalFinalizationReceipt, PeerFinalizationReceipt, PreparedHandshakeAuthority,
 };
 pub use handshake_io::{
-    HandshakeCompletePendingAuthority, HandshakeConfig, HandshakeError, VerificationDecision,
-    VerificationPrompt,
+    HandshakeCompletePendingAuthority, HandshakeConfig, HandshakeError, IncomingHandshakeConfig,
+    PRE_ADMISSION_SELECTION_WINDOW, PreAdmissionCandidate, SelectedPreAdmission,
+    VerificationDecision, VerificationPrompt,
 };
 fn utc() -> Result<i64, Invalid> {
     i64::try_from(
@@ -666,6 +667,25 @@ impl EndpointDropPauseHandle {
     }
 }
 impl ProvisionalEndpoint {
+    /// Creates an endpoint-local provisional identity. Neither the private key
+    /// nor a raw connection is returned to the product pairing coordinator.
+    pub fn bind_ephemeral(address: std::net::SocketAddr) -> Result<Self, Invalid> {
+        let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).map_err(|_| Invalid)?;
+        let mut parameters = rcgen::CertificateParams::default();
+        parameters.is_ca = rcgen::IsCa::ExplicitNoCa;
+        parameters.subject_alt_names = vec![rcgen::SanType::URI(
+            "urn:control-shift-f12:identity"
+                .try_into()
+                .map_err(|_| Invalid)?,
+        )];
+        parameters.key_usages = vec![rcgen::KeyUsagePurpose::DigitalSignature];
+        let certificate = parameters.self_signed(&key).map_err(|_| Invalid)?;
+        Self::bind(
+            address,
+            certificate.der().to_vec(),
+            rustls::pki_types::PrivatePkcs8KeyDer::from(key.serialize_der()).into(),
+        )
+    }
     pub fn bind(
         address: std::net::SocketAddr,
         certificate: Vec<u8>,
@@ -715,6 +735,7 @@ impl ProvisionalEndpoint {
             self.owner,
             self.scope.clone(),
             self.client.identity()?,
+            true,
         )
     }
     pub async fn accept(&self) -> Result<ProvisionalChannel, Invalid> {
@@ -735,6 +756,7 @@ impl ProvisionalEndpoint {
             self.owner,
             self.scope.clone(),
             self.client.identity()?,
+            false,
         )
     }
 }
@@ -793,6 +815,7 @@ pub struct ProvisionalChannel {
     owner: &'static ProcessOwner,
     scope: Arc<ConsentScope>,
     attempted: bool,
+    initiated_locally: bool,
 }
 impl ProvisionalChannel {
     // Only the strict endpoint can mint this capability. No raw public adoption.
@@ -802,6 +825,7 @@ impl ProvisionalChannel {
         owner: &'static ProcessOwner,
         scope: Arc<ConsentScope>,
         local_identity: Arc<rustls::sign::CertifiedKey>,
+        initiated_locally: bool,
     ) -> Result<Self, Invalid> {
         let observed = (|| {
             if connection.close_reason().is_some() {
@@ -845,6 +869,7 @@ impl ProvisionalChannel {
             owner,
             scope,
             attempted: false,
+            initiated_locally,
         })
     }
     pub fn connection_id(&self) -> &str {

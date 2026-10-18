@@ -63,6 +63,68 @@ public sealed class UiChildSessionTests
     }
 
     [Fact]
+    public void Cancel_pairing_contains_only_a_nonzero_generation()
+    {
+        var session = new UiChildSession();
+        using var cancelled = JsonDocument.Parse(session.CancelPairingFrame(9).Skip(4).ToArray());
+        Assert.Equal("ui.cancel_pairing", cancelled.RootElement.GetProperty("command").GetString());
+        var args = cancelled.RootElement.GetProperty("args");
+        Assert.Single(args.EnumerateObject());
+        Assert.Equal(9UL, args.GetProperty("generation").GetUInt64());
+        Assert.Throws<ArgumentOutOfRangeException>(() => session.CancelPairingFrame(0));
+    }
+
+    [Theory]
+    [InlineData("confirmed_relationship", "[{\"handle\":\"peer-1\",\"state\":\"unavailable\"}]")]
+    [InlineData("remote_outcome_unknown", "[]")]
+    [InlineData("not_started", "[]")]
+    public void New_snapshot_erases_sas_and_preserves_no_operational_authority(string state, string confirmed)
+    {
+        var session = new UiChildSession();
+        session.ReceiveOutput(Frame(Snapshot(1, "browsing")));
+        session.ReceiveOutput(Frame("""{"v":1,"kind":"ui_pairing_v1","generation":7,"phase":"awaiting_local_confirmation","candidate_handle":"peer-1","verification_words":["ember","ocean","violet","copper"]}"""));
+        session.ReceiveOutput(Frame(Snapshot(6, "not_started")));
+        Assert.NotNull(session.Pairing);
+        session.ReceiveOutput(Frame(Snapshot(8, state).Replace("\"confirmed\":[]", $"\"confirmed\":{confirmed}")));
+        Assert.Equal(ChildSessionPhase.Running, session.State.Phase);
+        Assert.Null(session.Pairing);
+        Assert.Equal(state, session.Snapshot!.State);
+        Assert.False(session.Snapshot.InputEnabled);
+        Assert.False(session.Snapshot.ClipboardEnabled);
+    }
+
+    [Fact]
+    public void G4_rejects_an_operational_relationship()
+    {
+        var session = new UiChildSession();
+        session.ReceiveOutput(Frame(Snapshot(1, "confirmed_relationship").Replace(
+            "\"confirmed\":[]", "\"confirmed\":[{\"handle\":\"peer-1\",\"state\":\"active\"}]")));
+        Assert.Equal(ChildSessionPhase.Terminal, session.State.Phase);
+    }
+
+    [Fact]
+    public void Nonterminal_refresh_preserves_the_original_sas_and_action_generation()
+    {
+        var session = new UiChildSession();
+        session.ReceiveOutput(Frame(Snapshot(1, "browsing")));
+        session.ReceiveOutput(Frame("""{"v":1,"kind":"ui_pairing_v1","generation":7,"phase":"awaiting_local_confirmation","candidate_handle":"peer-1","verification_words":["ember","ocean","violet","copper"]}"""));
+        ulong generation = 8;
+        foreach (var state in new[] { "bootstrap_connecting", "bootstrap_sas_pending", "bootstrap_receipt_prepared", "browsing" })
+        {
+            session.ReceiveOutput(Frame(Snapshot(generation++, state)));
+            Assert.Equal(ChildSessionPhase.Running, session.State.Phase);
+            Assert.Equal(7UL, session.Pairing!.Generation);
+            Assert.Equal(new[] { "ember", "ocean", "violet", "copper" }, session.Pairing.VerificationWords);
+            var presentation = G4PairingPresentation.From(session);
+            Assert.Equal(7UL, presentation.Generation);
+            Assert.True(presentation.CanMatch);
+            Assert.False(presentation.CanSelect);
+        }
+        session.ReceiveOutput(Frame(Snapshot(generation, "not_started")));
+        Assert.Null(session.Pairing);
+    }
+
+    [Fact]
     public void Discovery_response_is_accepted_only_after_a_current_projection()
     {
         var session = new UiChildSession();
@@ -110,6 +172,21 @@ public sealed class UiChildSessionTests
         session.ReceiveOutput(Frame("""{"v":1,"kind":"ui_response_v1","id":"anything-else","ok":true}"""));
 
         Assert.Equal(ChildSessionPhase.Terminal, session.State.Phase);
+    }
+
+    [Fact]
+    public void Autonomous_projection_does_not_complete_a_pending_gesture_response()
+    {
+        var session = new UiChildSession();
+        session.ReceiveOutput(Frame(Snapshot(1, "browsing")));
+        var older = RequestId(session.InitialRefreshFrame());
+        var current = RequestId(session.CancelPairingFrame(7));
+        session.ReceiveOutput(Frame(Snapshot(8, "not_started")));
+        session.ReceiveOutput(Frame(JsonSerializer.Serialize(new { v = 1, kind = "ui_response_v1", id = older, ok = true })));
+        Assert.True(session.IsAwaitingResponse(current));
+        Assert.False(session.IsAwaitingResponse(older));
+        session.ReceiveOutput(Frame(JsonSerializer.Serialize(new { v = 1, kind = "ui_response_v1", id = current, ok = true })));
+        Assert.False(session.IsAwaitingResponse(current));
     }
 
     [Fact]

@@ -17,6 +17,7 @@ pub enum UiRuntimeEvent {
     /// This reports a fact; it does not create trust or grant a capability.
     RelationshipVerified,
     Candidates(Vec<CandidateView>),
+    G4DurableRelationships(Vec<crate::ui_contract::RelationshipView>),
     BootstrapSasReady,
     BootstrapReceiptVerified,
     V01SasReady(V01View),
@@ -125,8 +126,7 @@ impl UiController {
             UiCommand::ConfirmBootstrap { matches: false }
                 if self.snapshot.state == UiState::BootstrapSasPending =>
             {
-                self.selected_candidate = None;
-                self.snapshot.state = UiState::Browsing;
+                self.reset_to_not_started();
                 Ok(())
             }
             UiCommand::BeginV01 if self.snapshot.state == UiState::ConfirmedRelationship => Ok(()),
@@ -199,6 +199,15 @@ impl UiController {
             UiRuntimeEvent::Candidates(candidates) if self.snapshot.state == UiState::Browsing => {
                 self.snapshot.candidates = candidates;
             }
+            UiRuntimeEvent::G4DurableRelationships(relationships) => {
+                self.clear_volatile();
+                self.snapshot.confirmed = relationships;
+                if !self.snapshot.confirmed.is_empty() {
+                    self.snapshot.state = UiState::ConfirmedRelationship;
+                    self.snapshot.layout.state = LayoutState::NotConfigured;
+                    self.snapshot.capabilities = CapabilityView::all_disabled();
+                }
+            }
             UiRuntimeEvent::BootstrapSasReady
                 if self.snapshot.state == UiState::BootstrapConnecting =>
             {
@@ -244,7 +253,9 @@ impl UiController {
             UiRuntimeEvent::RemoteOutcomeUnknown => {
                 self.clear_volatile();
                 self.snapshot.state = UiState::RemoteOutcomeUnknown;
-                self.snapshot.layout.state = LayoutState::RemoteOutcomeUnknown;
+                // G4 has no layout authority. Quarantine is represented by the
+                // top-level state while layout remains explicitly unavailable.
+                self.snapshot.layout.state = LayoutState::NotConfigured;
             }
             _ => {}
         }
@@ -256,8 +267,9 @@ impl UiController {
             UiState::BootstrapConnecting
             | UiState::BootstrapSasPending
             | UiState::BootstrapReceiptPrepared => {
-                self.selected_candidate = None;
-                self.snapshot.state = UiState::Browsing;
+                self.clear_volatile();
+                self.snapshot.state = UiState::RemoteOutcomeUnknown;
+                self.snapshot.layout.state = LayoutState::NotConfigured;
             }
             UiState::ProposalLocal | UiState::InventoryCurrent => {
                 self.snapshot.state = UiState::InventoryCurrent;

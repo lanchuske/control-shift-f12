@@ -84,6 +84,24 @@ struct MacDesktopShellPresentation: Equatable {
         automaticUpdatesEnabled: false,
         saveLayoutEnabled: false
     )
+
+    static let confirmed = Self(
+        title: "Computers confirmed", connectionStatus: "Confirmed — sharing unavailable",
+        findNearbyEnabled: false, confirmCodeEnabled: false, inputSharingEnabled: false,
+        clipboardSharingEnabled: false, automaticUpdatesEnabled: false, saveLayoutEnabled: false
+    )
+
+    static let quarantine = Self(
+        title: "Pairing needs reconciliation", connectionStatus: "Outcome unknown — quarantined",
+        findNearbyEnabled: false, confirmCodeEnabled: false, inputSharingEnabled: false,
+        clipboardSharingEnabled: false, automaticUpdatesEnabled: false, saveLayoutEnabled: false
+    )
+
+    static let pairingPending = Self(
+        title: "Compare computers", connectionStatus: "Pairing pending — sharing remains off",
+        findNearbyEnabled: false, confirmCodeEnabled: false, inputSharingEnabled: false,
+        clipboardSharingEnabled: false, automaticUpdatesEnabled: false, saveLayoutEnabled: false
+    )
 }
 
 /// A deliberately minimal candidate summary. The native host may render this
@@ -237,7 +255,9 @@ final class ChildRequestTracker {
         let approval = command == "ui.approve_sas"
             && args.count == 2 && (args["generation"] as? UInt64).map { $0 > 0 } == true
             && args["matches"] is Bool
-        guard (empty || select || approval),
+        let cancel = command == "ui.cancel_pairing"
+            && args.count == 1 && (args["generation"] as? UInt64).map { $0 > 0 } == true
+        guard (empty || select || approval || cancel),
               pending.count < 256, nextID < UInt64.max
         else { throw HostError.invalidFrame }
         nextID += 1
@@ -269,6 +289,8 @@ final class DiagnosticsFrameController {
     private(set) var presentation = DiagnosticsPresentation(runtime: .unknown, rows: [])
     private(set) var shell = MacDesktopShellPresentation.initial
     private(set) var pairing: MacPairingBridgeState?
+    private(set) var pairingGeneration: UInt64?
+    private(set) var snapshotGeneration: UInt64?
     private(set) var nearbyCandidates: [NearbyCandidatePresentation] = []
     private var highestGeneration: UInt64 = 0
     private var isClosed = false
@@ -313,6 +335,8 @@ final class DiagnosticsFrameController {
         presentation = DiagnosticsPresentation(runtime: .unknown, rows: [], refreshEnabled: false)
         shell = .initial
         pairing = nil
+        pairingGeneration = nil
+        snapshotGeneration = nil
         nearbyCandidates = []
     }
 
@@ -361,11 +385,13 @@ final class DiagnosticsFrameController {
               let schemaVersion = snapshot["schema_version"] as? Int,
               schemaVersion == 1,
               let state = snapshot["state"] as? String,
-              ["not_started", "browsing"].contains(state),
+              ["not_started", "browsing", "bootstrap_connecting", "bootstrap_sas_pending", "bootstrap_receipt_prepared",
+               "confirmed_relationship", "remote_outcome_unknown"].contains(state),
               let diagnostics = snapshot["diagnostics"] as? [Any], diagnostics.isEmpty,
               let rawCandidates = snapshot["candidates"] as? [[String: Any]],
               let candidates = validatedCandidates(rawCandidates, while: state),
-              let confirmed = snapshot["confirmed"] as? [Any], confirmed.isEmpty,
+              let confirmed = snapshot["confirmed"] as? [[String: Any]],
+              validatedRelationships(confirmed, while: state),
               snapshot["inventory"] is NSNull,
               let layout = snapshot["layout"] as? [String: Any],
               Set(layout.keys) == ["state"],
@@ -377,8 +403,34 @@ final class DiagnosticsFrameController {
         else { throw HostError.invalidFrame }
         guard envelope.snapshot.generation > highestGeneration else { return }
         highestGeneration = envelope.snapshot.generation
+        snapshotGeneration = envelope.snapshot.generation
+        if ["not_started", "confirmed_relationship", "remote_outcome_unknown"].contains(state) {
+            pairing = nil
+            pairingGeneration = nil
+        }
         nearbyCandidates = candidates
-        shell = state == "not_started" ? .readyToDiscover : .browsing
+        switch state {
+        case "confirmed_relationship": shell = .confirmed
+        case "remote_outcome_unknown": shell = .quarantine
+        case "browsing": shell = .browsing
+        case "bootstrap_connecting", "bootstrap_sas_pending", "bootstrap_receipt_prepared": shell = .pairingPending
+        default: shell = .readyToDiscover
+        }
+    }
+
+    private func validatedRelationships(_ relationships: [[String: Any]], while state: String) -> Bool {
+        guard state == "confirmed_relationship" else { return relationships.isEmpty }
+        guard !relationships.isEmpty, relationships.count <= 32 else { return false }
+        var handles = Set<String>()
+        return relationships.allSatisfy { relationship in
+            guard Set(relationship.keys) == ["handle", "state"],
+                  relationship["state"] as? String == "unavailable",
+                  let handle = relationship["handle"] as? String,
+                  !handle.isEmpty, handle.utf8.count <= 64,
+                  handle.allSatisfy({ $0.isASCII && ($0.isLetter || $0.isNumber || $0 == "-" || $0 == "_") })
+            else { return false }
+            return handles.insert(handle).inserted
+        }
     }
 
     private func validatedCandidates(_ candidates: [[String: Any]], while state: String) -> [NearbyCandidatePresentation]? {
@@ -439,6 +491,7 @@ final class DiagnosticsFrameController {
         guard generation > highestGeneration else { return }
         highestGeneration = generation
         pairing = state
+        pairingGeneration = generation
     }
 
     private func isValid(_ row: WireDiagnosticRow) -> Bool {
@@ -473,6 +526,7 @@ protocol ChildLifecycleChild: AnyObject {
     func sendStopDiscovery() throws
     func sendSelectCandidate(_ handle: String) throws
     func sendApproveSas(generation: UInt64, matches: Bool) throws
+    func sendCancelPairing(generation: UInt64) throws
     func closeInput()
     func closeOutput()
     func closeError()
@@ -525,6 +579,11 @@ final class ChildLifecycle {
     func approveSas(generation: UInt64, matches: Bool) {
         guard !isClosed else { return }
         try? child.sendApproveSas(generation: generation, matches: matches)
+    }
+
+    func cancelPairing(generation: UInt64) {
+        guard !isClosed else { return }
+        try? child.sendCancelPairing(generation: generation)
     }
 
     func close() throws {
@@ -687,6 +746,10 @@ final class BundledChild: ChildLifecycleChild {
         )
     }
 
+    func sendCancelPairing(generation: UInt64) throws {
+        try sendRequest(command: "ui.cancel_pairing", args: ["generation": generation])
+    }
+
     private func sendRequest(command: String, args: [String: Any] = [:]) throws {
         let frame = try requests.frame(command: command, args: args)
         try inputPipe.fileHandleForWriting.write(contentsOf: frame)
@@ -770,6 +833,117 @@ private final class FrameAccumulator {
     }
 }
 
+final class MacPairingControls: NSStackView {
+    let candidates = NSPopUpButton(frame: .zero, pullsDown: false)
+    let selectButton = NSButton(title: "Compare with selected computer", target: nil, action: nil)
+    let words = NSTextField(labelWithString: "")
+    let matchButton = NSButton(title: "Match", target: nil, action: nil)
+    let mismatchButton = NSButton(title: "Mismatch", target: nil, action: nil)
+    let cancelButton = NSButton(title: "Cancel", target: nil, action: nil)
+    private let status = NSTextField(wrappingLabelWithString: "")
+    private let controller: DiagnosticsFrameController
+    private let select: (String) -> Void
+    private let approve: (UInt64, Bool) -> Void
+    private let cancel: (UInt64) -> Void
+    private var displayedGeneration: UInt64?
+    private var displayedSnapshotGeneration: UInt64?
+    private var submittedGeneration: UInt64?
+    private var cancelledGeneration: UInt64?
+    private var submittedSnapshotGeneration: UInt64?
+
+    init(controller: DiagnosticsFrameController, select: @escaping (String) -> Void,
+         approve: @escaping (UInt64, Bool) -> Void, cancel: @escaping (UInt64) -> Void) {
+        self.controller = controller
+        self.select = select
+        self.approve = approve
+        self.cancel = cancel
+        super.init(frame: .zero)
+        orientation = .vertical
+        alignment = .leading
+        spacing = 8
+        candidates.setAccessibilityLabel("Current nearby computer")
+        words.font = .monospacedSystemFont(ofSize: 17, weight: .semibold)
+        words.setAccessibilityLabel("Verification words")
+        selectButton.target = self
+        selectButton.action = #selector(selectCurrentCandidate)
+        matchButton.target = self
+        matchButton.action = #selector(match)
+        mismatchButton.target = self
+        mismatchButton.action = #selector(mismatch)
+        cancelButton.target = self
+        cancelButton.action = #selector(cancelCurrentPairing)
+        let decisions = NSStackView(views: [matchButton, mismatchButton, cancelButton])
+        decisions.spacing = 8
+        [candidates, selectButton, status, words, decisions].forEach(addArrangedSubview)
+        render()
+    }
+    required init?(coder: NSCoder) { nil }
+
+    func render() {
+        displayedGeneration = controller.pairingGeneration
+        displayedSnapshotGeneration = controller.snapshotGeneration
+        let selected = candidates.titleOfSelectedItem
+        let available = controller.nearbyCandidates.filter {
+            $0.compatibility == "compatible" && $0.freshness == "current"
+        }.map(\.handle)
+        candidates.removeAllItems()
+        candidates.addItems(withTitles: available)
+        if let selected, available.contains(selected) { candidates.selectItem(withTitle: selected) }
+        let canSelect = controller.shell == .browsing && controller.pairing == nil
+            && displayedSnapshotGeneration != submittedSnapshotGeneration && !available.isEmpty
+        candidates.isEnabled = canSelect
+        selectButton.isEnabled = canSelect
+        words.stringValue = controller.pairing?.verificationWords.joined(separator: "  ") ?? ""
+        let pending = displayedGeneration != nil && displayedGeneration != submittedGeneration
+        matchButton.isEnabled = pending && controller.pairing?.phase == .awaitingLocalConfirmation
+        mismatchButton.isEnabled = matchButton.isEnabled
+        cancelButton.isEnabled = displayedGeneration != nil && displayedGeneration != cancelledGeneration
+        switch controller.pairing?.phase {
+        case .awaitingLocalConfirmation: status.stringValue = "Compare all four words on both computers."
+        case .awaitingRemoteConfirmation: status.stringValue = "Waiting for the other computer — sharing remains off."
+        case .readyForDurableAdmission: status.stringValue = "Saving confirmation — sharing remains off."
+        default: status.stringValue = controller.shell.connectionStatus
+        }
+        if let generation = displayedGeneration {
+            if generation == cancelledGeneration { status.stringValue = "Waiting for cancellation — sharing remains off." }
+            else if generation == submittedGeneration { status.stringValue = "Waiting for the other computer — sharing remains off." }
+        }
+    }
+
+    @objc private func selectCurrentCandidate() {
+        guard selectButton.isEnabled, controller.shell == .browsing, controller.pairing == nil,
+              displayedSnapshotGeneration == controller.snapshotGeneration,
+              let handle = candidates.titleOfSelectedItem,
+              controller.nearbyCandidates.contains(where: {
+                  $0.handle == handle && $0.compatibility == "compatible" && $0.freshness == "current"
+              }) else { return }
+        submittedSnapshotGeneration = displayedSnapshotGeneration
+        render()
+        select(handle)
+    }
+
+    @objc private func match() { decide(matches: true) }
+    @objc private func mismatch() { decide(matches: false) }
+    private func decide(matches: Bool) {
+        guard matchButton.isEnabled, let generation = displayedGeneration,
+              generation == controller.pairingGeneration,
+              controller.pairing?.phase == .awaitingLocalConfirmation else { return }
+        submittedGeneration = generation
+        if !matches { cancelledGeneration = generation }
+        render()
+        approve(generation, matches)
+    }
+
+    @objc private func cancelCurrentPairing() {
+        guard cancelButton.isEnabled, let generation = displayedGeneration,
+              generation == controller.pairingGeneration, controller.pairing != nil else { return }
+        submittedGeneration = generation
+        cancelledGeneration = generation
+        render()
+        cancel(generation)
+    }
+}
+
 final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource, NSTableViewDelegate {
     private let diagnostics = DiagnosticsFrameController()
     private var lifecycle: ChildLifecycle?
@@ -780,7 +954,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     private weak var journeyHeading: NSTextField?
     private weak var journeyStatus: NSTextField?
     private weak var pairingButton: NSButton?
-    private weak var nearbyCandidatesLabel: NSTextField?
+    private weak var pairingControls: MacPairingControls?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         let window = NSWindow(
@@ -864,17 +1038,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         let shell = diagnostics.shell
         journeyHeading?.stringValue = shell.title
         journeyStatus?.stringValue = shell.connectionStatus
-        pairingButton?.isEnabled = shell.findNearbyEnabled || shell == .browsing
+        pairingButton?.isEnabled = diagnostics.pairing == nil && (shell.findNearbyEnabled || shell == .browsing)
         pairingButton?.title = shell == .browsing ? "Stop searching" : "Find nearby computers"
-        if diagnostics.nearbyCandidates.isEmpty {
-            nearbyCandidatesLabel?.stringValue = shell == .browsing
-                ? "Searching for nearby computers…"
-                : "No nearby computers found yet."
-        } else {
-            nearbyCandidatesLabel?.stringValue = diagnostics.nearbyCandidates
-                .map(\.displayText)
-                .joined(separator: "\n")
-        }
+        pairingControls?.render()
     }
 
     private func desktopJourneyView() -> NSView {
@@ -892,14 +1058,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         pairing.setAccessibilityLabel("Find nearby computers")
         pairingButton = pairing
 
-        let candidates = NSTextField(wrappingLabelWithString: "No nearby computers found yet.")
-        candidates.textColor = .secondaryLabelColor
-        candidates.setAccessibilityLabel("Nearby computers")
-        nearbyCandidatesLabel = candidates
-
-        let confirm = NSButton(title: "Confirm code on both computers", target: nil, action: nil)
-        confirm.isEnabled = presentation.confirmCodeEnabled
-        confirm.setAccessibilityLabel("Confirm code on both computers")
+        let pairingControls = MacPairingControls(controller: diagnostics,
+            select: { [weak self] in self?.lifecycle?.selectCandidate($0) },
+            approve: { [weak self] in self?.lifecycle?.approveSas(generation: $0, matches: $1) },
+            cancel: { [weak self] in self?.lifecycle?.cancelPairing(generation: $0) })
+        self.pairingControls = pairingControls
 
         let map = NSTextField(wrappingLabelWithString: "Display map — pair another computer to arrange screens by dragging them into their physical positions.")
         map.textColor = .secondaryLabelColor
@@ -914,7 +1077,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         options.orientation = .horizontal
         options.spacing = 14
 
-        let content = NSStackView(views: [heading, status, pairing, candidates, confirm, map, options])
+        let content = NSStackView(views: [heading, status, pairing, pairingControls, map, options])
         content.orientation = .vertical
         content.alignment = .leading
         content.spacing = 8

@@ -31,6 +31,14 @@ pub struct HandshakeConfig {
     pub local_rendezvous: [u8; 16],
     pub selected_rendezvous: [u8; 16],
 }
+/// The accept side knows its local announcement, but need not select the
+/// initiator. Its remote rendezvous is obtained from the bounded G4 prelude and
+/// checked against the current catalog before any candidate is sealed.
+pub struct IncomingHandshakeConfig {
+    pub device_name: String,
+    pub os: String,
+    pub local_rendezvous: [u8; 16],
+}
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VerificationPrompt {
     pub attempt: [u8; 32],
@@ -60,6 +68,239 @@ impl VerificationPrompt {
 pub enum HandshakeError {
     Rejected,
     Cancelled,
+}
+
+/// Maximum time the G4 coordinator waits for a simultaneous competitor after
+/// the first validated candidate. The complete candidate lifetime remains 30s.
+pub const PRE_ADMISSION_SELECTION_WINDOW: Duration = Duration::from_secs(2);
+
+/// Validated rendezvous exchange, before replay consumption, store access or SAS.
+/// There is no public constructor, channel accessor, Clone or serialization.
+/// Dropping an unselected candidate closes its exact connection.
+/// ```compile_fail
+/// use seamless_transport::pairing_v2::provisional_tls::PreAdmissionCandidate;
+/// fn duplicate(candidate: PreAdmissionCandidate) { let _ = candidate.clone(); }
+/// ```
+/// ```compile_fail
+/// use seamless_transport::pairing_v2::provisional_tls::PreAdmissionCandidate;
+/// fn extract(candidate: PreAdmissionCandidate) { let _ = candidate.channel; }
+/// ```
+pub struct PreAdmissionCandidate {
+    channel: ProvisionalChannel,
+    prepared: PreparedCandidate,
+    local_rendezvous: [u8; 16],
+    remote_rendezvous: [u8; 16],
+    selection_deadline: tokio::time::Instant,
+}
+
+/// Move-only winner of the transport-owned deterministic election. Only the
+/// explicit G4 admission entry consumes it; it cannot expose or rebind QUIC.
+/// ```compile_fail
+/// use seamless_transport::pairing_v2::provisional_tls::SelectedPreAdmission;
+/// fn duplicate(winner: SelectedPreAdmission) { let _ = winner.clone(); }
+/// ```
+/// ```compile_fail
+/// use seamless_transport::pairing_v2::provisional_tls::SelectedPreAdmission;
+/// fn extract(winner: SelectedPreAdmission) { let _ = winner.candidate.channel; }
+/// ```
+/// ```compile_fail
+/// use seamless_transport::pairing_v2::provisional_tls::SelectedPreAdmission;
+/// fn raw(winner: SelectedPreAdmission) { let _ = winner.connection(); }
+/// ```
+pub struct SelectedPreAdmission {
+    candidate: PreAdmissionCandidate,
+}
+
+struct PreparedCandidate {
+    role: Role,
+    transcript: CandidateTranscript,
+    clock: LiveClock,
+    first: Stream,
+    second: Stream,
+}
+
+impl PreAdmissionCandidate {
+    /// Scheduling metadata only. At this deadline the coordinator stops waiting
+    /// for a competitor and may select the sole candidate. No socket data leaks.
+    pub fn selection_deadline(&self) -> tokio::time::Instant {
+        self.selection_deadline
+    }
+
+    /// Waits out the transport-owned simultaneous-selection window before
+    /// sealing a sole candidate. Cancellation drops/closes only this candidate.
+    pub async fn select_after_window(self) -> Result<SelectedPreAdmission, HandshakeError> {
+        self.validate()?;
+        tokio::time::sleep_until(self.selection_deadline).await;
+        self.select(None)
+    }
+
+    fn validate(&self) -> Result<(), HandshakeError> {
+        let _active = self
+            .channel
+            .active()
+            .map_err(|_| HandshakeError::Rejected)?;
+        if self
+            .prepared
+            .clock
+            .now()
+            .map_err(|_| HandshakeError::Rejected)?
+            .monotonic_ms
+            >= 30_000
+        {
+            return Err(HandshakeError::Rejected);
+        }
+        Ok(())
+    }
+
+    /// Consumes the complete bounded candidate set for this selected peer. A
+    /// simultaneous pair keeps the connection initiated by the smaller
+    /// rendezvous (not the smaller TLS fingerprint), regardless of arrival order.
+    /// The loser is closed synchronously before the winner seal is returned.
+    /// A sole candidate is valid only after its selection window; callers may
+    /// use `select_after_window` to wait without turning valid timing into error.
+    pub fn select(self, competitor: Option<Self>) -> Result<SelectedPreAdmission, HandshakeError> {
+        self.validate()?;
+        let Some(other) = competitor else {
+            if tokio::time::Instant::now() < self.selection_deadline {
+                return Err(HandshakeError::Rejected);
+            }
+            return Ok(SelectedPreAdmission { candidate: self });
+        };
+        other.validate()?;
+        if !Arc::ptr_eq(&self.channel.scope, &other.channel.scope)
+            || self.local_rendezvous != other.local_rendezvous
+            || self.remote_rendezvous != other.remote_rendezvous
+            || self.channel.leaf != other.channel.leaf
+            || self.channel.id == other.channel.id
+            || self.channel.initiated_locally == other.channel.initiated_locally
+        {
+            return Err(HandshakeError::Rejected);
+        }
+        let local_initiator_wins = self.local_rendezvous < self.remote_rendezvous;
+        let winner = if self.channel.initiated_locally == local_initiator_wins {
+            drop(other);
+            self
+        } else {
+            drop(self);
+            other
+        };
+        Ok(SelectedPreAdmission { candidate: winner })
+    }
+}
+
+impl SelectedPreAdmission {
+    pub(in crate::pairing_v2) async fn handshake<F, Fut>(
+        self,
+        store: &PendingStore,
+        confirm: F,
+    ) -> Result<HandshakeCompletePendingAuthority, HandshakeError>
+    where
+        F: FnOnce(VerificationPrompt) -> Fut,
+        Fut: std::future::Future<Output = VerificationDecision>,
+    {
+        self.candidate.validate()?;
+        let PreAdmissionCandidate {
+            channel, prepared, ..
+        } = self.candidate;
+        channel.handshake_prepared(prepared, store, confirm).await
+    }
+}
+
+#[cfg(test)]
+mod pre_admission_tests {
+    use super::*;
+
+    async fn candidates() -> (
+        ProvisionalEndpoint,
+        ProvisionalEndpoint,
+        PreAdmissionCandidate,
+        PreAdmissionCandidate,
+    ) {
+        let a = ProvisionalEndpoint::bind_ephemeral("127.0.0.1:0".parse().unwrap()).unwrap();
+        let b = ProvisionalEndpoint::bind_ephemeral("127.0.0.1:0".parse().unwrap()).unwrap();
+        let (left, right) = tokio::join!(a.connect(b.local_addr().unwrap()), b.accept());
+        let config = |local, selected| HandshakeConfig {
+            device_name: "Test peer".into(),
+            os: "macos".into(),
+            local_rendezvous: [local; 16],
+            selected_rendezvous: [selected; 16],
+        };
+        let (left, right) = tokio::join!(
+            left.unwrap().prepare_pre_admission(config(1, 2)),
+            right.unwrap().prepare_pre_admission(config(2, 1)),
+        );
+        (a, b, left.unwrap(), right.unwrap())
+    }
+
+    #[tokio::test]
+    async fn g4_pre_admission_early_sole_selection_fails_closed() {
+        let (_ea, _eb, left, right) = candidates().await;
+        let connection = left.channel.connection.clone();
+        assert!(left.select(None).is_err());
+        assert!(connection.close_reason().is_some());
+        drop(right);
+    }
+
+    #[tokio::test]
+    async fn g4_pre_admission_preparation_and_selection_do_not_consume_replay() {
+        let (_ea, _eb, mut left, right) = candidates().await;
+        left.selection_deadline = tokio::time::Instant::now();
+        let selected = left.select(None).unwrap();
+        let candidate = &selected.candidate;
+        let role = candidate.prepared.role;
+        let input = BindingInput::new(
+            &candidate.prepared.transcript.requests[role.index()],
+            &candidate.prepared.transcript.candidates[1 - role.index()],
+            &candidate.channel.leaf,
+            &candidate.channel.id,
+            candidate.channel.generation,
+            ALPN,
+        )
+        .unwrap();
+        // A first real consumption must still succeed *after* preparation and
+        // election; any eager consumption in either phase makes this fail.
+        candidate
+            .channel
+            .owner
+            .replay
+            .consume_input(&input)
+            .unwrap();
+        assert!(
+            candidate
+                .channel
+                .owner
+                .replay
+                .consume_input(&input)
+                .is_err()
+        );
+        drop((selected, right));
+    }
+
+    #[tokio::test]
+    async fn g4_pre_admission_expiry_closes_exact_candidate_before_store_or_sas() {
+        let (_ea, _eb, mut left, right) = candidates().await;
+        let connection = left.channel.connection.clone();
+        left.prepared.clock.origin = Instant::now() - Duration::from_secs(31);
+        assert!(left.select(None).is_err());
+        assert!(connection.close_reason().is_some());
+        drop(right);
+
+        let (_ea, _eb, mut left, right) = candidates().await;
+        left.selection_deadline = tokio::time::Instant::now();
+        let mut selected = left.select(None).unwrap();
+        selected.candidate.prepared.clock.origin = Instant::now() - Duration::from_secs(31);
+        let root = tempfile::tempdir().unwrap();
+        let store = PendingStore::open(root.path()).unwrap();
+        let version = store.version().unwrap();
+        assert!(
+            selected
+                .handshake(&store, |_| async { panic!("expired winner reached SAS") })
+                .await
+                .is_err()
+        );
+        assert_eq!(store.version().unwrap(), version);
+        drop(right);
+    }
 }
 
 const FINALIZATION_DOMAIN: &[u8] = b"control-shift-f12/finalization-v1";
@@ -1983,7 +2224,7 @@ impl ProvisionalChannel {
     /// One consumed sealed channel, two logical requester streams, one exporter.
     /// No RecoveryAuthority, active trust, admission or application stream is available.
     pub async fn handshake<F, Fut>(
-        mut self,
+        self,
         config: HandshakeConfig,
         store: &PendingStore,
         confirm: F,
@@ -1992,8 +2233,224 @@ impl ProvisionalChannel {
         F: FnOnce(VerificationPrompt) -> Fut,
         Fut: std::future::Future<Output = VerificationDecision>,
     {
-        let result =
-            tokio::time::timeout(Duration::from_secs(300), self.run(config, store, confirm)).await;
+        // Foundation retains its existing wire protocol; product G4 uses the
+        // distinct prelude and winner-only admission entry.
+        let candidate = self
+            .finish_pre_admission(
+                config,
+                tokio::time::Instant::now() + Duration::from_secs(30),
+            )
+            .await?;
+        SelectedPreAdmission { candidate }
+            .handshake(store, confirm)
+            .await
+    }
+
+    /// Performs only the two reciprocal, TLS-bound rendezvous exchanges. This
+    /// boundary deliberately has no store, reservation or user-confirmation port.
+    pub async fn prepare_pre_admission(
+        mut self,
+        config: HandshakeConfig,
+    ) -> Result<PreAdmissionCandidate, HandshakeError> {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        let expected = config.selected_rendezvous;
+        let result = tokio::time::timeout_at(
+            deadline,
+            self.exchange_rendezvous(config.local_rendezvous, Some(expected), |remote| {
+                remote == expected
+            }),
+        )
+        .await;
+        if !matches!(result, Ok(Ok(_))) {
+            self.connection
+                .close(APPLICATION_ERROR.into(), b"pairing rejected");
+            return Err(HandshakeError::Rejected);
+        }
+        self.finish_pre_admission(config, deadline).await
+    }
+
+    /// Prepares an incoming connection without a speculative local selection.
+    /// The callback is a current-catalog allowlist, not user approval: consent
+    /// is still required at SAS, after the deterministic election.
+    pub async fn prepare_incoming<F>(
+        mut self,
+        config: IncomingHandshakeConfig,
+        validate_remote: F,
+    ) -> Result<PreAdmissionCandidate, HandshakeError>
+    where
+        F: FnOnce([u8; 16]) -> bool,
+    {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        let result = if self.initiated_locally {
+            Err(HandshakeError::Rejected)
+        } else {
+            tokio::time::timeout_at(
+                deadline,
+                self.exchange_rendezvous(config.local_rendezvous, None, validate_remote),
+            )
+            .await
+            .map_err(|_| HandshakeError::Rejected)
+            .and_then(|result| result)
+        };
+        let remote = match result {
+            Ok(remote) => remote,
+            Err(error) => {
+                self.connection
+                    .close(APPLICATION_ERROR.into(), b"pairing rejected");
+                return Err(error);
+            }
+        };
+        self.finish_pre_admission(
+            HandshakeConfig {
+                device_name: config.device_name,
+                os: config.os,
+                local_rendezvous: config.local_rendezvous,
+                selected_rendezvous: remote,
+            },
+            deadline,
+        )
+        .await
+    }
+
+    async fn exchange_rendezvous<F>(
+        &mut self,
+        local: [u8; 16],
+        selected: Option<[u8; 16]>,
+        validate_remote: F,
+    ) -> Result<[u8; 16], HandshakeError>
+    where
+        F: FnOnce([u8; 16]) -> bool,
+    {
+        const PREFIX: &[u8; 16] = b"CSF12-G4-SELECT\0";
+        {
+            let _active = self.active().map_err(|_| HandshakeError::Rejected)?;
+        }
+        if local == [0; 16] || self.attempted {
+            return Err(HandshakeError::Rejected);
+        }
+        let pair = if self.initiated_locally {
+            self.connection.open_bi().await
+        } else {
+            self.connection.accept_bi().await
+        }
+        .map_err(|_| HandshakeError::Rejected)?;
+        let mut stream = Stream::new(pair);
+        let remote = if self.initiated_locally {
+            let remote = selected.ok_or(HandshakeError::Rejected)?;
+            if remote == [0; 16] || remote == local || !validate_remote(remote) {
+                return Err(HandshakeError::Rejected);
+            }
+            let mut offer = [0; 48];
+            offer[..16].copy_from_slice(PREFIX);
+            offer[16..32].copy_from_slice(&local);
+            offer[32..].copy_from_slice(&remote);
+            stream
+                .send
+                .write_all(&offer)
+                .await
+                .map_err(|_| HandshakeError::Rejected)?;
+            stream.send.finish().map_err(|_| HandshakeError::Rejected)?;
+            let mut acknowledgement = [0];
+            stream
+                .recv
+                .read_exact(&mut acknowledgement)
+                .await
+                .map_err(|_| HandshakeError::Rejected)?;
+            if acknowledgement != [1] {
+                return Err(HandshakeError::Rejected);
+            }
+            eof(&mut stream.recv)
+                .await
+                .map_err(|_| HandshakeError::Rejected)?;
+            remote
+        } else {
+            let mut offer = [0; 48];
+            stream
+                .recv
+                .read_exact(&mut offer)
+                .await
+                .map_err(|_| HandshakeError::Rejected)?;
+            eof(&mut stream.recv)
+                .await
+                .map_err(|_| HandshakeError::Rejected)?;
+            let remote = offer[16..32]
+                .try_into()
+                .map_err(|_| HandshakeError::Rejected)?;
+            if &offer[..16] != PREFIX
+                || offer[32..] != local
+                || remote == [0; 16]
+                || remote == local
+                || !validate_remote(remote)
+            {
+                return Err(HandshakeError::Rejected);
+            }
+            // Catalog/rendezvous acknowledgement only, never user consent.
+            stream
+                .send
+                .write_all(&[1])
+                .await
+                .map_err(|_| HandshakeError::Rejected)?;
+            stream.send.finish().map_err(|_| HandshakeError::Rejected)?;
+            remote
+        };
+        stream.clean = true;
+        Ok(remote)
+    }
+
+    async fn finish_pre_admission(
+        mut self,
+        config: HandshakeConfig,
+        deadline: tokio::time::Instant,
+    ) -> Result<PreAdmissionCandidate, HandshakeError> {
+        if config.local_rendezvous == [0; 16]
+            || config.selected_rendezvous == [0; 16]
+            || config.local_rendezvous == config.selected_rendezvous
+        {
+            self.connection
+                .close(APPLICATION_ERROR.into(), b"pairing rejected");
+            return Err(HandshakeError::Rejected);
+        }
+        let local_rendezvous = config.local_rendezvous;
+        let remote_rendezvous = config.selected_rendezvous;
+        let mut prepared =
+            match tokio::time::timeout_at(deadline, self.prepare_candidates(config)).await {
+                Ok(Ok(prepared)) => prepared,
+                _ => {
+                    self.connection
+                        .close(APPLICATION_ERROR.into(), b"pairing rejected");
+                    return Err(HandshakeError::Rejected);
+                }
+            };
+        // Prelude and reciprocal candidate exchange share one total deadline.
+        prepared.clock.origin = deadline.into_std() - Duration::from_secs(30);
+        let selection_deadline = (tokio::time::Instant::now() + PRE_ADMISSION_SELECTION_WINDOW)
+            .min(tokio::time::Instant::from_std(
+                prepared.clock.origin + Duration::from_secs(30),
+            ));
+        Ok(PreAdmissionCandidate {
+            channel: self,
+            prepared,
+            local_rendezvous,
+            remote_rendezvous,
+            selection_deadline,
+        })
+    }
+
+    async fn handshake_prepared<F, Fut>(
+        mut self,
+        prepared: PreparedCandidate,
+        store: &PendingStore,
+        confirm: F,
+    ) -> Result<HandshakeCompletePendingAuthority, HandshakeError>
+    where
+        F: FnOnce(VerificationPrompt) -> Fut,
+        Fut: std::future::Future<Output = VerificationDecision>,
+    {
+        let result = tokio::time::timeout(
+            Duration::from_secs(300),
+            self.run_prepared(prepared, store, confirm),
+        )
+        .await;
         match result {
             Ok(Ok(done)) => Ok(HandshakeCompletePendingAuthority {
                 role: done.role,
@@ -2027,16 +2484,10 @@ impl ProvisionalChannel {
         }
         Ok(active)
     }
-    async fn run<F, Fut>(
+    async fn prepare_candidates(
         &mut self,
         config: HandshakeConfig,
-        store: &PendingStore,
-        confirm: F,
-    ) -> Result<Completed, HandshakeError>
-    where
-        F: FnOnce(VerificationPrompt) -> Fut,
-        Fut: std::future::Future<Output = VerificationDecision>,
-    {
+    ) -> Result<PreparedCandidate, HandshakeError> {
         let reject = |_: Invalid| HandshakeError::Rejected;
         {
             let _active = self.active().map_err(reject)?;
@@ -2046,7 +2497,6 @@ impl ProvisionalChannel {
         }
         self.attempted = true;
         let clock = LiveClock::new().map_err(reject)?;
-        let version = store.version().map_err(|_| HandshakeError::Rejected)?;
         if self.local_identity.cert.len() != 1 {
             return Err(HandshakeError::Rejected);
         }
@@ -2103,7 +2553,7 @@ impl ProvisionalChannel {
             .await?;
             Ok::<_, Invalid>((second, pair))
         };
-        let (mut second, (request_b, candidate_a)) = if role == Role::B {
+        let (second, (request_b, candidate_a)) = if role == Role::B {
             tokio::select! {biased;_ = watch_request(&mut first.recv)=>return Err(HandshakeError::Rejected),result=next=>result.map_err(reject)?}
         } else {
             next.await.map_err(reject)?
@@ -2126,6 +2576,41 @@ impl ProvisionalChannel {
             utc().map_err(reject)?,
         )
         .map_err(reject)?;
+        Ok(PreparedCandidate {
+            role,
+            transcript,
+            clock,
+            first,
+            second,
+        })
+    }
+
+    async fn run_prepared<F, Fut>(
+        &mut self,
+        prepared: PreparedCandidate,
+        store: &PendingStore,
+        confirm: F,
+    ) -> Result<Completed, HandshakeError>
+    where
+        F: FnOnce(VerificationPrompt) -> Fut,
+        Fut: std::future::Future<Output = VerificationDecision>,
+    {
+        let reject = |_: Invalid| HandshakeError::Rejected;
+        let PreparedCandidate {
+            role,
+            transcript,
+            clock,
+            mut first,
+            mut second,
+        } = prepared;
+        {
+            let _active = self.active().map_err(reject)?;
+            if clock.now().map_err(reject)?.monotonic_ms >= 30_000 {
+                return Err(HandshakeError::Rejected);
+            }
+        }
+        let version = store.version().map_err(|_| HandshakeError::Rejected)?;
+        let cert = self.local_identity.cert[0].as_ref();
         let input = BindingInput::new(
             &transcript.requests[role.index()],
             &transcript.candidates[1 - role.index()],

@@ -94,6 +94,7 @@ fn select_extra_fields_are_invalid_but_valid_pairing_commands_remain_state_gated
             "ui.approve_sas",
             json!({"generation":1,"matches":false}),
         ),
+        ("cancel", "ui.cancel_pairing", json!({"generation":1})),
     ] {
         let frames = adapter.handle_host_request_at(2, &request(id, command, args));
         assert_eq!(frames.len(), 1, "a schema alone must not change projection");
@@ -121,6 +122,9 @@ fn pairing_request_fields_are_bounded_strict_and_replays_are_deterministic() {
         ("ui.approve_sas", json!({"generation":"1","matches":true})),
         ("ui.approve_sas", json!({"generation":1,"matches":"true"})),
         ("ui.approve_sas", json!({"generation":1})),
+        ("ui.cancel_pairing", json!({})),
+        ("ui.cancel_pairing", json!({"generation":0})),
+        ("ui.cancel_pairing", json!({"generation":1,"extra":true})),
     ];
     for (index, (command, args)) in invalid.into_iter().enumerate() {
         let frames =

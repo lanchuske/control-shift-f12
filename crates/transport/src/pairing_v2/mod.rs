@@ -23,7 +23,8 @@ pub(crate) mod admission_authority;
 /// ```
 pub use admission_authority::{
     AdmissionAuthorityStore, DistributedAdmissionSummary, DistributedPairingError,
-    ReconcileAdmission, handshake_and_commit_distributed,
+    DurableAdmission, DurableAdmissionState, ReconcileAdmission, handshake_and_commit_distributed,
+    handshake_selected_and_commit_distributed,
 };
 pub mod codec;
 mod evidence;

@@ -20,6 +20,7 @@ public sealed class UiChildSession
     public DesktopSnapshotProjection? Snapshot { get; private set; }
     public DiagnosticsProjection? Diagnostics { get; private set; }
     public PairingProjection? Pairing { get; private set; }
+    public bool IsAwaitingResponse(string requestId) => pendingRequestIds.Contains(requestId);
 
     public byte[] InitialRefreshFrame()
         => CreateRequest("ui.refresh");
@@ -40,6 +41,12 @@ public sealed class UiChildSession
     {
         if (generation == 0) throw new ArgumentOutOfRangeException(nameof(generation));
         return CreateRequest("ui.approve_sas", new { generation, matches });
+    }
+
+    public byte[] CancelPairingFrame(ulong generation)
+    {
+        if (generation == 0) throw new ArgumentOutOfRangeException(nameof(generation));
+        return CreateRequest("ui.cancel_pairing", new { generation });
     }
 
     private byte[] CreateRequest(string command, object? args = null)
@@ -143,6 +150,8 @@ public sealed class UiChildSession
                         return;
                     }
                     Snapshot = snapshot;
+                    if (snapshot.State is "not_started" or "confirmed_relationship" or "remote_outcome_unknown")
+                        Pairing = null;
                     State = State.ReceiveCurrentProjection(snapshot.Generation);
                     return;
                 case "ui_diagnostics_v1" when DiagnosticsProjection.TryParse(json, out var diagnostics):

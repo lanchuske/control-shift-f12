@@ -316,6 +316,11 @@ impl AdvertisementDriver for MdnsAdvertisementDriver {
         self.daemon
             .disable_interface(mdns_sd::IfKind::IPv6)
             .map_err(|_| SetupError::Unavailable)?;
+        // Add loopback without removing normal IPv4 LAN interfaces. This is
+        // still discovery-only; admission remains behind explicit SAS consent.
+        self.daemon
+            .enable_interface(mdns_sd::IfKind::LoopbackV4)
+            .map_err(|_| SetupError::Unavailable)?;
         self.monitor = Some(self.daemon.monitor().map_err(|_| SetupError::Unavailable)?);
         Ok(())
     }
@@ -360,7 +365,7 @@ impl AdvertisementDriver for MdnsAdvertisementDriver {
         }))
     }
 }
-struct EngineAdvertisement {
+pub(crate) struct EngineAdvertisement {
     driver: Box<dyn AdvertisementDriver>,
     name: String,
     withdrawn: bool,
@@ -371,6 +376,21 @@ impl EngineAdvertisement {
         let mut token = [0u8; 16];
         rand::rngs::OsRng.fill_bytes(&mut token);
         let rendezvous: String = token.iter().map(|b| format!("{b:02x}")).collect();
+        let info = advertisement_info(&rendezvous, port)?;
+        let daemon = mdns_sd::ServiceDaemon::new().map_err(|_| SetupError::Unavailable)?;
+        Self::start_with_driver(
+            info,
+            Box::new(MdnsAdvertisementDriver {
+                daemon,
+                monitor: None,
+            }),
+        )
+    }
+    pub(crate) fn start_exact(rendezvous: [u8; 16], port: u16) -> Result<Self, SetupError> {
+        let rendezvous: String = rendezvous
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
         let info = advertisement_info(&rendezvous, port)?;
         let daemon = mdns_sd::ServiceDaemon::new().map_err(|_| SetupError::Unavailable)?;
         Self::start_with_driver(

@@ -119,7 +119,7 @@ impl ConsentCatalog {
                 entry.expires = expires;
                 return Ok(entry.handle);
             }
-        } else if self.entries.len() >= 20 {
+        } else if self.entries.len() >= 32 {
             return Err(DiscoveryError::Limit);
         }
         let sequence = self.sequence.checked_add(1).ok_or(DiscoveryError::Limit)?;
@@ -181,6 +181,20 @@ impl ConsentCatalog {
             addresses: entry.advertisement.addresses.clone(),
         })
     }
+
+    /// Atomically consumes the current discovery window after selecting one
+    /// exact current handle. No later handle from the same window can begin a
+    /// second transport attempt.
+    pub fn select_once(
+        &mut self,
+        handle: CandidateHandle,
+        now: u64,
+    ) -> Result<SelectedLocator, DiscoveryError> {
+        let selected = self.select(handle, now)?;
+        self.deadline = None;
+        self.entries.clear();
+        Ok(selected)
+    }
 }
 
 fn opaque(value: &str) -> bool {
@@ -210,7 +224,13 @@ pub struct GuidedMdns {
 }
 impl GuidedMdns {
     pub fn start() -> Result<Self, DiscoveryError> {
-        Self::from_daemon(mdns_sd::ServiceDaemon::new().map_err(|_| DiscoveryError::Unavailable)?)
+        let daemon = mdns_sd::ServiceDaemon::new().map_err(|_| DiscoveryError::Unavailable)?;
+        // Keep normal LAN interfaces and also permit two product processes on
+        // one host to discover each other through the real mDNS path.
+        daemon
+            .enable_interface(mdns_sd::IfKind::LoopbackV4)
+            .map_err(|_| DiscoveryError::Unavailable)?;
+        Self::from_daemon(daemon)
     }
     fn from_daemon(daemon: mdns_sd::ServiceDaemon) -> Result<Self, DiscoveryError> {
         Self::from_daemon_with_duration(daemon, std::time::Duration::from_secs(300))

@@ -265,6 +265,12 @@ impl seamless_input::ui_stdio_adapter::TimedRequestReader for InheritedUiStdinRe
 fn run_ui_stdio_child() -> Result<(), OperationalError> {
     let mut reader = InheritedUiStdinReader::new();
     let mut stdout = io::stdout().lock();
+    #[cfg(feature = "pairing-v2-g4")]
+    {
+        let paths = AppPaths::discover()?;
+        seamless_input::ui_stdio_adapter::run_stdio_g4(&mut reader, &mut stdout, &paths.root)?;
+    }
+    #[cfg(not(feature = "pairing-v2-g4"))]
     seamless_input::ui_stdio_adapter::run_stdio(&mut reader, &mut stdout)?;
     reader.finish_read()?;
     Ok(())
