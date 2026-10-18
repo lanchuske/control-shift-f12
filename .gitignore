@@ -3,3 +3,4 @@
 /.superpowers/
 .DS_Store
 *.log
+native/**/.build/

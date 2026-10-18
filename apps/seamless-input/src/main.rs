@@ -1,14 +1,18 @@
 use std::{
     fmt,
     io::{self, Write},
-    process::ExitCode,
-    time::{Duration, SystemTime},
+    process::{self, ExitCode},
+    sync::mpsc::{self, Receiver, RecvTimeoutError},
+    thread,
+    time::{Duration, Instant, SystemTime},
 };
 
-use clap::{Args, Parser, Subcommand};
+use clap::{ArgGroup, Args, Parser, Subcommand};
 use seamless_discovery::{Discovery, manual_address};
 use seamless_input::{
-    supervisor::{AppPaths, CapabilityReport, NativeSupervisor},
+    diagnostics::{RuntimeObservation, compatibility_lines},
+    runtime_status::{RuntimeStatus, RuntimeStatusStore},
+    supervisor::{AppPaths, CapabilityReport, INPUT_SERVICE_INTERVAL, NativeSupervisor},
     tui,
 };
 use seamless_input_protocol::{NodeId, VERSION};
@@ -30,8 +34,25 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
+    /// Internal setup foundations; input, clipboard and pairing remain disabled.
+    #[command(group(
+        ArgGroup::new("control_channel")
+            .required(true)
+            .args(["stdio", "ui_stdio"])
+            .multiple(false)
+    ))]
+    Control {
+        /// Internal foundations channel; not for the desktop presentation host.
+        #[arg(long)]
+        stdio: bool,
+        /// Bounded redacted UI projection channel for a future native host.
+        #[arg(long, hide = true)]
+        ui_stdio: bool,
+    },
     /// Start this machine as a Control Shift F12 peer.
     Start,
+    /// Report the currently running peer and authenticated session count.
+    Status(StatusArgs),
     /// Pair this machine with another peer.
     Pair(PairArgs),
     /// List paired and discovered peers.
@@ -61,6 +82,16 @@ struct PairArgs {
     /// Connect directly when mDNS discovery is unavailable.
     #[arg(long, value_name = "HOST:PORT")]
     address: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct StatusArgs {
+    /// Read only the heartbeat owned by this process id.
+    #[arg(long, value_name = "PID")]
+    pid: u32,
+    /// Print a stable tab-separated record for native launchers.
+    #[arg(long)]
+    machine: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -98,9 +129,24 @@ impl<E: std::error::Error> From<E> for OperationalError {
 }
 
 async fn run(cli: Cli) -> Result<(), OperationalError> {
+    if matches!(&cli.command, Commands::Control { ui_stdio: true, .. }) {
+        return run_ui_stdio_child();
+    }
+
     let paths = AppPaths::discover()?;
     match cli.command {
+        Commands::Control {
+            stdio: true,
+            ui_stdio: false,
+        } => {
+            let _instance =
+                seamless_transport::setup_lock::SetupInstanceLock::acquire(&paths.root)?;
+            seamless_input::control_engine::run_stdio(io::stdin().lock(), io::stdout().lock())?;
+            Ok(())
+        }
+        Commands::Control { .. } => Err(OperationalError("invalid control channel".into())),
         Commands::Start => start(&paths).await,
+        Commands::Status(args) => status(&paths, args),
         Commands::Pair(args) => pair(&paths, &args.code, args.address.as_deref()).await,
         Commands::Peers => peers(&paths),
         Commands::Unpair { peer } => unpair(&paths, &peer),
@@ -113,9 +159,136 @@ async fn run(cli: Cli) -> Result<(), OperationalError> {
     }
 }
 
+enum InheritedRead {
+    Event(seamless_input::ui_stdio_adapter::StdioReadEvent),
+    Invalid,
+}
+
+/// A process-owned inherited stdin reader for the UI projection child.
+///
+/// The only terminal cancellation path is a direct child-process exit. That
+/// deliberately avoids returning from a broken-stdout path while an inherited
+/// stdin read remains blocked; a platform host must still provide its own
+/// cancellable pipe owner before it can be enabled.
+struct InheritedUiStdinReader {
+    receiver: Option<Receiver<InheritedRead>>,
+    worker: Option<thread::JoinHandle<()>>,
+}
+
+impl InheritedUiStdinReader {
+    fn new() -> Self {
+        Self {
+            receiver: None,
+            worker: None,
+        }
+    }
+
+    fn ensure_read(&mut self) {
+        if self.receiver.is_some() {
+            return;
+        }
+
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let worker = thread::spawn(move || {
+            let stdin = io::stdin();
+            let mut stdin = stdin.lock();
+            let result = match seamless_input::control_api::read_request(&mut stdin) {
+                Ok(Some(request)) => InheritedRead::Event(
+                    seamless_input::ui_stdio_adapter::StdioReadEvent::Request(request),
+                ),
+                Ok(None) => {
+                    InheritedRead::Event(seamless_input::ui_stdio_adapter::StdioReadEvent::Eof)
+                }
+                Err(_) => InheritedRead::Invalid,
+            };
+            let _ = sender.send(result);
+        });
+        self.receiver = Some(receiver);
+        self.worker = Some(worker);
+    }
+
+    fn finish_read(&mut self) -> io::Result<()> {
+        self.receiver = None;
+        if let Some(worker) = self.worker.take() {
+            worker
+                .join()
+                .map_err(|_| io::Error::other("ui stdio reader terminated unexpectedly"))?;
+        }
+        Ok(())
+    }
+}
+
+impl seamless_input::ui_stdio_adapter::TimedRequestReader for InheritedUiStdinReader {
+    fn receive_until(
+        &mut self,
+        timeout: Duration,
+    ) -> io::Result<seamless_input::ui_stdio_adapter::StdioReadEvent> {
+        self.ensure_read();
+        let result = self
+            .receiver
+            .as_ref()
+            .expect("reader exists after ensure_read")
+            .recv_timeout(timeout);
+        match result {
+            Ok(InheritedRead::Event(event)) => {
+                self.finish_read()?;
+                Ok(event)
+            }
+            Ok(InheritedRead::Invalid) => {
+                self.finish_read()?;
+                Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invalid ui stdio request",
+                ))
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                Ok(seamless_input::ui_stdio_adapter::StdioReadEvent::Timeout)
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                self.finish_read()?;
+                Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "ui stdio reader disconnected",
+                ))
+            }
+        }
+    }
+
+    fn cancel(&mut self) {
+        // The adapter calls this only after output has already failed. Process
+        // exit releases the blocked inherited read instead of returning a
+        // child with a detached worker.
+        process::exit(EXIT_OPERATIONAL_FAILURE.into());
+    }
+}
+
+fn run_ui_stdio_child() -> Result<(), OperationalError> {
+    let mut reader = InheritedUiStdinReader::new();
+    let mut stdout = io::stdout().lock();
+    seamless_input::ui_stdio_adapter::run_stdio(&mut reader, &mut stdout)?;
+    reader.finish_read()?;
+    Ok(())
+}
+
 async fn start(paths: &AppPaths) -> Result<(), OperationalError> {
+    let process_id = std::process::id();
+    let status_store = RuntimeStatusStore::within(&paths.root, process_id);
+    if let Err(error) = status_store.clear_owned(process_id) {
+        eprintln!("runtime status cleanup unavailable: {error}");
+    }
+    let _status_lease = RuntimeStatusLease {
+        store: status_store.clone(),
+        owner_pid: process_id,
+    };
     let mut supervisor = NativeSupervisor::bootstrap(paths)?;
-    let state = supervisor.tick().await?;
+    let mut state = supervisor.tick().await?;
+    let mut heartbeat_failed = match publish_status(&status_store, process_id, &state) {
+        Ok(()) => false,
+        Err(error) => {
+            eprintln!("runtime status heartbeat unavailable: {error}");
+            true
+        }
+    };
     println!(
         "Control Shift F12 running: {} display(s), {} authenticated session(s)",
         state.displays, state.authenticated_sessions
@@ -124,15 +297,84 @@ async fn start(paths: &AppPaths) -> Result<(), OperationalError> {
         .flush()
         .map_err(|error| OperationalError(error.to_string()))?;
     let mut interval = tokio::time::interval(Duration::from_millis(250));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut input_interval = tokio::time::interval(INPUT_SERVICE_INTERVAL);
+    input_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut last_heartbeat = Instant::now();
     loop {
         tokio::select! {
-            _ = interval.tick() => { supervisor.tick().await?; }
+            _ = interval.tick() => {
+                let next = supervisor.tick().await?;
+                let changed = next.displays != state.displays
+                    || next.authenticated_sessions != state.authenticated_sessions;
+                if changed || last_heartbeat.elapsed() >= Duration::from_secs(2) {
+                    match publish_status(&status_store, process_id, &next) {
+                        Ok(()) if heartbeat_failed => {
+                            eprintln!("runtime status heartbeat recovered");
+                            heartbeat_failed = false;
+                        }
+                        Ok(()) => heartbeat_failed = false,
+                        Err(error) if !heartbeat_failed => {
+                            eprintln!("runtime status heartbeat unavailable: {error}");
+                            heartbeat_failed = true;
+                        }
+                        Err(_) => {}
+                    }
+                    last_heartbeat = Instant::now();
+                }
+                state = next;
+            }
+            _ = input_interval.tick() => { supervisor.service_input().await?; }
             result = tokio::signal::ctrl_c() => {
                 result.map_err(|error| OperationalError(error.to_string()))?;
                 return Ok(());
             }
         }
     }
+}
+
+fn publish_status(
+    store: &RuntimeStatusStore,
+    process_id: u32,
+    state: &seamless_input::supervisor::SupervisorStatus,
+) -> Result<(), seamless_input::runtime_status::RuntimeStatusError> {
+    RuntimeStatus::live(process_id, state.displays, state.authenticated_sessions)
+        .and_then(|status| store.publish(&status))
+}
+
+struct RuntimeStatusLease {
+    store: RuntimeStatusStore,
+    owner_pid: u32,
+}
+
+impl Drop for RuntimeStatusLease {
+    fn drop(&mut self) {
+        let _ = self.store.clear_owned(self.owner_pid);
+    }
+}
+
+fn status(paths: &AppPaths, args: StatusArgs) -> Result<(), OperationalError> {
+    let store = RuntimeStatusStore::within(&paths.root, args.pid);
+    if let Some(status) = store.read_current(SystemTime::now())? {
+        if args.machine {
+            println!(
+                "state=running\tprocess_id={}\tdisplays={}\tauthenticated_sessions={}",
+                status.process_id, status.displays, status.authenticated_sessions
+            );
+        } else {
+            println!("{}", status.display_line());
+        }
+    } else {
+        if args.machine {
+            println!(
+                "state=stopped\tprocess_id={}\tdisplays=0\tauthenticated_sessions=0",
+                args.pid
+            );
+        } else {
+            println!("Control Shift F12 stopped: 0 authenticated session(s)");
+        }
+    }
+    Ok(())
 }
 
 async fn pair(
@@ -331,6 +573,10 @@ fn config(paths: &AppPaths, command: ConfigCommands) -> Result<(), OperationalEr
 
 fn doctor(paths: &AppPaths, report: bool) {
     let measured = CapabilityReport::measure(paths);
+    let diagnostics = measured.diagnostics(RuntimeObservation::from_owner_status(
+        &paths.root,
+        SystemTime::now(),
+    ));
     if report {
         println!("Control Shift F12 diagnostic report");
         println!("privacy: redacted");
@@ -341,11 +587,10 @@ fn doctor(paths: &AppPaths, report: bool) {
         println!("administrator elevation: not required");
         println!("user consent: checked separately from administrator elevation");
     }
+    for (label, value) in compatibility_lines(&diagnostics.rows) {
+        println!("{label}: {value}");
+    }
     println!("config: {}", measured.config);
-    println!("input access: {}", measured.input);
-    println!("clipboard access: {}", measured.clipboard);
-    println!("displays: {}", measured.displays);
-    println!("discovery: {}", measured.discovery);
     println!("UDP transport: {}", measured.udp_transport);
     println!("paired identity pins: {}", measured.identity);
     println!("enterprise restrictions: not bypassed");

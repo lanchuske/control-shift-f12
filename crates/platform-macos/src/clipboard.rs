@@ -14,6 +14,11 @@ pub trait ClipboardBackend {
     fn write(&mut self, content: &ClipboardContent) -> Result<(), ClipboardError>;
 }
 
+#[cfg(target_os = "macos")]
+pub trait PasteboardChangeToken {
+    fn current(&self) -> Result<u64, ClipboardError>;
+}
+
 #[derive(Debug, thiserror::Error, Clone, PartialEq, Eq)]
 pub enum ClipboardError {
     #[error("pasteboard access is unavailable")]
@@ -137,6 +142,7 @@ mod native {
     use super::*;
     use arboard::{Clipboard, ImageData};
     use image::{DynamicImage, ImageFormat, RgbaImage};
+    use objc2_app_kit::NSPasteboard;
     use std::{
         borrow::Cow,
         io::Cursor,
@@ -149,8 +155,16 @@ mod native {
     pub struct PasteboardBackend {
         clipboard: Mutex<Option<Clipboard>>,
         access: AccessState,
-        count: AtomicU64,
-        observed_hash: Mutex<Option<[u8; 32]>>,
+        change_token: Box<dyn PasteboardChangeToken>,
+        snapshot_count: AtomicU64,
+    }
+
+    pub(crate) struct NativePasteboardChangeToken(pub(crate) objc2::rc::Retained<NSPasteboard>);
+
+    impl PasteboardChangeToken for NativePasteboardChangeToken {
+        fn current(&self) -> Result<u64, ClipboardError> {
+            Ok(self.0.changeCount().max(0) as u64)
+        }
     }
 
     impl PasteboardBackend {
@@ -159,19 +173,36 @@ mod native {
                 Ok(clipboard) => Self {
                     clipboard: Mutex::new(Some(clipboard)),
                     access: AccessState::Granted,
-                    count: AtomicU64::new(0),
-                    observed_hash: Mutex::new(None),
+                    change_token: Box::new(NativePasteboardChangeToken(
+                        NSPasteboard::generalPasteboard(),
+                    )),
+                    snapshot_count: AtomicU64::new(0),
                 },
                 Err(_) => Self {
                     clipboard: Mutex::new(None),
                     access: AccessState::Denied,
-                    count: AtomicU64::new(0),
-                    observed_hash: Mutex::new(None),
+                    change_token: Box::new(NativePasteboardChangeToken(
+                        NSPasteboard::generalPasteboard(),
+                    )),
+                    snapshot_count: AtomicU64::new(0),
                 },
             }
         }
 
+        #[cfg(test)]
+        pub(crate) fn with_change_token_for_test(
+            change_token: impl PasteboardChangeToken + 'static,
+        ) -> Self {
+            Self {
+                clipboard: Mutex::new(None),
+                access: AccessState::Granted,
+                change_token: Box::new(change_token),
+                snapshot_count: AtomicU64::new(0),
+            }
+        }
+
         fn snapshot(&self) -> Result<Option<ClipboardContent>, ClipboardError> {
+            self.snapshot_count.fetch_add(1, Ordering::Relaxed);
             let mut guard = self.clipboard.lock().map_err(|_| ClipboardError::Backend)?;
             let clipboard = guard.as_mut().ok_or(ClipboardError::AccessUnavailable)?;
             match clipboard.get_text() {
@@ -197,6 +228,11 @@ mod native {
                 Err(_) => Err(ClipboardError::Backend),
             }
         }
+
+        #[cfg(test)]
+        pub(crate) fn snapshot_count_for_test(&self) -> u64 {
+            self.snapshot_count.load(Ordering::Relaxed)
+        }
     }
 
     impl Default for PasteboardBackend {
@@ -213,17 +249,7 @@ mod native {
             if self.access != AccessState::Granted {
                 return Err(ClipboardError::AccessUnavailable);
             }
-            let content = self.snapshot()?;
-            let hash = content.as_ref().map(MacClipboard::hash);
-            let mut observed = self
-                .observed_hash
-                .lock()
-                .map_err(|_| ClipboardError::Backend)?;
-            if *observed != hash {
-                *observed = hash;
-                self.count.fetch_add(1, Ordering::Relaxed);
-            }
-            Ok(self.count.load(Ordering::Relaxed))
+            self.change_token.current()
         }
         fn read(&mut self) -> Result<Option<ClipboardContent>, ClipboardError> {
             self.snapshot()
@@ -254,6 +280,8 @@ mod native {
     }
 }
 
+#[cfg(all(test, target_os = "macos"))]
+use native::NativePasteboardChangeToken;
 #[cfg(target_os = "macos")]
 pub use native::PasteboardBackend;
 
@@ -268,5 +296,87 @@ impl MacClipboard {
 impl Default for MacClipboard {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod native_change_token_tests {
+    use super::{
+        ClipboardBackend, ClipboardError, NativePasteboardChangeToken, PasteboardBackend,
+        PasteboardChangeToken,
+    };
+    use objc2_app_kit::{NSPasteboard, NSPasteboardTypeString};
+    use objc2_foundation::NSString;
+    use std::{cell::RefCell, collections::VecDeque, rc::Rc};
+
+    type TokenExpectations = Rc<RefCell<VecDeque<Result<u64, ClipboardError>>>>;
+
+    struct ExpectedTokens {
+        expected: TokenExpectations,
+    }
+
+    impl PasteboardChangeToken for ExpectedTokens {
+        fn current(&self) -> Result<u64, ClipboardError> {
+            self.expected
+                .borrow_mut()
+                .pop_front()
+                .expect("unexpected change-token read")
+        }
+    }
+
+    fn backend_with_tokens(
+        values: impl IntoIterator<Item = Result<u64, ClipboardError>>,
+    ) -> (PasteboardBackend, TokenExpectations) {
+        let expected = Rc::new(RefCell::new(values.into_iter().collect()));
+        let backend = PasteboardBackend::with_change_token_for_test(ExpectedTokens {
+            expected: Rc::clone(&expected),
+        });
+        (backend, expected)
+    }
+
+    #[test]
+    fn unchanged_native_change_checks_do_not_read_or_encode_clipboard_contents() {
+        let (backend, expected) = backend_with_tokens((0..100).map(|_| Ok(41)));
+        let before = backend.snapshot_count_for_test();
+
+        for _ in 0..100 {
+            let _ = backend.change_count();
+        }
+
+        assert_eq!(backend.snapshot_count_for_test(), before);
+        assert!(expected.borrow().is_empty());
+    }
+
+    #[test]
+    fn native_change_count_propagates_real_increments_and_errors() {
+        let (backend, expected) = backend_with_tokens([Ok(7), Ok(8), Err(ClipboardError::Backend)]);
+
+        assert_eq!(backend.change_count(), Ok(7));
+        assert_eq!(backend.change_count(), Ok(8));
+        assert_eq!(backend.change_count(), Err(ClipboardError::Backend));
+        assert!(expected.borrow().is_empty());
+    }
+
+    #[test]
+    fn native_unique_pasteboard_reports_real_change_count_increments_without_snapshots() {
+        let pasteboard = NSPasteboard::pasteboardWithUniqueName();
+        let backend = PasteboardBackend::with_change_token_for_test(NativePasteboardChangeToken(
+            pasteboard.clone(),
+        ));
+        let initial = backend.change_count().unwrap();
+        assert_eq!(initial, pasteboard.changeCount().max(0) as u64);
+
+        pasteboard.clearContents();
+        let cleared = backend.change_count().unwrap();
+        assert!(cleared > initial);
+
+        let value = NSString::from_str("control-shift-f12-change-token-test");
+        assert!(pasteboard.setString_forType(&value, unsafe { NSPasteboardTypeString }));
+        let written = backend.change_count().unwrap();
+        assert!(written >= cleared);
+        pasteboard.clearContents();
+        let cleared_again = backend.change_count().unwrap();
+        assert!(cleared_again > written);
+        assert_eq!(backend.snapshot_count_for_test(), 0);
     }
 }

@@ -395,6 +395,8 @@ struct FakeClipboardBackend {
     content: Rc<RefCell<Option<ClipboardContent>>>,
     writes: Rc<RefCell<Vec<ClipboardContent>>>,
     available: Rc<RefCell<bool>>,
+    read_error: Rc<RefCell<Option<clipboard::ClipboardError>>>,
+    write_error: Rc<RefCell<Option<clipboard::ClipboardError>>>,
 }
 
 impl clipboard::ClipboardBackend for FakeClipboardBackend {
@@ -405,9 +407,15 @@ impl clipboard::ClipboardBackend for FakeClipboardBackend {
         Ok(*self.sequence.borrow())
     }
     fn read(&mut self) -> Result<Option<ClipboardContent>, clipboard::ClipboardError> {
+        if let Some(error) = self.read_error.borrow().clone() {
+            return Err(error);
+        }
         Ok(self.content.borrow().clone())
     }
     fn write(&mut self, content: &ClipboardContent) -> Result<(), clipboard::ClipboardError> {
+        if let Some(error) = self.write_error.borrow().clone() {
+            return Err(error);
+        }
         self.writes.borrow_mut().push(content.clone());
         Ok(())
     }
@@ -419,7 +427,304 @@ fn clipboard_backend(content: Option<ClipboardContent>) -> FakeClipboardBackend 
         content: Rc::new(RefCell::new(content)),
         writes: Rc::new(RefCell::new(Vec::new())),
         available: Rc::new(RefCell::new(true)),
+        read_error: Rc::new(RefCell::new(None)),
+        write_error: Rc::new(RefCell::new(None)),
     }
+}
+
+#[test]
+fn clipboard_busy_after_availability_check_retries_the_same_sequence() {
+    let backend = clipboard_backend(Some(ClipboardContent::Text("recovered".into())));
+    let read_error = backend.read_error.clone();
+    let mut clipboard = clipboard::WindowsClipboard::with_backend(backend);
+    assert_eq!(clipboard.poll(0).unwrap(), ClipboardOutcome::Pending);
+    // Windows can lose access between the availability check and the read.
+    *read_error.borrow_mut() = Some(clipboard::ClipboardError::AccessUnavailable);
+    assert_eq!(clipboard.poll(200), Ok(ClipboardOutcome::Pending));
+    assert_eq!(clipboard.poll(400), Ok(ClipboardOutcome::Pending));
+    *read_error.borrow_mut() = None;
+    assert_eq!(
+        clipboard.poll(600),
+        Ok(ClipboardOutcome::Changed(ClipboardContent::Text(
+            "recovered".into()
+        )))
+    );
+    assert_eq!(clipboard.poll(800), Ok(ClipboardOutcome::Unchanged));
+}
+
+#[test]
+fn clipboard_backend_failures_remain_errors() {
+    let backend = clipboard_backend(None);
+    let read_error = backend.read_error.clone();
+    let mut clipboard = clipboard::WindowsClipboard::with_backend(backend);
+    assert_eq!(clipboard.poll(0).unwrap(), ClipboardOutcome::Pending);
+    *read_error.borrow_mut() = Some(clipboard::ClipboardError::Backend);
+    assert_eq!(clipboard.poll(200), Err(clipboard::ClipboardError::Backend));
+}
+
+#[test]
+fn local_conversion_failure_is_nonfatal_but_not_reported_as_accessible() {
+    let backend = clipboard_backend(Some(ClipboardContent::Text("recovered".into())));
+    let sequence = backend.sequence.clone();
+    let read_error = backend.read_error.clone();
+    let mut clipboard = clipboard::WindowsClipboard::with_backend(backend);
+
+    assert_eq!(clipboard.poll(0), Ok(ClipboardOutcome::Pending));
+    *read_error.borrow_mut() = Some(clipboard::ClipboardError::Conversion);
+    assert_eq!(clipboard.poll(200), Ok(ClipboardOutcome::Unchanged));
+    assert_eq!(clipboard.access_state(), AccessState::Denied);
+
+    *read_error.borrow_mut() = None;
+    *sequence.borrow_mut() = 2;
+    assert_eq!(clipboard.poll(400), Ok(ClipboardOutcome::Pending));
+    assert_eq!(
+        clipboard.poll(600),
+        Ok(ClipboardOutcome::Changed(ClipboardContent::Text(
+            "recovered".into()
+        )))
+    );
+    assert_eq!(clipboard.access_state(), AccessState::Granted);
+}
+
+#[test]
+fn malformed_local_image_is_nonfatal_and_does_not_weaken_remote_validation() {
+    let backend = clipboard_backend(Some(ClipboardContent::Png(vec![0; 32])));
+    let mut clipboard = clipboard::WindowsClipboard::with_backend(backend);
+
+    assert_eq!(clipboard.poll(0), Ok(ClipboardOutcome::Pending));
+    assert_eq!(clipboard.poll(200), Ok(ClipboardOutcome::Unchanged));
+    assert_eq!(clipboard.access_state(), AccessState::Denied);
+    assert_eq!(
+        clipboard.write_remote(&ClipboardContent::Png(vec![0; 32])),
+        Err(clipboard::ClipboardError::Conversion)
+    );
+}
+
+#[test]
+fn unavailable_clipboard_disables_only_sync_and_recovers_without_a_new_sequence() {
+    let backend = clipboard_backend(Some(ClipboardContent::Text("recovered".into())));
+    let available = backend.available.clone();
+    let writes = backend.writes.clone();
+    let write_error = backend.write_error.clone();
+    let mut clipboard = clipboard::WindowsClipboard::with_backend(backend);
+    assert_eq!(clipboard.poll(0).unwrap(), ClipboardOutcome::Pending);
+    *available.borrow_mut() = false;
+    *write_error.borrow_mut() = Some(clipboard::ClipboardError::AccessUnavailable);
+    assert_eq!(clipboard.access_state(), AccessState::Denied);
+    assert_eq!(clipboard.poll(200), Ok(ClipboardOutcome::Disabled));
+    assert_eq!(
+        clipboard.write_remote(&ClipboardContent::Text("blocked".into())),
+        Err(clipboard::ClipboardError::AccessUnavailable)
+    );
+    assert!(writes.borrow().is_empty());
+    *available.borrow_mut() = true;
+    assert_eq!(clipboard.access_state(), AccessState::Granted);
+    assert_eq!(
+        clipboard.poll(400),
+        Ok(ClipboardOutcome::Changed(ClipboardContent::Text(
+            "recovered".into()
+        )))
+    );
+}
+
+#[test]
+fn incoming_write_attempts_backend_even_when_read_only_probe_was_busy() {
+    let backend = clipboard_backend(None);
+    *backend.available.borrow_mut() = false;
+    let writes = backend.writes.clone();
+    let mut clipboard = clipboard::WindowsClipboard::with_backend(backend);
+    let remote = ClipboardContent::Text("arrived after lock release".into());
+    assert_eq!(clipboard.write_remote(&remote), Ok(()));
+    assert_eq!(writes.borrow().as_slice(), &[remote]);
+}
+
+#[test]
+fn incoming_busy_write_is_deferred_without_writing_and_retried_on_poll() {
+    let remote = ClipboardContent::Text("deferred".into());
+    let backend = clipboard_backend(Some(remote.clone()));
+    let writes = backend.writes.clone();
+    let write_error = backend.write_error.clone();
+    *write_error.borrow_mut() = Some(clipboard::ClipboardError::Busy);
+    let mut clipboard = clipboard::WindowsClipboard::with_backend(backend);
+    assert_eq!(clipboard.poll(0), Ok(ClipboardOutcome::Pending));
+    assert_eq!(clipboard.write_remote(&remote), Ok(()));
+    assert!(writes.borrow().is_empty());
+    assert_eq!(clipboard.poll(200), Ok(ClipboardOutcome::Pending));
+    assert!(writes.borrow().is_empty());
+    *write_error.borrow_mut() = None;
+    assert_eq!(clipboard.poll(400), Ok(ClipboardOutcome::Unchanged));
+    assert_eq!(writes.borrow().as_slice(), &[remote]);
+    assert_eq!(clipboard.poll(600), Ok(ClipboardOutcome::Unchanged));
+    assert_eq!(writes.borrow().len(), 1);
+}
+
+#[test]
+fn deferred_incoming_writes_keep_only_the_latest_valid_update() {
+    let backend = clipboard_backend(None);
+    let writes = backend.writes.clone();
+    let write_error = backend.write_error.clone();
+    *write_error.borrow_mut() = Some(clipboard::ClipboardError::Busy);
+    let mut clipboard = clipboard::WindowsClipboard::with_backend(backend);
+    assert_eq!(
+        clipboard.write_remote(&ClipboardContent::Text("old".into())),
+        Ok(())
+    );
+    let latest = ClipboardContent::Text("latest".into());
+    assert_eq!(clipboard.write_remote(&latest), Ok(()));
+    assert_eq!(
+        clipboard.write_remote(&ClipboardContent::Text("x".repeat(MAX_TEXT_BYTES + 1))),
+        Err(clipboard::ClipboardError::TooLarge)
+    );
+    *write_error.borrow_mut() = None;
+    assert_eq!(clipboard.poll(0), Ok(ClipboardOutcome::Pending));
+    assert_eq!(writes.borrow().as_slice(), &[latest]);
+}
+
+#[test]
+fn permanent_incoming_write_failures_never_write_or_suppress_local_content() {
+    for error in [
+        clipboard::ClipboardError::AccessUnavailable,
+        clipboard::ClipboardError::Conversion,
+        clipboard::ClipboardError::Backend,
+    ] {
+        let content = ClipboardContent::Text("not applied".into());
+        let backend = clipboard_backend(Some(content.clone()));
+        let writes = backend.writes.clone();
+        *backend.write_error.borrow_mut() = Some(error.clone());
+        let mut clipboard = clipboard::WindowsClipboard::with_backend(backend);
+        assert_eq!(clipboard.write_remote(&content), Err(error));
+        assert!(writes.borrow().is_empty());
+        assert_eq!(clipboard.poll(0), Ok(ClipboardOutcome::Pending));
+        assert_eq!(clipboard.poll(200), Ok(ClipboardOutcome::Changed(content)));
+    }
+}
+
+#[test]
+fn deferred_write_permanent_failure_is_returned_without_dedupe_commit() {
+    let content = ClipboardContent::Text("not applied".into());
+    let backend = clipboard_backend(Some(content.clone()));
+    let writes = backend.writes.clone();
+    let write_error = backend.write_error.clone();
+    *write_error.borrow_mut() = Some(clipboard::ClipboardError::Busy);
+    let mut clipboard = clipboard::WindowsClipboard::with_backend(backend);
+    assert_eq!(clipboard.write_remote(&content), Ok(()));
+    *write_error.borrow_mut() = Some(clipboard::ClipboardError::Backend);
+    assert_eq!(clipboard.poll(0), Err(clipboard::ClipboardError::Backend));
+    assert!(writes.borrow().is_empty());
+    assert_eq!(clipboard.poll(200), Ok(ClipboardOutcome::Pending));
+    assert_eq!(clipboard.poll(400), Ok(ClipboardOutcome::Changed(content)));
+}
+
+#[cfg(target_os = "windows")]
+#[test]
+fn native_clipboard_holder_process() {
+    use std::{
+        io::{Read, Write},
+        thread,
+        time::Duration,
+    };
+    use windows_sys::Win32::System::DataExchange::{CloseClipboard, OpenClipboard};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{CreateWindowExW, DestroyWindow};
+
+    if std::env::var_os("CSF12_TEST_HOLD_CLIPBOARD").is_none() {
+        return;
+    }
+    let window = unsafe {
+        CreateWindowExW(
+            0,
+            [
+                b'S' as u16,
+                b'T' as u16,
+                b'A' as u16,
+                b'T' as u16,
+                b'I' as u16,
+                b'C' as u16,
+                0,
+            ]
+            .as_ptr(),
+            std::ptr::null(),
+            0,
+            0,
+            0,
+            0,
+            0,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null(),
+        )
+    };
+    assert!(
+        !window.is_null(),
+        "failed to create clipboard holder window"
+    );
+    let opened = (0..100).any(|_| {
+        if unsafe { OpenClipboard(window) } != 0 {
+            true
+        } else {
+            thread::sleep(Duration::from_millis(5));
+            false
+        }
+    });
+    assert!(opened, "clipboard remained busy for the holder process");
+    println!("CSF12_CLIPBOARD_OPEN");
+    std::io::stdout().flush().unwrap();
+    let _ = std::io::stdin().read_exact(&mut [0]);
+    assert_ne!(unsafe { CloseClipboard() }, 0);
+    assert_ne!(unsafe { DestroyWindow(window) }, 0);
+}
+
+#[cfg(target_os = "windows")]
+#[test]
+fn native_clipboard_probe_detects_another_process_open_clipboard_without_changing_it() {
+    use std::{
+        io::{BufRead, BufReader, Write},
+        process::{Command, Stdio},
+        sync::mpsc,
+        thread,
+        time::{Duration, Instant},
+    };
+
+    let mut holder = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "native_clipboard_holder_process", "--nocapture"])
+        .env("CSF12_TEST_HOLD_CLIPBOARD", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let output = holder.stdout.take().unwrap();
+    let (opened_tx, opened_rx) = mpsc::channel();
+    let output_reader = thread::spawn(move || {
+        for line in BufReader::new(output).lines() {
+            if line.unwrap().contains("CSF12_CLIPBOARD_OPEN") {
+                let _ = opened_tx.send(());
+            }
+        }
+    });
+    if opened_rx.recv_timeout(Duration::from_secs(5)).is_err() {
+        let _ = holder.kill();
+        let _ = holder.wait();
+        output_reader.join().unwrap();
+        panic!("clipboard holder did not acquire the clipboard");
+    }
+    let mut clipboard = clipboard::WindowsClipboard::new();
+    assert_eq!(clipboard.access_state(), AccessState::Denied);
+    assert_eq!(clipboard.poll(0), Ok(ClipboardOutcome::Disabled));
+    assert_eq!(clipboard.poll(200), Ok(ClipboardOutcome::Disabled));
+    holder.stdin.take().unwrap().write_all(&[0]).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let status = loop {
+        if let Some(status) = holder.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            holder.kill().unwrap();
+            break holder.wait().unwrap();
+        }
+        thread::sleep(Duration::from_millis(10));
+    };
+    output_reader.join().unwrap();
+    assert!(status.success(), "clipboard holder did not exit cleanly");
 }
 
 #[test]

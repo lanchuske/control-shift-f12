@@ -1,0 +1,22 @@
+[extend]
+useDefault = true
+
+# These fields contain published deterministic cryptographic test vectors, not
+# credentials. Extend only the generic high-entropy rule, and require both an
+# exact fixture path and an exact synthetic field name.
+[[rules]]
+id = "generic-api-key"
+
+[[rules.allowlists]]
+description = "Deterministic CSF12 pairing test-vector fields"
+condition = "AND"
+regexTarget = "line"
+regexes = [
+  '''^\s*"(?:a_confirmation_key_sha256_hex|b_confirmation_key_sha256_hex|replay_token_hex|shared_secret_hex)"\s*:''',
+]
+paths = [
+  '''^crates/transport/tests/fixtures/pairing-v2/e2e-v01-real-candidate-hello\.json$''',
+  '''^crates/transport/tests/fixtures/pairing-v2/operational-session-v01\.json$''',
+  '''^crates/transport/tests/fixtures/pairing-v2/transport-v01-approved-fields\.json$''',
+  '''^crates/transport/tests/fixtures/pairing-v2/v01-canonical-transcript\.json$''',
+]

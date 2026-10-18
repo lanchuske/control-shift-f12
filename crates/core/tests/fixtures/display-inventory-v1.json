@@ -1,0 +1,20 @@
+{
+  "generation": 1,
+  "digest": "5e7147ee858446086c16ccd50d9761166c911418f9f4180e2d82040e5d3738e9",
+  "displays": [{
+    "runtime_index": 7,
+    "stable_display_id": null,
+    "name": null,
+    "name_provenance": "unavailable",
+    "logical_bounds": {"x": 0.0, "y": 0.0, "width": 1920.0, "height": 1080.0},
+    "backing_scale": {"x": 2.0, "y": 2.0},
+    "framebuffer_pixels": null,
+    "native_mode_pixels": null,
+    "effective_dpi": null,
+    "rotation_degrees": null,
+    "physical_mm": null,
+    "physical_size_quality": "unavailable",
+    "primary": null,
+    "mirror_group": null
+  }]
+}

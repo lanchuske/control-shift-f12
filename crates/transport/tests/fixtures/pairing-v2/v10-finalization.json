@@ -1,0 +1,27 @@
+{
+  "id": "V10",
+  "legal": [
+    [
+      "ready",
+      "A"
+    ],
+    [
+      "ready",
+      "B"
+    ],
+    [
+      "commit",
+      "A"
+    ],
+    [
+      "commit_ack",
+      "B"
+    ],
+    [
+      "complete",
+      "A"
+    ]
+  ],
+  "promotion": "only-after-complete",
+  "ready_order": "either"
+}

@@ -1,0 +1,317 @@
+#[cfg(unix)]
+use std::fs::File;
+use std::{
+    fs::{self, OpenOptions},
+    io::{self, Write},
+    path::{Path, PathBuf},
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
+
+use thiserror::Error;
+
+const VERSION: u8 = 1;
+const MAX_AGE: Duration = Duration::from_secs(5);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RuntimeStatus {
+    pub process_id: u32,
+    pub updated_unix_ms: u64,
+    pub displays: usize,
+    pub authenticated_sessions: usize,
+}
+
+/// Freshness of the local runtime heartbeat. Consumers must distinguish a
+/// missing heartbeat from a stale one so that an old success is never reused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeStatusRead {
+    Current(RuntimeStatus),
+    Missing,
+    Stale,
+}
+
+impl RuntimeStatus {
+    pub fn live(
+        process_id: u32,
+        displays: usize,
+        authenticated_sessions: usize,
+    ) -> Result<Self, RuntimeStatusError> {
+        Ok(Self {
+            process_id,
+            updated_unix_ms: unix_millis(SystemTime::now())?,
+            displays,
+            authenticated_sessions,
+        })
+    }
+
+    pub fn display_line(self) -> String {
+        format!(
+            "Control Shift F12 running: {} display(s), {} authenticated session(s)",
+            self.displays, self.authenticated_sessions
+        )
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum RuntimeStatusError {
+    #[error("runtime status I/O failed: {0}")]
+    Io(#[from] io::Error),
+    #[error("runtime status is invalid")]
+    Invalid,
+    #[error("system clock is before the Unix epoch")]
+    Clock,
+}
+
+#[derive(Debug, Clone)]
+pub struct RuntimeStatusStore {
+    path: PathBuf,
+    owner_pid: Option<u32>,
+}
+
+impl RuntimeStatusStore {
+    pub fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            owner_pid: None,
+        }
+    }
+
+    pub fn within(root: &Path, owner_pid: u32) -> Self {
+        Self {
+            path: root.join(format!("runtime-status.{owner_pid}.v1")),
+            owner_pid: Some(owner_pid),
+        }
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn publish(&self, status: &RuntimeStatus) -> Result<(), RuntimeStatusError> {
+        if self
+            .owner_pid
+            .is_some_and(|owner| owner != status.process_id)
+        {
+            return Err(RuntimeStatusError::Invalid);
+        }
+        if let Some(parent) = self.path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let temp = temp_path(&self.path);
+        let mut options = OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&temp)?;
+        writeln!(file, "version={VERSION}")?;
+        writeln!(file, "process_id={}", status.process_id)?;
+        writeln!(file, "updated_unix_ms={}", status.updated_unix_ms)?;
+        writeln!(file, "displays={}", status.displays)?;
+        writeln!(
+            file,
+            "authenticated_sessions={}",
+            status.authenticated_sessions
+        )?;
+        file.sync_all()?;
+        replace_file(&temp, &self.path)?;
+        sync_parent(&self.path)?;
+        Ok(())
+    }
+
+    pub fn read_current(
+        &self,
+        now: SystemTime,
+    ) -> Result<Option<RuntimeStatus>, RuntimeStatusError> {
+        match self.read_state(now)? {
+            RuntimeStatusRead::Current(status) => Ok(Some(status)),
+            RuntimeStatusRead::Missing | RuntimeStatusRead::Stale => Ok(None),
+        }
+    }
+
+    pub fn read_state(&self, now: SystemTime) -> Result<RuntimeStatusRead, RuntimeStatusError> {
+        let text = match fs::read_to_string(&self.path) {
+            Ok(text) => text,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok(RuntimeStatusRead::Missing);
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let status = decode(&text)?;
+        let now_ms = unix_millis(now)?;
+        if status.updated_unix_ms > now_ms.saturating_add(1_000) {
+            return Err(RuntimeStatusError::Invalid);
+        }
+        if now_ms.saturating_sub(status.updated_unix_ms) > MAX_AGE.as_millis() as u64 {
+            return Ok(RuntimeStatusRead::Stale);
+        }
+        Ok(RuntimeStatusRead::Current(status))
+    }
+
+    /// Read the one current owner heartbeat under an application root.
+    ///
+    /// A malformed, mismatched or ambiguous owner record is rejected rather
+    /// than selecting an arbitrary success. A stale record remains distinct
+    /// from an absent record so diagnostics cannot replay an old runtime.
+    pub fn read_owner_state(
+        root: &Path,
+        now: SystemTime,
+    ) -> Result<RuntimeStatusRead, RuntimeStatusError> {
+        let entries = match fs::read_dir(root) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok(RuntimeStatusRead::Missing);
+            }
+            Err(error) => return Err(error.into()),
+        };
+
+        let mut saw_stale = false;
+        let mut current = None;
+        for entry in entries {
+            let entry = entry?;
+            let Some(owner_pid) = owner_pid_from_path(&entry.path()) else {
+                continue;
+            };
+            let store = Self::new(entry.path());
+            match store.read_state(now)? {
+                RuntimeStatusRead::Current(status) if status.process_id == owner_pid => {
+                    if current.replace(status).is_some() {
+                        return Err(RuntimeStatusError::Invalid);
+                    }
+                }
+                RuntimeStatusRead::Current(_) => return Err(RuntimeStatusError::Invalid),
+                RuntimeStatusRead::Stale => saw_stale = true,
+                RuntimeStatusRead::Missing => {}
+            }
+        }
+        if let Some(status) = current {
+            Ok(RuntimeStatusRead::Current(status))
+        } else if saw_stale {
+            Ok(RuntimeStatusRead::Stale)
+        } else {
+            Ok(RuntimeStatusRead::Missing)
+        }
+    }
+
+    pub fn clear_owned(&self, owner_pid: u32) -> Result<(), RuntimeStatusError> {
+        if self.owner_pid != Some(owner_pid) {
+            return Err(RuntimeStatusError::Invalid);
+        }
+        let text = match fs::read_to_string(&self.path) {
+            Ok(text) => text,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+        };
+        if decode(&text)?.process_id != owner_pid {
+            return Err(RuntimeStatusError::Invalid);
+        }
+        match fs::remove_file(&self.path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    pub fn clear(&self) -> Result<(), RuntimeStatusError> {
+        match self.owner_pid {
+            Some(owner_pid) => self.clear_owned(owner_pid),
+            None => match fs::remove_file(&self.path) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(error.into()),
+            },
+        }
+    }
+}
+
+fn decode(text: &str) -> Result<RuntimeStatus, RuntimeStatusError> {
+    let mut version = None;
+    let mut process_id = None;
+    let mut updated_unix_ms = None;
+    let mut displays = None;
+    let mut authenticated_sessions = None;
+    for line in text.lines() {
+        let (key, value) = line.split_once('=').ok_or(RuntimeStatusError::Invalid)?;
+        match key {
+            "version" => version = value.parse::<u8>().ok(),
+            "process_id" => process_id = value.parse::<u32>().ok(),
+            "updated_unix_ms" => updated_unix_ms = value.parse::<u64>().ok(),
+            "displays" => displays = value.parse::<usize>().ok(),
+            "authenticated_sessions" => authenticated_sessions = value.parse::<usize>().ok(),
+            _ => return Err(RuntimeStatusError::Invalid),
+        }
+    }
+    if version != Some(VERSION) {
+        return Err(RuntimeStatusError::Invalid);
+    }
+    Ok(RuntimeStatus {
+        process_id: process_id.ok_or(RuntimeStatusError::Invalid)?,
+        updated_unix_ms: updated_unix_ms.ok_or(RuntimeStatusError::Invalid)?,
+        displays: displays.ok_or(RuntimeStatusError::Invalid)?,
+        authenticated_sessions: authenticated_sessions.ok_or(RuntimeStatusError::Invalid)?,
+    })
+}
+
+fn unix_millis(time: SystemTime) -> Result<u64, RuntimeStatusError> {
+    u64::try_from(
+        time.duration_since(UNIX_EPOCH)
+            .map_err(|_| RuntimeStatusError::Clock)?
+            .as_millis(),
+    )
+    .map_err(|_| RuntimeStatusError::Clock)
+}
+
+fn temp_path(path: &Path) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(".tmp");
+    PathBuf::from(name)
+}
+
+fn owner_pid_from_path(path: &Path) -> Option<u32> {
+    let name = path.file_name()?.to_str()?;
+    name.strip_prefix("runtime-status.")?
+        .strip_suffix(".v1")?
+        .parse()
+        .ok()
+}
+
+fn sync_parent(_path: &Path) -> Result<(), RuntimeStatusError> {
+    #[cfg(unix)]
+    if let Some(parent) = _path.parent() {
+        File::open(parent)?.sync_all()?;
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "windows"))]
+fn replace_file(source: &Path, destination: &Path) -> io::Result<()> {
+    fs::rename(source, destination)
+}
+
+#[cfg(target_os = "windows")]
+fn replace_file(source: &Path, destination: &Path) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+    };
+
+    let source: Vec<u16> = source.as_os_str().encode_wide().chain(Some(0)).collect();
+    let destination: Vec<u16> = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+    let moved = unsafe {
+        MoveFileExW(
+            source.as_ptr(),
+            destination.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if moved == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}

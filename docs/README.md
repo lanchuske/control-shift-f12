@@ -7,6 +7,11 @@ and the quickest path to testing.
 
 - [MVP specification](architecture/mvp-specification.md) — product boundaries,
   peer model, pairing, transport, topology, permissions, and acceptance evidence.
+- [Operational-session interoperability reference](operational-session-interoperability.md)
+  — frozen test-only session binding and vector contract; it is not runtime enablement.
+- [Native setup UX specification](native-setup-ux-specification.md) — proposed
+  AppKit and WinForms discovery, mutual confirmation, and display-layout UX;
+  it does not enable pairing or remote control.
 - [Repository layout](repository-layout.md) — where product code,
   platform adapters, tests, scripts, and community files live.
 

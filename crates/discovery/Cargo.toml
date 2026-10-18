@@ -4,5 +4,8 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+pairing-v2-experimental = []
+
 [dependencies]
 mdns-sd = "0.21"

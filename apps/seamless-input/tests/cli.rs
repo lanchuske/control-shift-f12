@@ -243,6 +243,35 @@ fn start_bootstraps_the_real_supervisor_and_stays_running() {
         child.try_wait().unwrap().is_none(),
         "start exited before supervision began"
     );
+    let status_deadline = Instant::now() + Duration::from_secs(5);
+    let live = loop {
+        let status = Command::new(env!("CARGO_BIN_EXE_seamless-input"))
+            .args(["status", "--pid", &child.id().to_string(), "--machine"])
+            .env("SEAMLESS_INPUT_HOME", &home)
+            .output()
+            .unwrap();
+        let snapshot = String::from_utf8(status.stdout).unwrap();
+        if snapshot.starts_with("state=running\t") || Instant::now() >= status_deadline {
+            break snapshot;
+        }
+        assert!(child.try_wait().unwrap().is_none());
+        thread::sleep(Duration::from_millis(25));
+    };
+    assert!(live.starts_with("state=running\t"), "{live}");
+    assert!(
+        live.contains(&format!("\tprocess_id={}\t", child.id())),
+        "{live}"
+    );
+
+    let foreign = Command::new(env!("CARGO_BIN_EXE_seamless-input"))
+        .args(["status", "--pid", "1", "--machine"])
+        .env("SEAMLESS_INPUT_HOME", &home)
+        .output()
+        .unwrap();
+    assert_eq!(
+        String::from_utf8(foreign.stdout).unwrap().trim(),
+        "state=stopped\tprocess_id=1\tdisplays=0\tauthenticated_sessions=0"
+    );
     child.kill().unwrap();
     let output = child.wait_with_output().unwrap();
     assert!(home.join("config.toml").is_file());
@@ -300,6 +329,76 @@ fn doctor_measures_real_local_capabilities() {
 }
 
 #[test]
+fn doctor_projects_the_owner_runtime_status_without_replaying_a_stale_success() {
+    let home = test_home();
+    let pid = 42_424;
+    let store = seamless_input::runtime_status::RuntimeStatusStore::within(&home, pid);
+    store
+        .publish(
+            &seamless_input::runtime_status::RuntimeStatus::live(pid, 1, 1)
+                .expect("current heartbeat"),
+        )
+        .unwrap();
+
+    let current = Command::new(env!("CARGO_BIN_EXE_seamless-input"))
+        .arg("doctor")
+        .env("SEAMLESS_INPUT_HOME", &home)
+        .output()
+        .unwrap();
+    assert!(String::from_utf8_lossy(&current.stdout).contains("runtime: PASS"));
+
+    std::fs::write(store.path(), "malformed\n").unwrap();
+    let malformed = Command::new(env!("CARGO_BIN_EXE_seamless-input"))
+        .arg("doctor")
+        .env("SEAMLESS_INPUT_HOME", &home)
+        .output()
+        .unwrap();
+    assert!(String::from_utf8_lossy(&malformed.stdout).contains("runtime: UNKNOWN"));
+}
+
+#[test]
+fn doctor_never_reports_runtime_or_sessions_as_pass_without_a_current_owner_heartbeat() {
+    let missing_home = test_home();
+    let missing = Command::new(env!("CARGO_BIN_EXE_seamless-input"))
+        .arg("doctor")
+        .env("SEAMLESS_INPUT_HOME", &missing_home)
+        .output()
+        .unwrap();
+    let missing = String::from_utf8(missing.stdout).unwrap();
+    assert!(missing.contains("runtime: NOT CONFIGURED"), "{missing}");
+    assert!(
+        missing.contains("authenticated sessions: UNKNOWN"),
+        "{missing}"
+    );
+    assert!(!missing.contains("runtime: PASS"), "{missing}");
+    assert!(
+        !missing.contains("authenticated sessions: PASS"),
+        "{missing}"
+    );
+
+    let stale_home = test_home();
+    let store = seamless_input::runtime_status::RuntimeStatusStore::within(&stale_home, 42_425);
+    store
+        .publish(&seamless_input::runtime_status::RuntimeStatus {
+            process_id: 42_425,
+            updated_unix_ms: 1,
+            displays: 1,
+            authenticated_sessions: 1,
+        })
+        .unwrap();
+    let stale = Command::new(env!("CARGO_BIN_EXE_seamless-input"))
+        .arg("doctor")
+        .env("SEAMLESS_INPUT_HOME", &stale_home)
+        .output()
+        .unwrap();
+    let stale = String::from_utf8(stale.stdout).unwrap();
+    assert!(stale.contains("runtime: UNKNOWN"), "{stale}");
+    assert!(stale.contains("authenticated sessions: UNKNOWN"), "{stale}");
+    assert!(!stale.contains("runtime: PASS"), "{stale}");
+    assert!(!stale.contains("authenticated sessions: PASS"), "{stale}");
+}
+
+#[test]
 fn doctor_report_is_opt_in_redacted_and_stable_identifier_free() {
     let output = run_with_sensitive_environment(&["doctor", "--report"]);
     assert!(output.status.success());
@@ -323,6 +422,27 @@ fn doctor_report_is_opt_in_redacted_and_stable_identifier_free() {
     assert!(stdout.contains("privacy: redacted"));
     assert!(stdout.contains("platform:"));
     assert!(stdout.contains("permissions:"));
+}
+
+#[test]
+fn status_fails_closed_when_no_live_runtime_heartbeat_exists() {
+    let output = run(&["status", "--pid", "4242"]);
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap().trim(),
+        "Control Shift F12 stopped: 0 authenticated session(s)"
+    );
+    assert_eq!(output.stderr, b"");
+}
+
+#[test]
+fn machine_status_is_stable_and_filtered_by_process_id() {
+    let output = run(&["status", "--pid", "8123", "--machine"]);
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap().trim(),
+        "state=stopped\tprocess_id=8123\tdisplays=0\tauthenticated_sessions=0"
+    );
 }
 
 #[test]
