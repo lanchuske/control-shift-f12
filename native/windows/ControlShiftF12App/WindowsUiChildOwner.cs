@@ -1,6 +1,7 @@
 using System;
 using System.Diagnostics;
 using System.IO;
+using System.Runtime.ExceptionServices;
 using System.Threading;
 using System.Threading.Tasks;
 using ControlShiftF12App.Core;
@@ -222,9 +223,11 @@ public sealed class WindowsUiChildOwner : IAsyncDisposable
         Action disposeStdoutGate
     )
     {
-        await close();
-        disposeChild();
-        disposeStdoutGate();
+        Exception failure = null!;
+        try { await close(); } catch (Exception error) { failure = error; }
+        try { disposeChild(); } catch (Exception error) { failure ??= error; }
+        try { disposeStdoutGate(); } catch (Exception error) { failure ??= error; }
+        if (failure is not null) ExceptionDispatchInfo.Capture(failure).Throw();
     }
 
     private void ThrowIfClosed()
