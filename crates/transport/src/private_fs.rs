@@ -17,7 +17,51 @@ pub(crate) struct PrivateDir(File);
 #[cfg(all(test, feature = "pairing-v2-experimental"))]
 pub(crate) mod faults {
     use super::StoreError;
-    std::thread_local! {static ARMED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };}
+    use std::sync::{Arc, Barrier};
+    std::thread_local! {
+        static ARMED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        static BEFORE_RENAME: std::cell::RefCell<Option<Arc<Pause>>> = const { std::cell::RefCell::new(None) };
+    }
+    struct Pause {
+        reached: Barrier,
+        release: Barrier,
+    }
+    #[derive(Clone)]
+    pub(crate) struct BeforeRenamePause(Arc<Pause>);
+
+    pub(crate) fn pause_before_rename() -> BeforeRenamePause {
+        let pause = Arc::new(Pause {
+            reached: Barrier::new(2),
+            release: Barrier::new(2),
+        });
+        BeforeRenamePause(pause)
+    }
+
+    impl BeforeRenamePause {
+        pub(crate) fn wait_until_reached(&self) {
+            self.0.reached.wait();
+        }
+
+        pub(crate) fn release(self) {
+            self.0.release.wait();
+        }
+
+        pub(crate) fn arm_on_current_thread(&self) {
+            BEFORE_RENAME.with(|slot| *slot.borrow_mut() = Some(self.0.clone()));
+        }
+    }
+
+    pub(crate) fn pause_point(file: &str, stage: &str) {
+        if file != "ledger.json" || stage != "before_rename" {
+            return;
+        }
+        let pause = BEFORE_RENAME.with(|slot| slot.borrow().clone());
+        if let Some(pause) = pause {
+            pause.reached.wait();
+            pause.release.wait();
+            BEFORE_RENAME.with(|slot| *slot.borrow_mut() = None);
+        }
+    }
     pub fn arm() {
         ARMED.set(true);
     }
@@ -48,7 +92,10 @@ pub(crate) mod faults {
 macro_rules! fault_point {
     ($file:expr, $stage:expr) => {
         #[cfg(all(test, feature = "pairing-v2-experimental"))]
-        faults::point($file, $stage)?;
+        {
+            faults::pause_point($file, $stage);
+            faults::point($file, $stage)?;
+        }
     };
 }
 
@@ -76,6 +123,14 @@ fn validate(file: &File, directory: bool) -> Result<(), StoreError> {
 }
 
 impl PrivateDir {
+    #[cfg(feature = "pairing-v2-experimental")]
+    pub(crate) fn try_clone(&self) -> Result<Self, StoreError> {
+        self.0
+            .try_clone()
+            .map(Self)
+            .map_err(|_| StoreError::Unavailable)
+    }
+
     pub fn root(path: &Path) -> Result<Self, StoreError> {
         if !path.is_absolute() {
             return Err(StoreError::Invalid);
@@ -231,6 +286,15 @@ impl PrivateDir {
             fault_point!(value, "before_dir_sync");
             self.0.sync_all().map_err(|_| StoreError::Unavailable)?;
             fault_point!(value, "after_dir_sync");
+            fault_point!(value, "before_readback");
+            if self.read(value, bytes.len())?.as_deref() != Some(bytes) {
+                return Err(StoreError::Invalid);
+            }
+            fault_point!(value, "after_readback");
+            fault_point!(value, "before_cleanup");
+            // The atomic rename consumed the temporary name. This boundary is
+            // explicit so crash schedules prove cleanup cannot alter publication.
+            fault_point!(value, "after_cleanup");
             Ok(())
         })();
         if result.is_err() {

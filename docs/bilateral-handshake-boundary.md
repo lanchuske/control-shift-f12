@@ -22,11 +22,42 @@ An authenticated signed/MACed Cancel is distinct from a protocol error. Every ot
 
 `HandshakeCompletePendingAuthority` has a private constructor and retains the sealed connection/request half. A private task continues watching late candidate DATA and extra streams. `is_protocol_valid()` becomes false after violation or connection closure; `durable_fc_hash()` then returns None. This is **not** an authenticated application session. The durable journal may remain as historical quarantined evidence even when the live result becomes invalid. Dropping the result closes the channel. The two-process harness holds each endpoint alive until the other process finishes via an out-of-band test acknowledgement; this acknowledgement is not pairing wire.
 
+The default-off admission foundation consumes that pending authority through a
+single watcher-owned freeze transition before durable publication. The watcher
+gives queued request DATA and extra streams priority over the freeze request. If
+a violation wins, publication is rejected. If freeze wins, it closes pairing
+QUIC and returns move-only `FrozenPromotionEvidence` with no channel, stream or
+runtime capability; only then may the transactional manifest be written. This
+watcher decision is the protocol linearization point. It holds no synchronous
+or asynchronous lock across filesystem I/O, so a store stall cannot deadlock or
+starve violation detection. A post-freeze peer send is transport-rejected, not
+an unobserved protocol event. Durable `PromotionReceipt` remains metadata only
+and cannot authorize input, clipboard, topology or a session.
+
+Endpoint consent and watcher freeze also share one synchronous three-state
+transition (`Active`, `Frozen`, `Revoked`). Endpoint Drop wins by moving to
+`Revoked`, which prevents freeze. Freeze wins by atomically installing a
+store-owned revoker while moving to `Frozen`; a later endpoint Drop first marks
+the scope revoked, then performs durable pin revocation outside the state lock,
+and only then closes the endpoint. Thus no lock is held across disk or network
+I/O, a paused save cannot deadlock Drop, and any future runtime-authority phase
+must observe both the channel-free frozen type and the durable revocation. This
+phase still has no method that emits runtime authority.
+
+Freeze also writes a per-attempt revocation guard before the scope can become
+`Frozen`. The live process registers the guard only for that exact random token.
+Drop unregisters it before attempting storage revocation. If lock, load, save or
+cleanup fails, the guard remains durable; reconciliation in this or a fresh
+process retries revocation and returns an error rather than `Promoted` until the
+pin is durably inactive. Cleanup happens only after durable revocation, so a
+crash cannot turn a failed Drop into usable authority. No filesystem operation
+is performed while the consent-state mutex is held.
+
 ## Durability and failure
 
 After both signed approvals, `PendingStore::prepare` creates only physically separate pending evidence. The existing CAS/revision/identity-generation/tombstone checks govern each write. Before returning local Commit, CommitAck or Complete bytes to the I/O adapter, the role-specific `Finalizer` must persist and flush its journal and manifest. Storage failure latches failure and returns no bytes to emit. No retry refreshes a failed CAS behind the caller's back.
 
-Ordinary precommit abort discards pending via the original expected version. Once a local durable decision exists, evidence stays quarantined. A storage failure or conflicting/corrupt manifest causes no cleanup. Process death/outer future cancellation may leave inert pending evidence for explicit reconciliation; this does not confer trust. A fresh retry creates fresh nonces, ephemeral keys and a new SAS. This driver never loads a RecoveryAuthority, never invokes a recovery shortcut and never promotes a peer. Windows cannot construct the required secure PendingStore backend here and remains fail-closed.
+Ordinary precommit abort discards pending via the original expected version. Once a local durable decision exists, evidence stays quarantined. A storage failure or conflicting/corrupt manifest causes no cleanup. Process death/outer future cancellation may leave inert pending evidence for explicit reconciliation; this does not confer trust. A fresh retry creates fresh nonces, ephemeral keys and a new SAS. This driver never loads a RecoveryAuthority, never invokes a recovery shortcut and never promotes a peer. A secure Windows `PendingStore` backend is present, but its exact native MSVC behavior remains unmeasured in this evidence set; every platform remains fail-closed.
 
 Session and emitter share one reference-counted `DerivedKeys` allocation, whose secret arrays are zeroizing. The emitter reference lives only through the bounded control attempt, including authenticated Cancel, and is cleared on terminal state. No secret keys/exporter bytes are written to the journal or logs.
 
@@ -47,6 +78,6 @@ Fault evidence is deliberately separated:
 - The loopback mutation matrix exercises fragmentation and malformed/reordered/duplicate/early-close records. These are not packet-loss, real-LAN interference or power-loss durability measurements.
 - RESET and STOP are also observed independently on real streams while the connection stays open, so connection-close does not mask a missing action.
 
-Pending gates: independent security/code review of this exact delta; external cryptographic audit; native macOS/Windows interop; real LAN and OS permission/network-policy behavior; Windows secure persistence; UI integration; authoritative recovery and a separately authorized admission/promotion phase. No active trust, input or clipboard was implemented here.
+Pending gates: independent security/code review of this exact delta; external cryptographic audit; native macOS/Windows interop; real LAN and OS permission/network-policy behavior; exact native Windows persistence validation; UI integration; authoritative recovery and a separately authorized admission/promotion phase. No active trust, input or clipboard was implemented here.
 
 The parent supplied separate baseline evidence: exact 75b2ebc display-probe binary passed on m2-24gb with an active graphical display; failures on sleeping-display hosts were a host-state condition. This is external baseline evidence, not a new native-display measurement by this delta.

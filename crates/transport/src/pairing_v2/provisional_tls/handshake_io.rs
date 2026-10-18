@@ -12,6 +12,7 @@ use super::*;
 use crate::pairing_pending::PendingStore;
 use rand::RngCore;
 use std::time::{Duration, Instant};
+use tokio::sync::oneshot;
 use zeroize::Zeroizing;
 #[cfg(test)]
 #[derive(Clone, Copy)]
@@ -55,20 +56,102 @@ pub enum HandshakeError {
     Rejected,
     Cancelled,
 }
+/// Move-only protocol evidence that remains quarantined from product runtime.
+///
+/// ```compile_fail
+/// use seamless_transport::pairing_v2::provisional_tls::HandshakeCompletePendingAuthority;
+/// fn require_clone<T: Clone>() {}
+/// require_clone::<HandshakeCompletePendingAuthority>();
+/// ```
+///
+/// ```compile_fail
+/// use seamless_transport::pairing_v2::provisional_tls::HandshakeCompletePendingAuthority;
+/// fn require_serialize<T: serde::Serialize>() {}
+/// require_serialize::<HandshakeCompletePendingAuthority>();
+/// ```
+///
+/// ```compile_fail
+/// use seamless_transport::pairing_v2::provisional_tls::HandshakeCompletePendingAuthority;
+/// fn leak(value: &HandshakeCompletePendingAuthority) { let _ = value.local_binding(); }
+/// ```
+///
+/// ```compile_fail
+/// use seamless_transport::pairing_v2::provisional_tls::HandshakeCompletePendingAuthority;
+/// async fn bypass(value: HandshakeCompletePendingAuthority) { let _ = value.seal_for_promotion().await; }
+/// ```
+///
+/// ```compile_fail
+/// use seamless_transport::pairing_v2::provisional_tls::HandshakeCompletePendingAuthority;
+/// fn forge() -> HandshakeCompletePendingAuthority {
+///     HandshakeCompletePendingAuthority { role: unsafe { std::mem::zeroed() } }
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use seamless_transport::pairing_v2::provisional_tls::HandshakeCompletePendingAuthority;
+/// fn input_runtime_capability(_: [u8; 32]) {}
+/// fn bypass(value: HandshakeCompletePendingAuthority) { input_runtime_capability(value); }
+/// ```
+///
+/// ```compile_fail
+/// use seamless_transport::pairing_v2::admission_authority::SealedAdmissionCommit;
+/// fn inject(_: SealedAdmissionCommit) {}
+/// ```
 pub struct HandshakeCompletePendingAuthority {
     pub(super) role: Role,
     pub(super) durable_fc_hash: [u8; 32],
-    pub(super) local_binding: [u8; 32],
+    local_binding: [u8; 32],
+    pending: crate::pairing_pending::PendingRecord,
+    transcript: [u8; 32],
+    certificate_fingerprints: [[u8; 32]; 2],
     _channel: ProvisionalChannel,
     _request: Stream,
     failed: Arc<AtomicBool>,
+    watcher: IngressWatcher,
+}
+/// Move-only, non-serializable protocol evidence. It deliberately has no public
+/// binding getter and cannot be reconstructed after restart.
+#[allow(dead_code)] // Intentionally unreachable from product until admission receives a separate GO.
+pub(crate) struct SealedPromotionEvidence {
+    role: Role,
+    durable_fc_hash: [u8; 32],
+    local_binding: Zeroizing<[u8; 32]>,
+    pending: crate::pairing_pending::PendingRecord,
+    transcript: [u8; 32],
+    certificate_fingerprints: [[u8; 32]; 2],
+    channel: ProvisionalChannel,
+    request: Stream,
+    failed: Arc<AtomicBool>,
+    watcher: IngressWatcher,
+}
+struct IngressWatcher {
+    freeze: Option<oneshot::Sender<crate::pairing_pending::AdmissionRevoker>>,
+    task: tokio::task::JoinHandle<IngressDisposition>,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IngressDisposition {
+    Frozen,
+    Invalid,
+}
+#[allow(dead_code)]
+pub(in crate::pairing_v2) struct SealedPromotionFields {
+    pub record: crate::pairing_pending::PendingRecord,
+    pub role: Role,
+    pub durable_fc_hash: [u8; 32],
+    pub local_binding: [u8; 32],
+    pub transcript: [u8; 32],
+    pub certificate_fingerprints: [[u8; 32]; 2],
 }
 struct Completed {
     role: Role,
     durable_fc_hash: [u8; 32],
     local_binding: [u8; 32],
+    pending: crate::pairing_pending::PendingRecord,
+    transcript: [u8; 32],
+    certificate_fingerprints: [[u8; 32]; 2],
     request: Stream,
     failed: Arc<AtomicBool>,
+    watcher: IngressWatcher,
 }
 impl HandshakeCompletePendingAuthority {
     pub fn is_protocol_valid(&self) -> bool {
@@ -80,6 +163,21 @@ impl HandshakeCompletePendingAuthority {
         send.write_all(&[1]).await.unwrap();
     }
     #[cfg(test)]
+    pub(super) async fn test_try_late_extra(&self) -> bool {
+        let Ok(Ok((mut send, _recv))) = tokio::time::timeout(
+            Duration::from_millis(250),
+            self._channel.connection.open_bi(),
+        )
+        .await
+        else {
+            return false;
+        };
+        matches!(
+            tokio::time::timeout(Duration::from_millis(250), send.write_all(&[1])).await,
+            Ok(Ok(()))
+        )
+    }
+    #[cfg(test)]
     pub(super) async fn test_late_candidate(&mut self) {
         self._request.send.write_all(&[1]).await.unwrap();
     }
@@ -89,8 +187,144 @@ impl HandshakeCompletePendingAuthority {
     pub fn durable_fc_hash(&self) -> Option<&[u8; 32]> {
         self.is_protocol_valid().then_some(&self.durable_fc_hash)
     }
-    pub fn local_binding(&self) -> &[u8; 32] {
-        &self.local_binding
+    #[cfg(test)]
+    pub(super) fn test_local_binding(&self) -> Option<&[u8; 32]> {
+        self.is_protocol_valid().then_some(&self.local_binding)
+    }
+    #[cfg(test)]
+    pub(super) fn test_attempt(&self) -> [u8; 32] {
+        self.pending.attempt_id
+    }
+
+    #[allow(dead_code)] // Foundation-only boundary; product wiring remains disabled.
+    pub(crate) async fn seal_for_promotion(
+        self,
+    ) -> Result<SealedPromotionEvidence, HandshakeError> {
+        if !self.is_protocol_valid() {
+            return Err(HandshakeError::Rejected);
+        }
+        // Give the permanently armed ingress watcher a scheduling boundary before
+        // moving the authority across the promotion frontier.
+        tokio::task::yield_now().await;
+        if !self.is_protocol_valid() {
+            return Err(HandshakeError::Rejected);
+        }
+        Ok(SealedPromotionEvidence {
+            role: self.role,
+            durable_fc_hash: self.durable_fc_hash,
+            local_binding: Zeroizing::new(self.local_binding),
+            pending: self.pending,
+            transcript: self.transcript,
+            certificate_fingerprints: self.certificate_fingerprints,
+            channel: self._channel,
+            request: self._request,
+            failed: self.failed,
+            watcher: self.watcher,
+        })
+    }
+}
+
+impl SealedPromotionEvidence {
+    /// Atomically closes pairing ingress at the watcher that owns all possible
+    /// post-handshake inputs. The biased state transition is the protocol
+    /// linearization point: a queued violation wins; otherwise freeze wins,
+    /// closes QUIC, and removes every channel from the resulting evidence.
+    pub(crate) async fn freeze(
+        mut self,
+        store: &PendingStore,
+    ) -> Result<FrozenPromotionEvidence, HandshakeError> {
+        let signal = self.watcher.freeze.take().ok_or(HandshakeError::Rejected)?;
+        let revoker = store
+            .admission_revoker(self.pending.peer_fingerprint, self.pending.attempt_id)
+            .map_err(|_| HandshakeError::Rejected)?;
+        signal.send(revoker).map_err(|_| HandshakeError::Rejected)?;
+        let static_result = self.revalidate_static();
+        let task = self.watcher.task;
+        match task.await.map_err(|_| HandshakeError::Rejected)? {
+            IngressDisposition::Frozen => {}
+            IngressDisposition::Invalid => return Err(HandshakeError::Rejected),
+        }
+        static_result?;
+        Ok(FrozenPromotionEvidence {
+            role: self.role,
+            durable_fc_hash: self.durable_fc_hash,
+            local_binding: self.local_binding,
+            pending: self.pending,
+            transcript: self.transcript,
+            certificate_fingerprints: self.certificate_fingerprints,
+        })
+    }
+
+    #[allow(dead_code)] // Called at each future promotion boundary, none of which is enabled yet.
+    pub(crate) fn revalidate(&self) -> Result<(), HandshakeError> {
+        if self.failed.load(Ordering::Acquire)
+            || self.channel.connection.close_reason().is_some()
+            || !self.request.clean
+        {
+            return Err(HandshakeError::Rejected);
+        }
+        self.revalidate_static()
+    }
+
+    fn revalidate_static(&self) -> Result<(), HandshakeError> {
+        if !self.request.clean
+            || self.pending.attempt_id == [0; 32]
+            || self.pending.peer_fingerprint != self.certificate_fingerprints[1 - self.role.index()]
+            || self.durable_fc_hash == [0; 32]
+            || self.transcript == [0; 32]
+            || *self.local_binding == [0; 32]
+        {
+            return Err(HandshakeError::Rejected);
+        }
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    pub(in crate::pairing_v2) fn fields(&self) -> SealedPromotionFields {
+        SealedPromotionFields {
+            record: self.pending.clone(),
+            role: self.role,
+            durable_fc_hash: self.durable_fc_hash,
+            local_binding: *self.local_binding,
+            transcript: self.transcript,
+            certificate_fingerprints: self.certificate_fingerprints,
+        }
+    }
+}
+
+/// Frozen, move-only evidence contains no network channel and therefore cannot
+/// observe a post-publication pairing event or act as runtime authority.
+pub(crate) struct FrozenPromotionEvidence {
+    role: Role,
+    durable_fc_hash: [u8; 32],
+    local_binding: Zeroizing<[u8; 32]>,
+    pending: crate::pairing_pending::PendingRecord,
+    transcript: [u8; 32],
+    certificate_fingerprints: [[u8; 32]; 2],
+}
+
+impl FrozenPromotionEvidence {
+    pub(crate) fn revalidate(&self) -> Result<(), HandshakeError> {
+        if self.pending.attempt_id == [0; 32]
+            || self.pending.peer_fingerprint != self.certificate_fingerprints[1 - self.role.index()]
+            || self.durable_fc_hash == [0; 32]
+            || self.transcript == [0; 32]
+            || *self.local_binding == [0; 32]
+        {
+            return Err(HandshakeError::Rejected);
+        }
+        Ok(())
+    }
+
+    pub(in crate::pairing_v2) fn fields(&self) -> SealedPromotionFields {
+        SealedPromotionFields {
+            record: self.pending.clone(),
+            role: self.role,
+            durable_fc_hash: self.durable_fc_hash,
+            local_binding: *self.local_binding,
+            transcript: self.transcript,
+            certificate_fingerprints: self.certificate_fingerprints,
+        }
     }
 }
 fn fresh<const N: usize>() -> Result<[u8; N], Invalid> {
@@ -387,9 +621,13 @@ impl ProvisionalChannel {
                 role: done.role,
                 durable_fc_hash: done.durable_fc_hash,
                 local_binding: done.local_binding,
+                pending: done.pending,
+                transcript: done.transcript,
+                certificate_fingerprints: done.certificate_fingerprints,
                 _channel: self,
                 _request: done.request,
                 failed: done.failed,
+                watcher: done.watcher,
             }),
             Ok(Err(HandshakeError::Cancelled)) => Err(HandshakeError::Cancelled),
             _ => {
@@ -399,9 +637,9 @@ impl ProvisionalChannel {
             }
         }
     }
-    fn active(&self) -> Result<std::sync::MutexGuard<'_, bool>, Invalid> {
-        let active = self.scope.lock().map_err(|_| Invalid)?;
-        if !*active
+    fn active(&self) -> Result<std::sync::MutexGuard<'_, super::ConsentState>, Invalid> {
+        let active = self.scope.0.lock().map_err(|_| Invalid)?;
+        if active.phase != super::ConsentPhase::Active
             || self.connection.close_reason().is_some()
             || self.id != format!("quic-{}", self.connection.stable_id())
         {
@@ -662,6 +900,9 @@ impl ProvisionalChannel {
             second.clean = true;
         }
         let fc = result?;
+        let (pending, transcript, certificate_fingerprints) = machine
+            .promotion_context()
+            .ok_or(HandshakeError::Rejected)?;
         let (request, mut incoming) = if role == Role::A {
             (first, second)
         } else {
@@ -670,16 +911,30 @@ impl ProvisionalChannel {
         let failed = Arc::new(AtomicBool::new(false));
         let signal = failed.clone();
         let connection = self.connection.clone();
+        let scope = self.scope.clone();
+        let (freeze, mut freeze_request) = oneshot::channel();
         // Successful control FIN does not forgive DATA on the request half,
         // extra streams or a later protocol error. Keep this monitor sealed.
-        tokio::spawn(async move {
-            let violation = tokio::select! {biased;
-                _=connection.closed()=>false,
+        let task = tokio::spawn(async move {
+            let disposition = tokio::select! {biased;
                 _=watch_request(&mut incoming.recv)=>true,
                 extra=connection.accept_bi()=>{if let Ok(pair)=extra{drop(Stream::new(pair));}true},
                 extra=connection.accept_uni()=>{if let Ok(mut recv)=extra{let _=recv.stop(APPLICATION_ERROR.into());}true},
+                request=&mut freeze_request=>{
+                    let Ok(revoker) = request else {
+                        signal.store(true, Ordering::Release);
+                        return IngressDisposition::Invalid;
+                    };
+                    if scope.freeze(revoker).is_err() {
+                        signal.store(true, Ordering::Release);
+                        return IngressDisposition::Invalid;
+                    }
+                    connection.close(APPLICATION_ERROR.into(), b"pairing ingress frozen");
+                    false
+                },
+                _=connection.closed()=>true,
             };
-            if violation {
+            if disposition {
                 signal.store(true, Ordering::Release);
                 incoming.clean = false;
                 drop(incoming);
@@ -687,14 +942,24 @@ impl ProvisionalChannel {
                     APPLICATION_ERROR.into(),
                     b"post-completion pairing violation",
                 );
+                IngressDisposition::Invalid
+            } else {
+                IngressDisposition::Frozen
             }
         });
         Ok(Completed {
             role,
             durable_fc_hash: fc,
             local_binding: binding,
+            pending,
+            transcript,
+            certificate_fingerprints,
             request,
             failed,
+            watcher: IngressWatcher {
+                freeze: Some(freeze),
+                task,
+            },
         })
     }
 }

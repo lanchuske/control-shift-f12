@@ -173,6 +173,17 @@ pub struct Finalizer {
     fc: Option<[u8; 32]>,
 }
 impl Finalizer {
+    pub(super) fn promotion_context(&self) -> Option<(PendingRecord, [u8; 32], [[u8; 32]; 2])> {
+        self.durable_fc_hash()?;
+        Some((
+            self.journal.pending.clone(),
+            self.context.transcript,
+            self.journal
+                .certificates
+                .each_ref()
+                .map(|certificate| hash(certificate)),
+        ))
+    }
     pub(super) fn durable_fc_bytes(&self) -> Result<Vec<u8>, Invalid> {
         if self.durable_fc_hash().is_none() {
             return Err(Invalid);

@@ -1,6 +1,11 @@
 //! Quarantined setup metadata. Nothing in this module grants trust or input.
 use serde::{Deserialize, Serialize};
 use std::path::Path;
+#[cfg(feature = "pairing-v2-experimental")]
+use std::{
+    collections::BTreeMap,
+    sync::{Mutex, OnceLock},
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum StoreError {
@@ -36,11 +41,139 @@ pub struct PendingRecord {
     pub revocation_generation: u64,
 }
 
+#[cfg(feature = "pairing-v2-experimental")]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct AdmissionReceiptRecord {
+    pub attempt: [u8; 32],
+    pub peer: [u8; 32],
+    pub peer_pin: [u8; 32],
+    pub durable_fc_hash: [u8; 32],
+    pub role: u8,
+    pub suite: String,
+    pub protocol_version: u16,
+    pub transcript: [u8; 32],
+    pub binding: [u8; 32],
+    pub revision: u64,
+    pub identity_generation: u64,
+    pub revocation_generation: u64,
+    pub policy_revision: u64,
+}
+
 pub struct PendingStore {
     #[cfg(any(unix, windows))]
     pending_dir: crate::private_fs::PrivateDir,
     #[cfg(any(unix, windows))]
     ledger_dir: crate::private_fs::PrivateDir,
+}
+
+#[cfg(feature = "pairing-v2-experimental")]
+pub(crate) struct AdmissionRevoker {
+    store: PendingStore,
+    peer: [u8; 32],
+    attempt: [u8; 32],
+    token: [u8; 32],
+    armed: bool,
+    owns_revocation: bool,
+}
+
+#[cfg(feature = "pairing-v2-experimental")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AdmissionGuardPhase {
+    Active,
+    RevokingOwned,
+    RevokingRetryable,
+}
+
+#[cfg(feature = "pairing-v2-experimental")]
+pub(crate) struct AdmissionGuardObservation([u8; 32]);
+
+#[cfg(feature = "pairing-v2-experimental")]
+impl AdmissionRevoker {
+    pub(crate) fn arm(&mut self) {
+        revocation_guard_phases().insert(self.token, AdmissionGuardPhase::Active);
+        self.armed = true;
+        self.owns_revocation = false;
+    }
+
+    pub(crate) fn mark_revoking(&mut self) -> bool {
+        if !self.armed {
+            return false;
+        }
+        if self.owns_revocation {
+            return true;
+        }
+        // This registry transition is the revocation linearization point. The
+        // mutex is never held across filesystem I/O: it only elects one durable
+        // revocation owner, so reconciliation can fail closed without deadlock.
+        let mut guards = revocation_guard_phases();
+        match guards.get(&self.token) {
+            Some(AdmissionGuardPhase::RevokingOwned) => false,
+            Some(AdmissionGuardPhase::Active | AdmissionGuardPhase::RevokingRetryable) | None => {
+                guards.insert(self.token, AdmissionGuardPhase::RevokingOwned);
+                self.owns_revocation = true;
+                true
+            }
+        }
+    }
+
+    pub(crate) fn revoke(&mut self) -> Result<(), StoreError> {
+        if !self.mark_revoking() {
+            return Err(StoreError::Unavailable);
+        }
+        // Ownership survives after the registry mutex is released. Durable I/O
+        // therefore runs lock-free with respect to the in-memory phase machine.
+        self.store.revoke_current(self.peer)?;
+        self.store.clear_admission_guard(self.attempt)?;
+        revocation_guard_phases().remove(&self.token);
+        self.armed = false;
+        self.owns_revocation = false;
+        Ok(())
+    }
+
+    fn release_for_retry(&mut self) {
+        if self.armed && self.owns_revocation {
+            revocation_guard_phases().insert(self.token, AdmissionGuardPhase::RevokingRetryable);
+            self.owns_revocation = false;
+        }
+    }
+}
+
+#[cfg(feature = "pairing-v2-experimental")]
+impl Drop for AdmissionRevoker {
+    fn drop(&mut self) {
+        if self.armed {
+            if !self.owns_revocation {
+                let _ = self.mark_revoking();
+            }
+            self.release_for_retry();
+        } else {
+            let _ = self.store.clear_admission_guard(self.attempt);
+        }
+    }
+}
+
+#[cfg(feature = "pairing-v2-experimental")]
+fn revocation_guards() -> &'static Mutex<BTreeMap<[u8; 32], AdmissionGuardPhase>> {
+    static GUARDS: OnceLock<Mutex<BTreeMap<[u8; 32], AdmissionGuardPhase>>> = OnceLock::new();
+    GUARDS.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+#[cfg(feature = "pairing-v2-experimental")]
+fn revocation_guard_phases()
+-> std::sync::MutexGuard<'static, BTreeMap<[u8; 32], AdmissionGuardPhase>> {
+    revocation_guards()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+#[cfg(feature = "pairing-v2-experimental")]
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AdmissionRevocationGuard {
+    attempt: [u8; 32],
+    peer: [u8; 32],
+    token: [u8; 32],
 }
 
 impl PendingStore {
@@ -55,6 +188,8 @@ impl PendingStore {
 mod unix {
     use super::*;
     use crate::private_fs::PrivateDir;
+    #[cfg(feature = "pairing-v2-experimental")]
+    use rand::RngCore;
     use sha2::{Digest, Sha256};
     use std::collections::BTreeSet;
 
@@ -77,6 +212,16 @@ mod unix {
         generation: u64,
     }
 
+    #[cfg(feature = "pairing-v2-experimental")]
+    #[derive(Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct ActivePin {
+        peer: [u8; 32],
+        pin: [u8; 32],
+        identity_generation: u64,
+        revocation_generation: u64,
+    }
+
     #[derive(Serialize, Deserialize)]
     #[serde(deny_unknown_fields)]
     struct Ledger {
@@ -85,6 +230,18 @@ mod unix {
         pending: Vec<Reference>,
         tombstones: Vec<[u8; 32]>,
         revocations: Vec<Revocation>,
+        #[cfg(feature = "pairing-v2-experimental")]
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        active_pins: Vec<ActivePin>,
+        #[cfg(feature = "pairing-v2-experimental")]
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        consumed_attempts: Vec<[u8; 32]>,
+        #[cfg(feature = "pairing-v2-experimental")]
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        admission_receipts: Vec<AdmissionReceiptRecord>,
+        #[cfg(feature = "pairing-v2-experimental")]
+        #[serde(default)]
+        policy_revision: u64,
         #[cfg(feature = "pairing-v2-experimental")]
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         recoveries: Vec<RecoveryConsumption>,
@@ -126,6 +283,14 @@ mod unix {
                 tombstones: vec![],
                 revocations: vec![],
                 #[cfg(feature = "pairing-v2-experimental")]
+                active_pins: vec![],
+                #[cfg(feature = "pairing-v2-experimental")]
+                consumed_attempts: vec![],
+                #[cfg(feature = "pairing-v2-experimental")]
+                admission_receipts: vec![],
+                #[cfg(feature = "pairing-v2-experimental")]
+                policy_revision: 0,
+                #[cfg(feature = "pairing-v2-experimental")]
                 recoveries: vec![],
                 #[cfg(feature = "pairing-v2-experimental")]
                 journals: vec![],
@@ -134,6 +299,79 @@ mod unix {
         fn validate(&self) -> Result<(), StoreError> {
             #[cfg(feature = "pairing-v2-experimental")]
             {
+                if self.active_pins.len() > MAX_HISTORY
+                    || self.consumed_attempts.len() > MAX_HISTORY
+                    || self.admission_receipts.len() > MAX_HISTORY
+                {
+                    return Err(StoreError::Invalid);
+                }
+                let pins: BTreeSet<_> = self.active_pins.iter().map(|p| p.peer).collect();
+                if pins.len() != self.active_pins.len()
+                    || self.active_pins.iter().any(|p| {
+                        p.peer == [0; 32]
+                            || p.pin == [0; 32]
+                            || p.identity_generation != self.version.identity_generation
+                            || p.revocation_generation != self.revocation(p.peer)
+                    })
+                {
+                    return Err(StoreError::Invalid);
+                }
+                let consumed: BTreeSet<_> = self.consumed_attempts.iter().copied().collect();
+                if consumed.len() != self.consumed_attempts.len()
+                    || self.consumed_attempts.contains(&[0; 32])
+                {
+                    return Err(StoreError::Invalid);
+                }
+                let receipts: BTreeSet<_> = self
+                    .admission_receipts
+                    .iter()
+                    .map(|receipt| receipt.attempt)
+                    .collect();
+                let receipt_revisions: BTreeSet<_> = self
+                    .admission_receipts
+                    .iter()
+                    .map(|receipt| receipt.revision)
+                    .collect();
+                if receipts.len() != self.admission_receipts.len()
+                    || receipt_revisions.len() != self.admission_receipts.len()
+                    || receipts != consumed
+                    || self.admission_receipts.iter().any(|receipt| {
+                        receipt.peer == [0; 32]
+                            || receipt.peer_pin == [0; 32]
+                            || receipt.durable_fc_hash == [0; 32]
+                            || receipt.transcript == [0; 32]
+                            || receipt.binding == [0; 32]
+                            || receipt.role > 1
+                            || receipt.suite != crate::pairing_v2::SUITE
+                            || receipt.protocol_version
+                                != crate::pairing_v2::admission_authority::PROTOCOL_VERSION
+                            || receipt.revision == 0
+                            || receipt.revision > self.version.revision
+                            || receipt.identity_generation > self.version.identity_generation
+                            || receipt.policy_revision
+                                != crate::pairing_v2::admission_authority::POLICY_REVISION
+                            || receipt.policy_revision != self.policy_revision
+                            || receipt.revocation_generation > self.revocation(receipt.peer)
+                    })
+                    || self.active_pins.iter().any(|pin| {
+                        !self.admission_receipts.iter().any(|receipt| {
+                            receipt.peer == pin.peer
+                                && receipt.peer_pin == pin.pin
+                                && receipt.identity_generation == pin.identity_generation
+                                && receipt.revocation_generation == pin.revocation_generation
+                        })
+                    })
+                    || self
+                        .pending
+                        .iter()
+                        .any(|p| consumed.contains(&p.record.attempt_id))
+                    || self
+                        .tombstones
+                        .iter()
+                        .any(|attempt| consumed.contains(attempt))
+                {
+                    return Err(StoreError::Invalid);
+                }
                 if self.recoveries.len() > MAX_HISTORY {
                     return Err(StoreError::Invalid);
                 }
@@ -227,7 +465,175 @@ mod unix {
         )
     }
 
+    #[cfg(feature = "pairing-v2-experimental")]
+    fn admission_guard_filename(attempt: [u8; 32]) -> String {
+        format!(
+            "admission-revocation-{}.json",
+            attempt
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+        )
+    }
+
     impl PendingStore {
+        #[cfg(feature = "pairing-v2-experimental")]
+        pub(crate) fn admission_revoker(
+            &self,
+            peer: [u8; 32],
+            attempt: [u8; 32],
+        ) -> Result<AdmissionRevoker, StoreError> {
+            if peer == [0; 32] || attempt == [0; 32] {
+                return Err(StoreError::Invalid);
+            }
+            let mut token = [0u8; 32];
+            rand::rngs::OsRng.fill_bytes(&mut token);
+            if token == [0; 32] {
+                return Err(StoreError::Invalid);
+            }
+            let guard = AdmissionRevocationGuard {
+                attempt,
+                peer,
+                token,
+            };
+            let bytes = serde_json::to_vec(&guard).map_err(|_| StoreError::Invalid)?;
+            self.ledger_dir
+                .replace(&admission_guard_filename(attempt), &bytes)?;
+            Ok(AdmissionRevoker {
+                store: PendingStore {
+                    pending_dir: self.pending_dir.try_clone()?,
+                    ledger_dir: self.ledger_dir.try_clone()?,
+                },
+                peer,
+                attempt,
+                token,
+                armed: false,
+                owns_revocation: false,
+            })
+        }
+
+        #[cfg(feature = "pairing-v2-experimental")]
+        pub(crate) fn clear_admission_guard(&self, attempt: [u8; 32]) -> Result<(), StoreError> {
+            let file = admission_guard_filename(attempt);
+            #[cfg(all(test, feature = "pairing-v2-experimental"))]
+            crate::private_fs::faults::point(&file, "before_remove")?;
+            self.ledger_dir.remove(&file)?;
+            #[cfg(all(test, feature = "pairing-v2-experimental"))]
+            crate::private_fs::faults::point(&file, "after_remove")?;
+            Ok(())
+        }
+
+        #[cfg(feature = "pairing-v2-experimental")]
+        pub(crate) fn resolve_admission_guard(
+            &self,
+            attempt: [u8; 32],
+        ) -> Result<Option<AdmissionGuardObservation>, StoreError> {
+            let file = admission_guard_filename(attempt);
+            let Some(bytes) = self.ledger_dir.read(&file, RECORD_LIMIT)? else {
+                return Ok(None);
+            };
+            let guard: AdmissionRevocationGuard =
+                serde_json::from_slice(&bytes).map_err(|_| StoreError::Invalid)?;
+            if guard.attempt != attempt || guard.peer == [0; 32] || guard.token == [0; 32] {
+                return Err(StoreError::Invalid);
+            }
+            match revocation_guard_phases().get(&guard.token).copied() {
+                Some(AdmissionGuardPhase::Active) => {
+                    return Ok(Some(AdmissionGuardObservation(guard.token)));
+                }
+                Some(AdmissionGuardPhase::RevokingOwned) => {
+                    return Err(StoreError::Unavailable);
+                }
+                Some(AdmissionGuardPhase::RevokingRetryable) => {}
+                None => {
+                    // The guard could have been removed after the first read by
+                    // a revocation that just completed in this process. Re-read
+                    // before treating an unknown token as crash recovery.
+                    if self.ledger_dir.read(&file, RECORD_LIMIT)?.is_none() {
+                        return Ok(None);
+                    }
+                }
+            }
+            let mut revoker = AdmissionRevoker {
+                store: PendingStore {
+                    pending_dir: self.pending_dir.try_clone()?,
+                    ledger_dir: self.ledger_dir.try_clone()?,
+                },
+                peer: guard.peer,
+                attempt,
+                token: guard.token,
+                armed: true,
+                owns_revocation: false,
+            };
+            revoker.revoke()?;
+            Ok(None)
+        }
+
+        #[cfg(feature = "pairing-v2-experimental")]
+        pub(crate) fn admission_guard_still_active(
+            &self,
+            observation: &AdmissionGuardObservation,
+        ) -> bool {
+            revocation_guard_phases().get(&observation.0) == Some(&AdmissionGuardPhase::Active)
+        }
+
+        #[cfg(feature = "pairing-v2-experimental")]
+        pub(super) fn revoke_current(&self, peer: [u8; 32]) -> Result<(), StoreError> {
+            #[cfg(all(test, feature = "pairing-v2-experimental"))]
+            crate::private_fs::faults::point("ledger.json", "before_revoke_lock")?;
+            let _lock = self.ledger_dir.lock()?;
+            #[cfg(all(test, feature = "pairing-v2-experimental"))]
+            crate::private_fs::faults::point("ledger.json", "before_revoke_load")?;
+            let mut ledger = self.load_validated_manifest()?;
+            let expected = ledger.version;
+            ledger.advance(expected)?;
+            if peer == [0; 32] {
+                return Err(StoreError::Invalid);
+            }
+            if let Some(revocation) = ledger.revocations.iter_mut().find(|r| r.peer == peer) {
+                revocation.generation = revocation
+                    .generation
+                    .checked_add(1)
+                    .ok_or(StoreError::Limit)?;
+            } else {
+                ledger.revocations.push(Revocation {
+                    peer,
+                    generation: 1,
+                });
+            }
+            ledger.active_pins.retain(|pin| pin.peer != peer);
+            let removed: Vec<_> = ledger
+                .pending
+                .iter()
+                .filter(|entry| entry.record.peer_fingerprint == peer)
+                .map(|entry| entry.record.attempt_id)
+                .collect();
+            let old_journals: Vec<_> = ledger
+                .journals
+                .iter()
+                .filter(|entry| removed.contains(&entry.attempt))
+                .map(journal_filename)
+                .collect();
+            ledger
+                .pending
+                .retain(|entry| entry.record.peer_fingerprint != peer);
+            ledger
+                .journals
+                .retain(|entry| !removed.contains(&entry.attempt));
+            ledger.tombstones.extend(&removed);
+            self.save(&ledger)?;
+            for attempt in removed {
+                #[cfg(all(test, feature = "pairing-v2-experimental"))]
+                crate::private_fs::faults::point("ledger.json", "before_revoke_remove")?;
+                self.pending_dir.remove(&filename(attempt))?;
+            }
+            for file in old_journals {
+                #[cfg(all(test, feature = "pairing-v2-experimental"))]
+                crate::private_fs::faults::point("ledger.json", "before_revoke_cleanup")?;
+                self.pending_dir.remove(&file)?;
+            }
+            Ok(())
+        }
         #[cfg(feature = "pairing-v2-experimental")]
         pub fn reconcile_pairing(
             &self,
@@ -478,6 +884,10 @@ mod unix {
             if ledger.tombstones.contains(&attempt) {
                 return Err(StoreError::ConsumedAttempt);
             }
+            #[cfg(feature = "pairing-v2-experimental")]
+            if ledger.consumed_attempts.contains(&attempt) {
+                return Err(StoreError::ConsumedAttempt);
+            }
             if ledger
                 .pending
                 .iter()
@@ -571,6 +981,8 @@ mod unix {
                     generation: 1,
                 });
             }
+            #[cfg(feature = "pairing-v2-experimental")]
+            ledger.active_pins.retain(|pin| pin.peer != peer);
             let removed: Vec<_> = ledger
                 .pending
                 .iter()
@@ -604,6 +1016,149 @@ mod unix {
             Ok(self.load_validated_manifest()?.revocation(peer))
         }
 
+        /// Internal foundation for a future reviewed admission authority. This is
+        /// deliberately crate-private and returns durable metadata, never a runtime
+        /// capability. Pending removal, pin, consumed marker and receipt share the
+        /// same manifest publication under the same multiprocess lock.
+        #[cfg(feature = "pairing-v2-experimental")]
+        #[allow(dead_code)] // Reachable only through the disabled admission foundation.
+        pub(crate) fn commit_sealed_admission(
+            &self,
+            expected: StoreVersion,
+            commit: crate::pairing_v2::admission_authority::SealedAdmissionCommit,
+        ) -> Result<AdmissionReceiptRecord, StoreError> {
+            commit.revalidate()?;
+            let _lock = self.ledger_dir.lock()?;
+            let mut ledger = self.load_validated_manifest()?;
+            commit.revalidate()?;
+            let record = commit.record();
+            let receipt = commit.receipt();
+            let expected_revocation_generation = receipt.revocation_generation;
+            let expected_policy_revision = receipt.policy_revision;
+            if ledger.version != expected
+                || record.version.identity_generation != expected.identity_generation
+                || ledger.policy_revision != expected_policy_revision
+                || ledger.revocation(record.peer_fingerprint) != expected_revocation_generation
+                || record.revocation_generation != expected_revocation_generation
+            {
+                return Err(StoreError::Conflict);
+            }
+            let pending = ledger
+                .pending
+                .iter()
+                .find(|entry| entry.record.attempt_id == record.attempt_id)
+                .ok_or_else(|| {
+                    if ledger.consumed_attempts.contains(&record.attempt_id) {
+                        StoreError::ConsumedAttempt
+                    } else {
+                        StoreError::Invalid
+                    }
+                })?;
+            if pending.record != *record
+                || receipt.attempt != record.attempt_id
+                || receipt.peer != record.peer_fingerprint
+                || receipt.revision != expected.revision.checked_add(1).ok_or(StoreError::Limit)?
+                || receipt.identity_generation != expected.identity_generation
+                || receipt.revocation_generation != expected_revocation_generation
+                || receipt.policy_revision != expected_policy_revision
+            {
+                return Err(StoreError::Invalid);
+            }
+            if let Some(pin) = ledger
+                .active_pins
+                .iter()
+                .find(|pin| pin.peer == receipt.peer)
+                && pin.pin != receipt.peer_pin
+            {
+                return Err(StoreError::Conflict);
+            }
+            if ledger.consumed_attempts.contains(&receipt.attempt)
+                || ledger
+                    .admission_receipts
+                    .iter()
+                    .any(|stored| stored.attempt == receipt.attempt)
+                || ledger.tombstones.contains(&receipt.attempt)
+            {
+                return Err(StoreError::ConsumedAttempt);
+            }
+            if ledger.active_pins.len() >= MAX_HISTORY
+                || ledger.consumed_attempts.len() >= MAX_HISTORY
+                || ledger.admission_receipts.len() >= MAX_HISTORY
+            {
+                return Err(StoreError::Limit);
+            }
+            commit.revalidate()?;
+            let old_journals: Vec<_> = ledger
+                .journals
+                .iter()
+                .filter(|entry| entry.attempt == receipt.attempt)
+                .map(journal_filename)
+                .collect();
+            ledger.advance(expected)?;
+            if !ledger
+                .active_pins
+                .iter()
+                .any(|pin| pin.peer == receipt.peer)
+            {
+                ledger.active_pins.push(ActivePin {
+                    peer: receipt.peer,
+                    pin: receipt.peer_pin,
+                    identity_generation: receipt.identity_generation,
+                    revocation_generation: receipt.revocation_generation,
+                });
+            }
+            ledger
+                .pending
+                .retain(|entry| entry.record.attempt_id != receipt.attempt);
+            ledger
+                .journals
+                .retain(|entry| entry.attempt != receipt.attempt);
+            ledger.consumed_attempts.push(receipt.attempt);
+            ledger.admission_receipts.push(receipt.clone());
+            // Final protocol check immediately precedes the single publication
+            // linearization point. No fallible protocol validation follows save.
+            commit.revalidate()?;
+            self.save(&ledger)?;
+            self.pending_dir.remove(&filename(receipt.attempt))?;
+            for file in old_journals {
+                self.pending_dir.remove(&file)?;
+            }
+            Ok(receipt.clone())
+        }
+
+        #[cfg(feature = "pairing-v2-experimental")]
+        #[allow(dead_code)] // Used only by the default-off admission foundation.
+        pub(crate) fn admission_state(
+            &self,
+            attempt: [u8; 32],
+        ) -> Result<(bool, Option<AdmissionReceiptRecord>, bool), StoreError> {
+            let _lock = self.ledger_dir.lock()?;
+            let ledger = self.load_validated_manifest()?;
+            let receipt = ledger
+                .admission_receipts
+                .iter()
+                .find(|receipt| receipt.attempt == attempt)
+                .cloned();
+            let active = receipt.as_ref().is_some_and(|receipt| {
+                receipt.identity_generation == ledger.version.identity_generation
+                    && receipt.revocation_generation == ledger.revocation(receipt.peer)
+                    && ledger.active_pins.iter().any(|pin| {
+                        pin.peer == receipt.peer
+                            && pin.pin == receipt.peer_pin
+                            && pin.identity_generation == receipt.identity_generation
+                            && pin.revocation_generation == receipt.revocation_generation
+                    })
+            });
+            Ok((
+                ledger
+                    .pending
+                    .iter()
+                    .any(|entry| entry.record.attempt_id == attempt),
+                receipt,
+                active,
+            ))
+        }
+
         /// Advances the setup epoch. Does not regenerate, read, or write a device private key.
         pub fn rotate_identity(&self, expected: StoreVersion) -> Result<(), StoreError> {
             let _lock = self.ledger_dir.lock()?;
@@ -614,6 +1169,8 @@ mod unix {
                 .identity_generation
                 .checked_add(1)
                 .ok_or(StoreError::Limit)?;
+            #[cfg(feature = "pairing-v2-experimental")]
+            ledger.active_pins.clear();
             let removed: Vec<_> = ledger.pending.iter().map(|r| r.record.attempt_id).collect();
             ledger.tombstones.extend(&removed);
             ledger.pending.clear();

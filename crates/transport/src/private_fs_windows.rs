@@ -317,6 +317,23 @@ pub(crate) struct PrivateDir {
 }
 
 impl PrivateDir {
+    #[cfg(feature = "pairing-v2-experimental")]
+    pub(crate) fn try_clone(&self) -> Result<Self, StoreError> {
+        self.validate_self()?;
+        let file = self.file.try_clone().map_err(|_| StoreError::Unavailable)?;
+        let handle = file.as_raw_handle().cast();
+        validate(handle, true, &self.sid)?;
+        if identity(&file_info(handle)?) != self.id {
+            return Err(StoreError::Invalid);
+        }
+        Ok(Self {
+            path: self.path.clone(),
+            file,
+            id: self.id,
+            sid: self.sid.clone(),
+        })
+    }
+
     pub fn root(path: &Path) -> Result<Self, StoreError> {
         if !path.is_absolute() {
             return Err(StoreError::Invalid);
@@ -501,9 +518,16 @@ impl PrivateDir {
             let target = self.open(value, false, false)?.ok_or(StoreError::Invalid)?;
             validate(target.as_raw_handle().cast(), false, &self.sid)?;
             fault_point!(value, "before_dir_sync");
-            let result = self.flush();
+            self.flush()?;
             fault_point!(value, "after_dir_sync");
-            result
+            fault_point!(value, "before_readback");
+            if self.read(value, bytes.len())?.as_deref() != Some(bytes) {
+                return Err(StoreError::Invalid);
+            }
+            fault_point!(value, "after_readback");
+            fault_point!(value, "before_cleanup");
+            fault_point!(value, "after_cleanup");
+            Ok(())
         })();
         if result.is_err() {
             let _ = std::fs::remove_file(self.path.join(tmp));
