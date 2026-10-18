@@ -36,6 +36,17 @@ public sealed class WindowsUiChildOwnerTests
 
         Assert.Equal("not_started", stopped.Snapshot!.State);
         Assert.Empty(stopped.Snapshot.Nearby);
+        var previousGeneration = stopped.Snapshot.Generation;
+        var restarted = await owner.StartDiscoveryAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal("browsing", restarted.Snapshot!.State);
+        Assert.True(restarted.Snapshot.Generation > previousGeneration);
+        for (var refresh = 0; refresh < 2; refresh++)
+        {
+            previousGeneration = owner.Session.Snapshot!.Generation;
+            var refreshed = await owner.RefreshAsync(TimeSpan.FromSeconds(5));
+            Assert.True(refreshed.Snapshot!.Generation > previousGeneration);
+            Assert.Equal("browsing", refreshed.Snapshot.State);
+        }
         await owner.CloseAsync();
         Assert.True(owner.HasExited);
         Assert.Equal(ChildSessionPhase.Terminal, owner.Session.State.Phase);

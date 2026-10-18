@@ -12,23 +12,31 @@ public sealed class UiChildSession
 {
     private const int MaxFrameBytes = 256 * 1024;
     private readonly FramedPayloadReader reader = new();
+    private readonly HashSet<string> pendingRequestIds = new(StringComparer.Ordinal);
+    private ulong nextRequestId;
 
     public ChildSessionState State { get; private set; } = ChildSessionState.Starting();
     public DesktopSnapshotProjection? Snapshot { get; private set; }
     public DiagnosticsProjection? Diagnostics { get; private set; }
     public PairingProjection? Pairing { get; private set; }
 
-    public static byte[] InitialRefreshFrame()
-        => CreateFixedRequest("windows-refresh", "ui.refresh");
+    public byte[] InitialRefreshFrame()
+        => CreateRequest("ui.refresh");
 
-    public static byte[] StartDiscoveryFrame()
-        => CreateFixedRequest("windows-start-discovery", "ui.start_discovery");
+    public byte[] StartDiscoveryFrame()
+        => CreateRequest("ui.start_discovery");
 
-    public static byte[] StopDiscoveryFrame()
-        => CreateFixedRequest("windows-stop-discovery", "ui.stop_discovery");
+    public byte[] StopDiscoveryFrame()
+        => CreateRequest("ui.stop_discovery");
 
-    private static byte[] CreateFixedRequest(string id, string command)
+    private byte[] CreateRequest(string command)
     {
+        if (State.Phase == ChildSessionPhase.Terminal || pendingRequestIds.Count >= 256
+            || nextRequestId == ulong.MaxValue)
+        {
+            throw new InvalidOperationException("The local child request limit was reached.");
+        }
+        var id = $"windows-{++nextRequestId}";
         var payload = Encoding.UTF8.GetBytes($"{{\"v\":1,\"id\":\"{id}\",\"command\":\"{command}\",\"args\":{{}}}}");
         var frame = new byte[sizeof(uint) + payload.Length];
         frame[0] = (byte)(payload.Length >> 24);
@@ -36,6 +44,7 @@ public sealed class UiChildSession
         frame[2] = (byte)(payload.Length >> 8);
         frame[3] = (byte)payload.Length;
         payload.CopyTo(frame, sizeof(uint));
+        pendingRequestIds.Add(id);
         return frame;
     }
 
@@ -146,15 +155,16 @@ public sealed class UiChildSession
         }
     }
 
-    private static bool IsRecognizedResponse(JsonElement root) =>
+    private bool IsRecognizedResponse(JsonElement root) =>
         root.ValueKind == JsonValueKind.Object
         && root.EnumerateObject().Select(property => property.Name).ToHashSet(StringComparer.Ordinal)
             .SetEquals(["v", "kind", "id", "ok"])
         && root.TryGetProperty("v", out var version) && version.TryGetInt32(out var v) && v == 1
         && root.TryGetProperty("kind", out var kind) && kind.GetString() == "ui_response_v1"
         && root.TryGetProperty("id", out var id)
-        && id.GetString() is "windows-refresh" or "windows-start-discovery" or "windows-stop-discovery"
-        && root.TryGetProperty("ok", out var ok) && ok.ValueKind == JsonValueKind.True;
+        && id.ValueKind == JsonValueKind.String
+        && root.TryGetProperty("ok", out var ok) && ok.ValueKind == JsonValueKind.True
+        && pendingRequestIds.Remove(id.GetString()!);
 
     private void Fault()
     {
@@ -164,6 +174,7 @@ public sealed class UiChildSession
 
     private void ClearProjection()
     {
+        pendingRequestIds.Clear();
         Snapshot = null;
         Diagnostics = null;
         Pairing = null;

@@ -126,12 +126,11 @@ final class ControlShiftF12AppTests: XCTestCase {
 
     func testStartDiscoveryAcknowledgementIsAcceptedWithoutEnablingSharing() throws {
         let child = RecordingChild()
-        let session = DiagnosticsSession(lifecycle: ChildLifecycle(child: child))
-        let response = """
-        {"v":1,"kind":"ui_response_v1","id":"mac-start-discovery","ok":true}
-        """.data(using: .utf8)!
+        let controller = DiagnosticsFrameController()
+        let session = DiagnosticsSession(controller: controller, lifecycle: ChildLifecycle(child: child))
+        let response = try acknowledgement(controller, command: "ui.start_discovery")
 
-        try session.receive(.data(frame(response)))
+        try session.receive(.data(response))
 
         XCTAssertFalse(session.isTerminal)
         XCTAssertEqual(child.terminateCalls, 0)
@@ -182,7 +181,8 @@ final class ControlShiftF12AppTests: XCTestCase {
 
     func testAllowedSnapshotDiagnosticsAndResponseDoNotTerminateTheChildSession() throws {
         let child = RecordingChild()
-        let session = DiagnosticsSession(lifecycle: ChildLifecycle(child: child))
+        let controller = DiagnosticsFrameController()
+        let session = DiagnosticsSession(controller: controller, lifecycle: ChildLifecycle(child: child))
         let snapshot = """
         {"v":1,"kind":"ui_snapshot_v1","snapshot":{
           "schema_version":1,"generation":1,"state":"not_started",
@@ -195,10 +195,7 @@ final class ControlShiftF12AppTests: XCTestCase {
 
         try session.receive(.data(frame(snapshot)))
         try session.receive(.data(frame(diagnosticsPayload(generation: 2))))
-        let response = """
-        {"v":1,"kind":"ui_response_v1","id":"mac-refresh","ok":true}
-        """.data(using: .utf8)!
-        try session.receive(.data(frame(response)))
+        try session.receive(.data(try acknowledgement(controller, command: "ui.refresh")))
 
         XCTAssertFalse(session.isTerminal)
         XCTAssertFalse(session.presentation.rows.isEmpty)
@@ -344,6 +341,13 @@ final class ControlShiftF12AppTests: XCTestCase {
         XCTAssertTrue(session.presentation.rows.isEmpty)
         XCTAssertFalse(session.presentation.refreshEnabled)
         XCTAssertEqual(child.terminateCalls, 1)
+    }
+
+    private func acknowledgement(_ controller: DiagnosticsFrameController, command: String) throws -> Data {
+        let request = try controller.requests.frame(command: command)
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: request.dropFirst(4)) as? [String: Any])
+        let id = try XCTUnwrap(object["id"] as? String)
+        return frame(try JSONSerialization.data(withJSONObject: ["v": 1, "kind": "ui_response_v1", "id": id, "ok": true]))
     }
 
     private func frame(_ payload: Data) -> Data {

@@ -62,7 +62,7 @@ public sealed class WindowsUiChildOwner : IAsyncDisposable
             throw new InvalidOperationException("The initial projection has already been requested.");
         }
 
-        await WriteFixedRequestAsync(UiChildSession.InitialRefreshFrame(), timeout);
+        await WriteFixedRequestAsync(Session.InitialRefreshFrame(), timeout);
         return await ReadUntilProjectionAsync(previousGeneration: null, timeout);
     }
 
@@ -75,7 +75,7 @@ public sealed class WindowsUiChildOwner : IAsyncDisposable
             throw new InvalidOperationException("Discovery is unavailable outside the reviewed local starting state.");
         }
 
-        await WriteFixedRequestAsync(UiChildSession.StartDiscoveryFrame(), timeout);
+        await WriteFixedRequestAsync(Session.StartDiscoveryFrame(), timeout);
         return await ReadUntilProjectionAsync(previous.Generation, timeout);
     }
 
@@ -88,7 +88,18 @@ public sealed class WindowsUiChildOwner : IAsyncDisposable
             throw new InvalidOperationException("Discovery is not active.");
         }
 
-        await WriteFixedRequestAsync(UiChildSession.StopDiscoveryFrame(), timeout);
+        await WriteFixedRequestAsync(Session.StopDiscoveryFrame(), timeout);
+        return await ReadUntilProjectionAsync(previous.Generation, timeout);
+    }
+
+    public async Task<UiChildSession> RefreshAsync(TimeSpan timeout)
+    {
+        ThrowIfClosed();
+        if (Session.State.Phase != ChildSessionPhase.Running || Session.Snapshot is not { } previous)
+        {
+            throw new InvalidOperationException("The local child has no current projection.");
+        }
+        await WriteFixedRequestAsync(Session.InitialRefreshFrame(), timeout);
         return await ReadUntilProjectionAsync(previous.Generation, timeout);
     }
 
