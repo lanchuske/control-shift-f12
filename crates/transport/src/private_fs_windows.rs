@@ -164,11 +164,12 @@ macro_rules! fault_point {
 
 fn flush_before_rename(file: &File, _value: &str) -> Result<(), StoreError> {
     fault_point!(_value, "before_file_sync");
-    file.sync_all().map_err(|error| {
-        #[cfg(test)]
+    let result = file.sync_all();
+    #[cfg(test)]
+    if let Err(error) = &result {
         faults::record_failure("pre-file-flush", error.raw_os_error());
-        StoreError::Unavailable
-    })?;
+    }
+    result.map_err(|_| StoreError::Unavailable)?;
     #[cfg(test)]
     faults::record("pre-file-flush");
     fault_point!(_value, "after_file_sync");
@@ -190,11 +191,12 @@ fn publish_renamed_file(
 }
 
 fn flush_after_rename(file: &File) -> Result<(), StoreError> {
-    file.sync_all().map_err(|error| {
-        #[cfg(test)]
+    let result = file.sync_all();
+    #[cfg(test)]
+    if let Err(error) = &result {
         faults::record_failure("post-file-flush", error.raw_os_error());
-        StoreError::Unavailable
-    })?;
+    }
+    result.map_err(|_| StoreError::Unavailable)?;
     #[cfg(test)]
     faults::record("post-file-flush");
     Ok(())
@@ -516,11 +518,12 @@ impl PrivateDir {
             harden(handle, true, &self.sid)?;
         }
         validate(handle, true, &self.sid)?;
-        self.flush().map_err(|error| {
-            #[cfg(test)]
+        let result = self.flush();
+        #[cfg(test)]
+        if result.is_err() {
             faults::record_failure("directory-flush", None);
-            error
-        })?;
+        }
+        result?;
         Ok(Self {
             path,
             file,
