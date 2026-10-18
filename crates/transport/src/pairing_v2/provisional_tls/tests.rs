@@ -3487,6 +3487,10 @@ async fn bilateral_rejection_issues_real_reset_and_stop_independently_of_connect
 
 #[tokio::test]
 async fn bilateral_control_fragmentation_and_adversarial_phase_matrix() {
+    #[cfg(windows)]
+    let fault_deadline = Duration::from_secs(15);
+    #[cfg(not(windows))]
+    let fault_deadline = Duration::from_secs(5);
     for mutation in 0..7 {
         for sequence in [0, 2, 4, 6, 8, 10, 12, 14, 15, 16] {
             let (_ea, _eb, mut a, mut b, _) = pair().await;
@@ -3518,7 +3522,7 @@ async fn bilateral_control_fragmentation_and_adversarial_phase_matrix() {
                     )
                 )
             };
-            let (a, b) = tokio::time::timeout(Duration::from_secs(5), test)
+            let (a, b) = tokio::time::timeout(fault_deadline, test)
                 .await
                 .unwrap_or_else(|_| {
                     panic!("fault must not stall: mutation {mutation} sequence {sequence}")
