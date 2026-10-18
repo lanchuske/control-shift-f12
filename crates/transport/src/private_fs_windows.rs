@@ -971,9 +971,8 @@ mod tests {
     }
 
     #[test]
-    fn root_relative_rename_handles_short_and_supplementary_leaves() {
+    fn absolute_rename_handles_short_and_supplementary_leaves() {
         let root = tempfile::tempdir().unwrap();
-        let root_handle = directory(root.path());
         for leaf in ["x", "🦀"] {
             for replace in [false, true] {
                 if replace {
