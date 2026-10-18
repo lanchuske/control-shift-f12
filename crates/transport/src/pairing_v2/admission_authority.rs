@@ -36,18 +36,78 @@ impl PromotionReceipt {
 pub enum ReconcileAdmission {
     Pending,
     Promoted,
+    RemoteOutcomeUnknown,
     Revoked,
     Absent,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+/// Opaque metadata result for G4. It is deliberately not a transport, input,
+/// clipboard, layout or operational-session capability.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DistributedAdmissionSummary {
+    attempt: [u8; 32],
+    state: ReconcileAdmission,
+}
+
+/// Public G4 boundary for a UI: it exposes only user verification and the
+/// durable admission outcome, never the pending store or transport authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum DistributedPairingError {
+    #[error("pairing was rejected")]
+    Rejected,
+    #[error("pairing was cancelled")]
+    Cancelled,
+    #[error("durable pairing state could not be committed")]
+    Storage,
+}
+
+pub async fn handshake_and_commit_distributed<F, Fut>(
+    store: &AdmissionAuthorityStore,
+    channel: super::provisional_tls::ProvisionalChannel,
+    config: super::provisional_tls::HandshakeConfig,
+    confirm: F,
+) -> Result<DistributedAdmissionSummary, DistributedPairingError>
+where
+    F: FnOnce(super::provisional_tls::VerificationPrompt) -> Fut,
+    Fut: std::future::Future<Output = super::provisional_tls::VerificationDecision>,
+{
+    let authority = channel
+        .handshake(config, &store.store, confirm)
+        .await
+        .map_err(|error| match error {
+            super::provisional_tls::HandshakeError::Cancelled => DistributedPairingError::Cancelled,
+            super::provisional_tls::HandshakeError::Rejected => DistributedPairingError::Rejected,
+        })?;
+    store
+        .commit_distributed(authority)
+        .await
+        .map_err(|_| DistributedPairingError::Storage)
+}
+
+impl DistributedAdmissionSummary {
+    pub fn attempt(&self) -> [u8; 32] {
+        self.attempt
+    }
+
+    pub fn is_confirmed(&self) -> bool {
+        self.state == ReconcileAdmission::Promoted
+    }
+
+    pub fn state(&self) -> ReconcileAdmission {
+        self.state
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum BilateralCommitPhase {
     Prepared,
     Staged,
     ProofVerified,
     Frozen,
     Finalized,
+    PeerCommitVerified,
     Confirmed,
+    Quarantined,
     Aborted,
 }
 
@@ -58,6 +118,7 @@ pub(crate) struct PreparedBilateralCommit<'a> {
     store: &'a PendingStore,
     live: Option<super::provisional_tls::PreparedHandshakeAuthority>,
     frozen: Option<super::provisional_tls::FrozenPromotionEvidence>,
+    distributed_frozen: Option<super::provisional_tls::DistributedFrozenHandshakeAuthority>,
     receipt: Option<AdmissionReceiptRecord>,
     proof: Option<super::provisional_tls::PeerFinalizationReceipt>,
     phase: BilateralCommitPhase,
@@ -75,6 +136,7 @@ impl<'a> PreparedBilateralCommit<'a> {
             store: &owner.store,
             live: Some(live),
             frozen: None,
+            distributed_frozen: None,
             receipt: None,
             proof: None,
             phase: BilateralCommitPhase::Prepared,
@@ -199,6 +261,20 @@ impl<'a> PreparedBilateralCommit<'a> {
         Ok(())
     }
 
+    async fn freeze_distributed_once(&mut self) -> Result<(), StoreError> {
+        if self.phase != BilateralCommitPhase::ProofVerified || self.proof.is_none() {
+            return Err(StoreError::Invalid);
+        }
+        let live = self.live.take().ok_or(StoreError::Invalid)?;
+        let frozen = live
+            .freeze_distributed()
+            .await
+            .map_err(|_| StoreError::Invalid)?;
+        self.distributed_frozen = Some(frozen);
+        self.phase = BilateralCommitPhase::Frozen;
+        Ok(())
+    }
+
     async fn finalize_once(
         &mut self,
         #[cfg(test)] hook: Option<&BilateralCommitTestHook>,
@@ -228,8 +304,60 @@ impl<'a> PreparedBilateralCommit<'a> {
         Ok(())
     }
 
-    fn confirm_once(&mut self) -> Result<(), StoreError> {
+    async fn finalize_distributed_once(&mut self) -> Result<(), StoreError> {
+        if self.phase != BilateralCommitPhase::Frozen {
+            return Err(StoreError::Invalid);
+        }
+        let attempt = self.attempt()?;
+        let expected = self.store.version()?;
+        let handoff = self
+            .distributed_frozen
+            .as_mut()
+            .ok_or(StoreError::Invalid)?
+            .take_store_handoff()
+            .map_err(|_| StoreError::Invalid)?;
+        let (stored, mut revoker) = self
+            .store
+            .finalize_staged_admission(expected, attempt, handoff)?;
+        revoker.release_to_store()?;
+        self.receipt = Some(stored);
+        self.phase = BilateralCommitPhase::Finalized;
+        Ok(())
+    }
+
+    async fn exchange_durable_commit_once(&mut self) -> Result<(), StoreError> {
         if self.phase != BilateralCommitPhase::Finalized {
+            return Err(StoreError::Invalid);
+        }
+        let receipt = self.receipt()?.clone();
+        let proof = self.proof.as_ref().ok_or(StoreError::Invalid)?;
+        let statement = super::provisional_tls::LocalDurableCommit::new(
+            receipt.bilateral.transaction_id,
+            receipt.bilateral.local_receipt_hash,
+            proof.peer_receipt_hash(),
+            receipt.transcript,
+            receipt.identity_generation,
+            receipt.revocation_generation,
+            proof.identity_generation(),
+            proof.revocation_generation(),
+            receipt.policy_revision,
+        )
+        .map_err(|_| StoreError::Invalid)?;
+        self.distributed_frozen
+            .as_mut()
+            .ok_or(StoreError::Invalid)?
+            .exchange_durable_commit(statement)
+            .await
+            .map_err(|_| StoreError::Invalid)?;
+        self.phase = BilateralCommitPhase::PeerCommitVerified;
+        Ok(())
+    }
+
+    fn confirm_once(&mut self) -> Result<(), StoreError> {
+        if !matches!(
+            self.phase,
+            BilateralCommitPhase::Finalized | BilateralCommitPhase::PeerCommitVerified
+        ) {
             return Err(StoreError::Invalid);
         }
         let proof = self.proof.as_ref().ok_or(StoreError::Invalid)?;
@@ -244,11 +372,24 @@ impl<'a> PreparedBilateralCommit<'a> {
         )?;
         self.receipt = Some(confirmed);
         self.phase = BilateralCommitPhase::Confirmed;
+        if let Some(frozen) = self.distributed_frozen.take() {
+            frozen.close_confirmed();
+        }
         Ok(())
     }
 
+    fn quarantine(&mut self) {
+        self.live = None;
+        self.frozen = None;
+        self.distributed_frozen = None;
+        self.phase = BilateralCommitPhase::Quarantined;
+    }
+
     fn abort_exact(&mut self) -> bool {
-        if matches!(self.phase, BilateralCommitPhase::Aborted) {
+        if matches!(
+            self.phase,
+            BilateralCommitPhase::Aborted | BilateralCommitPhase::Quarantined
+        ) {
             return false;
         }
         let mut staged = false;
@@ -308,9 +449,23 @@ impl<'a> PreparedBilateralCommit<'a> {
 // Successful confirmation and an explicit abort both disarm this owner.
 impl Drop for PreparedBilateralCommit<'_> {
     fn drop(&mut self) {
+        if self.distributed_frozen.is_some()
+            && matches!(
+                self.phase,
+                BilateralCommitPhase::Finalized | BilateralCommitPhase::PeerCommitVerified
+            )
+        {
+            // Cancellation of the coordinator future after local publication
+            // is an ambiguous remote outcome, never evidence that rollback is
+            // safe. Dropping the channel preserves the store-owned receipt.
+            self.quarantine();
+            return;
+        }
         if !matches!(
             self.phase,
-            BilateralCommitPhase::Confirmed | BilateralCommitPhase::Aborted
+            BilateralCommitPhase::Confirmed
+                | BilateralCommitPhase::Quarantined
+                | BilateralCommitPhase::Aborted
         ) {
             let _ = self.abort_exact();
         }
@@ -772,6 +927,7 @@ pub(crate) async fn commit_bilateral_foundation_with_test_hook(
     .await
 }
 
+#[allow(clippy::too_many_arguments)] // Mirrors the immutable bilateral wire fields explicitly.
 fn prepared_bilateral_record(
     local_identity: [u8; 32],
     peer_identity: [u8; 32],
@@ -816,6 +972,67 @@ impl AdmissionAuthorityStore {
 
     pub fn version(&self) -> Result<StoreVersion, StoreError> {
         self.store.version()
+    }
+
+    pub(crate) fn pending_store_for_handshake(&self) -> &PendingStore {
+        &self.store
+    }
+
+    pub async fn commit_distributed(
+        &self,
+        authority: super::provisional_tls::HandshakeCompletePendingAuthority,
+    ) -> Result<DistributedAdmissionSummary, StoreError> {
+        let attempt = authority.test_attempt_for_commit();
+        let mut commit = match PreparedBilateralCommit::prepare(self, authority).await {
+            Ok(commit) => commit,
+            Err(error) => {
+                cancel_pending_attempt_exact(self, attempt);
+                return Err(error);
+            }
+        };
+        let outcome = async {
+            // Both halves derive the same attempt from the authenticated
+            // transcript. The receipt exchange below rejects any asymmetric
+            // transaction before either local handoff can be finalized.
+            commit.stage_once(attempt)?;
+            #[cfg(test)]
+            distributed_process_checkpoint("after_stage");
+            let local = commit.local_finalization_receipt()?;
+            commit.exchange_once(local).await?;
+            commit.freeze_distributed_once().await?;
+            commit.finalize_distributed_once().await?;
+            #[cfg(test)]
+            distributed_process_checkpoint("after_local_commit");
+            commit.exchange_durable_commit_once().await?;
+            #[cfg(test)]
+            distributed_process_checkpoint("after_durable_exchange");
+            commit.confirm_once()?;
+            Ok(DistributedAdmissionSummary {
+                attempt,
+                state: ReconcileAdmission::Promoted,
+            })
+        }
+        .await;
+        if outcome.is_err() {
+            #[cfg(test)]
+            eprintln!("distributed admission failed in phase {:?}", commit.phase);
+            if matches!(
+                commit.phase,
+                BilateralCommitPhase::Finalized | BilateralCommitPhase::PeerCommitVerified
+            ) {
+                // The store now owns an active exact receipt. Transport loss
+                // cannot prove the peer's final outcome, so retain quarantine
+                // for authenticated recovery instead of pretending rollback.
+                commit.quarantine();
+                return Ok(DistributedAdmissionSummary {
+                    attempt,
+                    state: ReconcileAdmission::RemoteOutcomeUnknown,
+                });
+            } else {
+                let _ = commit.abort_exact();
+            }
+        }
+        outcome
     }
 
     pub fn prepare(
@@ -863,6 +1080,31 @@ impl AdmissionAuthorityStore {
             (false, Some(_), false) => Ok(ReconcileAdmission::Revoked),
             (false, None, false) => Ok(ReconcileAdmission::Absent),
             _ => Err(StoreError::Invalid),
+        }
+    }
+
+    /// G4-only metadata classification. Unlike the legacy foundation view,
+    /// store ownership without authenticated peer commit proof is quarantined.
+    pub fn reconcile_distributed(
+        &self,
+        attempt: [u8; 32],
+    ) -> Result<ReconcileAdmission, StoreError> {
+        let state = self.reconcile(attempt)?;
+        if state != ReconcileAdmission::Promoted {
+            return Ok(state);
+        }
+        let (_, receipt, active) = self.store.admission_state(attempt)?;
+        let receipt = receipt.ok_or(StoreError::Invalid)?;
+        if !active {
+            return Err(StoreError::Invalid);
+        }
+        if matches!(
+            receipt.bilateral.state,
+            crate::pairing_pending::BilateralAdmissionState::BilateralConfirmed
+        ) {
+            Ok(ReconcileAdmission::Promoted)
+        } else {
+            Ok(ReconcileAdmission::RemoteOutcomeUnknown)
         }
     }
 
@@ -1111,6 +1353,20 @@ impl AdmissionAuthorityStore {
             identity_generation: stored.identity_generation,
             revocation_generation: stored.revocation_generation,
         })
+    }
+}
+
+#[cfg(test)]
+fn distributed_process_checkpoint(name: &str) {
+    if let Ok(mode) = std::env::var("CSF12_DISTRIBUTED_COMMIT_CRASH") {
+        if mode == name {
+            std::process::exit(92);
+        }
+        if mode == format!("stall_{name}") {
+            loop {
+                std::thread::park();
+            }
+        }
     }
 }
 

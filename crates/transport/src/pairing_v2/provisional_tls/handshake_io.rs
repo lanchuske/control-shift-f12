@@ -66,6 +66,50 @@ const FINALIZATION_DOMAIN: &[u8] = b"control-shift-f12/finalization-v1";
 const FINALIZATION_EXPORTER_LABEL: &[u8] = b"EXPORTER-ControlShiftF12-Finalization-v1";
 const FINALIZATION_DEADLINE: Duration = Duration::from_secs(5);
 
+/// Local durable-commit statement used only after the exact staged receipt has
+/// been transferred to the local store. It carries no runtime authority.
+pub(crate) struct LocalDurableCommit {
+    transaction_id: BilateralTransactionId,
+    local_receipt_hash: [u8; 32],
+    peer_receipt_hash: [u8; 32],
+    transcript: [u8; 32],
+    identity_generation: u64,
+    revocation_generation: u64,
+    peer_identity_generation: u64,
+    peer_revocation_generation: u64,
+    policy_revision: u64,
+}
+
+impl LocalDurableCommit {
+    #[allow(clippy::too_many_arguments)] // Keeps both stores' generations explicit and ordered.
+    pub(in crate::pairing_v2) fn new(
+        transaction_id: BilateralTransactionId,
+        local_receipt_hash: [u8; 32],
+        peer_receipt_hash: [u8; 32],
+        transcript: [u8; 32],
+        identity_generation: u64,
+        revocation_generation: u64,
+        peer_identity_generation: u64,
+        peer_revocation_generation: u64,
+        policy_revision: u64,
+    ) -> Result<Self, HandshakeError> {
+        if local_receipt_hash == [0; 32] || peer_receipt_hash == [0; 32] {
+            return Err(HandshakeError::Rejected);
+        }
+        Ok(Self {
+            transaction_id,
+            local_receipt_hash,
+            peer_receipt_hash,
+            transcript,
+            identity_generation,
+            revocation_generation,
+            peer_identity_generation,
+            peer_revocation_generation,
+            policy_revision,
+        })
+    }
+}
+
 /// Local-only data prepared for the bounded finalization exchange.  It is not
 /// a durable receipt and cannot activate any capability by itself.
 #[derive(Clone)]
@@ -122,6 +166,13 @@ pub(crate) struct PeerFinalizationReceipt {
     identity_generation: u64,
     revocation_generation: u64,
     policy_revision: u64,
+}
+
+#[derive(Clone, Copy)]
+struct DecodedPeerReceipt {
+    hash: [u8; 32],
+    identity_generation: u64,
+    revocation_generation: u64,
 }
 
 impl PeerFinalizationReceipt {
@@ -197,6 +248,7 @@ pub struct HandshakeCompletePendingAuthority {
     failed: Arc<AtomicBool>,
     watcher: IngressWatcher,
     finalization_complete: bool,
+    durable_commit_complete: bool,
 }
 
 /// Internal, move-only live authority reserved for a bilateral durable
@@ -204,6 +256,13 @@ pub struct HandshakeCompletePendingAuthority {
 pub(crate) struct PreparedHandshakeAuthority {
     authority: HandshakeCompletePendingAuthority,
     reservation: super::PreparedAdmissionHandoff,
+}
+
+/// Frozen local store handoff that deliberately retains the authenticated
+/// provisional channel for the post-commit proof exchange.
+pub(crate) struct DistributedFrozenHandshakeAuthority {
+    authority: HandshakeCompletePendingAuthority,
+    handoff: Option<super::FrozenAdmissionHandoff>,
 }
 
 impl PreparedHandshakeAuthority {
@@ -281,12 +340,65 @@ impl PreparedHandshakeAuthority {
         })
     }
 
+    pub(in crate::pairing_v2) async fn freeze_distributed(
+        self,
+    ) -> Result<DistributedFrozenHandshakeAuthority, HandshakeError> {
+        if !self.authority.is_protocol_valid() {
+            return Err(HandshakeError::Rejected);
+        }
+        tokio::task::yield_now().await;
+        if !self.authority.is_protocol_valid() {
+            return Err(HandshakeError::Rejected);
+        }
+        let handoff = self
+            .reservation
+            .freeze()
+            .map_err(|_| HandshakeError::Rejected)?;
+        Ok(DistributedFrozenHandshakeAuthority {
+            authority: self.authority,
+            handoff: Some(handoff),
+        })
+    }
+
     #[cfg(test)]
     pub(in crate::pairing_v2) fn test_matches_ownership(
         &self,
         ownership: &crate::pairing_pending::AdmissionOwnership,
     ) -> bool {
         self.reservation.test_matches_ownership(ownership)
+    }
+}
+
+impl DistributedFrozenHandshakeAuthority {
+    pub(in crate::pairing_v2) fn take_store_handoff(
+        &mut self,
+    ) -> Result<super::FrozenAdmissionHandoff, HandshakeError> {
+        self.handoff.take().ok_or(HandshakeError::Rejected)
+    }
+
+    pub(in crate::pairing_v2) async fn exchange_durable_commit(
+        &mut self,
+        statement: LocalDurableCommit,
+    ) -> Result<(), HandshakeError> {
+        self.authority.exchange_durable_commit(statement).await
+    }
+
+    pub(in crate::pairing_v2) fn close_confirmed(mut self) {
+        self.authority
+            ._channel
+            .connection
+            .close(APPLICATION_ERROR.into(), b"distributed admission confirmed");
+        if let Some(task) = self.authority.watcher.task.take() {
+            task.abort();
+        }
+    }
+}
+
+impl Drop for DistributedFrozenHandshakeAuthority {
+    fn drop(&mut self) {
+        if let Some(handoff) = self.handoff.take() {
+            let _ = handoff.abort_exact();
+        }
     }
 }
 /// Move-only, non-serializable protocol evidence. It deliberately has no public
@@ -655,7 +767,7 @@ impl HandshakeCompletePendingAuthority {
             };
             let local = finalization_record(local_kind, &local_values, &key)
                 .map_err(|_| HandshakeError::Rejected)?;
-            let peer_hash = if self.role == Role::A {
+            let peer = if self.role == Role::A {
                 #[cfg(test)]
                 if matches!(receipt.test_fault, Some(FinalizationTestFault::NoBody)) {
                     std::future::pending::<()>().await;
@@ -671,7 +783,7 @@ impl HandshakeCompletePendingAuthority {
                 let remote = finalization_read(&mut stream.recv)
                     .await
                     .map_err(|_| HandshakeError::Rejected)?;
-                let hash = decode_local_receipt(&remote, &key, &receipt)
+                let peer = decode_local_receipt(&remote, &key, &receipt)
                     .map_err(|_| HandshakeError::Rejected)?;
                 #[cfg(test)]
                 if matches!(
@@ -680,27 +792,30 @@ impl HandshakeCompletePendingAuthority {
                 ) {
                     std::future::pending::<()>().await;
                 }
-                let ack =
-                    finalization_record("finalization-peer-ack", &ack_values(&receipt, hash), &key)
-                        .map_err(|_| HandshakeError::Rejected)?;
+                let ack = finalization_record(
+                    "finalization-peer-ack",
+                    &ack_values(&receipt, peer.hash),
+                    &key,
+                )
+                .map_err(|_| HandshakeError::Rejected)?;
                 finalization_send(&mut stream, &ack).await?;
                 let remote_ack = finalization_read(&mut stream.recv)
                     .await
                     .map_err(|_| HandshakeError::Rejected)?;
-                decode_ack(&remote_ack, &key, &receipt, hash)
+                decode_ack(&remote_ack, &key, &receipt, peer)
                     .map_err(|_| HandshakeError::Rejected)?;
-                hash
+                peer
             } else {
                 let remote = finalization_read(&mut stream.recv)
                     .await
                     .map_err(|_| HandshakeError::Rejected)?;
-                let hash = decode_local_receipt(&remote, &key, &receipt)
+                let peer = decode_local_receipt(&remote, &key, &receipt)
                     .map_err(|_| HandshakeError::Rejected)?;
                 finalization_send(&mut stream, &local).await?;
                 let remote_ack = finalization_read(&mut stream.recv)
                     .await
                     .map_err(|_| HandshakeError::Rejected)?;
-                decode_ack(&remote_ack, &key, &receipt, hash)
+                decode_ack(&remote_ack, &key, &receipt, peer)
                     .map_err(|_| HandshakeError::Rejected)?;
                 #[cfg(test)]
                 inject_finalization_extra(&self._channel.connection, receipt.test_fault).await?;
@@ -711,15 +826,18 @@ impl HandshakeCompletePendingAuthority {
                 ) {
                     std::future::pending::<()>().await;
                 }
-                let ack =
-                    finalization_record("finalization-peer-ack", &ack_values(&receipt, hash), &key)
-                        .map_err(|_| HandshakeError::Rejected)?;
+                let ack = finalization_record(
+                    "finalization-peer-ack",
+                    &ack_values(&receipt, peer.hash),
+                    &key,
+                )
+                .map_err(|_| HandshakeError::Rejected)?;
                 finalization_send(&mut stream, &ack).await?;
-                hash
+                peer
             };
             stream.send.finish().map_err(|_| HandshakeError::Rejected)?;
             stream.clean = true;
-            Ok::<_, HandshakeError>(peer_hash)
+            Ok::<_, HandshakeError>(peer)
         };
         let result = tokio::select! { biased;
             extra = self._channel.connection.accept_bi() => {
@@ -730,11 +848,11 @@ impl HandshakeCompletePendingAuthority {
                 if let Ok(mut recv) = extra { let _ = recv.stop(APPLICATION_ERROR.into()); }
                 Err(HandshakeError::Rejected)
             },
-            _ = self._channel.connection.closed() => Err(HandshakeError::Rejected),
             result = protocol => result,
+            _ = self._channel.connection.closed() => Err(HandshakeError::Rejected),
         };
-        let peer_receipt_hash = match result {
-            Ok(hash) => hash,
+        let peer = match result {
+            Ok(peer) => peer,
             Err(error) => {
                 self.failed.store(true, Ordering::Release);
                 self._channel
@@ -753,12 +871,168 @@ impl HandshakeCompletePendingAuthority {
         self.finalization_complete = true;
         Ok(PeerFinalizationReceipt {
             transaction_id: receipt.transaction_id,
-            peer_receipt_hash,
+            peer_receipt_hash: peer.hash,
             transcript: receipt.fields.transcript,
-            identity_generation: receipt.identity_generation,
-            revocation_generation: receipt.revocation_generation,
+            identity_generation: peer.identity_generation,
+            revocation_generation: peer.revocation_generation,
             policy_revision: receipt.policy_revision,
         })
+    }
+
+    async fn exchange_durable_commit(
+        &mut self,
+        statement: LocalDurableCommit,
+    ) -> Result<(), HandshakeError> {
+        let result = tokio::time::timeout(
+            FINALIZATION_DEADLINE,
+            self.exchange_durable_commit_bounded(statement),
+        )
+        .await;
+        match result {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(_)) | Err(_) => {
+                self.failed.store(true, Ordering::Release);
+                self._channel.connection.close(
+                    APPLICATION_ERROR.into(),
+                    b"durable commit proof rejected or timed out",
+                );
+                Err(HandshakeError::Rejected)
+            }
+        }
+    }
+
+    async fn exchange_durable_commit_bounded(
+        &mut self,
+        statement: LocalDurableCommit,
+    ) -> Result<(), HandshakeError> {
+        if !self.is_protocol_valid()
+            || !self.finalization_complete
+            || self.durable_commit_complete
+            || statement.transcript != self.transcript
+            || statement.identity_generation != self.pending.version.identity_generation
+            || statement.revocation_generation != self.pending.revocation_generation
+            || statement.policy_revision != 0
+        {
+            return Err(HandshakeError::Rejected);
+        }
+        let (reply, access) = oneshot::channel();
+        let finalization = self
+            .watcher
+            .finalization
+            .take()
+            .ok_or(HandshakeError::Rejected)?;
+        finalization
+            .send(reply)
+            .map_err(|_| HandshakeError::Rejected)?;
+        let access = access
+            .await
+            .map_err(|_| HandshakeError::Rejected)?
+            .map_err(|_| HandshakeError::Rejected)?;
+        let task = self.watcher.task.take().ok_or(HandshakeError::Rejected)?;
+        let incoming = match task.await.map_err(|_| HandshakeError::Rejected)? {
+            IngressDisposition::FinalizationReady(incoming) => incoming,
+            _ => return Err(HandshakeError::Rejected),
+        };
+        let mut stream = match access {
+            FinalizationAccess::Initiator => Stream::new(
+                self._channel
+                    .connection
+                    .open_bi()
+                    .await
+                    .map_err(|_| HandshakeError::Rejected)?,
+            ),
+            FinalizationAccess::Responder(stream) => stream,
+        };
+        let key = finalization_key(
+            &self._channel.connection,
+            statement.transaction_id,
+            statement.transcript,
+        )
+        .map_err(|_| HandshakeError::Rejected)?;
+        let local = finalization_record(
+            "durable-commit-published",
+            &durable_commit_values(&statement),
+            &key,
+        )
+        .map_err(|_| HandshakeError::Rejected)?;
+        let local_commit_hash: [u8; 32] = Sha256::digest(&local[4..]).into();
+        let protocol = async {
+            let peer_commit = if self.role == Role::A {
+                finalization_send(&mut stream, &local).await?;
+                let remote = finalization_read(&mut stream.recv)
+                    .await
+                    .map_err(|_| HandshakeError::Rejected)?;
+                decode_durable_commit(&remote, &key, &statement)
+                    .map_err(|_| HandshakeError::Rejected)?
+            } else {
+                let remote = finalization_read(&mut stream.recv)
+                    .await
+                    .map_err(|_| HandshakeError::Rejected)?;
+                let decoded = decode_durable_commit(&remote, &key, &statement)
+                    .map_err(|_| HandshakeError::Rejected)?;
+                finalization_send(&mut stream, &local).await?;
+                decoded
+            };
+            let ack = finalization_record(
+                "durable-commit-peer-ack",
+                &durable_commit_ack_values(&statement, peer_commit),
+                &key,
+            )
+            .map_err(|_| HandshakeError::Rejected)?;
+            if self.role == Role::A {
+                finalization_send(&mut stream, &ack).await?;
+                let remote_ack = finalization_read(&mut stream.recv)
+                    .await
+                    .map_err(|_| HandshakeError::Rejected)?;
+                decode_durable_commit_ack(&remote_ack, &key, &statement, local_commit_hash)
+                    .map_err(|_| HandshakeError::Rejected)?;
+            } else {
+                let remote_ack = finalization_read(&mut stream.recv)
+                    .await
+                    .map_err(|_| HandshakeError::Rejected)?;
+                decode_durable_commit_ack(&remote_ack, &key, &statement, local_commit_hash)
+                    .map_err(|_| HandshakeError::Rejected)?;
+                finalization_send(&mut stream, &ack).await?;
+                // The responder must not close the connection until the
+                // initiator has consumed this final acknowledgement. The
+                // initiator sends FIN only after successful validation.
+                let mut trailing = [0u8; 1];
+                if stream
+                    .recv
+                    .read(&mut trailing)
+                    .await
+                    .map_err(|_| HandshakeError::Rejected)?
+                    .is_some()
+                {
+                    return Err(HandshakeError::Rejected);
+                }
+            }
+            stream.send.finish().map_err(|_| HandshakeError::Rejected)?;
+            stream.clean = true;
+            Ok::<_, HandshakeError>(())
+        };
+        let result = tokio::select! { biased;
+            extra = self._channel.connection.accept_bi() => {
+                if let Ok(pair) = extra { drop(Stream::new(pair)); }
+                Err(HandshakeError::Rejected)
+            },
+            extra = self._channel.connection.accept_uni() => {
+                if let Ok(mut recv) = extra { let _ = recv.stop(APPLICATION_ERROR.into()); }
+                Err(HandshakeError::Rejected)
+            },
+            result = protocol => result,
+            _ = self._channel.connection.closed() => Err(HandshakeError::Rejected),
+        };
+        result?;
+        self.watcher = spawn_ingress_watcher(
+            self.role,
+            self._channel.connection.clone(),
+            self._channel.scope.clone(),
+            self.failed.clone(),
+            incoming,
+        );
+        self.durable_commit_complete = true;
+        Ok(())
     }
 
     #[allow(dead_code)] // Foundation-only boundary; product wiring remains disabled.
@@ -1160,7 +1434,7 @@ fn decode_local_receipt(
     raw: &[u8],
     key: &[u8; 32],
     expected: &LocalFinalizationReceipt,
-) -> Result<[u8; 32], Invalid> {
+) -> Result<DecodedPeerReceipt, Invalid> {
     let values = decode(
         "finalization-local-published",
         raw,
@@ -1175,7 +1449,7 @@ fn decode_local_receipt(
     let remote_transaction =
         BilateralTransactionId::from_bytes(bytes32(&unsigned[0])?).map_err(|_| Invalid)?;
     let remote_hash = bytes32(&unsigned[1])?;
-    if remote_transaction != expected.transaction_id
+    let invalid = remote_transaction != expected.transaction_id
         || remote_hash == [0; 32]
         || bytes32(&unsigned[2])? != expected.fields.peer_identity
         || bytes32(&unsigned[3])? != expected.fields.local_identity
@@ -1183,13 +1457,17 @@ fn decode_local_receipt(
         || bytes32(&unsigned[5])? != expected.fields.local_attempt
         || bytes32(&unsigned[6])? != expected.fields.local_identity
         || bytes32(&unsigned[7])? != expected.fields.transcript
-        || number(&unsigned[8])? != expected.identity_generation
-        || number(&unsigned[9])? != expected.revocation_generation
-        || number(&unsigned[10])? != expected.policy_revision
-    {
+        || number(&unsigned[10])? != expected.policy_revision;
+    if invalid {
+        #[cfg(test)]
+        eprintln!("distributed finalization receipt rejected");
         return Err(Invalid);
     }
-    Ok(remote_hash)
+    Ok(DecodedPeerReceipt {
+        hash: remote_hash,
+        identity_generation: number(&unsigned[8])?,
+        revocation_generation: number(&unsigned[9])?,
+    })
 }
 
 fn ack_values(receipt: &LocalFinalizationReceipt, peer_receipt_hash: [u8; 32]) -> Vec<Value> {
@@ -1208,22 +1486,122 @@ fn decode_ack(
     raw: &[u8],
     key: &[u8; 32],
     expected: &LocalFinalizationReceipt,
-    peer_hash: [u8; 32],
+    peer: DecodedPeerReceipt,
 ) -> Result<(), Invalid> {
     let values = decode("finalization-peer-ack", raw, &[2, 2, 2, 2, 1, 1, 1, 2])?;
     let mut unsigned = values.clone();
     let mac = bytes32(&unsigned.pop().ok_or(Invalid)?)?;
     let body = encode("finalization-peer-ack", &unsigned)?;
-    if finalization_mac(key, b"finalization-peer-ack", &body)? != mac
+    let invalid = finalization_mac(key, b"finalization-peer-ack", &body)? != mac
         || BilateralTransactionId::from_bytes(bytes32(&unsigned[0])?).map_err(|_| Invalid)?
             != expected.transaction_id
-        || bytes32(&unsigned[1])? != peer_hash
+        || bytes32(&unsigned[1])? != peer.hash
         || bytes32(&unsigned[2])? != expected.receipt_hash
         || bytes32(&unsigned[3])? != expected.fields.transcript
-        || number(&unsigned[4])? != expected.identity_generation
-        || number(&unsigned[5])? != expected.revocation_generation
-        || number(&unsigned[6])? != expected.policy_revision
-    {
+        || number(&unsigned[4])? != peer.identity_generation
+        || number(&unsigned[5])? != peer.revocation_generation
+        || number(&unsigned[6])? != expected.policy_revision;
+    if invalid {
+        #[cfg(test)]
+        eprintln!("distributed finalization ack rejected");
+        return Err(Invalid);
+    }
+    Ok(())
+}
+
+fn durable_commit_values(statement: &LocalDurableCommit) -> Vec<Value> {
+    vec![
+        Value::Bytes(statement.transaction_id.as_bytes().to_vec()),
+        Value::Bytes(statement.local_receipt_hash.to_vec()),
+        Value::Bytes(statement.peer_receipt_hash.to_vec()),
+        Value::Bytes(statement.transcript.to_vec()),
+        Value::Number(statement.identity_generation),
+        Value::Number(statement.revocation_generation),
+        Value::Number(statement.peer_identity_generation),
+        Value::Number(statement.peer_revocation_generation),
+        Value::Number(statement.policy_revision),
+    ]
+}
+
+fn decode_durable_commit(
+    raw: &[u8],
+    key: &[u8; 32],
+    expected: &LocalDurableCommit,
+) -> Result<[u8; 32], Invalid> {
+    let values = decode(
+        "durable-commit-published",
+        raw,
+        &[2, 2, 2, 2, 1, 1, 1, 1, 1, 2],
+    )?;
+    let mut unsigned = values.clone();
+    let mac = bytes32(&unsigned.pop().ok_or(Invalid)?)?;
+    let body = encode("durable-commit-published", &unsigned)?;
+    let invalid = finalization_mac(key, b"durable-commit-published", &body)? != mac
+        || BilateralTransactionId::from_bytes(bytes32(&unsigned[0])?).map_err(|_| Invalid)?
+            != expected.transaction_id
+        || bytes32(&unsigned[1])? != expected.peer_receipt_hash
+        || bytes32(&unsigned[2])? != expected.local_receipt_hash
+        || bytes32(&unsigned[3])? != expected.transcript
+        || number(&unsigned[4])? != expected.peer_identity_generation
+        || number(&unsigned[5])? != expected.peer_revocation_generation
+        || number(&unsigned[6])? != expected.identity_generation
+        || number(&unsigned[7])? != expected.revocation_generation
+        || number(&unsigned[8])? != expected.policy_revision;
+    if invalid {
+        #[cfg(test)]
+        eprintln!("distributed durable commit record rejected");
+        return Err(Invalid);
+    }
+    Ok(Sha256::digest(raw).into())
+}
+
+fn durable_commit_ack_values(
+    statement: &LocalDurableCommit,
+    peer_commit_hash: [u8; 32],
+) -> Vec<Value> {
+    vec![
+        Value::Bytes(statement.transaction_id.as_bytes().to_vec()),
+        Value::Bytes(peer_commit_hash.to_vec()),
+        Value::Bytes(statement.local_receipt_hash.to_vec()),
+        Value::Bytes(statement.peer_receipt_hash.to_vec()),
+        Value::Bytes(statement.transcript.to_vec()),
+        Value::Number(statement.identity_generation),
+        Value::Number(statement.revocation_generation),
+        Value::Number(statement.peer_identity_generation),
+        Value::Number(statement.peer_revocation_generation),
+        Value::Number(statement.policy_revision),
+    ]
+}
+
+fn decode_durable_commit_ack(
+    raw: &[u8],
+    key: &[u8; 32],
+    expected: &LocalDurableCommit,
+    local_commit_hash: [u8; 32],
+) -> Result<(), Invalid> {
+    let values = decode(
+        "durable-commit-peer-ack",
+        raw,
+        &[2, 2, 2, 2, 2, 1, 1, 1, 1, 1, 2],
+    )?;
+    let mut unsigned = values.clone();
+    let mac = bytes32(&unsigned.pop().ok_or(Invalid)?)?;
+    let body = encode("durable-commit-peer-ack", &unsigned)?;
+    let invalid = finalization_mac(key, b"durable-commit-peer-ack", &body)? != mac
+        || BilateralTransactionId::from_bytes(bytes32(&unsigned[0])?).map_err(|_| Invalid)?
+            != expected.transaction_id
+        || bytes32(&unsigned[1])? != local_commit_hash
+        || bytes32(&unsigned[2])? != expected.peer_receipt_hash
+        || bytes32(&unsigned[3])? != expected.local_receipt_hash
+        || bytes32(&unsigned[4])? != expected.transcript
+        || number(&unsigned[5])? != expected.peer_identity_generation
+        || number(&unsigned[6])? != expected.peer_revocation_generation
+        || number(&unsigned[7])? != expected.identity_generation
+        || number(&unsigned[8])? != expected.revocation_generation
+        || number(&unsigned[9])? != expected.policy_revision;
+    if invalid {
+        #[cfg(test)]
+        eprintln!("distributed durable commit ack rejected");
         return Err(Invalid);
     }
     Ok(())
@@ -1427,6 +1805,7 @@ impl ProvisionalChannel {
                 failed: done.failed,
                 watcher: done.watcher,
                 finalization_complete: false,
+                durable_commit_complete: false,
             }),
             Ok(Err(HandshakeError::Cancelled)) => Err(HandshakeError::Cancelled),
             _ => {

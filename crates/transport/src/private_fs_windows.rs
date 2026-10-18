@@ -125,18 +125,18 @@ fn rename_open_file(source: &File, destination: &Path, replace: bool) -> Result<
 
 #[cfg(test)]
 pub(crate) mod faults {
-    #[cfg(feature = "pairing-v2-experimental")]
+    #[cfg(feature = "pairing-v2-g4")]
     use super::StoreError;
     use std::cell::RefCell;
     std::thread_local! {static ARMED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };}
     std::thread_local! {static OPERATIONS: RefCell<Vec<&'static str>> = const { RefCell::new(Vec::new()) };}
     std::thread_local! {static FAILURE: RefCell<Option<(&'static str, Option<i32>)>> = const { RefCell::new(None) };}
     std::thread_local! {static RENAME_ATTEMPTS: RefCell<Vec<u32>> = const { RefCell::new(Vec::new()) };}
-    #[cfg(feature = "pairing-v2-experimental")]
+    #[cfg(feature = "pairing-v2-g4")]
     pub fn arm() {
         ARMED.set(true);
     }
-    #[cfg(feature = "pairing-v2-experimental")]
+    #[cfg(feature = "pairing-v2-g4")]
     pub fn point(file: &str, stage: &str) -> Result<(), StoreError> {
         if !ARMED.get() {
             return Ok(());
@@ -188,7 +188,7 @@ pub(crate) mod faults {
 
 macro_rules! fault_point {
     ($file:expr, $stage:expr) => {
-        #[cfg(all(test, feature = "pairing-v2-experimental"))]
+        #[cfg(all(test, feature = "pairing-v2-g4"))]
         faults::point($file, $stage)?;
     };
 }
@@ -520,7 +520,7 @@ pub(crate) struct PrivateDir {
 }
 
 impl PrivateDir {
-    #[cfg(feature = "pairing-v2-experimental")]
+    #[cfg(feature = "pairing-v2-g4")]
     pub(crate) fn try_clone(&self) -> Result<Self, StoreError> {
         self.validate_self()?;
         let file = self.file.try_clone().map_err(|_| StoreError::Unavailable)?;

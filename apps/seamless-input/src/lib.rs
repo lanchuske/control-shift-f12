@@ -6,10 +6,10 @@ pub mod control_engine;
 pub mod cursor;
 pub mod diagnostics;
 pub mod display_inventory;
-#[cfg(feature = "pairing-v2-experimental")]
+#[cfg(feature = "pairing-v2-g4")]
 pub mod guided_setup;
 pub mod peer;
-#[cfg(feature = "pairing-v2-experimental")]
+#[cfg(feature = "pairing-v2-g4")]
 pub mod product_pairing_adapter;
 pub mod runtime;
 pub mod runtime_status;

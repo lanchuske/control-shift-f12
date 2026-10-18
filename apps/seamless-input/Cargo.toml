@@ -11,7 +11,9 @@ FileDescription = "Control Shift F12"
 OriginalFilename = "seamless-input.exe"
 
 [features]
-pairing-v2-experimental = ["seamless-discovery/pairing-v2-experimental", "seamless-transport/pairing-v2-experimental", "dep:mdns-sd", "dep:rustls"]
+pairing-v2-g4 = ["seamless-discovery/pairing-v2-g4", "seamless-transport/pairing-v2-g4", "dep:mdns-sd", "dep:rustls"]
+pairing-v2-operational-experimental = ["pairing-v2-g4", "seamless-transport/pairing-v2-operational-experimental"]
+pairing-v2-experimental = ["pairing-v2-g4", "seamless-discovery/pairing-v2-experimental", "seamless-transport/pairing-v2-experimental"]
 
 [dependencies]
 clap.workspace = true

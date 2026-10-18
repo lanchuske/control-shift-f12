@@ -24,8 +24,8 @@ mod handshake_io;
 mod tests;
 #[allow(unused_imports)] // Constructed through the sealed handoff boundary.
 pub(crate) use handshake_io::{
-    FrozenPromotionEvidence, LocalFinalizationReceipt, PeerFinalizationReceipt,
-    PreparedHandshakeAuthority,
+    DistributedFrozenHandshakeAuthority, FrozenPromotionEvidence, LocalDurableCommit,
+    LocalFinalizationReceipt, PeerFinalizationReceipt, PreparedHandshakeAuthority,
 };
 pub use handshake_io::{
     HandshakeCompletePendingAuthority, HandshakeConfig, HandshakeError, VerificationDecision,
@@ -308,6 +308,10 @@ impl rustls::client::ResolvesClientCert for ClientAuthEvidence {
     }
 }
 impl ClientAuthEvidence {
+    #[cfg_attr(
+        not(any(test, feature = "pairing-v2-operational-experimental")),
+        allow(dead_code)
+    )]
     pub(crate) fn was_requested(&self) -> bool {
         self.requested.load(Ordering::Acquire)
     }

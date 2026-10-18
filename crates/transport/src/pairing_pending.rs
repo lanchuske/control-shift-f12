@@ -1,9 +1,9 @@
 //! Quarantined setup metadata. Nothing in this module grants trust or input.
 use serde::{Deserialize, Serialize};
-#[cfg(feature = "pairing-v2-experimental")]
+#[cfg(feature = "pairing-v2-g4")]
 use sha2::{Digest, Sha256};
 use std::path::Path;
-#[cfg(feature = "pairing-v2-experimental")]
+#[cfg(feature = "pairing-v2-g4")]
 use std::{
     collections::BTreeMap,
     sync::{Mutex, OnceLock},
@@ -27,7 +27,7 @@ pub enum StoreError {
     UnsupportedPlatform,
 }
 
-#[cfg(all(test, feature = "pairing-v2-experimental", any(unix, windows)))]
+#[cfg(all(test, feature = "pairing-v2-g4", any(unix, windows)))]
 mod bilateral_admission_state_tests {
     use super::*;
 
@@ -654,20 +654,20 @@ pub struct PendingRecord {
     pub revocation_generation: u64,
 }
 
-#[cfg(feature = "pairing-v2-experimental")]
+#[cfg(feature = "pairing-v2-g4")]
 const BILATERAL_TRANSACTION_DOMAIN: &[u8] = b"control-shift-f12/admission-v1";
 
-#[cfg(feature = "pairing-v2-experimental")]
+#[cfg(feature = "pairing-v2-g4")]
 const BILATERAL_RECEIPT_DOMAIN: &[u8] = b"control-shift-f12/admission-receipt-v1";
 
 /// Domain-separated identifier for one bilateral admission attempt. It is
 /// derived from authenticated handshake data; callers never supply it.
-#[cfg(feature = "pairing-v2-experimental")]
+#[cfg(feature = "pairing-v2-g4")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
 pub(crate) struct BilateralTransactionId([u8; 32]);
 
-#[cfg(feature = "pairing-v2-experimental")]
+#[cfg(feature = "pairing-v2-g4")]
 impl BilateralTransactionId {
     fn is_valid(self) -> bool {
         self.0 != [0; 32]
@@ -686,7 +686,7 @@ impl BilateralTransactionId {
 /// Inputs that determine a bilateral transaction identity and bind the local
 /// receipt descriptor. The two identity / attempt pairs are sorted before
 /// hashing, so each peer derives the same ID from inverted perspectives.
-#[cfg(feature = "pairing-v2-experimental")]
+#[cfg(feature = "pairing-v2-g4")]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct BilateralTransactionFields {
@@ -700,7 +700,7 @@ pub(crate) struct BilateralTransactionFields {
     pub(crate) policy_revision: u64,
 }
 
-#[cfg(feature = "pairing-v2-experimental")]
+#[cfg(feature = "pairing-v2-g4")]
 pub(crate) fn derive_bilateral_transaction_id(
     fields: &BilateralTransactionFields,
 ) -> BilateralTransactionId {
@@ -722,7 +722,7 @@ pub(crate) fn derive_bilateral_transaction_id(
     BilateralTransactionId(digest.finalize().into())
 }
 
-#[cfg(feature = "pairing-v2-experimental")]
+#[cfg(feature = "pairing-v2-g4")]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum BilateralAdmissionState {
@@ -735,7 +735,7 @@ pub(crate) enum BilateralAdmissionState {
 /// A durable local receipt is not enough to resume a bilateral relationship.
 /// This classification is intentionally metadata-only: a later recovery
 /// protocol must obtain authenticated peer evidence before any usable session.
-#[cfg(feature = "pairing-v2-experimental")]
+#[cfg(feature = "pairing-v2-g4")]
 #[allow(dead_code)] // Consumed by the peer-aware recovery exchange in the next phase.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BilateralRecoveryDisposition {
@@ -747,7 +747,7 @@ pub(crate) enum BilateralRecoveryDisposition {
 /// Durable bilateral status attached to every admission receipt. A local
 /// receipt starts prepared, then can become store-owned but remains inactive
 /// until a later authenticated peer confirmation changes it to confirmed.
-#[cfg(feature = "pairing-v2-experimental")]
+#[cfg(feature = "pairing-v2-g4")]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct BilateralAdmissionRecord {
@@ -762,7 +762,7 @@ pub(crate) struct BilateralAdmissionRecord {
     pub(crate) policy_revision: u64,
 }
 
-#[cfg(feature = "pairing-v2-experimental")]
+#[cfg(feature = "pairing-v2-g4")]
 impl BilateralAdmissionRecord {
     pub(crate) fn prepared(
         fields: &BilateralTransactionFields,
@@ -856,7 +856,7 @@ impl BilateralAdmissionRecord {
     }
 }
 
-#[cfg(feature = "pairing-v2-experimental")]
+#[cfg(feature = "pairing-v2-g4")]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum AdmissionOwnership {
@@ -874,7 +874,7 @@ pub(crate) enum AdmissionOwnership {
     },
 }
 
-#[cfg(feature = "pairing-v2-experimental")]
+#[cfg(feature = "pairing-v2-g4")]
 impl AdmissionOwnership {
     pub(crate) fn guard_token(&self) -> [u8; 32] {
         match self {
@@ -908,7 +908,7 @@ impl AdmissionOwnership {
     }
 }
 
-#[cfg(feature = "pairing-v2-experimental")]
+#[cfg(feature = "pairing-v2-g4")]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct AdmissionReceiptRecord {
@@ -933,7 +933,7 @@ pub(crate) struct AdmissionReceiptRecord {
     pub bilateral: BilateralAdmissionRecord,
 }
 
-#[cfg(feature = "pairing-v2-experimental")]
+#[cfg(feature = "pairing-v2-g4")]
 fn admission_receipt_hash(receipt: &AdmissionReceiptRecord) -> [u8; 32] {
     let mut digest = Sha256::new();
     digest.update(BILATERAL_RECEIPT_DOMAIN);
@@ -967,7 +967,7 @@ fn admission_receipt_hash(receipt: &AdmissionReceiptRecord) -> [u8; 32] {
     digest.finalize().into()
 }
 
-#[cfg(feature = "pairing-v2-experimental")]
+#[cfg(feature = "pairing-v2-g4")]
 pub(crate) fn bind_prepared_bilateral_receipt_hash(receipt: &mut AdmissionReceiptRecord) {
     let hash = admission_receipt_hash(receipt);
     receipt.bilateral.bind_local_receipt_hash(hash);
@@ -977,7 +977,7 @@ pub(crate) fn bind_prepared_bilateral_receipt_hash(receipt: &mut AdmissionReceip
 /// crate-private input to the sealed operational-session boundary, never a
 /// runtime-control capability.  In particular, it contains no connection or
 /// stream handle and cannot enable input, clipboard, or topology.
-#[cfg(feature = "pairing-v2-experimental")]
+#[cfg(feature = "pairing-v2-g4")]
 #[allow(dead_code)] // Sealed default-off operational foundation; no product caller in this phase.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct OperationalAdmissionSnapshot {
@@ -988,7 +988,7 @@ pub(crate) struct OperationalAdmissionSnapshot {
 /// A local-only preflight lease.  Its token is deliberately process-local and
 /// never serialized; dropping it only releases this attempt, never a durable
 /// pin or receipt.
-#[cfg(feature = "pairing-v2-experimental")]
+#[cfg(feature = "pairing-v2-g4")]
 #[allow(dead_code)] // Sealed default-off operational foundation; no product caller in this phase.
 pub(crate) struct OperationalPreflightLease {
     store: PendingStore,
@@ -1001,7 +1001,7 @@ pub(crate) struct OperationalPreflightLease {
 
 /// A local-only final lease.  It must be checked before every operational
 /// record; a durable revoke/rotation wins by making that check fail closed.
-#[cfg(feature = "pairing-v2-experimental")]
+#[cfg(feature = "pairing-v2-g4")]
 #[allow(dead_code)] // Sealed default-off operational foundation; no product caller in this phase.
 pub(crate) struct OperationalFinalLease {
     store: PendingStore,
@@ -1011,7 +1011,7 @@ pub(crate) struct OperationalFinalLease {
     live: bool,
 }
 
-#[cfg(feature = "pairing-v2-experimental")]
+#[cfg(feature = "pairing-v2-g4")]
 #[allow(dead_code)] // Sealed default-off operational foundation; no product caller in this phase.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum OperationalLeasePhase {
@@ -1024,7 +1024,7 @@ enum OperationalLeasePhase {
     },
 }
 
-#[cfg(feature = "pairing-v2-experimental")]
+#[cfg(feature = "pairing-v2-g4")]
 #[allow(dead_code)] // Sealed default-off operational foundation; no product caller in this phase.
 #[derive(Clone, Debug)]
 struct OperationalLeaseState {
@@ -1032,13 +1032,13 @@ struct OperationalLeaseState {
     phase: OperationalLeasePhase,
 }
 
-#[cfg(feature = "pairing-v2-experimental")]
+#[cfg(feature = "pairing-v2-g4")]
 fn operational_leases() -> &'static Mutex<BTreeMap<[u8; 32], OperationalLeaseState>> {
     static LEASES: OnceLock<Mutex<BTreeMap<[u8; 32], OperationalLeaseState>>> = OnceLock::new();
     LEASES.get_or_init(|| Mutex::new(BTreeMap::new()))
 }
 
-#[cfg(feature = "pairing-v2-experimental")]
+#[cfg(feature = "pairing-v2-g4")]
 fn operational_lease_states()
 -> std::sync::MutexGuard<'static, BTreeMap<[u8; 32], OperationalLeaseState>> {
     operational_leases()
@@ -1053,7 +1053,7 @@ pub struct PendingStore {
     ledger_dir: crate::private_fs::PrivateDir,
 }
 
-#[cfg(feature = "pairing-v2-experimental")]
+#[cfg(feature = "pairing-v2-g4")]
 pub(crate) struct AdmissionRevoker {
     store: PendingStore,
     peer: [u8; 32],
@@ -1063,7 +1063,7 @@ pub(crate) struct AdmissionRevoker {
     owns_revocation: bool,
 }
 
-#[cfg(feature = "pairing-v2-experimental")]
+#[cfg(feature = "pairing-v2-g4")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AdmissionGuardPhase {
     Active,
@@ -1071,10 +1071,10 @@ enum AdmissionGuardPhase {
     RevokingRetryable,
 }
 
-#[cfg(feature = "pairing-v2-experimental")]
+#[cfg(feature = "pairing-v2-g4")]
 pub(crate) struct AdmissionGuardObservation([u8; 32]);
 
-#[cfg(feature = "pairing-v2-experimental")]
+#[cfg(feature = "pairing-v2-g4")]
 impl AdmissionRevoker {
     #[allow(dead_code)] // Consumed by the staged durable handoff in Task 3.
     pub(crate) fn matches_handoff_token(&self, token: [u8; 32]) -> bool {
@@ -1189,7 +1189,7 @@ impl AdmissionRevoker {
     }
 }
 
-#[cfg(feature = "pairing-v2-experimental")]
+#[cfg(feature = "pairing-v2-g4")]
 impl Drop for AdmissionRevoker {
     fn drop(&mut self) {
         if self.armed {
@@ -1205,13 +1205,13 @@ impl Drop for AdmissionRevoker {
     }
 }
 
-#[cfg(feature = "pairing-v2-experimental")]
+#[cfg(feature = "pairing-v2-g4")]
 fn revocation_guards() -> &'static Mutex<BTreeMap<[u8; 32], AdmissionGuardPhase>> {
     static GUARDS: OnceLock<Mutex<BTreeMap<[u8; 32], AdmissionGuardPhase>>> = OnceLock::new();
     GUARDS.get_or_init(|| Mutex::new(BTreeMap::new()))
 }
 
-#[cfg(feature = "pairing-v2-experimental")]
+#[cfg(feature = "pairing-v2-g4")]
 fn revocation_guard_phases()
 -> std::sync::MutexGuard<'static, BTreeMap<[u8; 32], AdmissionGuardPhase>> {
     revocation_guards()
@@ -1219,7 +1219,7 @@ fn revocation_guard_phases()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-#[cfg(feature = "pairing-v2-experimental")]
+#[cfg(feature = "pairing-v2-g4")]
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AdmissionRevocationGuard {
@@ -1240,7 +1240,7 @@ impl PendingStore {
 mod unix {
     use super::*;
     use crate::private_fs::PrivateDir;
-    #[cfg(feature = "pairing-v2-experimental")]
+    #[cfg(feature = "pairing-v2-g4")]
     use rand::RngCore;
     use sha2::{Digest, Sha256};
     use std::collections::BTreeSet;
@@ -1264,7 +1264,7 @@ mod unix {
         generation: u64,
     }
 
-    #[cfg(feature = "pairing-v2-experimental")]
+    #[cfg(feature = "pairing-v2-g4")]
     #[derive(Serialize, Deserialize)]
     #[serde(deny_unknown_fields)]
     struct ActivePin {
@@ -1277,7 +1277,7 @@ mod unix {
     /// One durable reservation per peer while an admission is pending or
     /// awaiting the live-to-store handoff.  StoreOwned admissions use their
     /// active pin as the durable reservation instead.
-    #[cfg(feature = "pairing-v2-experimental")]
+    #[cfg(feature = "pairing-v2-g4")]
     #[derive(Serialize, Deserialize)]
     #[serde(deny_unknown_fields)]
     struct AdmissionReservation {
@@ -1293,30 +1293,30 @@ mod unix {
         pending: Vec<Reference>,
         tombstones: Vec<[u8; 32]>,
         revocations: Vec<Revocation>,
-        #[cfg(feature = "pairing-v2-experimental")]
+        #[cfg(feature = "pairing-v2-g4")]
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         active_pins: Vec<ActivePin>,
-        #[cfg(feature = "pairing-v2-experimental")]
+        #[cfg(feature = "pairing-v2-g4")]
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         admission_reservations: Vec<AdmissionReservation>,
-        #[cfg(feature = "pairing-v2-experimental")]
+        #[cfg(feature = "pairing-v2-g4")]
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         consumed_attempts: Vec<[u8; 32]>,
-        #[cfg(feature = "pairing-v2-experimental")]
+        #[cfg(feature = "pairing-v2-g4")]
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         admission_receipts: Vec<AdmissionReceiptRecord>,
-        #[cfg(feature = "pairing-v2-experimental")]
+        #[cfg(feature = "pairing-v2-g4")]
         #[serde(default)]
         policy_revision: u64,
-        #[cfg(feature = "pairing-v2-experimental")]
+        #[cfg(feature = "pairing-v2-g4")]
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         recoveries: Vec<RecoveryConsumption>,
-        #[cfg(feature = "pairing-v2-experimental")]
+        #[cfg(feature = "pairing-v2-g4")]
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         journals: Vec<JournalReference>,
     }
 
-    #[cfg(feature = "pairing-v2-experimental")]
+    #[cfg(feature = "pairing-v2-g4")]
     #[derive(Serialize, Deserialize)]
     #[serde(deny_unknown_fields)]
     struct RecoveryConsumption {
@@ -1324,7 +1324,7 @@ mod unix {
         body: Vec<u8>,
         signature: Vec<u8>,
     }
-    #[cfg(feature = "pairing-v2-experimental")]
+    #[cfg(feature = "pairing-v2-g4")]
     #[derive(Serialize, Deserialize)]
     #[serde(deny_unknown_fields)]
     struct JournalReference {
@@ -1332,7 +1332,7 @@ mod unix {
         revision: u64,
         digest: [u8; 32],
     }
-    #[cfg(feature = "pairing-v2-experimental")]
+    #[cfg(feature = "pairing-v2-g4")]
     fn journal_filename(r: &JournalReference) -> String {
         format!("journal-{}-{}", r.revision, filename(r.attempt))
     }
@@ -1348,24 +1348,24 @@ mod unix {
                 pending: vec![],
                 tombstones: vec![],
                 revocations: vec![],
-                #[cfg(feature = "pairing-v2-experimental")]
+                #[cfg(feature = "pairing-v2-g4")]
                 active_pins: vec![],
-                #[cfg(feature = "pairing-v2-experimental")]
+                #[cfg(feature = "pairing-v2-g4")]
                 admission_reservations: vec![],
-                #[cfg(feature = "pairing-v2-experimental")]
+                #[cfg(feature = "pairing-v2-g4")]
                 consumed_attempts: vec![],
-                #[cfg(feature = "pairing-v2-experimental")]
+                #[cfg(feature = "pairing-v2-g4")]
                 admission_receipts: vec![],
-                #[cfg(feature = "pairing-v2-experimental")]
+                #[cfg(feature = "pairing-v2-g4")]
                 policy_revision: 0,
-                #[cfg(feature = "pairing-v2-experimental")]
+                #[cfg(feature = "pairing-v2-g4")]
                 recoveries: vec![],
-                #[cfg(feature = "pairing-v2-experimental")]
+                #[cfg(feature = "pairing-v2-g4")]
                 journals: vec![],
             }
         }
         fn validate(&self) -> Result<(), StoreError> {
-            #[cfg(feature = "pairing-v2-experimental")]
+            #[cfg(feature = "pairing-v2-g4")]
             {
                 if self.active_pins.len() > MAX_HISTORY
                     || self.admission_reservations.len() > MAX_PENDING
@@ -1591,7 +1591,7 @@ mod unix {
         )
     }
 
-    #[cfg(feature = "pairing-v2-experimental")]
+    #[cfg(feature = "pairing-v2-g4")]
     fn admission_guard_filename(attempt: [u8; 32]) -> String {
         format!(
             "admission-revocation-{}.json",
@@ -1603,7 +1603,7 @@ mod unix {
     }
 
     impl PendingStore {
-        #[cfg(feature = "pairing-v2-experimental")]
+        #[cfg(feature = "pairing-v2-g4")]
         fn clone_for_operational_lease(&self) -> Result<Self, StoreError> {
             Ok(Self {
                 pending_dir: self.pending_dir.try_clone()?,
@@ -1611,7 +1611,7 @@ mod unix {
             })
         }
 
-        #[cfg(feature = "pairing-v2-experimental")]
+        #[cfg(feature = "pairing-v2-g4")]
         fn current_operational_snapshot(
             &self,
             attempt: [u8; 32],
@@ -1649,7 +1649,7 @@ mod unix {
         /// Acquires a process-local operational preflight lease only after one
         /// atomic durable snapshot read.  The lease is never serialized and an
         /// ordinary drop merely forgets the local token.
-        #[cfg(feature = "pairing-v2-experimental")]
+        #[cfg(feature = "pairing-v2-g4")]
         pub(crate) fn acquire_operational_preflight_lease(
             &self,
             attempt: [u8; 32],
@@ -1690,7 +1690,7 @@ mod unix {
             })
         }
 
-        #[cfg(feature = "pairing-v2-experimental")]
+        #[cfg(feature = "pairing-v2-g4")]
         pub(crate) fn operational_admission_snapshot(
             &self,
             attempt: [u8; 32],
@@ -1698,7 +1698,7 @@ mod unix {
             self.current_operational_snapshot(attempt)
         }
 
-        #[cfg(feature = "pairing-v2-experimental")]
+        #[cfg(feature = "pairing-v2-g4")]
         #[allow(dead_code)] // Used by the sealed final lease once the V01 driver is wired.
         fn operational_snapshot_still_current(
             &self,
@@ -1707,7 +1707,7 @@ mod unix {
             Ok(self.current_operational_snapshot(snapshot.receipt.attempt)? == *snapshot)
         }
 
-        #[cfg(feature = "pairing-v2-experimental")]
+        #[cfg(feature = "pairing-v2-g4")]
         pub(crate) fn admission_revoker(
             &self,
             peer: [u8; 32],
@@ -1742,7 +1742,7 @@ mod unix {
             })
         }
 
-        #[cfg(feature = "pairing-v2-experimental")]
+        #[cfg(feature = "pairing-v2-g4")]
         pub(crate) fn clear_admission_guard_exact(
             &self,
             attempt: [u8; 32],
@@ -1761,15 +1761,15 @@ mod unix {
             if guard.attempt != attempt || guard.token != token {
                 return Err(StoreError::Invalid);
             }
-            #[cfg(all(test, feature = "pairing-v2-experimental"))]
+            #[cfg(all(test, feature = "pairing-v2-g4"))]
             crate::private_fs::faults::point(&file, "before_remove")?;
             self.ledger_dir.remove(&file)?;
-            #[cfg(all(test, feature = "pairing-v2-experimental"))]
+            #[cfg(all(test, feature = "pairing-v2-g4"))]
             crate::private_fs::faults::point(&file, "after_remove")?;
             Ok(())
         }
 
-        #[cfg(feature = "pairing-v2-experimental")]
+        #[cfg(feature = "pairing-v2-g4")]
         pub(crate) fn resolve_admission_guard(
             &self,
             attempt: [u8; 32],
@@ -1870,7 +1870,7 @@ mod unix {
             Ok(None)
         }
 
-        #[cfg(feature = "pairing-v2-experimental")]
+        #[cfg(feature = "pairing-v2-g4")]
         pub(crate) fn admission_guard_still_active(
             &self,
             observation: &AdmissionGuardObservation,
@@ -1878,17 +1878,17 @@ mod unix {
             revocation_guard_phases().get(&observation.0) == Some(&AdmissionGuardPhase::Active)
         }
 
-        #[cfg(feature = "pairing-v2-experimental")]
+        #[cfg(feature = "pairing-v2-g4")]
         pub(super) fn revoke_current(
             &self,
             peer: [u8; 32],
             attempt: [u8; 32],
             token: [u8; 32],
         ) -> Result<(), StoreError> {
-            #[cfg(all(test, feature = "pairing-v2-experimental"))]
+            #[cfg(all(test, feature = "pairing-v2-g4"))]
             crate::private_fs::faults::point("ledger.json", "before_revoke_lock")?;
             let _lock = self.ledger_dir.lock()?;
-            #[cfg(all(test, feature = "pairing-v2-experimental"))]
+            #[cfg(all(test, feature = "pairing-v2-g4"))]
             crate::private_fs::faults::point("ledger.json", "before_revoke_load")?;
             let mut ledger = self.load_validated_manifest()?;
             if peer == [0; 32] || attempt == [0; 32] || token == [0; 32] {
@@ -1961,18 +1961,18 @@ mod unix {
             ledger.tombstones.extend(&removed);
             self.save(&ledger)?;
             for attempt in removed {
-                #[cfg(all(test, feature = "pairing-v2-experimental"))]
+                #[cfg(all(test, feature = "pairing-v2-g4"))]
                 crate::private_fs::faults::point("ledger.json", "before_revoke_remove")?;
                 self.pending_dir.remove(&filename(attempt))?;
             }
             for file in old_journals {
-                #[cfg(all(test, feature = "pairing-v2-experimental"))]
+                #[cfg(all(test, feature = "pairing-v2-g4"))]
                 crate::private_fs::faults::point("ledger.json", "before_revoke_cleanup")?;
                 self.pending_dir.remove(&file)?;
             }
             Ok(())
         }
-        #[cfg(feature = "pairing-v2-experimental")]
+        #[cfg(feature = "pairing-v2-g4")]
         pub fn reconcile_pairing(
             &self,
             attempt: [u8; 32],
@@ -2015,7 +2015,7 @@ mod unix {
             }
             Ok(ReconcileOutcome::Discarded)
         }
-        #[cfg(feature = "pairing-v2-experimental")]
+        #[cfg(feature = "pairing-v2-g4")]
         pub(crate) fn persist_pairing_journal(
             &self,
             expected: StoreVersion,
@@ -2072,7 +2072,7 @@ mod unix {
             }
             Ok(())
         }
-        #[cfg(feature = "pairing-v2-experimental")]
+        #[cfg(feature = "pairing-v2-g4")]
         fn read_journal(
             &self,
             reference: &JournalReference,
@@ -2095,7 +2095,7 @@ mod unix {
         }
         /// Consumes only a signature-checked request from an authoritative context
         /// provider. This does NOT populate that context or authorize admission.
-        #[cfg(feature = "pairing-v2-experimental")]
+        #[cfg(feature = "pairing-v2-g4")]
         pub fn consume_verified_recovery(
             &self,
             proof: crate::pairing_v2::VerifiedRecoveryUse,
@@ -2186,7 +2186,7 @@ mod unix {
                     return Err(StoreError::Invalid);
                 }
             }
-            #[cfg(feature = "pairing-v2-experimental")]
+            #[cfg(feature = "pairing-v2-g4")]
             for reference in &ledger.journals {
                 let journal = self.read_journal(reference)?;
                 if !ledger.pending.iter().any(|r| r.record == journal.pending) {
@@ -2225,7 +2225,7 @@ mod unix {
             if ledger.tombstones.contains(&attempt) {
                 return Err(StoreError::ConsumedAttempt);
             }
-            #[cfg(feature = "pairing-v2-experimental")]
+            #[cfg(feature = "pairing-v2-g4")]
             if ledger.consumed_attempts.contains(&attempt) {
                 return Err(StoreError::ConsumedAttempt);
             }
@@ -2233,11 +2233,11 @@ mod unix {
             // relationship for this peer.  Reject a retry before it can create
             // pending metadata or a live revocation guard: later cancellation
             // is peer-scoped and must never revoke that existing relationship.
-            #[cfg(feature = "pairing-v2-experimental")]
+            #[cfg(feature = "pairing-v2-g4")]
             if ledger.active_pins.iter().any(|pin| pin.peer == peer) {
                 return Err(StoreError::Conflict);
             }
-            #[cfg(feature = "pairing-v2-experimental")]
+            #[cfg(feature = "pairing-v2-g4")]
             if ledger
                 .admission_reservations
                 .iter()
@@ -2265,7 +2265,7 @@ mod unix {
             let digest = Sha256::digest(&bytes).into();
             // An interrupted prepare may leave an orphan file. Only the locked ledger can reference it.
             self.pending_dir.replace(&filename(attempt), &bytes)?;
-            #[cfg(feature = "pairing-v2-experimental")]
+            #[cfg(feature = "pairing-v2-g4")]
             ledger
                 .admission_reservations
                 .push(AdmissionReservation { peer, attempt });
@@ -2302,24 +2302,24 @@ mod unix {
                 return Err(StoreError::Invalid);
             }
             ledger.pending.retain(|r| r.record.attempt_id != attempt);
-            #[cfg(feature = "pairing-v2-experimental")]
+            #[cfg(feature = "pairing-v2-g4")]
             ledger
                 .admission_reservations
                 .retain(|reservation| reservation.attempt != attempt);
-            #[cfg(feature = "pairing-v2-experimental")]
+            #[cfg(feature = "pairing-v2-g4")]
             let old_journals: Vec<_> = ledger
                 .journals
                 .iter()
                 .filter(|r| r.attempt == attempt)
                 .map(journal_filename)
                 .collect();
-            #[cfg(feature = "pairing-v2-experimental")]
+            #[cfg(feature = "pairing-v2-g4")]
             ledger.journals.retain(|r| r.attempt != attempt);
             ledger.tombstones.push(attempt);
             self.save(&ledger)?;
             // Durable tombstone is authoritative even if deletion fails: no resurrection on retry.
             self.pending_dir.remove(&filename(attempt))?;
-            #[cfg(feature = "pairing-v2-experimental")]
+            #[cfg(feature = "pairing-v2-g4")]
             for file in old_journals {
                 self.pending_dir.remove(&file)?;
             }
@@ -2346,9 +2346,9 @@ mod unix {
                     generation: 1,
                 });
             }
-            #[cfg(feature = "pairing-v2-experimental")]
+            #[cfg(feature = "pairing-v2-g4")]
             ledger.active_pins.retain(|pin| pin.peer != peer);
-            #[cfg(feature = "pairing-v2-experimental")]
+            #[cfg(feature = "pairing-v2-g4")]
             ledger
                 .admission_reservations
                 .retain(|reservation| reservation.peer != peer);
@@ -2359,21 +2359,21 @@ mod unix {
                 .map(|r| r.record.attempt_id)
                 .collect();
             ledger.pending.retain(|r| r.record.peer_fingerprint != peer);
-            #[cfg(feature = "pairing-v2-experimental")]
+            #[cfg(feature = "pairing-v2-g4")]
             let old_journals: Vec<_> = ledger
                 .journals
                 .iter()
                 .filter(|r| removed.contains(&r.attempt))
                 .map(journal_filename)
                 .collect();
-            #[cfg(feature = "pairing-v2-experimental")]
+            #[cfg(feature = "pairing-v2-g4")]
             ledger.journals.retain(|r| !removed.contains(&r.attempt));
             ledger.tombstones.extend(&removed);
             self.save(&ledger)?;
             for attempt in removed {
                 self.pending_dir.remove(&filename(attempt))?;
             }
-            #[cfg(feature = "pairing-v2-experimental")]
+            #[cfg(feature = "pairing-v2-g4")]
             for file in old_journals {
                 self.pending_dir.remove(&file)?;
             }
@@ -2389,7 +2389,7 @@ mod unix {
         /// deliberately crate-private and returns durable metadata, never a runtime
         /// capability. Pending removal, pin, consumed marker and receipt share the
         /// same manifest publication under the same multiprocess lock.
-        #[cfg(feature = "pairing-v2-experimental")]
+        #[cfg(feature = "pairing-v2-g4")]
         #[allow(dead_code)] // Reachable only through the disabled admission foundation.
         pub(crate) fn commit_sealed_admission(
             &self,
@@ -2508,7 +2508,7 @@ mod unix {
         /// First publication of a live admission finalization.  A staged
         /// receipt consumes the pending attempt but is explicitly ineligible:
         /// its provisional endpoint still owns the exact revocation guard.
-        #[cfg(feature = "pairing-v2-experimental")]
+        #[cfg(feature = "pairing-v2-g4")]
         pub(crate) fn stage_sealed_admission(
             &self,
             expected: StoreVersion,
@@ -2589,7 +2589,7 @@ mod unix {
         /// active pin is a durable reservation only: Task 1 deliberately
         /// keeps every bilateral state ineligible for an operational
         /// snapshot until a later authenticated peer proof exists.
-        #[cfg(feature = "pairing-v2-experimental")]
+        #[cfg(feature = "pairing-v2-g4")]
         #[allow(dead_code)] // Task 2 storage transition; Task 3 wires authenticated proof.
         pub(crate) fn publish_local_bilateral_receipt(
             &self,
@@ -2708,7 +2708,7 @@ mod unix {
         /// Persists the local observation of an exact peer receipt.  This is
         /// bookkeeping only; without Task 3's authenticated proof it cannot
         /// activate an admission.
-        #[cfg(feature = "pairing-v2-experimental")]
+        #[cfg(feature = "pairing-v2-g4")]
         #[allow(dead_code)] // Task 2 storage transition; Task 3 wires authenticated proof.
         pub(crate) fn confirm_bilateral_receipt(
             &self,
@@ -2766,7 +2766,7 @@ mod unix {
 
         /// Aborts only the exact durable transaction.  In particular, an old
         /// timeout/drop cannot revoke a later attempt for the same peer.
-        #[cfg(feature = "pairing-v2-experimental")]
+        #[cfg(feature = "pairing-v2-g4")]
         #[allow(dead_code)] // Task 2 storage transition; Task 3 wires authenticated proof.
         pub(crate) fn abort_bilateral_transaction(
             &self,
@@ -2821,7 +2821,7 @@ mod unix {
         /// Endpoint-drop recovery for a live staged bilateral transaction.
         /// The opaque sidecar token is the sole authority: no peer lookup or
         /// peer-wide revocation is allowed on this path.
-        #[cfg(feature = "pairing-v2-experimental")]
+        #[cfg(feature = "pairing-v2-g4")]
         pub(crate) fn abort_bilateral_guard_exact(
             &self,
             attempt: [u8; 32],
@@ -2869,7 +2869,7 @@ mod unix {
         /// Second publication of live admission finalization.  Only an exact
         /// staged receipt may become `StoreOwned`, and the active pin appears
         /// in the same locked manifest publication as that ownership election.
-        #[cfg(feature = "pairing-v2-experimental")]
+        #[cfg(feature = "pairing-v2-g4")]
         pub(crate) fn finalize_staged_admission(
             &self,
             expected: StoreVersion,
@@ -2957,7 +2957,7 @@ mod unix {
             Ok((finalized, revoker))
         }
 
-        #[cfg(feature = "pairing-v2-experimental")]
+        #[cfg(feature = "pairing-v2-g4")]
         #[allow(dead_code)] // Used only by the default-off admission foundation.
         pub(crate) fn admission_state(
             &self,
@@ -2995,7 +2995,7 @@ mod unix {
         /// It deliberately does not create an operational snapshot: even a
         /// locally confirmed receipt must obtain a fresh authenticated peer
         /// recovery acknowledgement before it can be used by a later phase.
-        #[cfg(feature = "pairing-v2-experimental")]
+        #[cfg(feature = "pairing-v2-g4")]
         pub(crate) fn recovery_disposition(
             &self,
             attempt: [u8; 32],
@@ -3025,7 +3025,7 @@ mod unix {
         /// authenticated peer-recovery exchange. The descriptor itself has no
         /// authority: callers must bind it to the pinned peer over a fresh
         /// mutual-TLS channel before they can transition either receipt.
-        #[cfg(feature = "pairing-v2-experimental")]
+        #[cfg(feature = "pairing-v2-g4")]
         pub(crate) fn recovery_evidence(
             &self,
             attempt: [u8; 32],
@@ -3053,7 +3053,7 @@ mod unix {
         /// has authenticated and compared both descriptors. This still cannot
         /// create an operational snapshot; that requires a later sealed
         /// operational proof.
-        #[cfg(feature = "pairing-v2-experimental")]
+        #[cfg(feature = "pairing-v2-g4")]
         pub(crate) fn confirm_authenticated_peer_recovery(
             &self,
             attempt: [u8; 32],
@@ -3096,22 +3096,22 @@ mod unix {
                 .identity_generation
                 .checked_add(1)
                 .ok_or(StoreError::Limit)?;
-            #[cfg(feature = "pairing-v2-experimental")]
+            #[cfg(feature = "pairing-v2-g4")]
             ledger.active_pins.clear();
-            #[cfg(feature = "pairing-v2-experimental")]
+            #[cfg(feature = "pairing-v2-g4")]
             ledger.admission_reservations.clear();
             let removed: Vec<_> = ledger.pending.iter().map(|r| r.record.attempt_id).collect();
             ledger.tombstones.extend(&removed);
             ledger.pending.clear();
-            #[cfg(feature = "pairing-v2-experimental")]
+            #[cfg(feature = "pairing-v2-g4")]
             let old_journals: Vec<_> = ledger.journals.iter().map(journal_filename).collect();
-            #[cfg(feature = "pairing-v2-experimental")]
+            #[cfg(feature = "pairing-v2-g4")]
             ledger.journals.clear();
             self.save(&ledger)?;
             for attempt in removed {
                 self.pending_dir.remove(&filename(attempt))?;
             }
-            #[cfg(feature = "pairing-v2-experimental")]
+            #[cfg(feature = "pairing-v2-g4")]
             for file in old_journals {
                 self.pending_dir.remove(&file)?;
             }
@@ -3119,7 +3119,7 @@ mod unix {
         }
     }
 
-    #[cfg(feature = "pairing-v2-experimental")]
+    #[cfg(feature = "pairing-v2-g4")]
     #[allow(dead_code)] // Sealed default-off operational foundation; no product caller in this phase.
     impl OperationalPreflightLease {
         pub(crate) fn snapshot(&self) -> &OperationalAdmissionSnapshot {
@@ -3195,7 +3195,7 @@ mod unix {
         }
     }
 
-    #[cfg(feature = "pairing-v2-experimental")]
+    #[cfg(feature = "pairing-v2-g4")]
     impl Drop for OperationalPreflightLease {
         fn drop(&mut self) {
             if self.live {
@@ -3205,7 +3205,7 @@ mod unix {
         }
     }
 
-    #[cfg(feature = "pairing-v2-experimental")]
+    #[cfg(feature = "pairing-v2-g4")]
     #[allow(dead_code)] // Sealed default-off operational foundation; no product caller in this phase.
     impl OperationalFinalLease {
         /// This is intentionally a check-only capability: callers receive no
@@ -3232,7 +3232,7 @@ mod unix {
         }
     }
 
-    #[cfg(feature = "pairing-v2-experimental")]
+    #[cfg(feature = "pairing-v2-g4")]
     impl Drop for OperationalFinalLease {
         fn drop(&mut self) {
             if self.live {
@@ -3245,7 +3245,7 @@ mod unix {
 
 #[cfg(not(any(unix, windows)))]
 impl PendingStore {
-    #[cfg(feature = "pairing-v2-experimental")]
+    #[cfg(feature = "pairing-v2-g4")]
     pub fn reconcile_pairing(
         &self,
         _attempt: [u8; 32],
@@ -3253,7 +3253,7 @@ impl PendingStore {
     ) -> Result<crate::pairing_v2::ReconcileOutcome, StoreError> {
         Err(StoreError::UnsupportedPlatform)
     }
-    #[cfg(feature = "pairing-v2-experimental")]
+    #[cfg(feature = "pairing-v2-g4")]
     pub(crate) fn persist_pairing_journal(
         &self,
         _expected: StoreVersion,
@@ -3261,7 +3261,7 @@ impl PendingStore {
     ) -> Result<(), StoreError> {
         Err(StoreError::UnsupportedPlatform)
     }
-    #[cfg(feature = "pairing-v2-experimental")]
+    #[cfg(feature = "pairing-v2-g4")]
     pub fn consume_verified_recovery(
         &self,
         _proof: crate::pairing_v2::VerifiedRecoveryUse,
