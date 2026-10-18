@@ -589,6 +589,52 @@ mod tests {
     use super::*;
     use std::{fs::OpenOptions, os::windows::fs::OpenOptionsExt};
 
+    fn path_replace_with_retained_source(
+        _source: &File,
+        from: &Path,
+        to: &Path,
+    ) -> Result<(), u32> {
+        let from = wide(from.as_os_str());
+        let to = wide(to.as_os_str());
+        if unsafe {
+            ReplaceFileW(
+                to.as_ptr(),
+                from.as_ptr(),
+                ptr::null(),
+                0,
+                ptr::null(),
+                ptr::null(),
+            )
+        } != 0
+        {
+            Ok(())
+        } else {
+            Err(unsafe { GetLastError() })
+        }
+    }
+
+    #[test]
+    fn retained_source_handle_can_replace_existing_target() {
+        let root = tempfile::tempdir().unwrap();
+        let from = root.path().join("replacement");
+        let to = root.path().join("target");
+        std::fs::write(&from, b"new").unwrap();
+        std::fs::write(&to, b"old").unwrap();
+        let source = open_path(&from, false, OPEN_EXISTING).unwrap().unwrap();
+        let source_id = identity(&file_info(source.as_raw_handle().cast()).unwrap());
+
+        let result = path_replace_with_retained_source(&source, &from, &to);
+
+        assert_eq!(result, Ok(()), "path replace failed with {result:?}");
+        assert!(!from.exists());
+        assert_eq!(std::fs::read(&to).unwrap(), b"new");
+        let target = open_path(&to, false, OPEN_EXISTING).unwrap().unwrap();
+        assert_eq!(
+            identity(&file_info(target.as_raw_handle().cast()).unwrap()),
+            source_id
+        );
+    }
+
     #[test]
     fn atomic_replace_retries_transient_sharing_violations() {
         let root = tempfile::tempdir().unwrap();
