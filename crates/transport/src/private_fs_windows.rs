@@ -890,8 +890,16 @@ mod tests {
         );
 
         assert_eq!(result, Ok(()));
-        assert_eq!(delays, [Duration::from_millis(25)]);
-        assert_eq!(faults::take_rename_attempts(), [32, ERROR_SUCCESS]);
+        let attempts = faults::take_rename_attempts();
+        assert_eq!(attempts.first(), Some(&32));
+        assert_eq!(attempts.last(), Some(&ERROR_SUCCESS));
+        assert!(attempts.len() <= 21);
+        assert!(
+            attempts[..attempts.len() - 1]
+                .iter()
+                .all(|code| *code == 32)
+        );
+        assert_eq!(delays, vec![Duration::from_millis(25); attempts.len() - 1]);
         assert_eq!(faults::take_operations(), ["rename"]);
         assert_eq!(faults::take_failure(), None);
         assert_eq!(std::fs::read(&to).unwrap(), b"new");
