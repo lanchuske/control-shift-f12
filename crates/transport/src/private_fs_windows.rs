@@ -433,6 +433,22 @@ fn open_path_with_flags(
     disposition: u32,
     additional_flags: u32,
 ) -> Result<Option<File>, StoreError> {
+    open_path_with_access_flags(
+        path,
+        directory,
+        disposition,
+        additional_flags,
+        GENERIC_READ | GENERIC_WRITE | DELETE | READ_CONTROL | WRITE_DAC | WRITE_OWNER,
+    )
+}
+
+fn open_path_with_access_flags(
+    path: &Path,
+    directory: bool,
+    disposition: u32,
+    additional_flags: u32,
+    access: u32,
+) -> Result<Option<File>, StoreError> {
     let flags = if directory {
         FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT
     } else {
@@ -441,7 +457,7 @@ fn open_path_with_flags(
     let handle = unsafe {
         CreateFileW(
             wide(path.as_os_str()).as_ptr(),
-            GENERIC_READ | GENERIC_WRITE | DELETE | READ_CONTROL | WRITE_DAC | WRITE_OWNER,
+            access,
             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
             ptr::null(),
             disposition,
@@ -463,6 +479,17 @@ fn open_path_with_flags(
 
 fn open_path(path: &Path, directory: bool, disposition: u32) -> Result<Option<File>, StoreError> {
     open_path_with_flags(path, directory, disposition, 0)
+}
+
+fn open_retained_directory(path: &Path) -> Result<File, StoreError> {
+    open_path_with_access_flags(
+        path,
+        true,
+        OPEN_EXISTING,
+        0,
+        GENERIC_READ | GENERIC_WRITE | READ_CONTROL,
+    )?
+    .ok_or(StoreError::Invalid)
 }
 
 pub(crate) struct PrivateDir {
@@ -495,9 +522,9 @@ impl PrivateDir {
             return Err(StoreError::Invalid);
         }
         std::fs::create_dir_all(path).map_err(|_| StoreError::Unavailable)?;
-        let file = open_path(path, true, OPEN_EXISTING)?.ok_or(StoreError::Invalid)?;
+        let administrative = open_path(path, true, OPEN_EXISTING)?.ok_or(StoreError::Invalid)?;
         let sid = current_user_sid()?;
-        let handle = file.as_raw_handle().cast();
+        let handle = administrative.as_raw_handle().cast();
         let info = file_info(handle)?;
         if info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
             || info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY == 0
@@ -506,6 +533,13 @@ impl PrivateDir {
         }
         harden(handle, true, &sid)?;
         validate(handle, true, &sid)?;
+        let file = open_retained_directory(path)?;
+        let retained_handle = file.as_raw_handle().cast();
+        validate(retained_handle, true, &sid)?;
+        if identity(&file_info(retained_handle)?) != identity(&info) {
+            return Err(StoreError::Invalid);
+        }
+        drop(administrative);
         Ok(Self {
             path: path.to_owned(),
             file,
@@ -533,8 +567,8 @@ impl PrivateDir {
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => false,
             Err(_) => return Err(StoreError::Unavailable),
         };
-        let file = open_path(&path, true, OPEN_EXISTING)?.ok_or(StoreError::Invalid)?;
-        let handle = file.as_raw_handle().cast();
+        let administrative = open_path(&path, true, OPEN_EXISTING)?.ok_or(StoreError::Invalid)?;
+        let handle = administrative.as_raw_handle().cast();
         let info = file_info(handle)?;
         if info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
             return Err(StoreError::Invalid);
@@ -543,12 +577,19 @@ impl PrivateDir {
             harden(handle, true, &self.sid)?;
         }
         validate(handle, true, &self.sid)?;
+        let file = open_retained_directory(&path)?;
+        let retained_handle = file.as_raw_handle().cast();
+        validate(retained_handle, true, &self.sid)?;
+        if identity(&file_info(retained_handle)?) != identity(&info) {
+            return Err(StoreError::Invalid);
+        }
         let result = self.flush();
         #[cfg(test)]
         if result.is_err() {
             faults::record_failure("directory-flush", None);
         }
         result?;
+        drop(administrative);
         Ok(Self {
             path,
             file,
@@ -720,33 +761,6 @@ impl PrivateDir {
 mod tests {
     use super::*;
     use std::{fs::OpenOptions, os::windows::fs::OpenOptionsExt};
-
-    fn directory_with_access(path: &Path, access: u32) -> Result<File, u32> {
-        let handle = unsafe {
-            CreateFileW(
-                wide(path.as_os_str()).as_ptr(),
-                access,
-                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                ptr::null(),
-                OPEN_EXISTING,
-                FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
-                ptr::null_mut(),
-            )
-        };
-        if handle == INVALID_HANDLE_VALUE {
-            Err(unsafe { GetLastError() })
-        } else {
-            Ok(unsafe { File::from_raw_handle(handle.cast()) })
-        }
-    }
-
-    fn flush_code(file: &File) -> u32 {
-        if unsafe { FlushFileBuffers(file.as_raw_handle().cast()) } == 0 {
-            unsafe { GetLastError() }
-        } else {
-            ERROR_SUCCESS
-        }
-    }
 
     #[test]
     fn retained_source_handle_can_replace_existing_target() {
@@ -991,80 +1005,6 @@ mod tests {
                 }
             }
         }
-    }
-
-    #[test]
-    fn retained_directory_rights_diagnostic_matrix() {
-        let candidate = GENERIC_READ | GENERIC_WRITE | READ_CONTROL;
-        let rows = [
-            ("broad", candidate | DELETE | WRITE_DAC | WRITE_OWNER, false),
-            ("candidate", candidate, true),
-            ("candidate_plus_delete", candidate | DELETE, false),
-            (
-                "candidate_plus_security_write",
-                candidate | WRITE_DAC | WRITE_OWNER,
-                false,
-            ),
-            ("read_control_only", GENERIC_READ | READ_CONTROL, false),
-        ];
-        let mut candidate_passed = false;
-        let mut observed = 0;
-
-        for (label, access, is_candidate) in rows {
-            let root = tempfile::tempdir().unwrap();
-            let private = PrivateDir::root(root.path()).unwrap();
-            let mut target = private.open("x", true, true).unwrap().unwrap();
-            target.write_all(b"old").unwrap();
-            target.sync_all().unwrap();
-            drop(target);
-            let mut source = private.open("source", true, true).unwrap().unwrap();
-            source.write_all(b"new").unwrap();
-            source.sync_all().unwrap();
-            let admin_id = identity(&file_info(private.file.as_raw_handle().cast()).unwrap());
-            let retained = match directory_with_access(root.path(), access) {
-                Ok(file) => file,
-                Err(code) => {
-                    writeln!(
-                        std::io::stderr(),
-                        "CSF12_RIGHTS label={label} access=0x{access:08x} open_error={code}"
-                    )
-                    .unwrap();
-                    continue;
-                }
-            };
-            let validation = validate(retained.as_raw_handle().cast(), true, &private.sid);
-            let identity_matches = file_info(retained.as_raw_handle().cast())
-                .map(|info| identity(&info) == admin_id)
-                .unwrap_or(false);
-            drop(private);
-
-            let flush_before = flush_code(&retained);
-            faults::reset_operations();
-            let rename = rename_open_file(&source, &root.path().join("x"), true);
-            let attempts = faults::take_rename_attempts();
-            let flush_after = flush_code(&retained);
-            writeln!(
-                std::io::stderr(),
-                "CSF12_RIGHTS label={label} access=0x{access:08x} validation={validation:?} identity={identity_matches} flush_before={flush_before} rename={rename:?} attempts={attempts:?} flush_after={flush_after}"
-            )
-            .unwrap();
-            assert_eq!(attempts.len(), 1, "{label} must make one native call");
-            observed += 1;
-            if is_candidate {
-                candidate_passed = validation == Ok(())
-                    && identity_matches
-                    && flush_before == ERROR_SUCCESS
-                    && rename == Ok(())
-                    && attempts == [ERROR_SUCCESS]
-                    && flush_after == ERROR_SUCCESS;
-            }
-        }
-
-        assert_eq!(observed, rows.len(), "every rights row must reach rename");
-        assert!(
-            candidate_passed,
-            "candidate retained-directory rights did not preserve the full contract"
-        );
     }
 
     #[test]

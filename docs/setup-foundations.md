@@ -92,9 +92,11 @@ root and its ancestor path are caller-controlled; no peer chooses those paths.
 On Windows, the same ledger and record contract uses a physically separate
 owner-only store with a protected current-user DACL. Handles are opened without
 following the final reparse point and validate owner, exact one-ACE ACL, type,
-link count and retained directory identity. Existing insecure children are
-rejected rather than silently repaired. Writers use a cross-process byte-range
-lock, bounded reads, temporary owner-only files opened write-through,
+link count and retained directory identity. Directory setup uses a short-lived
+administrative handle; the long-lived handle is reopened and identity-matched
+with read, write and security-query access but without delete or security-write
+rights. Existing insecure children are rejected rather than silently repaired.
+Writers use a cross-process byte-range lock, bounded reads, temporary owner-only files opened write-through,
 pre-publication file flush, handle-based publication, post-publication file
 flush, and directory flush. Existing targets are replaced in one
 `FileRenameInfoEx` call with an absolute destination, a null root handle,
