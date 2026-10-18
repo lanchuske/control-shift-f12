@@ -19,6 +19,7 @@ struct Harness {
     input: Option<ChildStdin>,
     frames: Receiver<Value>,
     stderr: Arc<Mutex<String>>,
+    history: Arc<Mutex<Vec<Value>>>,
 }
 
 impl Harness {
@@ -56,6 +57,8 @@ impl Harness {
             }
         });
         let (sender, frames) = mpsc::sync_channel(64);
+        let history = Arc::new(Mutex::new(Vec::new()));
+        let captured_history = history.clone();
         thread::spawn(move || {
             loop {
                 let mut prefix = [0; 4];
@@ -70,9 +73,15 @@ impl Harness {
                 if output.read_exact(&mut body).is_err() {
                     break;
                 }
-                let Ok(frame) = serde_json::from_slice(&body) else {
+                let Ok(frame) = serde_json::from_slice::<Value>(&body) else {
                     break;
                 };
+                if let Ok(mut observed) = captured_history.lock() {
+                    observed.push(frame.clone());
+                    if observed.len() > 64 {
+                        observed.remove(0);
+                    }
+                }
                 if sender.send(frame).is_err() {
                     break;
                 }
@@ -84,6 +93,7 @@ impl Harness {
             input,
             frames,
             stderr,
+            history,
         }
     }
 
@@ -112,8 +122,9 @@ impl Harness {
             );
             let frame = self.frames.recv_timeout(remaining).unwrap_or_else(|error| {
                 panic!(
-                    "child frame before deadline at {label}: {error:?}; stderr={}",
-                    self.stderr.lock().unwrap()
+                    "child frame before deadline at {label}: {error:?}; history={:?}; stderr={}",
+                    self.history.lock().unwrap(),
+                    self.stderr.lock().unwrap(),
                 )
             });
             if predicate(&frame) {
@@ -370,4 +381,92 @@ fn helper_stop_then_start_isolates_the_new_generation() {
         |frame| frame["kind"] == "ui_snapshot_v1",
     );
     assert_eq!(current["snapshot"]["state"], "browsing");
+}
+
+#[test]
+fn helper_either_rendezvous_order_can_select_unilaterally() {
+    for (a_rendezvous, b_rendezvous) in [
+        (
+            "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "11111111111111111111111111111111",
+        ),
+        (
+            "11111111111111111111111111111111",
+            "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        ),
+    ] {
+        let a_root = tempfile::tempdir().unwrap();
+        let b_root = tempfile::tempdir().unwrap();
+        let a_reservation = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let b_reservation = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let a_address = a_reservation.local_addr().unwrap().to_string();
+        let b_address = b_reservation.local_addr().unwrap().to_string();
+        drop(a_reservation);
+        drop(b_reservation);
+        let mut a = Harness::start(
+            a_root.path(),
+            a_rendezvous,
+            b_rendezvous,
+            &a_address,
+            &b_address,
+        );
+        let mut b = Harness::start(
+            b_root.path(),
+            b_rendezvous,
+            a_rendezvous,
+            &b_address,
+            &a_address,
+        );
+        a.send("start-a", "ui.start_discovery", json!({}));
+        b.send("start-b", "ui.start_discovery", json!({}));
+        let a_snapshot = a.wait_for(
+            Instant::now() + Duration::from_secs(10),
+            "unilateral discovery",
+            |frame| {
+                frame["kind"] == "ui_snapshot_v1"
+                    && frame["snapshot"]["candidates"]
+                        .as_array()
+                        .is_some_and(|value| value.len() == 1)
+            },
+        );
+        a.send(
+            "select-a",
+            "ui.select_candidate",
+            json!({"handle":a_snapshot["snapshot"]["candidates"][0]["handle"]}),
+        );
+
+        let a_pairing = a.wait_for(
+            Instant::now() + Duration::from_secs(15),
+            "unilateral selector sas",
+            |frame| frame["kind"] == "ui_pairing_v1",
+        );
+        let b_pairing = b.wait_for(
+            Instant::now() + Duration::from_secs(15),
+            "unilateral receiver sas",
+            |frame| frame["kind"] == "ui_pairing_v1",
+        );
+        assert_eq!(
+            a_pairing["verification_words"],
+            b_pairing["verification_words"]
+        );
+        a.send(
+            "mismatch-a",
+            "ui.approve_sas",
+            json!({"generation":a_pairing["generation"],"matches":false}),
+        );
+        b.send(
+            "mismatch-b",
+            "ui.approve_sas",
+            json!({"generation":b_pairing["generation"],"matches":false}),
+        );
+        for child in [&a, &b] {
+            child.wait_for(
+                Instant::now() + Duration::from_secs(10),
+                "unilateral mismatch",
+                |frame| {
+                    frame["kind"] == "ui_snapshot_v1" && frame["snapshot"]["state"] == "not_started"
+                },
+            );
+        }
+    }
 }

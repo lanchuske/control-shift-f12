@@ -159,14 +159,13 @@ impl PreAdmissionCandidate {
     /// A sole candidate is valid only after its selection window; callers may
     /// use `select_after_window` to wait without turning valid timing into error.
     pub fn select(self, competitor: Option<Self>) -> Result<SelectedPreAdmission, HandshakeError> {
-        self.validate()?;
         let Some(other) = competitor else {
+            self.validate()?;
             if tokio::time::Instant::now() < self.selection_deadline {
                 return Err(HandshakeError::Rejected);
             }
             return Ok(SelectedPreAdmission { candidate: self });
         };
-        other.validate()?;
         if !Arc::ptr_eq(&self.channel.scope, &other.channel.scope)
             || self.local_rendezvous != other.local_rendezvous
             || self.remote_rendezvous != other.remote_rendezvous
@@ -184,6 +183,10 @@ impl PreAdmissionCandidate {
             drop(self);
             other
         };
+        // The peer can close its corresponding loser before this side elects.
+        // Validate the deterministic shared winner after synchronously dropping
+        // the loser; an inactive loser must not reject a still-live winner.
+        winner.validate()?;
         Ok(SelectedPreAdmission { candidate: winner })
     }
 }

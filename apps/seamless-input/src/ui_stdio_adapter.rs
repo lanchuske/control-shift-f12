@@ -432,6 +432,12 @@ impl UiStdioAdapter {
                     let rejected = self.rejected(&request.id, UiError::Blocked);
                     return self.with_pending(pending, rejected);
                 }
+                #[cfg(feature = "pairing-v2-g4")]
+                if self.g4.is_some() {
+                    // Seal the stopped session before any already-forwarded
+                    // event can be observed by a later poll or restart.
+                    self.g4_generation = self.g4_generation.saturating_add(1);
+                }
                 let result = self
                     .controller
                     .apply_local_at(now_ms, UiCommand::StopDiscovery);
@@ -590,12 +596,19 @@ impl UiStdioAdapter {
             }
         }
         for event in events {
+            if event
+                .session_generation()
+                .is_some_and(|generation| generation != self.g4_generation)
+            {
+                continue;
+            }
             match event {
                 G4Event::Browsing { .. } => {}
                 G4Event::Candidates { candidates, .. } => self
                     .controller
                     .on_runtime_at(now_ms, UiRuntimeEvent::Candidates(candidates)),
                 G4Event::SasReady {
+                    generation: _,
                     token,
                     candidate,
                     words,
@@ -633,7 +646,10 @@ impl UiStdioAdapter {
                         self.outgoing.push(ChildFrame::Pairing(frame));
                     }
                 }
-                G4Event::DurableSnapshot(entries) => {
+                G4Event::DurableSnapshot {
+                    generation,
+                    entries,
+                } => {
                     let confirmed: Vec<RelationshipView> = entries
                         .iter()
                         .filter(|entry| entry.confirmed)
@@ -653,15 +669,21 @@ impl UiStdioAdapter {
                         );
                     }
                     self.active_pairing = None;
+                    if generation.is_some() {
+                        self.g4_generation = self.g4_generation.saturating_add(1);
+                    }
                 }
-                G4Event::RemoteOutcomeUnknown => {
+                G4Event::RemoteOutcomeUnknown { .. } => {
                     self.controller
                         .on_runtime_at(now_ms, UiRuntimeEvent::RemoteOutcomeUnknown);
                     self.active_pairing = None;
+                    self.g4_generation = self.g4_generation.saturating_add(1);
                 }
-                G4Event::Rejected | G4Event::Cancelled | G4Event::Expired => {
-                    let _ = self.controller.apply_local_at(now_ms, UiCommand::Cancel);
+                G4Event::Rejected { .. } | G4Event::Cancelled { .. } | G4Event::Expired { .. } => {
+                    self.controller
+                        .on_runtime_at(now_ms, UiRuntimeEvent::PairingAborted);
                     self.active_pairing = None;
+                    self.g4_generation = self.g4_generation.saturating_add(1);
                 }
             }
             self.publish_snapshot_and_diagnostics();
@@ -840,6 +862,11 @@ pub struct InstantEpoch {
     origin: Instant,
 }
 
+#[cfg(not(test))]
+const G4_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(4);
+#[cfg(test)]
+const G4_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(25);
+
 impl InstantEpoch {
     pub fn new() -> Self {
         Self {
@@ -888,8 +915,12 @@ pub fn run_stdio_with_adapter<C: MonotonicClock>(
     mut adapter: UiStdioAdapter,
     clock: &mut C,
 ) -> io::Result<()> {
-    loop {
-        match reader.receive_until(adapter.wait_until_next_deadline())? {
+    let result = 'stdio: loop {
+        let event = match reader.receive_until(adapter.wait_until_next_deadline()) {
+            Ok(event) => event,
+            Err(error) => break Err(error),
+        };
+        match event {
             StdioReadEvent::Request(request) => {
                 // Time is sampled after the blocking receive returns, so an
                 // overdue request cannot confirm or refresh a stale SAS.
@@ -897,22 +928,31 @@ pub fn run_stdio_with_adapter<C: MonotonicClock>(
                 for frame in adapter.handle_host_request_at(now_ms, &request) {
                     if let Err(error) = control_api::write_message(writer, &frame) {
                         reader.cancel();
-                        return Err(error);
+                        break 'stdio Err(error);
                     }
                 }
             }
-            StdioReadEvent::Eof => return Ok(()),
+            StdioReadEvent::Eof => break Ok(()),
             StdioReadEvent::Timeout => {
                 let now_ms = clock.now_ms();
                 for frame in adapter.poll_at(now_ms) {
                     if let Err(error) = control_api::write_message(writer, &frame) {
                         reader.cancel();
-                        return Err(error);
+                        break 'stdio Err(error);
                     }
                 }
             }
         }
+    };
+    #[cfg(feature = "pairing-v2-g4")]
+    if let Some(mut worker) = adapter.g4.take()
+        && let Err(error) = worker.shutdown(G4_SHUTDOWN_TIMEOUT)
+    {
+        return Err(io::Error::other(format!(
+            "G4 worker shutdown failed after stdio termination: {error:?}"
+        )));
     }
+    result
 }
 
 #[cfg(all(test, feature = "pairing-v2-g4"))]
@@ -941,23 +981,30 @@ mod g4_tests {
                         freshness: CandidateFreshness::Current,
                     }],
                 }],
-                G4Command::Select { .. } => vec![G4Event::SasReady {
+                G4Command::Select { generation, .. } => vec![G4Event::SasReady {
+                    generation,
                     token: PairingToken::from_engine([1; 32], [2; 32], 3),
                     candidate: "nearby-1".to_owned().try_into().unwrap(),
                     words: ["able", "baker", "cable", "delta"].map(str::to_owned),
                 }],
-                G4Command::Decide { matches: true, .. } if self.commit_on_match => vec![
-                    G4Event::DurableSnapshot(vec![crate::g4_pairing::DurableView {
-                        handle: "relationship-1".into(),
-                        confirmed: true,
-                    }]),
-                ],
-                G4Command::Cancel { .. } if self.quarantine_on_cancel => vec![
-                    G4Event::DurableSnapshot(vec![crate::g4_pairing::DurableView {
-                        handle: "quarantine-1".into(),
-                        confirmed: false,
-                    }]),
-                ],
+                G4Command::Decide { matches: true, .. } if self.commit_on_match => {
+                    vec![G4Event::DurableSnapshot {
+                        generation: Some(1),
+                        entries: vec![crate::g4_pairing::DurableView {
+                            handle: "relationship-1".into(),
+                            confirmed: true,
+                        }],
+                    }]
+                }
+                G4Command::Cancel { .. } if self.quarantine_on_cancel => {
+                    vec![G4Event::DurableSnapshot {
+                        generation: Some(1),
+                        entries: vec![crate::g4_pairing::DurableView {
+                            handle: "quarantine-1".into(),
+                            confirmed: false,
+                        }],
+                    }]
+                }
                 _ => Vec::new(),
             }
         }
@@ -1001,6 +1048,238 @@ mod g4_tests {
             std::thread::sleep(Duration::from_millis(2));
         }
         panic!("expected G4 command was not recorded");
+    }
+
+    struct RestartBackend {
+        starts: u64,
+    }
+
+    impl G4WorkerBackend for RestartBackend {
+        fn command(&mut self, command: G4Command) -> Vec<G4Event> {
+            match command {
+                G4Command::Start { generation } => {
+                    self.starts += 1;
+                    let candidate = CandidateView {
+                        handle: format!("nearby-{generation}").try_into().unwrap(),
+                        compatibility: CandidateCompatibility::Compatible,
+                        freshness: CandidateFreshness::Current,
+                    };
+                    if self.starts == 2 {
+                        vec![
+                            G4Event::Rejected {
+                                generation: generation - 1,
+                            },
+                            G4Event::Candidates {
+                                generation,
+                                candidates: vec![candidate],
+                            },
+                        ]
+                    } else {
+                        vec![G4Event::Candidates {
+                            generation,
+                            candidates: vec![candidate],
+                        }]
+                    }
+                }
+                G4Command::Stop { generation } => vec![G4Event::SasReady {
+                    generation,
+                    token: PairingToken::from_engine([9; 32], [8; 32], 7),
+                    candidate: format!("nearby-{generation}").try_into().unwrap(),
+                    words: ["able", "baker", "cable", "delta"].map(str::to_owned),
+                }],
+                _ => Vec::new(),
+            }
+        }
+
+        fn poll(&mut self) -> Vec<G4Event> {
+            Vec::new()
+        }
+
+        fn shutdown(&mut self) {}
+    }
+
+    #[test]
+    fn delayed_terminal_from_stopped_generation_cannot_abort_restart() {
+        let mut adapter = UiStdioAdapter::new(0);
+        adapter.g4 = Some(G4PairingWorker::spawn(RestartBackend { starts: 0 }).unwrap());
+        adapter.handle_host_request_at(
+            0,
+            &request("start-1", "ui.start_discovery", serde_json::json!({})),
+        );
+        poll_until(
+            &mut adapter,
+            |frame| matches!(frame, ChildFrame::Snapshot(snapshot) if snapshot.snapshot.candidates.iter().any(|candidate| candidate.handle.as_str() == "nearby-1")),
+        );
+        adapter.handle_host_request_at(
+            1,
+            &request("stop", "ui.stop_discovery", serde_json::json!({})),
+        );
+        std::thread::sleep(Duration::from_millis(20));
+        assert!(
+            adapter
+                .poll_at(2)
+                .iter()
+                .all(|frame| !matches!(frame, ChildFrame::Pairing(_)))
+        );
+        adapter.handle_host_request_at(
+            3,
+            &request("start-2", "ui.start_discovery", serde_json::json!({})),
+        );
+
+        poll_until(
+            &mut adapter,
+            |frame| matches!(frame, ChildFrame::Snapshot(snapshot) if snapshot.snapshot.state == UiState::Browsing && snapshot.snapshot.candidates.iter().any(|candidate| candidate.handle.as_str() == "nearby-3")),
+        );
+        assert_eq!(adapter.controller.snapshot().state, UiState::Browsing);
+    }
+
+    struct RejectingBackend;
+
+    impl G4WorkerBackend for RejectingBackend {
+        fn command(&mut self, command: G4Command) -> Vec<G4Event> {
+            match command {
+                G4Command::Start { generation } => vec![G4Event::Candidates {
+                    generation,
+                    candidates: vec![CandidateView {
+                        handle: "nearby-1".to_owned().try_into().unwrap(),
+                        compatibility: CandidateCompatibility::Compatible,
+                        freshness: CandidateFreshness::Current,
+                    }],
+                }],
+                G4Command::Select { generation, .. } => {
+                    vec![G4Event::Rejected { generation }]
+                }
+                _ => Vec::new(),
+            }
+        }
+
+        fn poll(&mut self) -> Vec<G4Event> {
+            Vec::new()
+        }
+
+        fn shutdown(&mut self) {}
+    }
+
+    #[test]
+    fn remote_precommit_rejection_returns_to_discovery_entry_state() {
+        let mut adapter = UiStdioAdapter::new(0);
+        adapter.g4 = Some(G4PairingWorker::spawn(RejectingBackend).unwrap());
+        adapter.handle_host_request_at(
+            0,
+            &request("start", "ui.start_discovery", serde_json::json!({})),
+        );
+        poll_until(
+            &mut adapter,
+            |frame| matches!(frame, ChildFrame::Snapshot(snapshot) if snapshot.snapshot.candidates.len() == 1),
+        );
+        adapter.handle_host_request_at(
+            1,
+            &request(
+                "select",
+                "ui.select_candidate",
+                serde_json::json!({"handle":"nearby-1"}),
+            ),
+        );
+
+        poll_until(
+            &mut adapter,
+            |frame| matches!(frame, ChildFrame::Snapshot(snapshot) if snapshot.snapshot.state == UiState::NotStarted),
+        );
+        assert_eq!(adapter.controller.snapshot().state, UiState::NotStarted);
+    }
+
+    struct ConfirmedThenLateRejectedBackend;
+
+    impl G4WorkerBackend for ConfirmedThenLateRejectedBackend {
+        fn command(&mut self, command: G4Command) -> Vec<G4Event> {
+            match command {
+                G4Command::Start { generation } => vec![
+                    G4Event::DurableSnapshot {
+                        generation: Some(generation),
+                        entries: vec![crate::g4_pairing::DurableView {
+                            handle: "relationship-1".into(),
+                            confirmed: true,
+                        }],
+                    },
+                    G4Event::Rejected { generation },
+                ],
+                _ => Vec::new(),
+            }
+        }
+
+        fn poll(&mut self) -> Vec<G4Event> {
+            Vec::new()
+        }
+
+        fn shutdown(&mut self) {}
+    }
+
+    #[test]
+    fn durable_terminal_seals_generation_against_late_rejection() {
+        let mut adapter = UiStdioAdapter::new(0);
+        adapter.g4 = Some(G4PairingWorker::spawn(ConfirmedThenLateRejectedBackend).unwrap());
+        adapter.handle_host_request_at(
+            0,
+            &request("start", "ui.start_discovery", serde_json::json!({})),
+        );
+
+        poll_until(
+            &mut adapter,
+            |frame| matches!(frame, ChildFrame::Snapshot(snapshot) if snapshot.snapshot.state == UiState::ConfirmedRelationship),
+        );
+        assert_eq!(
+            adapter.controller.snapshot().state,
+            UiState::ConfirmedRelationship
+        );
+    }
+
+    struct EofReader;
+
+    impl TimedRequestReader for EofReader {
+        fn receive_until(&mut self, _timeout: Duration) -> io::Result<StdioReadEvent> {
+            Ok(StdioReadEvent::Eof)
+        }
+
+        fn cancel(&mut self) {}
+    }
+
+    struct FixedClock;
+
+    impl MonotonicClock for FixedClock {
+        fn now_ms(&mut self) -> u64 {
+            0
+        }
+    }
+
+    struct SlowEofBackend;
+
+    impl G4WorkerBackend for SlowEofBackend {
+        fn command(&mut self, _command: G4Command) -> Vec<G4Event> {
+            Vec::new()
+        }
+
+        fn poll(&mut self) -> Vec<G4Event> {
+            Vec::new()
+        }
+
+        fn shutdown(&mut self) {}
+    }
+
+    impl Drop for SlowEofBackend {
+        fn drop(&mut self) {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    #[test]
+    fn stdio_eof_propagates_worker_shutdown_timeout() {
+        let mut adapter = UiStdioAdapter::new(0);
+        adapter.g4 = Some(G4PairingWorker::spawn(SlowEofBackend).unwrap());
+        let error =
+            run_stdio_with_adapter(&mut EofReader, &mut Vec::new(), adapter, &mut FixedClock)
+                .unwrap_err();
+
+        assert!(error.to_string().contains("ShutdownTimeout"));
     }
 
     #[test]

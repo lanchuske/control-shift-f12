@@ -166,7 +166,7 @@ struct MacPairingBridgeState: Equatable {
 
     private static func validWords(_ words: [String]) -> Bool {
         words.count == 4 && words.allSatisfy {
-            !$0.isEmpty && $0.count <= 24 && $0.allSatisfy { $0 >= "a" && $0 <= "z" }
+            !$0.isEmpty && $0.count <= 16 && $0.allSatisfy { $0 >= "a" && $0 <= "z" }
         }
     }
 }
@@ -480,14 +480,7 @@ final class DiagnosticsFrameController {
         var state = MacPairingBridgeState()
         state.beginVerification(candidate: candidate, words: words)
         guard state.phase == .awaitingLocalConfirmation else { throw HostError.invalidFrame }
-        switch phase {
-        case "awaiting_local_confirmation": break
-        case "awaiting_remote_confirmation": state.approveLocalDisplay(matches: true)
-        case "ready_for_durable_admission":
-            state.approveLocalDisplay(matches: true)
-            state.acceptRemoteDisplay()
-        default: throw HostError.invalidFrame
-        }
+        guard phase == "awaiting_local_confirmation" else { throw HostError.invalidFrame }
         guard generation > highestGeneration else { return }
         highestGeneration = generation
         pairing = state

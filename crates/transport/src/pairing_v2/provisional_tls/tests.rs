@@ -694,6 +694,42 @@ async fn g4_pre_admission_simultaneous_election_both_orders_closes_loser_before_
 }
 
 #[tokio::test]
+async fn g4_pre_admission_peer_closed_loser_still_converges_on_shared_winner() {
+    let (ac, ak) = identity(true);
+    let (bc, bk) = identity(true);
+    let ea = ProvisionalEndpoint::bind("127.0.0.1:0".parse().unwrap(), ac, ak).unwrap();
+    let eb = ProvisionalEndpoint::bind("127.0.0.1:0".parse().unwrap(), bc, bk).unwrap();
+    let (a_out, b_in, b_out, a_in) = tokio::join!(
+        ea.connect(eb.local_addr().unwrap()),
+        eb.accept(),
+        eb.connect(ea.local_addr().unwrap()),
+        ea.accept(),
+    );
+    let (a_out, b_in, b_out, a_in) = (a_out.unwrap(), b_in.unwrap(), b_out.unwrap(), a_in.unwrap());
+    let a_winner = a_out.connection.clone();
+    let b_winner = b_in.connection.clone();
+    let b_loser = b_out.connection.clone();
+    let (a_out, b_in, b_out, a_in) = tokio::join!(
+        a_out.prepare_pre_admission(handshake_config(1, 2)),
+        b_in.prepare_pre_admission(handshake_config(2, 1)),
+        b_out.prepare_pre_admission(handshake_config(2, 1)),
+        a_in.prepare_pre_admission(handshake_config(1, 2)),
+    );
+    let (a_out, b_in, b_out, a_in) = (a_out.unwrap(), b_in.unwrap(), b_out.unwrap(), a_in.unwrap());
+
+    let _a = a_out.select(Some(a_in)).unwrap();
+    tokio::time::timeout(Duration::from_secs(2), b_loser.closed())
+        .await
+        .unwrap();
+
+    let _b = b_out
+        .select(Some(b_in))
+        .expect("an already-closed loser must not reject the shared live winner");
+    assert!(a_winner.close_reason().is_none());
+    assert!(b_winner.close_reason().is_none());
+}
+
+#[tokio::test]
 async fn one_local_sas_approval_never_commits_a_relationship() {
     let (_ea, _eb, a, b, _) = pair().await;
     let ta = tempfile::tempdir().unwrap();

@@ -26,6 +26,7 @@ pub enum UiRuntimeEvent {
     Diagnostics(Vec<DiagnosticRow>),
     PermissionRevoked,
     ReceiptRevoked,
+    PairingAborted,
     RemoteOutcomeUnknown,
 }
 
@@ -250,6 +251,7 @@ impl UiController {
                 self.snapshot.capabilities = CapabilityView::all_disabled();
             }
             UiRuntimeEvent::ReceiptRevoked => self.reset_to_not_started(),
+            UiRuntimeEvent::PairingAborted => self.reset_to_not_started(),
             UiRuntimeEvent::RemoteOutcomeUnknown => {
                 self.clear_volatile();
                 self.snapshot.state = UiState::RemoteOutcomeUnknown;

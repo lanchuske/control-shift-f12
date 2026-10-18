@@ -14,7 +14,8 @@ use seamless_discovery::guided::{
 use seamless_transport::pairing_v2::{
     AdmissionAuthorityStore, DurableAdmissionState, handshake_selected_and_commit_distributed,
     provisional_tls::{
-        HandshakeConfig, IncomingHandshakeConfig, PreAdmissionCandidate, ProvisionalEndpoint,
+        HandshakeConfig, IncomingHandshakeConfig, PRE_ADMISSION_SELECTION_WINDOW,
+        PreAdmissionCandidate, ProvisionalEndpoint,
     },
 };
 use std::{
@@ -252,15 +253,42 @@ pub enum G4Event {
         candidates: Vec<CandidateView>,
     },
     SasReady {
+        generation: u64,
         token: PairingToken,
         candidate: CandidateHandle,
         words: [String; 4],
     },
-    DurableSnapshot(Vec<DurableView>),
-    Rejected,
-    Cancelled,
-    Expired,
-    RemoteOutcomeUnknown,
+    DurableSnapshot {
+        generation: Option<u64>,
+        entries: Vec<DurableView>,
+    },
+    Rejected {
+        generation: u64,
+    },
+    Cancelled {
+        generation: u64,
+    },
+    Expired {
+        generation: u64,
+    },
+    RemoteOutcomeUnknown {
+        generation: u64,
+    },
+}
+
+impl G4Event {
+    pub(crate) fn session_generation(&self) -> Option<u64> {
+        match self {
+            Self::Browsing { generation }
+            | Self::Candidates { generation, .. }
+            | Self::SasReady { generation, .. }
+            | Self::Rejected { generation }
+            | Self::Cancelled { generation }
+            | Self::Expired { generation }
+            | Self::RemoteOutcomeUnknown { generation } => Some(*generation),
+            Self::DurableSnapshot { generation, .. } => *generation,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -307,7 +335,6 @@ impl RealG4Backend {
                     .block_on(async {
                         tokio::time::timeout(Duration::from_secs(2), &mut *task).await
                     })
-                    .map_err(|_| SetupError::Unavailable)?
                     .map(|_| ())
                     .map_err(|_| SetupError::Unavailable)
             }
@@ -336,7 +363,9 @@ impl RealG4Backend {
             store,
             origin: Instant::now(),
         };
-        let _ = backend.event_tx.try_send(durable_snapshot(&backend.store)?);
+        let _ = backend
+            .event_tx
+            .try_send(durable_snapshot(&backend.store, None)?);
         Ok(backend)
     }
 
@@ -407,6 +436,7 @@ impl RealG4Backend {
         let (decision_tx, decision_rx) = tokio::sync::mpsc::channel(1);
         let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
         let task = self.runtime.spawn(run_live_attempt(
+            generation,
             endpoint,
             local,
             allowlist.clone(),
@@ -439,7 +469,7 @@ impl RealG4Backend {
         }
         let mut session = self.session.take().unwrap();
         let _ = session.cancel.send(true);
-        self.join_task_bounded(&mut session.task)?;
+        let joined = self.join_task_bounded(&mut session.task);
         // Joining closes the generation: every event now present belongs to
         // this stopped attempt and is returned before a new Start is allowed.
         let mut terminal = Vec::new();
@@ -447,12 +477,13 @@ impl RealG4Backend {
             terminal.push(event);
         }
         if !report_outcome {
-            return Ok(Vec::new());
+            return joined.map(|()| Vec::new());
         }
-        if terminal.is_empty() {
-            terminal.push(G4Event::Cancelled);
+        if joined.is_err() {
+            return Ok(vec![G4Event::RemoteOutcomeUnknown { generation }]);
         }
-        Ok(terminal)
+        let snapshot = durable_snapshot(&self.store, Some(generation));
+        Ok(classify_stopped_attempt(generation, terminal, snapshot))
     }
 
     fn refresh(&mut self) -> Vec<G4Event> {
@@ -472,12 +503,16 @@ impl RealG4Backend {
                             Ok(()) | Err(SetupError::InvalidArguments) => {}
                             Err(SetupError::Limit) => {
                                 let _ = session.cancel.send(true);
-                                emitted.push(G4Event::Rejected);
+                                emitted.push(G4Event::Rejected {
+                                    generation: session.generation,
+                                });
                                 break;
                             }
                             Err(_) => {
                                 let _ = session.cancel.send(true);
-                                emitted.push(G4Event::Rejected);
+                                emitted.push(G4Event::Rejected {
+                                    generation: session.generation,
+                                });
                                 break;
                             }
                         }
@@ -492,11 +527,15 @@ impl RealG4Backend {
                         }),
                         Err(SetupError::Expired) => {
                             let _ = session.cancel.send(true);
-                            emitted.push(G4Event::Expired);
+                            emitted.push(G4Event::Expired {
+                                generation: session.generation,
+                            });
                         }
                         Err(_) => {
                             let _ = session.cancel.send(true);
-                            emitted.push(G4Event::Rejected);
+                            emitted.push(G4Event::Rejected {
+                                generation: session.generation,
+                            });
                         }
                     }
                 }
@@ -515,11 +554,11 @@ impl RealG4Backend {
             }
             if matches!(
                 event,
-                G4Event::DurableSnapshot(_)
-                    | G4Event::Rejected
-                    | G4Event::Cancelled
-                    | G4Event::Expired
-                    | G4Event::RemoteOutcomeUnknown
+                G4Event::DurableSnapshot { .. }
+                    | G4Event::Rejected { .. }
+                    | G4Event::Cancelled { .. }
+                    | G4Event::Expired { .. }
+                    | G4Event::RemoteOutcomeUnknown { .. }
             ) {
                 terminal = true;
             }
@@ -529,9 +568,40 @@ impl RealG4Backend {
             && let Some(mut session) = self.session.take()
             && self.join_task_bounded(&mut session.task).is_err()
         {
-            emitted.push(G4Event::Rejected);
+            emitted.push(G4Event::RemoteOutcomeUnknown {
+                generation: session.generation,
+            });
         }
         emitted
+    }
+}
+
+fn classify_stopped_attempt(
+    generation: u64,
+    mut terminal: Vec<G4Event>,
+    snapshot: Result<G4Event, SetupError>,
+) -> Vec<G4Event> {
+    match snapshot {
+        Ok(snapshot) if matches!(&snapshot, G4Event::DurableSnapshot { entries, .. } if !entries.is_empty()) =>
+        {
+            vec![snapshot]
+        }
+        Err(_) => vec![G4Event::RemoteOutcomeUnknown { generation }],
+        _ if terminal.is_empty() => vec![G4Event::Cancelled { generation }],
+        _ => {
+            // The task completed and the store is empty, so only a classified
+            // precommit terminal can remain.
+            terminal.retain(|event| {
+                matches!(
+                    event,
+                    G4Event::Rejected { .. } | G4Event::Cancelled { .. } | G4Event::Expired { .. }
+                )
+            });
+            if terminal.is_empty() {
+                terminal.push(G4Event::Cancelled { generation });
+            }
+            terminal
+        }
     }
 }
 
@@ -579,7 +649,10 @@ fn test_pairing_config() -> Result<Option<TestPairingConfig>, SetupError> {
     }))
 }
 
-fn durable_snapshot(store: &AdmissionAuthorityStore) -> Result<G4Event, SetupError> {
+fn durable_snapshot(
+    store: &AdmissionAuthorityStore,
+    generation: Option<u64>,
+) -> Result<G4Event, SetupError> {
     let relationships = store
         .durable_admissions()
         .map_err(|_| SetupError::Unavailable)?
@@ -593,11 +666,15 @@ fn durable_snapshot(store: &AdmissionAuthorityStore) -> Result<G4Event, SetupErr
             confirmed: entry.state() == DurableAdmissionState::Confirmed,
         })
         .collect();
-    Ok(G4Event::DurableSnapshot(relationships))
+    Ok(G4Event::DurableSnapshot {
+        generation,
+        entries: relationships,
+    })
 }
 
 #[allow(clippy::too_many_arguments)] // Explicitly names each bounded ownership channel.
 async fn run_live_attempt(
+    generation: u64,
     endpoint: Arc<ProvisionalEndpoint>,
     local_rendezvous: [u8; 16],
     allowlist: Arc<Mutex<BTreeMap<[u8; 16], CandidateHandle>>>,
@@ -610,7 +687,9 @@ async fn run_live_attempt(
     let incoming_endpoint = endpoint.clone();
     let incoming_allowlist = allowlist.clone();
     let incoming = async move {
-        let channel = incoming_endpoint.accept().await.map_err(|_| ())?;
+        let channel = incoming_endpoint.accept().await.map_err(|_error| {
+            eprintln!("G4_PAIRING_REJECT_STAGE=incoming_accept");
+        })?;
         let selected_handle = Arc::new(Mutex::new(None));
         let captured_handle = selected_handle.clone();
         let candidate = channel
@@ -636,7 +715,9 @@ async fn run_live_attempt(
                 },
             )
             .await
-            .map_err(|_| ())?;
+            .map_err(|_error| {
+                eprintln!("G4_PAIRING_REJECT_STAGE=incoming_prepare");
+            })?;
         let handle = selected_handle.lock().map_err(|_| ())?.clone().ok_or(())?;
         Ok::<_, ()>((candidate, handle))
     };
@@ -644,8 +725,16 @@ async fn run_live_attempt(
     let outgoing = async move {
         let (handle, locator) = selected.recv().await.ok_or(())?;
         let remote = decode_rendezvous(&locator.rendezvous).map_err(|_| ())?;
+        // Prefer exactly one dialer when both users select concurrently, but
+        // preserve unilateral selection: the larger rendezvous waits out the
+        // duplicate window, then dials if no incoming candidate won first.
+        if local_rendezvous >= remote {
+            tokio::time::sleep(PRE_ADMISSION_SELECTION_WINDOW).await;
+        }
         let address = *locator.addresses.first().ok_or(())?;
-        let channel = outgoing_endpoint.connect(address).await.map_err(|_| ())?;
+        let channel = outgoing_endpoint.connect(address).await.map_err(|_error| {
+            eprintln!("G4_PAIRING_REJECT_STAGE=outgoing_connect");
+        })?;
         let candidate = channel
             .prepare_pre_admission(HandshakeConfig {
                 device_name: "Control Shift F12".into(),
@@ -654,45 +743,52 @@ async fn run_live_attempt(
                 selected_rendezvous: remote,
             })
             .await
-            .map_err(|_| ())?;
+            .map_err(|_error| {
+                eprintln!("G4_PAIRING_REJECT_STAGE=outgoing_prepare");
+            })?;
         Ok::<_, ()>((candidate, handle))
     };
-    tokio::pin!(incoming);
-    tokio::pin!(outgoing);
-    let ((first, candidate_handle), first_incoming): (
-        (PreAdmissionCandidate, CandidateHandle),
-        bool,
-    ) = tokio::select! {
-        _ = cancel.changed() => { let _ = events.try_send(G4Event::Cancelled); return; }
-        result = &mut incoming => match result { Ok(value) => (value, true), Err(_) => { let _ = events.try_send(G4Event::Rejected); return; } },
-        result = &mut outgoing => match result { Ok(value) => (value, false), Err(_) => { let _ = events.try_send(G4Event::Rejected); return; } },
-    };
-    let deadline = first.selection_deadline();
-    let competitor = if first_incoming {
-        tokio::time::timeout_at(deadline, &mut outgoing)
-            .await
-            .ok()
-            .and_then(Result::ok)
-    } else {
-        tokio::time::timeout_at(deadline, &mut incoming)
-            .await
-            .ok()
-            .and_then(Result::ok)
-    };
-    let winner = match competitor {
-        Some((competitor, competing_handle)) => {
-            if competing_handle != candidate_handle {
-                Err(seamless_transport::pairing_v2::provisional_tls::HandshakeError::Rejected)
-            } else {
+    let selected = {
+        tokio::pin!(incoming);
+        tokio::pin!(outgoing);
+        let ((first, candidate_handle), first_incoming): (
+            (PreAdmissionCandidate, CandidateHandle),
+            bool,
+        ) = tokio::select! {
+            _ = cancel.changed() => { let _ = events.try_send(G4Event::Cancelled { generation }); return; }
+            result = &mut incoming => match result { Ok(value) => (value, true), Err(_) => { let _ = events.try_send(G4Event::Rejected { generation }); return; } },
+            result = &mut outgoing => match result { Ok(value) => (value, false), Err(_) => { let _ = events.try_send(G4Event::Rejected { generation }); return; } },
+        };
+        let deadline = first.selection_deadline();
+        let competitor = if first_incoming {
+            tokio::time::timeout_at(deadline, &mut outgoing)
+                .await
+                .ok()
+                .and_then(Result::ok)
+        } else {
+            tokio::time::timeout_at(deadline, &mut incoming)
+                .await
+                .ok()
+                .and_then(Result::ok)
+        };
+        let winner = match competitor {
+            Some((competitor, competing_handle)) if competing_handle == candidate_handle => {
                 first.select(Some(competitor))
             }
-        }
-        None => first.select_after_window().await,
+            Some(_) => {
+                Err(seamless_transport::pairing_v2::provisional_tls::HandshakeError::Rejected)
+            }
+            None => first.select_after_window().await,
+        };
+        winner.map(|winner| (winner, candidate_handle))
     };
-    let winner = match winner {
-        Ok(winner) => winner,
-        Err(_) => {
-            let _ = events.try_send(G4Event::Rejected);
+    // The incoming/outgoing preparation futures are dropped by this point, so
+    // neither a losing connection nor a pending dial survives into SAS.
+    let (winner, candidate_handle) = match selected {
+        Ok(value) => value,
+        Err(_error) => {
+            eprintln!("G4_PAIRING_REJECT_STAGE=selection_convergence");
+            let _ = events.try_send(G4Event::Rejected { generation });
             return;
         }
     };
@@ -707,6 +803,7 @@ async fn run_live_attempt(
                 );
                 if event_tx
                     .send(G4Event::SasReady {
+                        generation,
                         token,
                         candidate: candidate_handle,
                         words: prompt.words.clone(),
@@ -730,45 +827,71 @@ async fn run_live_attempt(
         }
     };
     match outcome {
-        None => match durable_snapshot(&store) {
-            Ok(G4Event::DurableSnapshot(entries))
+        None => match durable_snapshot(&store, Some(generation)) {
+            Ok(G4Event::DurableSnapshot { entries, .. })
                 if entries.iter().any(|entry| !entry.confirmed) =>
             {
-                let _ = events.send(G4Event::DurableSnapshot(entries)).await;
+                let _ = events
+                    .send(G4Event::DurableSnapshot {
+                        generation: Some(generation),
+                        entries,
+                    })
+                    .await;
             }
             Ok(_) => {
-                let _ = events.send(G4Event::Cancelled).await;
+                let _ = events.send(G4Event::Cancelled { generation }).await;
             }
             Err(_) => {
-                let _ = events.send(G4Event::RemoteOutcomeUnknown).await;
+                let _ = events
+                    .send(G4Event::RemoteOutcomeUnknown { generation })
+                    .await;
             }
         },
         Some(Ok(_)) => {
-            if let Ok(snapshot) = durable_snapshot(&store) {
+            if let Ok(snapshot) = durable_snapshot(&store, Some(generation)) {
                 let _ = events.send(snapshot).await;
             }
         }
         Some(Err(seamless_transport::pairing_v2::DistributedPairingError::Cancelled)) => {
-            let _ = events.send(G4Event::Cancelled).await;
+            let _ = events.send(G4Event::Cancelled { generation }).await;
         }
         Some(Err(seamless_transport::pairing_v2::DistributedPairingError::Rejected)) => {
-            let _ = events.send(G4Event::Rejected).await;
+            let _ = events.send(G4Event::Rejected { generation }).await;
         }
         Some(Err(seamless_transport::pairing_v2::DistributedPairingError::Storage)) => {
-            let _ = events.send(G4Event::RemoteOutcomeUnknown).await;
+            let _ = events
+                .send(G4Event::RemoteOutcomeUnknown { generation })
+                .await;
         }
     }
 }
 
 impl G4WorkerBackend for RealG4Backend {
     fn command(&mut self, command: G4Command) -> Vec<G4Event> {
+        let fallback_generation = match &command {
+            G4Command::Start { generation }
+            | G4Command::Stop { generation }
+            | G4Command::Select { generation, .. }
+            | G4Command::Cancel { generation } => *generation,
+            G4Command::Decide { token, .. } => self
+                .session
+                .as_ref()
+                .map(|session| session.generation)
+                .unwrap_or_else(|| token.generation()),
+        };
         let result = match command {
             G4Command::Start { generation } => {
                 // A durable snapshot queued by open belongs to backend startup,
                 // never to the pairing attempt that is about to be created.
                 let mut startup = Vec::new();
                 while let Ok(event) = self.events.try_recv() {
-                    if matches!(event, G4Event::DurableSnapshot(_)) {
+                    if matches!(
+                        event,
+                        G4Event::DurableSnapshot {
+                            generation: None,
+                            ..
+                        }
+                    ) {
                         startup.push(event);
                     }
                 }
@@ -820,7 +943,9 @@ impl G4WorkerBackend for RealG4Backend {
         result.unwrap_or_else(|_error| {
             #[cfg(feature = "g4-test-helper")]
             eprintln!("G4_TEST_BACKEND_REJECT={_error:?}");
-            vec![G4Event::Rejected]
+            vec![G4Event::Rejected {
+                generation: fallback_generation,
+            }]
         })
     }
 
@@ -888,6 +1013,7 @@ impl G4PairingWorker {
                     }
                 }
                 backend.shutdown();
+                drop(backend);
                 let _ = stopped_tx.send(());
             })
             .map_err(|_| WorkerError::Closed)?;
@@ -938,7 +1064,9 @@ impl Drop for G4PairingWorker {
         self.stopping.store(true, Ordering::Release);
         self.commands.take();
         self.events.take();
-        if let Some(thread) = self.thread.take() {
+        if self.stopped.recv_timeout(Duration::from_secs(2)).is_ok()
+            && let Some(thread) = self.thread.take()
+        {
             let _ = thread.join();
         }
     }
@@ -948,6 +1076,7 @@ impl Drop for G4PairingWorker {
 mod tests {
     use super::*;
     use seamless_discovery::{Advertisement, guided::LocatorEvent};
+    use std::sync::atomic::AtomicBool;
 
     fn advertisement(n: u64) -> Advertisement {
         Advertisement {
@@ -1002,5 +1131,81 @@ mod tests {
         let selected = catalog.select_once(&views[0].handle, 12).unwrap();
         assert_eq!(selected.rendezvous, format!("{:032x}", 1));
         assert!(catalog.select_once(&views[0].handle, 13).is_err());
+    }
+
+    #[test]
+    fn repeated_observation_preserves_the_ui_handle_until_selection() {
+        let mut catalog = G4DiscoveryCatalog::open([3; 8], 10).unwrap();
+        catalog
+            .apply(LocatorEvent::Observed(advertisement(1)), 11)
+            .unwrap();
+        let original = catalog.views(11).unwrap()[0].handle.clone();
+
+        catalog
+            .apply(LocatorEvent::Observed(advertisement(1)), 12)
+            .unwrap();
+
+        assert_eq!(catalog.views(12).unwrap()[0].handle, original);
+        assert!(catalog.select_once(&original, 13).is_ok());
+    }
+
+    struct SlowDropBackend {
+        dropped: Arc<AtomicBool>,
+    }
+
+    impl G4WorkerBackend for SlowDropBackend {
+        fn command(&mut self, _command: G4Command) -> Vec<G4Event> {
+            Vec::new()
+        }
+
+        fn poll(&mut self) -> Vec<G4Event> {
+            Vec::new()
+        }
+
+        fn shutdown(&mut self) {}
+    }
+
+    impl Drop for SlowDropBackend {
+        fn drop(&mut self) {
+            std::thread::sleep(Duration::from_millis(200));
+            self.dropped.store(true, Ordering::Release);
+        }
+    }
+
+    #[test]
+    fn worker_shutdown_timeout_is_observable_before_backend_drop_completes() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let mut worker = G4PairingWorker::spawn(SlowDropBackend {
+            dropped: dropped.clone(),
+        })
+        .unwrap();
+        let started = Instant::now();
+
+        assert_eq!(
+            worker.shutdown(Duration::from_millis(25)),
+            Err(WorkerError::ShutdownTimeout)
+        );
+        assert!(started.elapsed() < Duration::from_millis(150));
+        assert!(!dropped.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn stopped_postcommit_attempt_projects_store_quarantine_not_precommit_cancel() {
+        let quarantine = G4Event::DurableSnapshot {
+            generation: Some(7),
+            entries: vec![DurableView {
+                handle: "quarantine-1".into(),
+                confirmed: false,
+            }],
+        };
+
+        assert_eq!(
+            classify_stopped_attempt(7, Vec::new(), Ok(quarantine.clone())),
+            vec![quarantine]
+        );
+        assert_eq!(
+            classify_stopped_attempt(7, Vec::new(), Err(SetupError::Unavailable)),
+            vec![G4Event::RemoteOutcomeUnknown { generation: 7 }]
+        );
     }
 }

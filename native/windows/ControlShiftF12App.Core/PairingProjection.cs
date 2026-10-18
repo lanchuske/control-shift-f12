@@ -24,13 +24,8 @@ public sealed record PairingProjection(
                 || !root.TryGetProperty("phase", out var phase) || phase.GetString() is not { } phaseText
                 || !root.TryGetProperty("candidate_handle", out var handle) || handle.ValueKind != JsonValueKind.String || !ValidHandle(handle.GetString()!)
                 || !root.TryGetProperty("verification_words", out var words) || !ValidWords(words, out var parsed)) return false;
-            var parsedPhase = phaseText switch
-            {
-                "awaiting_local_confirmation" => PairingBridgePhase.AwaitingLocalConfirmation,
-                "awaiting_remote_confirmation" => PairingBridgePhase.AwaitingRemoteConfirmation,
-                "ready_for_durable_admission" => PairingBridgePhase.ReadyForDurableAdmission,
-                _ => throw new JsonException(),
-            };
+            if (phaseText != "awaiting_local_confirmation") throw new JsonException();
+            var parsedPhase = PairingBridgePhase.AwaitingLocalConfirmation;
             projection = new(value, parsedPhase, handle.GetString()!, parsed);
             return true;
         }
@@ -43,7 +38,7 @@ public sealed record PairingProjection(
         words = [];
         if (value.ValueKind != JsonValueKind.Array || value.GetArrayLength() != 4) return false;
         var values = value.EnumerateArray().Select(item => item.ValueKind == JsonValueKind.String ? item.GetString() : null).ToArray();
-        if (values.Any(word => word is null || word.Length is 0 or > 24 || word.Any(c => c is < 'a' or > 'z'))) return false;
+        if (values.Any(word => word is null || word.Length is 0 or > 16 || word.Any(c => c is < 'a' or > 'z'))) return false;
         words = values!;
         return true;
     }
