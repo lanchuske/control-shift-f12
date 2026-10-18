@@ -213,9 +213,18 @@ public sealed class WindowsUiChildOwner : IAsyncDisposable
 
     public async ValueTask DisposeAsync()
     {
-        await CloseAsync();
-        child.Dispose();
-        stdoutGate.Dispose();
+        await DisposeAfterCloseAsync(CloseAsync, child.Dispose, stdoutGate.Dispose);
+    }
+
+    internal static async Task DisposeAfterCloseAsync(
+        Func<Task> close,
+        Action disposeChild,
+        Action disposeStdoutGate
+    )
+    {
+        await close();
+        disposeChild();
+        disposeStdoutGate();
     }
 
     private void ThrowIfClosed()

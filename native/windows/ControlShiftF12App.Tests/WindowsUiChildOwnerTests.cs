@@ -7,6 +7,26 @@ namespace ControlShiftF12App.Tests;
 public sealed class WindowsUiChildOwnerTests
 {
     [Fact]
+    public async Task Dispose_releases_both_owned_resources_when_close_fails_and_preserves_failure()
+    {
+        var childDisposed = false;
+        var gateDisposed = false;
+        var expected = new InvalidOperationException("close failed");
+
+        var actual = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            WindowsUiChildOwner.DisposeAfterCloseAsync(
+                () => Task.FromException(expected),
+                () => childDisposed = true,
+                () => gateDisposed = true
+            )
+        );
+
+        Assert.Same(expected, actual);
+        Assert.True(childDisposed);
+        Assert.True(gateDisposed);
+    }
+
+    [Fact]
     public async Task Owned_child_drains_more_than_two_mebibytes_of_stderr_before_stdout()
     {
         var executable = FindProbeExecutable();
