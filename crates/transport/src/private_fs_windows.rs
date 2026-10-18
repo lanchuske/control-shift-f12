@@ -899,6 +899,192 @@ mod tests {
     }
 
     #[test]
+    fn hosted_stage_isolation_diagnostic() {
+        struct Observation {
+            result: Result<(), StoreError>,
+            attempts: Vec<u32>,
+            operations: Vec<&'static str>,
+            failure: Option<(&'static str, Option<i32>)>,
+        }
+
+        fn emit(label: &str, outcome: Result<Observation, String>) -> bool {
+            let line = match &outcome {
+                Ok(observation) => {
+                    let stage = match (observation.attempts.as_slice(), observation.result.as_ref())
+                    {
+                        ([], Err(_)) => "before-publication-failure",
+                        ([code], Err(_)) if *code != ERROR_SUCCESS => "native-rename-failure",
+                        ([ERROR_SUCCESS], Err(_)) => "post-rename-failure",
+                        ([ERROR_SUCCESS], Ok(())) => "success",
+                        _ => "observer-violation",
+                    };
+                    format!(
+                        "CSF12_DIAG label={label} stage={stage} result={:?} calls={} attempts={:?} operations={:?} failure={:?}\n",
+                        observation.result,
+                        observation.attempts.len(),
+                        observation.attempts,
+                        observation.operations,
+                        observation.failure
+                    )
+                }
+                Err(stage) => format!(
+                    "CSF12_DIAG label={label} stage=setup result=Err calls=0 detail={stage}\n"
+                ),
+            };
+            std::io::stderr()
+                .write_all(line.as_bytes())
+                .expect("write diagnostic line");
+            match &outcome {
+                Ok(Observation {
+                    result: Ok(()),
+                    attempts,
+                    ..
+                }) => attempts == &[ERROR_SUCCESS],
+                _ => false,
+            }
+        }
+
+        fn store<T>(stage: &str, result: Result<T, StoreError>) -> Result<T, String> {
+            result.map_err(|error| format!("{stage}:{error:?}"))
+        }
+
+        fn io<T>(stage: &str, result: std::io::Result<T>) -> Result<T, String> {
+            result.map_err(|error| format!("{stage}:{error:?}"))
+        }
+
+        fn observed(result: Result<(), StoreError>) -> Result<Observation, String> {
+            Ok(Observation {
+                result,
+                attempts: faults::take_rename_attempts(),
+                operations: faults::take_operations(),
+                failure: faults::take_failure(),
+            })
+        }
+
+        let mut passed = Vec::new();
+
+        passed.push(emit(
+            "private_target_directory_retained",
+            (|| {
+                let root = tempfile::tempdir().map_err(|error| format!("tempdir:{error:?}"))?;
+                let private = store("private-root", PrivateDir::root(root.path()))?;
+                let mut target = store("target-open", private.open("target", true, true))?
+                    .ok_or_else(|| "target-open:none".to_owned())?;
+                io("target-write", target.write_all(b"old"))?;
+                io("target-flush", target.sync_all())?;
+                drop(target);
+                let from = root.path().join(".pending-diagnostic.tmp");
+                io("source-write", std::fs::write(&from, b"new"))?;
+                let source = store("source-open", open_path(&from, false, OPEN_EXISTING))?
+                    .ok_or_else(|| "source-open:none".to_owned())?;
+                faults::reset_operations();
+                let result = rename_open_file(&source, &root.path().join("target"), true);
+                std::hint::black_box(&private);
+                observed(result)
+            })(),
+        ));
+
+        passed.push(emit(
+            "private_target_directory_dropped",
+            (|| {
+                let root = tempfile::tempdir().map_err(|error| format!("tempdir:{error:?}"))?;
+                let private = store("private-root", PrivateDir::root(root.path()))?;
+                let mut target = store("target-open", private.open("target", true, true))?
+                    .ok_or_else(|| "target-open:none".to_owned())?;
+                io("target-write", target.write_all(b"old"))?;
+                io("target-flush", target.sync_all())?;
+                drop(target);
+                let from = root.path().join(".pending-diagnostic.tmp");
+                io("source-write", std::fs::write(&from, b"new"))?;
+                let source = store("source-open", open_path(&from, false, OPEN_EXISTING))?
+                    .ok_or_else(|| "source-open:none".to_owned())?;
+                drop(private);
+                faults::reset_operations();
+                observed(rename_open_file(&source, &root.path().join("target"), true))
+            })(),
+        ));
+
+        for (label, flags) in [
+            ("raw_source_normal", 0),
+            ("raw_source_write_through", FILE_FLAG_WRITE_THROUGH),
+        ] {
+            passed.push(emit(
+                label,
+                (|| {
+                    let root = tempfile::tempdir().map_err(|error| format!("tempdir:{error:?}"))?;
+                    let private = store("private-root", PrivateDir::root(root.path()))?;
+                    io(
+                        "target-write",
+                        std::fs::write(root.path().join("target"), b"old"),
+                    )?;
+                    let from = root.path().join(".pending-diagnostic.tmp");
+                    let mut source = store(
+                        "source-open",
+                        open_path_with_flags(&from, false, CREATE_NEW, flags),
+                    )?
+                    .ok_or_else(|| "source-open:none".to_owned())?;
+                    io("source-write", source.write_all(b"new"))?;
+                    io("source-flush", source.sync_all())?;
+                    faults::reset_operations();
+                    let result = rename_open_file(&source, &root.path().join("target"), true);
+                    std::hint::black_box(&private);
+                    observed(result)
+                })(),
+            ));
+        }
+
+        passed.push(emit(
+            "private_source_write_through",
+            (|| {
+                let root = tempfile::tempdir().map_err(|error| format!("tempdir:{error:?}"))?;
+                let private = store("private-root", PrivateDir::root(root.path()))?;
+                io(
+                    "target-write",
+                    std::fs::write(root.path().join("target"), b"old"),
+                )?;
+                let mut source = store(
+                    "source-open",
+                    private.open_with_flags(
+                        ".pending-diagnostic.tmp",
+                        true,
+                        true,
+                        FILE_FLAG_WRITE_THROUGH,
+                    ),
+                )?
+                .ok_or_else(|| "source-open:none".to_owned())?;
+                io("source-write", source.write_all(b"new"))?;
+                io("source-flush", source.sync_all())?;
+                faults::reset_operations();
+                observed(rename_open_file(&source, &root.path().join("target"), true))
+            })(),
+        ));
+
+        for (label, existing) in [
+            ("full_replace_missing_target", false),
+            ("full_replace_existing_target", true),
+        ] {
+            passed.push(emit(
+                label,
+                (|| {
+                    let root = tempfile::tempdir().map_err(|error| format!("tempdir:{error:?}"))?;
+                    let private = store("private-root", PrivateDir::root(root.path()))?;
+                    if existing {
+                        let mut target = store("target-open", private.open("target", true, true))?
+                            .ok_or_else(|| "target-open:none".to_owned())?;
+                        io("target-write", target.write_all(b"old"))?;
+                        io("target-flush", target.sync_all())?;
+                        drop(target);
+                    }
+                    faults::reset_operations();
+                    observed(private.replace("target", b"new"))
+                })(),
+            ));
+        }
+
+        assert_eq!(passed, vec![true; 7], "one or more diagnostic cases failed");
+    }
+
+    #[test]
     fn replacement_operations_run_in_durable_order() {
         let root = tempfile::tempdir().unwrap();
         let private = PrivateDir::root(root.path()).unwrap();
