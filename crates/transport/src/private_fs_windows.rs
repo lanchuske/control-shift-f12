@@ -522,8 +522,20 @@ impl PrivateDir {
             return Err(StoreError::Invalid);
         }
         std::fs::create_dir_all(path).map_err(|_| StoreError::Unavailable)?;
-        let administrative = open_path(path, true, OPEN_EXISTING)?.ok_or(StoreError::Invalid)?;
         let sid = current_user_sid()?;
+        if let Ok(file) = open_retained_directory(path) {
+            let handle = file.as_raw_handle().cast();
+            if validate(handle, true, &sid).is_ok() {
+                let info = file_info(handle)?;
+                return Ok(Self {
+                    path: path.to_owned(),
+                    file,
+                    id: identity(&info),
+                    sid,
+                });
+            }
+        }
+        let administrative = open_path(path, true, OPEN_EXISTING)?.ok_or(StoreError::Invalid)?;
         let handle = administrative.as_raw_handle().cast();
         let info = file_info(handle)?;
         if info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
@@ -548,13 +560,18 @@ impl PrivateDir {
         })
     }
 
-    fn validate_self(&self) -> Result<(), StoreError> {
+    fn open_validated_current(&self) -> Result<File, StoreError> {
         validate(self.file.as_raw_handle().cast(), true, &self.sid)?;
-        let current = open_path(&self.path, true, OPEN_EXISTING)?.ok_or(StoreError::Invalid)?;
+        let current = open_retained_directory(&self.path)?;
         validate(current.as_raw_handle().cast(), true, &self.sid)?;
         if identity(&file_info(current.as_raw_handle().cast())?) != self.id {
             return Err(StoreError::Invalid);
         }
+        Ok(current)
+    }
+
+    fn validate_self(&self) -> Result<(), StoreError> {
+        drop(self.open_validated_current()?);
         Ok(())
     }
 
@@ -567,29 +584,37 @@ impl PrivateDir {
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => false,
             Err(_) => return Err(StoreError::Unavailable),
         };
-        let administrative = open_path(&path, true, OPEN_EXISTING)?.ok_or(StoreError::Invalid)?;
-        let handle = administrative.as_raw_handle().cast();
-        let info = file_info(handle)?;
-        if info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-            return Err(StoreError::Invalid);
-        }
-        if created {
+        let (file, info) = if created {
+            let administrative =
+                open_path(&path, true, OPEN_EXISTING)?.ok_or(StoreError::Invalid)?;
+            let handle = administrative.as_raw_handle().cast();
+            let info = file_info(handle)?;
+            if info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+                return Err(StoreError::Invalid);
+            }
             harden(handle, true, &self.sid)?;
-        }
-        validate(handle, true, &self.sid)?;
-        let file = open_retained_directory(&path)?;
-        let retained_handle = file.as_raw_handle().cast();
-        validate(retained_handle, true, &self.sid)?;
-        if identity(&file_info(retained_handle)?) != identity(&info) {
-            return Err(StoreError::Invalid);
-        }
+            validate(handle, true, &self.sid)?;
+            let file = open_retained_directory(&path)?;
+            let retained_handle = file.as_raw_handle().cast();
+            validate(retained_handle, true, &self.sid)?;
+            if identity(&file_info(retained_handle)?) != identity(&info) {
+                return Err(StoreError::Invalid);
+            }
+            drop(administrative);
+            (file, info)
+        } else {
+            let file = open_retained_directory(&path)?;
+            let handle = file.as_raw_handle().cast();
+            validate(handle, true, &self.sid)?;
+            let info = file_info(handle)?;
+            (file, info)
+        };
         let result = self.flush();
         #[cfg(test)]
         if result.is_err() {
             faults::record_failure("directory-flush", None);
         }
         result?;
-        drop(administrative);
         Ok(Self {
             path,
             file,
@@ -760,7 +785,7 @@ impl PrivateDir {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{fs::OpenOptions, os::windows::fs::OpenOptionsExt};
+    use std::{fs::OpenOptions, os::windows::fs::OpenOptionsExt, sync::Arc};
 
     #[test]
     fn retained_source_handle_can_replace_existing_target() {
@@ -818,6 +843,30 @@ mod tests {
             identity(&file_info(target.as_raw_handle().cast()).unwrap()),
             source_id
         );
+    }
+
+    #[test]
+    fn concurrent_directory_validation_does_not_block_publication() {
+        let root = tempfile::tempdir().unwrap();
+        let private = Arc::new(PrivateDir::root(root.path()).unwrap());
+        private.replace("target", b"old").unwrap();
+        let observer = Arc::clone(&private);
+        let (held_tx, held_rx) = std::sync::mpsc::sync_channel(0);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
+        let thread = std::thread::spawn(move || {
+            let current = observer.open_validated_current().unwrap();
+            held_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            drop(current);
+        });
+        held_rx.recv().unwrap();
+
+        let result = private.replace("target", b"new");
+
+        release_tx.send(()).unwrap();
+        thread.join().unwrap();
+        assert_eq!(result, Ok(()));
+        assert_eq!(private.read("target", 3).unwrap().as_deref(), Some(b"new"));
     }
 
     #[test]

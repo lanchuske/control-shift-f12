@@ -95,7 +95,9 @@ following the final reparse point and validate owner, exact one-ACE ACL, type,
 link count and retained directory identity. Directory setup uses a short-lived
 administrative handle; the long-lived handle is reopened and identity-matched
 with read, write and security-query access but without delete or security-write
-rights. Existing insecure children are rejected rather than silently repaired.
+rights. Normal root validation and existing-child opens use that same reduced
+mask; administrative rights are reacquired only when hardening is required.
+Existing insecure children are rejected rather than silently repaired.
 Writers use a cross-process byte-range lock, bounded reads, temporary owner-only files opened write-through,
 pre-publication file flush, handle-based publication, post-publication file
 flush, and directory flush. Existing targets are replaced in one
