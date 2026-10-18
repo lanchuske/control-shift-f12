@@ -95,8 +95,13 @@ following the final reparse point and validate owner, exact one-ACE ACL, type,
 link count and retained directory identity. Existing insecure children are
 rejected rather than silently repaired. Writers use a cross-process byte-range
 lock, bounded reads, temporary owner-only files opened write-through,
-pre-publication file flush, handle-based `FileRenameInfo`, post-publication file
-flush, and directory flush; any unsupported or ambiguous durability result
+pre-publication file flush, handle-based publication, post-publication file
+flush, and directory flush. Existing targets are replaced in one
+`FileRenameInfoEx` call with replace-if-present and POSIX rename semantics, so
+already-open target handles continue to identify the old file while later
+opens identify the newly published file. This storage primitive requires
+Windows 10 version 1607 or Windows Server 2016 and filesystem support; any
+unsupported or ambiguous durability result
 fails closed. Native durability evidence is scoped to the recorded Windows/NTFS
 environment and process-death boundaries, not physical power-loss survival.
 The trusted local root and its caller-controlled ancestor path remain outside

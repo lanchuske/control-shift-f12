@@ -10,13 +10,12 @@ use std::{
         io::{AsRawHandle, FromRawHandle},
     },
     path::{Path, PathBuf},
-    ptr, thread,
-    time::Duration,
+    ptr,
 };
 use windows_sys::Win32::{
     Foundation::{
-        CloseHandle, ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, ERROR_SHARING_VIOLATION,
-        GENERIC_READ, GENERIC_WRITE, GetLastError, HANDLE, INVALID_HANDLE_VALUE, LocalFree,
+        CloseHandle, ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, GENERIC_READ, GENERIC_WRITE,
+        GetLastError, HANDLE, INVALID_HANDLE_VALUE, LocalFree,
     },
     Security::{
         ACCESS_ALLOWED_ACE, ACL, ACL_REVISION, ACL_SIZE_INFORMATION, AclSizeInformation,
@@ -32,7 +31,7 @@ use windows_sys::Win32::{
         FILE_ALL_ACCESS, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL,
         FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
         FILE_FLAG_WRITE_THROUGH, FILE_RENAME_INFO, FILE_SHARE_DELETE, FILE_SHARE_READ,
-        FILE_SHARE_WRITE, FileRenameInfo, FlushFileBuffers, GetFileInformationByHandle,
+        FILE_SHARE_WRITE, FileRenameInfoEx, FlushFileBuffers, GetFileInformationByHandle,
         LOCKFILE_EXCLUSIVE_LOCK, LockFileEx, OPEN_EXISTING, READ_CONTROL,
         SetFileInformationByHandle, WRITE_DAC, WRITE_OWNER,
     },
@@ -43,38 +42,8 @@ use windows_sys::Win32::{
 };
 
 const ERROR_SUCCESS: u32 = 0;
-const HANDLE_RENAME_RETRIES: usize = 20;
-const HANDLE_RENAME_RETRY_DELAY: Duration = Duration::from_millis(25);
-
-fn retry_sharing_violation(
-    mut operation: impl FnMut() -> Result<(), u32>,
-    mut backoff: impl FnMut(Duration),
-) -> Result<(), u32> {
-    for attempt in 0..=HANDLE_RENAME_RETRIES {
-        match operation() {
-            Ok(()) => return Ok(()),
-            Err(error) if error == ERROR_SHARING_VIOLATION && attempt < HANDLE_RENAME_RETRIES => {
-                backoff(HANDLE_RENAME_RETRY_DELAY);
-            }
-            Err(error) => return Err(error),
-        }
-    }
-    unreachable!()
-}
-
-fn complete_rename_with_retry(
-    operation: impl FnMut() -> Result<(), u32>,
-    backoff: impl FnMut(Duration),
-) -> Result<(), StoreError> {
-    retry_sharing_violation(operation, backoff).map_err(|_error| {
-        #[cfg(test)]
-        faults::record_failure("rename", Some(_error as i32));
-        StoreError::Unavailable
-    })?;
-    #[cfg(test)]
-    faults::record("rename");
-    Ok(())
-}
+const FILE_RENAME_FLAG_REPLACE_IF_EXISTS: u32 = 0x0000_0001;
+const FILE_RENAME_FLAG_POSIX_SEMANTICS: u32 = 0x0000_0002;
 
 fn rename_info(destination: &Path, replace: bool) -> Result<(Vec<usize>, u32), StoreError> {
     let name: Vec<u16> = destination.as_os_str().encode_wide().collect();
@@ -100,7 +69,12 @@ fn rename_info(destination: &Path, replace: bool) -> Result<(Vec<usize>, u32), S
     let mut storage = vec![0usize; words];
     let info = storage.as_mut_ptr().cast::<FILE_RENAME_INFO>();
     unsafe {
-        (*info).Anonymous.ReplaceIfExists = replace;
+        (*info).Anonymous.Flags = FILE_RENAME_FLAG_POSIX_SEMANTICS
+            | if replace {
+                FILE_RENAME_FLAG_REPLACE_IF_EXISTS
+            } else {
+                0
+            };
         (*info).RootDirectory = ptr::null_mut();
         (*info).FileNameLength = name_bytes;
         ptr::copy_nonoverlapping(
@@ -113,45 +87,30 @@ fn rename_info(destination: &Path, replace: bool) -> Result<(Vec<usize>, u32), S
 }
 
 fn rename_open_file(source: &File, destination: &Path, replace: bool) -> Result<(), StoreError> {
-    rename_open_file_with_backoff(source, destination, replace, || None, thread::sleep)
-}
-
-fn rename_open_file_with_backoff(
-    source: &File,
-    destination: &Path,
-    replace: bool,
-    mut injected_error: impl FnMut() -> Option<u32>,
-    backoff: impl FnMut(Duration),
-) -> Result<(), StoreError> {
     let (info, used) = rename_info(destination, replace)?;
-    complete_rename_with_retry(
-        || {
-            if let Some(error) = injected_error() {
-                #[cfg(test)]
-                faults::record_rename_attempt(error);
-                return Err(error);
-            }
-            let result = unsafe {
-                SetFileInformationByHandle(
-                    source.as_raw_handle().cast(),
-                    FileRenameInfo,
-                    info.as_ptr().cast(),
-                    used,
-                )
-            };
-            if result == 0 {
-                let error = unsafe { GetLastError() };
-                #[cfg(test)]
-                faults::record_rename_attempt(error);
-                Err(error)
-            } else {
-                #[cfg(test)]
-                faults::record_rename_attempt(ERROR_SUCCESS);
-                Ok(())
-            }
-        },
-        backoff,
-    )
+    let result = unsafe {
+        SetFileInformationByHandle(
+            source.as_raw_handle().cast(),
+            FileRenameInfoEx,
+            info.as_ptr().cast(),
+            used,
+        )
+    };
+    let _error = if result == 0 {
+        unsafe { GetLastError() }
+    } else {
+        ERROR_SUCCESS
+    };
+    #[cfg(test)]
+    faults::record_rename_attempt(_error);
+    if result == 0 {
+        #[cfg(test)]
+        faults::record_failure("rename", Some(_error as i32));
+        return Err(StoreError::Unavailable);
+    }
+    #[cfg(test)]
+    faults::record("rename");
+    Ok(())
 }
 
 #[cfg(test)]
@@ -815,139 +774,6 @@ mod tests {
     }
 
     #[test]
-    fn sharing_retry_returns_after_first_success_without_backoff() {
-        let mut calls = 0;
-        let mut delays = Vec::new();
-        let result = retry_sharing_violation(
-            || {
-                calls += 1;
-                Ok(())
-            },
-            |delay| delays.push(delay),
-        );
-        assert_eq!(result, Ok(()));
-        assert_eq!(calls, 1);
-        assert!(delays.is_empty());
-    }
-
-    #[test]
-    fn sharing_retry_recovers_once_after_code_32() {
-        let mut outcomes = [Err(32), Ok(())].into_iter();
-        let mut calls = 0;
-        let mut delays = Vec::new();
-        let result = retry_sharing_violation(
-            || {
-                calls += 1;
-                outcomes.next().expect("operation called after success")
-            },
-            |delay| delays.push(delay),
-        );
-        assert_eq!(result, Ok(()));
-        assert_eq!(calls, 2);
-        assert_eq!(delays, [Duration::from_millis(25)]);
-    }
-
-    #[test]
-    fn sharing_retry_stops_on_non_sharing_error_after_code_32() {
-        let mut outcomes = [Err(32), Err(5)].into_iter();
-        let mut calls = 0;
-        let mut delays = Vec::new();
-        let result = retry_sharing_violation(
-            || {
-                calls += 1;
-                outcomes
-                    .next()
-                    .expect("operation called after terminal error")
-            },
-            |delay| delays.push(delay),
-        );
-        assert_eq!(result, Err(5));
-        assert_eq!(calls, 2);
-        assert_eq!(delays, [Duration::from_millis(25)]);
-    }
-
-    #[test]
-    fn sharing_retry_allows_success_on_call_21() {
-        let mut outcomes = vec![Err(32); 20];
-        outcomes.push(Ok(()));
-        let mut outcomes = outcomes.into_iter();
-        let mut calls = 0;
-        let mut delays = Vec::new();
-        let result = retry_sharing_violation(
-            || {
-                calls += 1;
-                outcomes.next().expect("operation called after success")
-            },
-            |delay| delays.push(delay),
-        );
-        assert_eq!(result, Ok(()));
-        assert_eq!(calls, 21);
-        assert_eq!(delays, vec![Duration::from_millis(25); 20]);
-    }
-
-    #[test]
-    fn sharing_retry_exhausts_after_21_sharing_violations() {
-        let mut outcomes = vec![Err(32); 21].into_iter();
-        let mut calls = 0;
-        let mut delays = Vec::new();
-        let result = retry_sharing_violation(
-            || {
-                calls += 1;
-                outcomes
-                    .next()
-                    .expect("operation called beyond retry limit")
-            },
-            |delay| delays.push(delay),
-        );
-        assert_eq!(result, Err(32));
-        assert_eq!(calls, 21);
-        assert_eq!(delays, vec![Duration::from_millis(25); 20]);
-    }
-
-    #[test]
-    fn retried_publication_records_one_logical_rename_after_the_real_rename_succeeds() {
-        let root = tempfile::tempdir().unwrap();
-        let from = root.path().join("replacement");
-        let to = root.path().join("target");
-        std::fs::write(&from, b"new").unwrap();
-        std::fs::write(&to, b"old").unwrap();
-        let source = open_path(&from, false, OPEN_EXISTING).unwrap().unwrap();
-        let source_id = identity(&file_info(source.as_raw_handle().cast()).unwrap());
-        let mut injected = Some(32);
-        let mut delays = Vec::new();
-        faults::reset_operations();
-
-        let result = rename_open_file_with_backoff(
-            &source,
-            &to,
-            true,
-            || injected.take(),
-            |delay| delays.push(delay),
-        );
-
-        assert_eq!(result, Ok(()));
-        let attempts = faults::take_rename_attempts();
-        assert_eq!(attempts.first(), Some(&32));
-        assert_eq!(attempts.last(), Some(&ERROR_SUCCESS));
-        assert!(attempts.len() <= 21);
-        assert!(
-            attempts[..attempts.len() - 1]
-                .iter()
-                .all(|code| *code == 32)
-        );
-        assert_eq!(delays, vec![Duration::from_millis(25); attempts.len() - 1]);
-        assert_eq!(faults::take_operations(), ["rename"]);
-        assert_eq!(faults::take_failure(), None);
-        assert_eq!(std::fs::read(&to).unwrap(), b"new");
-        assert!(!from.exists());
-        let target = open_path(&to, false, OPEN_EXISTING).unwrap().unwrap();
-        assert_eq!(
-            identity(&file_info(target.as_raw_handle().cast()).unwrap()),
-            source_id
-        );
-    }
-
-    #[test]
     fn destination_blocker_fails_immediately_and_preserves_both_files() {
         let root = tempfile::tempdir().unwrap();
         let from = root.path().join("replacement");
@@ -960,39 +786,35 @@ mod tests {
             .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
             .open(&to)
             .unwrap();
-        let mut backoffs = 0;
         faults::reset_operations();
 
-        let result = rename_open_file_with_backoff(&source, &to, true, || None, |_| backoffs += 1);
+        let result = rename_open_file(&source, &to, true);
         let attempts = faults::take_rename_attempts();
 
         assert_eq!(result, Err(StoreError::Unavailable));
-        assert_eq!(attempts, [5]);
-        assert_eq!(backoffs, 0);
-        assert_eq!(faults::take_failure(), Some(("rename", Some(5))));
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts, [32]);
+        assert_eq!(faults::take_failure(), Some(("rename", Some(32))));
         assert_eq!(std::fs::read(&to).unwrap(), b"old");
         assert_eq!(std::fs::read(&from).unwrap(), b"new");
         drop(blocker);
     }
 
     #[test]
-    fn handle_rename_does_not_retry_a_non_sharing_error() {
+    fn handle_rename_makes_one_call_for_a_non_sharing_error() {
         let root = tempfile::tempdir().unwrap();
         let from = root.path().join("replacement");
         let to = root.path().join("missing-parent").join("target");
         std::fs::write(&from, b"new").unwrap();
         let source = open_path(&from, false, OPEN_EXISTING).unwrap().unwrap();
-        let mut backoffs = 0;
         faults::reset_operations();
 
-        let result = rename_open_file_with_backoff(&source, &to, true, || None, |_| backoffs += 1);
+        let result = rename_open_file(&source, &to, true);
         let attempts = faults::take_rename_attempts();
 
         assert_eq!(result, Err(StoreError::Unavailable));
         assert_eq!(attempts.len(), 1);
         assert_ne!(attempts[0], ERROR_SUCCESS);
-        assert_ne!(attempts[0], 32);
-        assert_eq!(backoffs, 0);
         assert_eq!(std::fs::read(&from).unwrap(), b"new");
     }
 
@@ -1044,6 +866,10 @@ mod tests {
         let (storage, used) = rename_info(destination, true).unwrap();
         let info = storage.as_ptr().cast::<FILE_RENAME_INFO>();
         assert_eq!(
+            unsafe { (*info).Anonymous.Flags },
+            FILE_RENAME_FLAG_REPLACE_IF_EXISTS | FILE_RENAME_FLAG_POSIX_SEMANTICS
+        );
+        assert_eq!(
             unsafe { (*info).FileNameLength },
             u32::try_from(expected_units * size_of::<u16>()).unwrap()
         );
@@ -1060,6 +886,16 @@ mod tests {
                 .read()
         };
         assert_eq!(terminator, 0);
+    }
+
+    #[test]
+    fn rename_info_uses_posix_semantics_without_replace_for_a_missing_target() {
+        let (storage, _) = rename_info(Path::new(r"C:\temp\new-target"), false).unwrap();
+        let info = storage.as_ptr().cast::<FILE_RENAME_INFO>();
+        assert_eq!(
+            unsafe { (*info).Anonymous.Flags },
+            FILE_RENAME_FLAG_POSIX_SEMANTICS
+        );
     }
 
     #[test]
