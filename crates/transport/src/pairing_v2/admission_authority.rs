@@ -1,5 +1,7 @@
 //! Durable admission foundation. This module deliberately emits no runtime
 //! authority: product behavior remains fail-closed until a later reviewed phase.
+#[cfg(test)]
+use crate::pairing_pending::AdmissionOwnership;
 use crate::pairing_pending::{
     AdmissionReceiptRecord, PendingRecord, PendingStore, StoreError, StoreVersion,
 };
@@ -184,6 +186,11 @@ impl AdmissionAuthorityStore {
                 identity_generation: expected.identity_generation,
                 revocation_generation: expected_revocation_generation,
                 policy_revision: POLICY_REVISION,
+                ownership: AdmissionOwnership::StoreOwned {
+                    guard_token: record.attempt_id,
+                    staged_revision: expected.revision,
+                    handoff_revision: expected.revision.checked_add(1).ok_or(StoreError::Limit)?,
+                },
             },
             None,
         );
@@ -208,7 +215,38 @@ impl AdmissionAuthorityStore {
     ) -> Result<PromotionReceipt, StoreError> {
         let commit =
             SealedAdmissionCommit::from_authority(expected, authority, &self.store).await?;
-        let stored = self.store.commit_sealed_admission(expected, commit)?;
+        commit.revalidate()?;
+        let staged =
+            self.store
+                .stage_sealed_admission(expected, commit.record(), commit.receipt())?;
+        let attempt = staged.attempt;
+        let staged_version = StoreVersion {
+            revision: staged.revision,
+            identity_generation: staged.identity_generation,
+        };
+        let handoff = commit.into_live_handoff()?;
+        let (stored, mut revoker) =
+            match self
+                .store
+                .finalize_staged_admission(staged_version, attempt, handoff)
+            {
+                Ok(finalized) => finalized,
+                Err(error) => {
+                    // The endpoint may have won the one ownership election. A
+                    // staged receipt remains ineligible; reconciliation either
+                    // completes conservative revocation or reports the I/O error.
+                    let _ = self.store.resolve_admission_guard(attempt);
+                    return Err(error);
+                }
+            };
+        // The durable final publication is authoritative. A failed exact-token
+        // sidecar unlink deliberately returns no ordinary success; a later
+        // reconciliation sees StoreOwned and performs cleanup only.
+        revoker.release_to_store()?;
+        let (_, _, active) = self.store.admission_state(attempt)?;
+        if !active {
+            return Err(StoreError::Conflict);
+        }
         Ok(PromotionReceipt {
             attempt: stored.attempt,
             peer: stored.peer,
@@ -243,6 +281,11 @@ impl AdmissionAuthorityStore {
                 identity_generation: expected.identity_generation,
                 revocation_generation: record.revocation_generation,
                 policy_revision: POLICY_REVISION,
+                ownership: AdmissionOwnership::StoreOwned {
+                    guard_token: record.attempt_id,
+                    staged_revision: expected.revision,
+                    handoff_revision: expected.revision.checked_add(1).ok_or(StoreError::Limit)?,
+                },
             },
             Some(fail_on),
         );
@@ -259,7 +302,7 @@ impl AdmissionAuthorityStore {
 }
 
 enum CommitWitness {
-    Live(Box<super::provisional_tls::FrozenPromotionEvidence>),
+    Live,
     #[cfg(test)]
     Synthetic {
         validations: Cell<usize>,
@@ -274,6 +317,7 @@ pub(crate) struct SealedAdmissionCommit {
     record: PendingRecord,
     receipt: AdmissionReceiptRecord,
     witness: CommitWitness,
+    live_handoff: Option<super::provisional_tls::FrozenAdmissionHandoff>,
 }
 
 impl SealedAdmissionCommit {
@@ -292,7 +336,7 @@ impl SealedAdmissionCommit {
             .await
             .map_err(|_| StoreError::Invalid)?;
         frozen.revalidate().map_err(|_| StoreError::Invalid)?;
-        let fields = frozen.fields();
+        let (fields, handoff) = frozen.into_store_handoff();
         let receipt = AdmissionReceiptRecord {
             attempt: fields.record.attempt_id,
             peer: fields.record.peer_fingerprint,
@@ -307,17 +351,24 @@ impl SealedAdmissionCommit {
             identity_generation: expected.identity_generation,
             revocation_generation: fields.record.revocation_generation,
             policy_revision: POLICY_REVISION,
+            ownership: handoff.awaiting_handoff_ownership(
+                expected.revision.checked_add(1).ok_or(StoreError::Limit)?,
+            ),
         };
         Ok(Self {
             record: fields.record,
             receipt,
-            witness: CommitWitness::Live(Box::new(frozen)),
+            witness: CommitWitness::Live,
+            live_handoff: Some(handoff),
         })
     }
 
     pub(crate) fn revalidate(&self) -> Result<(), StoreError> {
         match &self.witness {
-            CommitWitness::Live(evidence) => evidence.revalidate().map_err(|_| StoreError::Invalid),
+            // A live witness was revalidated immediately before its immutable
+            // fields and private handoff were separated. The handoff itself
+            // remains one-shot and is claimed only after staging.
+            CommitWitness::Live => Ok(()),
             #[cfg(test)]
             CommitWitness::Synthetic {
                 validations,
@@ -342,6 +393,16 @@ impl SealedAdmissionCommit {
         &self.receipt
     }
 
+    fn into_live_handoff(
+        mut self,
+    ) -> Result<super::provisional_tls::FrozenAdmissionHandoff, StoreError> {
+        match self.witness {
+            CommitWitness::Live => self.live_handoff.take().ok_or(StoreError::Invalid),
+            #[cfg(test)]
+            CommitWitness::Synthetic { .. } => Err(StoreError::Invalid),
+        }
+    }
+
     #[cfg(test)]
     fn synthetic(
         record: PendingRecord,
@@ -355,6 +416,7 @@ impl SealedAdmissionCommit {
                 validations: Cell::new(0),
                 fail_on,
             },
+            live_handoff: None,
         }
     }
 }
@@ -386,6 +448,30 @@ mod tests {
             suite: super::super::SUITE,
             transcript: [23; 32],
             binding: [24; 32],
+        }
+    }
+
+    fn awaiting_receipt(record: &PendingRecord, expected: StoreVersion) -> AdmissionReceiptRecord {
+        let evidence = evidence(record);
+        let revision = expected.revision.checked_add(1).unwrap();
+        AdmissionReceiptRecord {
+            attempt: evidence.attempt,
+            peer: evidence.peer,
+            peer_pin: evidence.peer_pin,
+            durable_fc_hash: evidence.fc,
+            role: evidence.role,
+            suite: evidence.suite.to_owned(),
+            protocol_version: PROTOCOL_VERSION,
+            transcript: evidence.transcript,
+            binding: evidence.binding,
+            revision,
+            identity_generation: expected.identity_generation,
+            revocation_generation: record.revocation_generation,
+            policy_revision: POLICY_REVISION,
+            ownership: AdmissionOwnership::AwaitingHandoff {
+                guard_token: [46; 32],
+                staged_revision: revision,
+            },
         }
     }
 
@@ -453,7 +539,7 @@ mod tests {
     }
 
     #[test]
-    fn incompatible_pin_is_rejected_without_partial_consumption() {
+    fn incompatible_pin_retry_is_rejected_before_partial_consumption() {
         let root = tempfile::tempdir().unwrap();
         let store = AdmissionAuthorityStore::open(root.path()).unwrap();
         let first = store
@@ -462,19 +548,137 @@ mod tests {
         store
             .commit_metadata(store.version().unwrap(), 0, &first, evidence(&first))
             .unwrap();
-        let second = store
-            .prepare(store.version().unwrap(), [33; 32], first.peer_fingerprint)
-            .unwrap();
-        let mut conflicting = evidence(&second);
-        conflicting.peer_pin = [99; 32];
         assert_eq!(
-            store.commit_metadata(store.version().unwrap(), 0, &second, conflicting),
+            store.prepare(store.version().unwrap(), [33; 32], first.peer_fingerprint),
             Err(StoreError::Conflict)
         );
         assert_eq!(
-            store.reconcile(second.attempt_id).unwrap(),
-            ReconcileAdmission::Pending
+            store.reconcile(first.attempt_id).unwrap(),
+            ReconcileAdmission::Promoted
         );
+    }
+
+    #[test]
+    fn second_attempt_for_same_peer_and_pin_is_rejected_without_inheriting_pin() {
+        let root = tempfile::tempdir().unwrap();
+        let store = AdmissionAuthorityStore::open(root.path()).unwrap();
+        let first = store
+            .prepare(store.version().unwrap(), [41; 32], [42; 32])
+            .unwrap();
+        store
+            .commit_metadata(store.version().unwrap(), 0, &first, evidence(&first))
+            .unwrap();
+        assert_eq!(
+            store.prepare(store.version().unwrap(), [43; 32], first.peer_fingerprint),
+            Err(StoreError::Conflict)
+        );
+        assert_eq!(
+            store.reconcile(first.attempt_id).unwrap(),
+            ReconcileAdmission::Promoted
+        );
+    }
+
+    #[test]
+    fn staged_peer_reservation_rejects_retry_before_finalization() {
+        let root = tempfile::tempdir().unwrap();
+        let store = AdmissionAuthorityStore::open(root.path()).unwrap();
+        let first = store
+            .prepare(store.version().unwrap(), [44; 32], [45; 32])
+            .unwrap();
+        let expected = store.version().unwrap();
+        let staged = awaiting_receipt(&first, expected);
+        store
+            .store
+            .stage_sealed_admission(expected, &first, &staged)
+            .unwrap();
+
+        let retry = [47; 32];
+        assert_eq!(
+            store.prepare(store.version().unwrap(), retry, first.peer_fingerprint),
+            Err(StoreError::Conflict)
+        );
+        assert_eq!(store.pending(retry).unwrap(), None);
+    }
+
+    #[test]
+    fn cancellation_and_revocation_release_peer_reservations() {
+        let root = tempfile::tempdir().unwrap();
+        let store = AdmissionAuthorityStore::open(root.path()).unwrap();
+        let pending = store
+            .prepare(store.version().unwrap(), [48; 32], [49; 32])
+            .unwrap();
+        store
+            .cancel(store.version().unwrap(), pending.attempt_id)
+            .unwrap();
+        store
+            .prepare(store.version().unwrap(), [50; 32], pending.peer_fingerprint)
+            .unwrap();
+
+        let staged = store
+            .prepare(store.version().unwrap(), [51; 32], [52; 32])
+            .unwrap();
+        let expected = store.version().unwrap();
+        store
+            .store
+            .stage_sealed_admission(expected, &staged, &awaiting_receipt(&staged, expected))
+            .unwrap();
+        store
+            .revoke_candidate(store.version().unwrap(), staged.peer_fingerprint)
+            .unwrap();
+        store
+            .prepare(store.version().unwrap(), [53; 32], staged.peer_fingerprint)
+            .unwrap();
+    }
+
+    #[test]
+    fn stale_cancelled_guard_cannot_revoke_newer_promoted_peer() {
+        let root = tempfile::tempdir().unwrap();
+        let store = AdmissionAuthorityStore::open(root.path()).unwrap();
+        let first = store
+            .prepare(store.version().unwrap(), [54; 32], [55; 32])
+            .unwrap();
+        let mut stale = store
+            .store
+            .admission_revoker(first.peer_fingerprint, first.attempt_id)
+            .unwrap();
+        stale.arm();
+        store
+            .cancel(store.version().unwrap(), first.attempt_id)
+            .unwrap();
+
+        let replacement = store
+            .prepare(store.version().unwrap(), [56; 32], first.peer_fingerprint)
+            .unwrap();
+        store
+            .commit_metadata(
+                store.version().unwrap(),
+                replacement.revocation_generation,
+                &replacement,
+                evidence(&replacement),
+            )
+            .unwrap();
+        stale.revoke().unwrap();
+
+        assert_eq!(
+            store.reconcile(replacement.attempt_id).unwrap(),
+            ReconcileAdmission::Promoted
+        );
+    }
+
+    #[test]
+    fn identity_rotation_releases_pending_peer_reservation() {
+        let root = tempfile::tempdir().unwrap();
+        let store = AdmissionAuthorityStore::open(root.path()).unwrap();
+        let pending = store
+            .prepare(store.version().unwrap(), [57; 32], [58; 32])
+            .unwrap();
+        store
+            .store
+            .rotate_identity(store.version().unwrap())
+            .unwrap();
+        store
+            .prepare(store.version().unwrap(), [59; 32], pending.peer_fingerprint)
+            .unwrap();
     }
 
     #[test]
@@ -679,6 +883,102 @@ mod tests {
                 "{field}"
             );
         }
+    }
+
+    #[test]
+    fn ownership_schema_is_required_ordered_unique_and_store_owned_for_pins() {
+        let root = tempfile::tempdir().unwrap();
+        let store = AdmissionAuthorityStore::open(root.path()).unwrap();
+        let first = store
+            .prepare(store.version().unwrap(), [101; 32], [102; 32])
+            .unwrap();
+        store
+            .commit_metadata(store.version().unwrap(), 0, &first, evidence(&first))
+            .unwrap();
+        let ledger_path = root.path().join("pairing-tombstones/ledger.json");
+        let valid = std::fs::read(&ledger_path).unwrap();
+
+        let mutations: [fn(&mut serde_json::Value); 5] = [
+            |ledger: &mut serde_json::Value| {
+                ledger["schema"] = serde_json::json!(1);
+            },
+            |ledger: &mut serde_json::Value| {
+                ledger["admission_receipts"][0]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("ownership");
+            },
+            |ledger: &mut serde_json::Value| {
+                ledger["admission_receipts"][0]["ownership"]["guard_token"] =
+                    serde_json::to_value([0u8; 32]).unwrap();
+            },
+            |ledger: &mut serde_json::Value| {
+                let revision = ledger["admission_receipts"][0]["revision"]
+                    .as_u64()
+                    .unwrap();
+                ledger["admission_receipts"][0]["ownership"]["staged_revision"] =
+                    serde_json::json!(revision);
+            },
+            |ledger: &mut serde_json::Value| {
+                ledger["admission_receipts"][0]["ownership"]["state"] =
+                    serde_json::json!("awaiting_handoff");
+                ledger["admission_receipts"][0]["ownership"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("handoff_revision");
+            },
+        ];
+        for mutate in mutations {
+            let mut ledger: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&ledger_path).unwrap()).unwrap();
+            mutate(&mut ledger);
+            std::fs::write(&ledger_path, serde_json::to_vec(&ledger).unwrap()).unwrap();
+            assert!(AdmissionAuthorityStore::open(root.path()).is_err());
+            std::fs::write(&ledger_path, &valid).unwrap();
+        }
+    }
+
+    #[test]
+    fn pending_ledger_without_peer_reservation_fails_closed_on_reopen() {
+        let root = tempfile::tempdir().unwrap();
+        let store = AdmissionAuthorityStore::open(root.path()).unwrap();
+        store
+            .prepare(store.version().unwrap(), [107; 32], [108; 32])
+            .unwrap();
+        let ledger_path = root.path().join("pairing-tombstones/ledger.json");
+        let mut ledger: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&ledger_path).unwrap()).unwrap();
+        ledger
+            .as_object_mut()
+            .unwrap()
+            .remove("admission_reservations");
+        std::fs::write(&ledger_path, serde_json::to_vec(&ledger).unwrap()).unwrap();
+        assert!(AdmissionAuthorityStore::open(root.path()).is_err());
+    }
+
+    #[test]
+    fn repeated_admission_guard_tokens_fail_closed_on_reopen() {
+        let root = tempfile::tempdir().unwrap();
+        let store = AdmissionAuthorityStore::open(root.path()).unwrap();
+        let first = store
+            .prepare(store.version().unwrap(), [111; 32], [112; 32])
+            .unwrap();
+        store
+            .commit_metadata(store.version().unwrap(), 0, &first, evidence(&first))
+            .unwrap();
+        let second = store
+            .prepare(store.version().unwrap(), [113; 32], [114; 32])
+            .unwrap();
+        store
+            .commit_metadata(store.version().unwrap(), 0, &second, evidence(&second))
+            .unwrap();
+        let ledger_path = root.path().join("pairing-tombstones/ledger.json");
+        let mut ledger: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&ledger_path).unwrap()).unwrap();
+        let token = ledger["admission_receipts"][0]["ownership"]["guard_token"].clone();
+        ledger["admission_receipts"][1]["ownership"]["guard_token"] = token;
+        std::fs::write(&ledger_path, serde_json::to_vec(&ledger).unwrap()).unwrap();
+        assert!(AdmissionAuthorityStore::open(root.path()).is_err());
     }
 
     #[test]

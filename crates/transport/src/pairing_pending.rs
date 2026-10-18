@@ -43,6 +43,58 @@ pub struct PendingRecord {
 
 #[cfg(feature = "pairing-v2-experimental")]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
+pub(crate) enum AdmissionOwnership {
+    /// The receipt is staged, but its provisional endpoint still owns the
+    /// revocation guard. It is never operationally eligible.
+    AwaitingHandoff {
+        guard_token: [u8; 32],
+        staged_revision: u64,
+    },
+    /// The durable store owns the exact guard after a reviewed handoff.
+    StoreOwned {
+        guard_token: [u8; 32],
+        staged_revision: u64,
+        handoff_revision: u64,
+    },
+}
+
+#[cfg(feature = "pairing-v2-experimental")]
+impl AdmissionOwnership {
+    fn guard_token(&self) -> [u8; 32] {
+        match self {
+            Self::AwaitingHandoff { guard_token, .. } | Self::StoreOwned { guard_token, .. } => {
+                *guard_token
+            }
+        }
+    }
+
+    fn is_store_owned(&self) -> bool {
+        matches!(self, Self::StoreOwned { .. })
+    }
+
+    fn is_well_formed_for(&self, receipt_revision: u64) -> bool {
+        match self {
+            Self::AwaitingHandoff {
+                guard_token,
+                staged_revision,
+            } => *guard_token != [0; 32] && *staged_revision == receipt_revision,
+            Self::StoreOwned {
+                guard_token,
+                staged_revision,
+                handoff_revision,
+            } => {
+                *guard_token != [0; 32]
+                    && *staged_revision > 0
+                    && *staged_revision < *handoff_revision
+                    && *handoff_revision == receipt_revision
+            }
+        }
+    }
+}
+
+#[cfg(feature = "pairing-v2-experimental")]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct AdmissionReceiptRecord {
     pub attempt: [u8; 32],
@@ -58,6 +110,9 @@ pub(crate) struct AdmissionReceiptRecord {
     pub identity_generation: u64,
     pub revocation_generation: u64,
     pub policy_revision: u64,
+    /// No default is intentional: an old receipt can never silently become a
+    /// durable admission after this ownership boundary was introduced.
+    pub ownership: AdmissionOwnership,
 }
 
 /// Immutable read of a currently active durable admission.  This is a
@@ -163,6 +218,34 @@ pub(crate) struct AdmissionGuardObservation([u8; 32]);
 
 #[cfg(feature = "pairing-v2-experimental")]
 impl AdmissionRevoker {
+    #[allow(dead_code)] // Consumed by the staged durable handoff in Task 3.
+    pub(crate) fn matches_handoff_token(&self, token: [u8; 32]) -> bool {
+        self.armed
+            && !self.owns_revocation
+            && self.token == token
+            && token != [0; 32]
+            && revocation_guard_phases().get(&token) == Some(&AdmissionGuardPhase::Active)
+    }
+
+    pub(crate) fn handoff_token(&self) -> [u8; 32] {
+        self.token
+    }
+
+    /// The final manifest publication has made this exact guard store-owned.
+    /// Disarm before best-effort sidecar cleanup: a cleanup failure must be
+    /// reconciled from durable metadata, never turned into a later revocation
+    /// by this destructor.
+    pub(crate) fn release_to_store(&mut self) -> Result<(), StoreError> {
+        if !self.matches_handoff_token(self.token) {
+            return Err(StoreError::Invalid);
+        }
+        self.armed = false;
+        self.owns_revocation = false;
+        revocation_guard_phases().remove(&self.token);
+        self.store
+            .clear_admission_guard_exact(self.attempt, self.token)
+    }
+
     pub(crate) fn arm(&mut self) {
         revocation_guard_phases().insert(self.token, AdmissionGuardPhase::Active);
         self.armed = true;
@@ -196,8 +279,10 @@ impl AdmissionRevoker {
         }
         // Ownership survives after the registry mutex is released. Durable I/O
         // therefore runs lock-free with respect to the in-memory phase machine.
-        self.store.revoke_current(self.peer)?;
-        self.store.clear_admission_guard(self.attempt)?;
+        self.store
+            .revoke_current(self.peer, self.attempt, self.token)?;
+        self.store
+            .clear_admission_guard_exact(self.attempt, self.token)?;
         revocation_guard_phases().remove(&self.token);
         self.armed = false;
         self.owns_revocation = false;
@@ -221,7 +306,9 @@ impl Drop for AdmissionRevoker {
             }
             self.release_for_retry();
         } else {
-            let _ = self.store.clear_admission_guard(self.attempt);
+            let _ = self
+                .store
+                .clear_admission_guard_exact(self.attempt, self.token);
         }
     }
 }
@@ -295,6 +382,17 @@ mod unix {
         revocation_generation: u64,
     }
 
+    /// One durable reservation per peer while an admission is pending or
+    /// awaiting the live-to-store handoff.  StoreOwned admissions use their
+    /// active pin as the durable reservation instead.
+    #[cfg(feature = "pairing-v2-experimental")]
+    #[derive(Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct AdmissionReservation {
+        peer: [u8; 32],
+        attempt: [u8; 32],
+    }
+
     #[derive(Serialize, Deserialize)]
     #[serde(deny_unknown_fields)]
     struct Ledger {
@@ -306,6 +404,9 @@ mod unix {
         #[cfg(feature = "pairing-v2-experimental")]
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         active_pins: Vec<ActivePin>,
+        #[cfg(feature = "pairing-v2-experimental")]
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        admission_reservations: Vec<AdmissionReservation>,
         #[cfg(feature = "pairing-v2-experimental")]
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         consumed_attempts: Vec<[u8; 32]>,
@@ -347,7 +448,7 @@ mod unix {
     impl Ledger {
         fn new() -> Self {
             Self {
-                schema: 1,
+                schema: 2,
                 version: StoreVersion {
                     revision: 0,
                     identity_generation: 0,
@@ -357,6 +458,8 @@ mod unix {
                 revocations: vec![],
                 #[cfg(feature = "pairing-v2-experimental")]
                 active_pins: vec![],
+                #[cfg(feature = "pairing-v2-experimental")]
+                admission_reservations: vec![],
                 #[cfg(feature = "pairing-v2-experimental")]
                 consumed_attempts: vec![],
                 #[cfg(feature = "pairing-v2-experimental")]
@@ -373,13 +476,62 @@ mod unix {
             #[cfg(feature = "pairing-v2-experimental")]
             {
                 if self.active_pins.len() > MAX_HISTORY
+                    || self.admission_reservations.len() > MAX_PENDING
                     || self.consumed_attempts.len() > MAX_HISTORY
                     || self.admission_receipts.len() > MAX_HISTORY
                 {
                     return Err(StoreError::Invalid);
                 }
                 let pins: BTreeSet<_> = self.active_pins.iter().map(|p| p.peer).collect();
+                let reserved_peers: BTreeSet<_> = self
+                    .admission_reservations
+                    .iter()
+                    .map(|reservation| reservation.peer)
+                    .collect();
+                let reserved_attempts: BTreeSet<_> = self
+                    .admission_reservations
+                    .iter()
+                    .map(|reservation| reservation.attempt)
+                    .collect();
                 if pins.len() != self.active_pins.len()
+                    || reserved_peers.len() != self.admission_reservations.len()
+                    || reserved_attempts.len() != self.admission_reservations.len()
+                    || self.admission_reservations.iter().any(|reservation| {
+                        reservation.peer == [0; 32]
+                            || reservation.attempt == [0; 32]
+                            || !self.pending.iter().any(|pending| {
+                                pending.record.attempt_id == reservation.attempt
+                                    && pending.record.peer_fingerprint == reservation.peer
+                            }) && !self.admission_receipts.iter().any(|receipt| {
+                                receipt.attempt == reservation.attempt
+                                    && receipt.peer == reservation.peer
+                                    && matches!(
+                                        receipt.ownership,
+                                        AdmissionOwnership::AwaitingHandoff { .. }
+                                    )
+                                    && receipt.identity_generation
+                                        == self.version.identity_generation
+                                    && receipt.revocation_generation
+                                        == self.revocation(receipt.peer)
+                            })
+                    })
+                    || self.pending.iter().any(|pending| {
+                        !self.admission_reservations.iter().any(|reservation| {
+                            reservation.attempt == pending.record.attempt_id
+                                && reservation.peer == pending.record.peer_fingerprint
+                        })
+                    })
+                    || self.admission_receipts.iter().any(|receipt| {
+                        matches!(
+                            receipt.ownership,
+                            AdmissionOwnership::AwaitingHandoff { .. }
+                        ) && receipt.identity_generation == self.version.identity_generation
+                            && receipt.revocation_generation == self.revocation(receipt.peer)
+                            && !self.admission_reservations.iter().any(|reservation| {
+                                reservation.attempt == receipt.attempt
+                                    && reservation.peer == receipt.peer
+                            })
+                    })
                     || self.active_pins.iter().any(|p| {
                         p.peer == [0; 32]
                             || p.pin == [0; 32]
@@ -405,8 +557,14 @@ mod unix {
                     .iter()
                     .map(|receipt| receipt.revision)
                     .collect();
+                let receipt_guard_tokens: BTreeSet<_> = self
+                    .admission_receipts
+                    .iter()
+                    .map(|receipt| receipt.ownership.guard_token())
+                    .collect();
                 if receipts.len() != self.admission_receipts.len()
                     || receipt_revisions.len() != self.admission_receipts.len()
+                    || receipt_guard_tokens.len() != self.admission_receipts.len()
                     || receipts != consumed
                     || self.admission_receipts.iter().any(|receipt| {
                         receipt.peer == [0; 32]
@@ -420,6 +578,7 @@ mod unix {
                                 != crate::pairing_v2::admission_authority::PROTOCOL_VERSION
                             || receipt.revision == 0
                             || receipt.revision > self.version.revision
+                            || !receipt.ownership.is_well_formed_for(receipt.revision)
                             || receipt.identity_generation > self.version.identity_generation
                             || receipt.policy_revision
                                 != crate::pairing_v2::admission_authority::POLICY_REVISION
@@ -432,6 +591,7 @@ mod unix {
                                 && receipt.peer_pin == pin.pin
                                 && receipt.identity_generation == pin.identity_generation
                                 && receipt.revocation_generation == pin.revocation_generation
+                                && receipt.ownership.is_store_owned()
                         })
                     })
                     || self
@@ -476,7 +636,7 @@ mod unix {
                     };
                 }
             }
-            if self.schema != 1
+            if self.schema != 2
                 || self.pending.len() > MAX_PENDING
                 || self.tombstones.len() > MAX_HISTORY
                 || self.revocations.len() > MAX_HISTORY
@@ -577,6 +737,7 @@ mod unix {
             let active = receipt.identity_generation == ledger.version.identity_generation
                 && receipt.revocation_generation == ledger.revocation(receipt.peer)
                 && receipt.policy_revision == ledger.policy_revision
+                && receipt.ownership.is_store_owned()
                 && ledger.active_pins.iter().any(|pin| {
                     pin.peer == receipt.peer
                         && pin.pin == receipt.peer_pin
@@ -688,8 +849,24 @@ mod unix {
         }
 
         #[cfg(feature = "pairing-v2-experimental")]
-        pub(crate) fn clear_admission_guard(&self, attempt: [u8; 32]) -> Result<(), StoreError> {
+        pub(crate) fn clear_admission_guard_exact(
+            &self,
+            attempt: [u8; 32],
+            token: [u8; 32],
+        ) -> Result<(), StoreError> {
+            if token == [0; 32] {
+                return Err(StoreError::Invalid);
+            }
+            let _lock = self.ledger_dir.lock()?;
             let file = admission_guard_filename(attempt);
+            let Some(bytes) = self.ledger_dir.read(&file, RECORD_LIMIT)? else {
+                return Ok(());
+            };
+            let guard: AdmissionRevocationGuard =
+                serde_json::from_slice(&bytes).map_err(|_| StoreError::Invalid)?;
+            if guard.attempt != attempt || guard.token != token {
+                return Err(StoreError::Invalid);
+            }
             #[cfg(all(test, feature = "pairing-v2-experimental"))]
             crate::private_fs::faults::point(&file, "before_remove")?;
             self.ledger_dir.remove(&file)?;
@@ -729,6 +906,36 @@ mod unix {
                     }
                 }
             }
+            // After a process restart there is no in-memory phase entry.  The
+            // ledger therefore makes the sole durable ownership decision: an
+            // exact StoreOwned record only needs stale-sidecar cleanup; every
+            // other state remains conservative and is revoked below.
+            let store_owns_guard = {
+                let _lock = self.ledger_dir.lock()?;
+                let ledger = self.load_validated_manifest()?;
+                ledger.admission_receipts.iter().any(|receipt| {
+                    receipt.attempt == guard.attempt
+                        && receipt.peer == guard.peer
+                        && matches!(
+                            receipt.ownership,
+                            AdmissionOwnership::StoreOwned { guard_token, .. }
+                                if guard_token == guard.token
+                        )
+                        && receipt.identity_generation == ledger.version.identity_generation
+                        && receipt.revocation_generation == ledger.revocation(receipt.peer)
+                        && ledger.active_pins.iter().any(|pin| {
+                            pin.peer == receipt.peer
+                                && pin.pin == receipt.peer_pin
+                                && pin.identity_generation == receipt.identity_generation
+                                && pin.revocation_generation == receipt.revocation_generation
+                        })
+                })
+            };
+            if store_owns_guard {
+                self.clear_admission_guard_exact(attempt, guard.token)?;
+                revocation_guard_phases().remove(&guard.token);
+                return Ok(None);
+            }
             let mut revoker = AdmissionRevoker {
                 store: PendingStore {
                     pending_dir: self.pending_dir.try_clone()?,
@@ -753,18 +960,52 @@ mod unix {
         }
 
         #[cfg(feature = "pairing-v2-experimental")]
-        pub(super) fn revoke_current(&self, peer: [u8; 32]) -> Result<(), StoreError> {
+        pub(super) fn revoke_current(
+            &self,
+            peer: [u8; 32],
+            attempt: [u8; 32],
+            token: [u8; 32],
+        ) -> Result<(), StoreError> {
             #[cfg(all(test, feature = "pairing-v2-experimental"))]
             crate::private_fs::faults::point("ledger.json", "before_revoke_lock")?;
             let _lock = self.ledger_dir.lock()?;
             #[cfg(all(test, feature = "pairing-v2-experimental"))]
             crate::private_fs::faults::point("ledger.json", "before_revoke_load")?;
             let mut ledger = self.load_validated_manifest()?;
-            let expected = ledger.version;
-            ledger.advance(expected)?;
-            if peer == [0; 32] {
+            if peer == [0; 32] || attempt == [0; 32] || token == [0; 32] {
                 return Err(StoreError::Invalid);
             }
+            // A delayed endpoint may still hold an old guard after its attempt
+            // was cancelled and another attempt for this peer completed. Only
+            // the exact current reservation (or staged receipt with the same
+            // guard token) can revoke peer-scoped metadata. Everything else is
+            // stale and is limited to exact sidecar cleanup by the caller.
+            let owns_pending = ledger.pending.iter().any(|entry| {
+                entry.record.attempt_id == attempt
+                    && entry.record.peer_fingerprint == peer
+                    && ledger.admission_reservations.iter().any(|reservation| {
+                        reservation.attempt == attempt && reservation.peer == peer
+                    })
+            });
+            let owns_staged = ledger.admission_receipts.iter().any(|receipt| {
+                receipt.attempt == attempt
+                    && receipt.peer == peer
+                    && receipt.identity_generation == ledger.version.identity_generation
+                    && receipt.revocation_generation == ledger.revocation(peer)
+                    && matches!(
+                        receipt.ownership,
+                        AdmissionOwnership::AwaitingHandoff { guard_token, .. }
+                            if guard_token == token
+                    )
+                    && ledger.admission_reservations.iter().any(|reservation| {
+                        reservation.attempt == attempt && reservation.peer == peer
+                    })
+            });
+            if !owns_pending && !owns_staged {
+                return Ok(());
+            }
+            let expected = ledger.version;
+            ledger.advance(expected)?;
             if let Some(revocation) = ledger.revocations.iter_mut().find(|r| r.peer == peer) {
                 revocation.generation = revocation
                     .generation
@@ -777,6 +1018,9 @@ mod unix {
                 });
             }
             ledger.active_pins.retain(|pin| pin.peer != peer);
+            ledger
+                .admission_reservations
+                .retain(|reservation| reservation.peer != peer);
             let removed: Vec<_> = ledger
                 .pending
                 .iter()
@@ -1063,6 +1307,22 @@ mod unix {
             if ledger.consumed_attempts.contains(&attempt) {
                 return Err(StoreError::ConsumedAttempt);
             }
+            // A current StoreOwned pin represents the one admitted durable
+            // relationship for this peer.  Reject a retry before it can create
+            // pending metadata or a live revocation guard: later cancellation
+            // is peer-scoped and must never revoke that existing relationship.
+            #[cfg(feature = "pairing-v2-experimental")]
+            if ledger.active_pins.iter().any(|pin| pin.peer == peer) {
+                return Err(StoreError::Conflict);
+            }
+            #[cfg(feature = "pairing-v2-experimental")]
+            if ledger
+                .admission_reservations
+                .iter()
+                .any(|reservation| reservation.peer == peer)
+            {
+                return Err(StoreError::Conflict);
+            }
             if ledger
                 .pending
                 .iter()
@@ -1083,6 +1343,10 @@ mod unix {
             let digest = Sha256::digest(&bytes).into();
             // An interrupted prepare may leave an orphan file. Only the locked ledger can reference it.
             self.pending_dir.replace(&filename(attempt), &bytes)?;
+            #[cfg(feature = "pairing-v2-experimental")]
+            ledger
+                .admission_reservations
+                .push(AdmissionReservation { peer, attempt });
             ledger.pending.push(Reference {
                 record: record.clone(),
                 digest,
@@ -1116,6 +1380,10 @@ mod unix {
                 return Err(StoreError::Invalid);
             }
             ledger.pending.retain(|r| r.record.attempt_id != attempt);
+            #[cfg(feature = "pairing-v2-experimental")]
+            ledger
+                .admission_reservations
+                .retain(|reservation| reservation.attempt != attempt);
             #[cfg(feature = "pairing-v2-experimental")]
             let old_journals: Vec<_> = ledger
                 .journals
@@ -1158,6 +1426,10 @@ mod unix {
             }
             #[cfg(feature = "pairing-v2-experimental")]
             ledger.active_pins.retain(|pin| pin.peer != peer);
+            #[cfg(feature = "pairing-v2-experimental")]
+            ledger
+                .admission_reservations
+                .retain(|reservation| reservation.peer != peer);
             let removed: Vec<_> = ledger
                 .pending
                 .iter()
@@ -1239,11 +1511,18 @@ mod unix {
             {
                 return Err(StoreError::Invalid);
             }
-            if let Some(pin) = ledger
+            if !ledger.admission_reservations.iter().any(|reservation| {
+                reservation.attempt == receipt.attempt && reservation.peer == receipt.peer
+            }) {
+                return Err(StoreError::Invalid);
+            }
+            // A pin is bound to exactly one durable admission receipt.  A
+            // later attempt for that peer must never inherit the first
+            // receipt's pin, even when it presents the same value.
+            if ledger
                 .active_pins
                 .iter()
-                .find(|pin| pin.peer == receipt.peer)
-                && pin.pin != receipt.peer_pin
+                .any(|pin| pin.peer == receipt.peer)
             {
                 return Err(StoreError::Conflict);
             }
@@ -1288,6 +1567,9 @@ mod unix {
             ledger
                 .journals
                 .retain(|entry| entry.attempt != receipt.attempt);
+            ledger
+                .admission_reservations
+                .retain(|reservation| reservation.attempt != receipt.attempt);
             ledger.consumed_attempts.push(receipt.attempt);
             ledger.admission_receipts.push(receipt.clone());
             // Final protocol check immediately precedes the single publication
@@ -1299,6 +1581,173 @@ mod unix {
                 self.pending_dir.remove(&file)?;
             }
             Ok(receipt.clone())
+        }
+
+        /// First publication of a live admission finalization.  A staged
+        /// receipt consumes the pending attempt but is explicitly ineligible:
+        /// its provisional endpoint still owns the exact revocation guard.
+        #[cfg(feature = "pairing-v2-experimental")]
+        pub(crate) fn stage_sealed_admission(
+            &self,
+            expected: StoreVersion,
+            record: &PendingRecord,
+            receipt: &AdmissionReceiptRecord,
+        ) -> Result<AdmissionReceiptRecord, StoreError> {
+            let _lock = self.ledger_dir.lock()?;
+            let mut ledger = self.load_validated_manifest()?;
+            let expected_revision = expected.revision.checked_add(1).ok_or(StoreError::Limit)?;
+            if ledger.version != expected
+                || record.version.identity_generation != expected.identity_generation
+                || ledger.policy_revision != receipt.policy_revision
+                || ledger.revocation(record.peer_fingerprint) != receipt.revocation_generation
+                || record.revocation_generation != receipt.revocation_generation
+                || receipt.attempt != record.attempt_id
+                || receipt.peer != record.peer_fingerprint
+                || receipt.revision != expected_revision
+                || receipt.identity_generation != expected.identity_generation
+                || !matches!(
+                    receipt.ownership,
+                    AdmissionOwnership::AwaitingHandoff { .. }
+                )
+            {
+                return Err(StoreError::Conflict);
+            }
+            let pending = ledger
+                .pending
+                .iter()
+                .find(|entry| entry.record.attempt_id == record.attempt_id)
+                .ok_or_else(|| {
+                    if ledger.consumed_attempts.contains(&record.attempt_id) {
+                        StoreError::ConsumedAttempt
+                    } else {
+                        StoreError::Invalid
+                    }
+                })?;
+            if pending.record != *record
+                || ledger.consumed_attempts.contains(&receipt.attempt)
+                || ledger
+                    .admission_receipts
+                    .iter()
+                    .any(|stored| stored.attempt == receipt.attempt)
+                || ledger.tombstones.contains(&receipt.attempt)
+                || ledger.consumed_attempts.len() >= MAX_HISTORY
+                || ledger.admission_receipts.len() >= MAX_HISTORY
+            {
+                return Err(StoreError::ConsumedAttempt);
+            }
+            if !ledger.admission_reservations.iter().any(|reservation| {
+                reservation.attempt == receipt.attempt && reservation.peer == receipt.peer
+            }) {
+                return Err(StoreError::Invalid);
+            }
+            let old_journals: Vec<_> = ledger
+                .journals
+                .iter()
+                .filter(|entry| entry.attempt == receipt.attempt)
+                .map(journal_filename)
+                .collect();
+            ledger.advance(expected)?;
+            ledger
+                .pending
+                .retain(|entry| entry.record.attempt_id != receipt.attempt);
+            ledger
+                .journals
+                .retain(|entry| entry.attempt != receipt.attempt);
+            ledger.consumed_attempts.push(receipt.attempt);
+            ledger.admission_receipts.push(receipt.clone());
+            self.save(&ledger)?;
+            self.pending_dir.remove(&filename(receipt.attempt))?;
+            for file in old_journals {
+                self.pending_dir.remove(&file)?;
+            }
+            Ok(receipt.clone())
+        }
+
+        /// Second publication of live admission finalization.  Only an exact
+        /// staged receipt may become `StoreOwned`, and the active pin appears
+        /// in the same locked manifest publication as that ownership election.
+        #[cfg(feature = "pairing-v2-experimental")]
+        pub(crate) fn finalize_staged_admission(
+            &self,
+            expected: StoreVersion,
+            attempt: [u8; 32],
+            handoff: crate::pairing_v2::provisional_tls::FrozenAdmissionHandoff,
+        ) -> Result<(AdmissionReceiptRecord, AdmissionRevoker), StoreError> {
+            let _lock = self.ledger_dir.lock()?;
+            let mut ledger = self.load_validated_manifest()?;
+            let final_revision = expected.revision.checked_add(1).ok_or(StoreError::Limit)?;
+            let ownership = handoff.store_owned_ownership(expected.revision, final_revision);
+            let receipt_index = ledger
+                .admission_receipts
+                .iter()
+                .position(|stored| stored.attempt == attempt)
+                .ok_or(StoreError::Invalid)?;
+            let receipt = &ledger.admission_receipts[receipt_index];
+            let current_revocation = ledger.revocation(receipt.peer);
+            let matches_stage = matches!(
+                (&receipt.ownership, &ownership),
+                (
+                    AdmissionOwnership::AwaitingHandoff {
+                        guard_token: staged_token,
+                        staged_revision,
+                    },
+                    AdmissionOwnership::StoreOwned {
+                        guard_token: final_token,
+                        staged_revision: final_staged_revision,
+                        handoff_revision,
+                    },
+                ) if *staged_token == *final_token
+                    && *staged_revision == expected.revision
+                    && *final_staged_revision == expected.revision
+                    && *handoff_revision == final_revision
+            );
+            if ledger.version != expected
+                || !matches_stage
+                || receipt.revision != expected.revision
+                || receipt.identity_generation != expected.identity_generation
+                || receipt.revocation_generation != current_revocation
+                || receipt.policy_revision != ledger.policy_revision
+                || ledger
+                    .active_pins
+                    .iter()
+                    .any(|pin| pin.peer == receipt.peer)
+            {
+                return Err(StoreError::Conflict);
+            }
+            if ledger.active_pins.len() >= MAX_HISTORY {
+                return Err(StoreError::Limit);
+            }
+            if !ledger.admission_reservations.iter().any(|reservation| {
+                reservation.attempt == attempt && reservation.peer == receipt.peer
+            }) {
+                return Err(StoreError::Invalid);
+            }
+            // The file lock is held across this short ownership election, but
+            // `claim` releases the consent mutex before any filesystem I/O.
+            // Thus endpoint drop and final publication have one ordered owner
+            // without ever holding a mutex across a save.
+            let revoker = handoff.claim().map_err(|_| StoreError::Invalid)?;
+            let peer = receipt.peer;
+            let peer_pin = receipt.peer_pin;
+            let identity_generation = receipt.identity_generation;
+            let revocation_generation = receipt.revocation_generation;
+            ledger.advance(expected)?;
+            ledger.admission_receipts[receipt_index].revision = final_revision;
+            ledger.admission_receipts[receipt_index].ownership = ownership;
+            ledger
+                .admission_reservations
+                .retain(|reservation| reservation.attempt != attempt);
+            if !ledger.active_pins.iter().any(|pin| pin.peer == peer) {
+                ledger.active_pins.push(ActivePin {
+                    peer,
+                    pin: peer_pin,
+                    identity_generation,
+                    revocation_generation,
+                });
+            }
+            let finalized = ledger.admission_receipts[receipt_index].clone();
+            self.save(&ledger)?;
+            Ok((finalized, revoker))
         }
 
         #[cfg(feature = "pairing-v2-experimental")]
@@ -1317,6 +1766,7 @@ mod unix {
             let active = receipt.as_ref().is_some_and(|receipt| {
                 receipt.identity_generation == ledger.version.identity_generation
                     && receipt.revocation_generation == ledger.revocation(receipt.peer)
+                    && receipt.ownership.is_store_owned()
                     && ledger.active_pins.iter().any(|pin| {
                         pin.peer == receipt.peer
                             && pin.pin == receipt.peer_pin
@@ -1346,6 +1796,8 @@ mod unix {
                 .ok_or(StoreError::Limit)?;
             #[cfg(feature = "pairing-v2-experimental")]
             ledger.active_pins.clear();
+            #[cfg(feature = "pairing-v2-experimental")]
+            ledger.admission_reservations.clear();
             let removed: Vec<_> = ledger.pending.iter().map(|r| r.record.attempt_id).collect();
             ledger.tombstones.extend(&removed);
             ledger.pending.clear();

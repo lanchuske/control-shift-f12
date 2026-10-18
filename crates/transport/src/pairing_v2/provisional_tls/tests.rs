@@ -95,7 +95,7 @@ async fn one_local_sas_approval_never_commits_a_relationship() {
 }
 
 #[tokio::test]
-async fn current_foundation_revokes_committed_metadata_on_listener_shutdown() {
+async fn current_foundation_preserves_store_owned_metadata_on_listener_shutdown() {
     let (ea, _eb, a, b, _) = pair().await;
     let ta = tempfile::tempdir().unwrap();
     let tb = tempfile::tempdir().unwrap();
@@ -125,14 +125,93 @@ async fn current_foundation_revokes_committed_metadata_on_listener_shutdown() {
         crate::pairing_v2::admission_authority::ReconcileAdmission::Promoted
     );
     drop(ea);
-    // This is the current reviewed foundation boundary, not product success.
-    // Task 3 requires an independently reviewed, crash-safe handoff of durable
-    // ownership before normal listener cleanup can preserve a relationship.
+    // This remains durable metadata only.  The handoff has transferred just
+    // the revocation guard, so listener cleanup must not revoke it.
     assert_eq!(
         store.reconcile(receipt.attempt()).unwrap(),
-        crate::pairing_v2::admission_authority::ReconcileAdmission::Revoked
+        crate::pairing_v2::admission_authority::ReconcileAdmission::Promoted
     );
 }
+
+#[tokio::test]
+async fn duplicate_live_attempt_cannot_revoke_existing_promoted_peer() {
+    let (a_identity, a_key) = identity(true);
+    let a_retry_key = a_key.clone_key();
+    let (b_identity, b_key) = identity(true);
+    let b_retry_key = b_key.clone_key();
+    let ea = ProvisionalEndpoint::bind("127.0.0.1:0".parse().unwrap(), a_identity.clone(), a_key)
+        .unwrap();
+    let eb = ProvisionalEndpoint::bind("127.0.0.1:0".parse().unwrap(), b_identity.clone(), b_key)
+        .unwrap();
+    let (first_a, first_b) = tokio::join!(ea.connect(eb.local_addr().unwrap()), eb.accept());
+    let ta = tempfile::tempdir().unwrap();
+    let tb = tempfile::tempdir().unwrap();
+    let sa = crate::pairing_pending::PendingStore::open(ta.path()).unwrap();
+    let sb = crate::pairing_pending::PendingStore::open(tb.path()).unwrap();
+    let (first_a, first_b) = tokio::join!(
+        first_a.unwrap().handshake(
+            handshake_config(1, 2),
+            &sa,
+            |p| async move { p.decision(true) }
+        ),
+        first_b.unwrap().handshake(
+            handshake_config(2, 1),
+            &sb,
+            |p| async move { p.decision(true) }
+        )
+    );
+    let _first_b = first_b.unwrap();
+    let store =
+        crate::pairing_v2::admission_authority::AdmissionAuthorityStore::open(ta.path()).unwrap();
+    let receipt = store
+        .commit_sealed_foundation(store.version().unwrap(), first_a.unwrap())
+        .await
+        .unwrap();
+    assert_eq!(
+        store.reconcile(receipt.attempt()).unwrap(),
+        crate::pairing_v2::admission_authority::ReconcileAdmission::Promoted
+    );
+
+    drop(ea);
+    drop(eb);
+    let retry_a =
+        ProvisionalEndpoint::bind("127.0.0.1:0".parse().unwrap(), a_identity, a_retry_key).unwrap();
+    let retry_b =
+        ProvisionalEndpoint::bind("127.0.0.1:0".parse().unwrap(), b_identity, b_retry_key).unwrap();
+    let (second_a, second_b) = tokio::join!(
+        retry_a.connect(retry_b.local_addr().unwrap()),
+        retry_b.accept()
+    );
+    let (second_a, second_b) = tokio::join!(
+        second_a.unwrap().handshake(
+            handshake_config(3, 4),
+            &sa,
+            |p| async move { p.decision(true) }
+        ),
+        second_b.unwrap().handshake(
+            handshake_config(4, 3),
+            &sb,
+            |p| async move { p.decision(true) }
+        )
+    );
+    assert!(
+        second_a.is_err(),
+        "duplicate attempt must be rejected before handoff"
+    );
+    assert!(
+        second_b.is_err(),
+        "duplicate attempt must be rejected before handoff"
+    );
+    drop(retry_a);
+    drop(retry_b);
+
+    assert_eq!(
+        store.reconcile(receipt.attempt()).unwrap(),
+        crate::pairing_v2::admission_authority::ReconcileAdmission::Promoted,
+        "a duplicate live attempt must not revoke an already promoted peer"
+    );
+}
+
 #[tokio::test]
 async fn bilateral_rejects_substituted_tls_connection_before_candidate_io() {
     let (_ea, _eb, mut a, _b, _) = pair().await;
@@ -290,6 +369,49 @@ async fn bilateral_pending_authority_seals_into_live_move_only_evidence() {
 }
 
 #[tokio::test]
+async fn frozen_handoff_transfers_only_the_revocation_guard_not_transport_authority() {
+    let (ea, _eb, a, b, _) = pair().await;
+    let ta = tempfile::tempdir().unwrap();
+    let tb = tempfile::tempdir().unwrap();
+    let sa = crate::pairing_pending::PendingStore::open(ta.path()).unwrap();
+    let sb = crate::pairing_pending::PendingStore::open(tb.path()).unwrap();
+    let (a, b) = tokio::join!(
+        a.handshake(
+            handshake_config(1, 2),
+            &sa,
+            |p| async move { p.decision(true) }
+        ),
+        b.handshake(
+            handshake_config(2, 1),
+            &sb,
+            |p| async move { p.decision(true) }
+        )
+    );
+    let frozen = a
+        .unwrap()
+        .seal_for_promotion()
+        .await
+        .unwrap()
+        .freeze(&sa)
+        .await
+        .unwrap();
+    let scope = ea.scope.clone();
+    let revoker = frozen.test_claim_handoff().unwrap();
+    assert_eq!(
+        scope.0.lock().unwrap().phase,
+        super::ConsentPhase::TransferredToStore
+    );
+    drop(ea);
+    assert_eq!(
+        scope.0.lock().unwrap().phase,
+        super::ConsentPhase::TransferredToStore,
+        "endpoint cleanup must not reclaim a claimed handoff guard"
+    );
+    drop(revoker);
+    drop(b.unwrap());
+}
+
+#[tokio::test]
 async fn bilateral_sealed_evidence_rejects_late_invalidation_before_commit() {
     let (_ea, _eb, a, b, _) = pair().await;
     let ta = tempfile::tempdir().unwrap();
@@ -320,7 +442,7 @@ async fn bilateral_sealed_evidence_rejects_late_invalidation_before_commit() {
 
 #[tokio::test]
 async fn bilateral_sealed_evidence_commits_only_durable_metadata_not_runtime_authority() {
-    let (_ea, _eb, a, b, _) = pair().await;
+    let (ea, _eb, a, b, _) = pair().await;
     let ta = tempfile::tempdir().unwrap();
     let tb = tempfile::tempdir().unwrap();
     let sa = crate::pairing_pending::PendingStore::open(ta.path()).unwrap();
@@ -356,6 +478,14 @@ async fn bilateral_sealed_evidence_commits_only_durable_metadata_not_runtime_aut
             .iter()
             .all(|name| !name.starts_with("journal-")),
         "admission left an orphan journal: {pending_files:?}"
+    );
+    // Once the durable store owns the exact revocation guard, endpoint cleanup
+    // must only close provisional transport.  Before that transfer, drop still
+    // retains its existing cancellation/revocation behavior.
+    drop(ea);
+    assert_eq!(
+        store.reconcile(receipt.attempt()).unwrap(),
+        crate::pairing_v2::admission_authority::ReconcileAdmission::Promoted
     );
     drop(b.unwrap());
 }
@@ -572,6 +702,204 @@ async fn endpoint_drop_that_revokes_scope_before_freeze_blocks_publication() {
     );
 }
 
+/// A cancelled admission can still have a frozen endpoint waiting to be
+/// dropped. That endpoint must clean up only its own guard: a later admission
+/// for the same peer is a different durable owner and must survive.
+#[tokio::test]
+async fn stale_endpoint_drop_after_cancel_keeps_replacement_promoted() {
+    let (a_identity, a_key) = identity(true);
+    let a_retry_key = a_key.clone_key();
+    let (b_identity, b_key) = identity(true);
+    let b_retry_key = b_key.clone_key();
+    let ea = ProvisionalEndpoint::bind("127.0.0.1:0".parse().unwrap(), a_identity.clone(), a_key)
+        .unwrap();
+    let eb = ProvisionalEndpoint::bind("127.0.0.1:0".parse().unwrap(), b_identity.clone(), b_key)
+        .unwrap();
+    let (a, b) = tokio::join!(ea.connect(eb.local_addr().unwrap()), eb.accept());
+    let ta = tempfile::tempdir().unwrap();
+    let tb = tempfile::tempdir().unwrap();
+    let sa = crate::pairing_pending::PendingStore::open(ta.path()).unwrap();
+    let sb = crate::pairing_pending::PendingStore::open(tb.path()).unwrap();
+    let (a, b) = tokio::join!(
+        a.unwrap().handshake(
+            handshake_config(1, 2),
+            &sa,
+            |p| async move { p.decision(true) }
+        ),
+        b.unwrap().handshake(
+            handshake_config(2, 1),
+            &sb,
+            |p| async move { p.decision(true) }
+        )
+    );
+    let a = a.unwrap();
+    let b = b.unwrap();
+    let attempt = a.test_attempt();
+    let store =
+        crate::pairing_v2::admission_authority::AdmissionAuthorityStore::open(ta.path()).unwrap();
+    let cancelled = store.pending(attempt).unwrap().unwrap();
+    store
+        .cancel(store.version().unwrap(), cancelled.attempt_id)
+        .unwrap();
+    sb.cancel(sb.version().unwrap(), b.test_attempt()).unwrap();
+    drop(b);
+
+    // Freeze after cancellation so the real endpoint owns a stale guard. The
+    // stage fails closed, but the endpoint's Drop still exercises the actual
+    // consent-scope revocation path rather than calling a revoker directly.
+    assert_eq!(
+        store
+            .commit_sealed_foundation(store.version().unwrap(), a)
+            .await,
+        Err(crate::pairing_pending::StoreError::Invalid)
+    );
+
+    // Re-establish B with fresh endpoints but the same two identities. This
+    // creates a real bilateral record and consumes the live sealed authority
+    // through the staged/final durable publication path.
+    drop(eb);
+    let replacement_a =
+        ProvisionalEndpoint::bind("127.0.0.1:0".parse().unwrap(), a_identity, a_retry_key).unwrap();
+    let replacement_b = ProvisionalEndpoint::bind(
+        "127.0.0.1:0".parse().unwrap(),
+        b_identity.clone(),
+        b_retry_key,
+    )
+    .unwrap();
+    let (replacement_a_channel, replacement_b_channel) = tokio::join!(
+        replacement_a.connect(replacement_b.local_addr().unwrap()),
+        replacement_b.accept()
+    );
+    let (replacement_a_authority, replacement_b_authority) = tokio::join!(
+        replacement_a_channel
+            .unwrap()
+            .handshake(
+                handshake_config(3, 4),
+                &sa,
+                |p| async move { p.decision(true) }
+            ),
+        replacement_b_channel
+            .unwrap()
+            .handshake(
+                handshake_config(4, 3),
+                &sb,
+                |p| async move { p.decision(true) }
+            )
+    );
+    let replacement_a_authority = replacement_a_authority.unwrap();
+    // Keep B's sealed authority alive until A's promotion has frozen ingress
+    // and published its durable record. Dropping B first is an intentional
+    // peer shutdown, which the fail-closed ingress watcher must reject rather
+    // than race with the promotion this test is meant to exercise.
+    let replacement_b_authority = replacement_b_authority.unwrap();
+    let replacement_attempt = replacement_a_authority.test_attempt();
+    let replacement = store
+        .commit_sealed_foundation(store.version().unwrap(), replacement_a_authority)
+        .await
+        .unwrap();
+    assert_eq!(replacement.attempt(), replacement_attempt);
+    let (_, receipt, active) = sa.admission_state(replacement_attempt).unwrap();
+    assert!(active);
+    assert_eq!(
+        receipt.unwrap().peer_pin,
+        <[u8; 32]>::from(Sha256::digest(&b_identity))
+    );
+
+    // Only after the replacement has reached durable promotion may either
+    // endpoint close. A's old endpoint must not revoke B's exact ownership.
+    drop(replacement_b_authority);
+    drop(ea);
+    assert_eq!(
+        store.reconcile(replacement_attempt).unwrap(),
+        crate::pairing_v2::admission_authority::ReconcileAdmission::Promoted
+    );
+    let (_, receipt, active) = sa.admission_state(replacement_attempt).unwrap();
+    assert!(active);
+    assert_eq!(
+        receipt.unwrap().peer_pin,
+        <[u8; 32]>::from(Sha256::digest(&b_identity))
+    );
+    drop(replacement_a);
+    drop(replacement_b);
+}
+
+/// Identity rotation invalidates a staged, live handoff. Endpoint destruction
+/// afterwards must only clear its old guard; reopening must not keep either an
+/// active admission or an orphaned peer reservation.
+#[tokio::test]
+async fn rotation_then_endpoint_drop_recovers_staged_guard_without_reservation() {
+    let (ea, _eb, a, b, _) = pair().await;
+    let ta = tempfile::tempdir().unwrap();
+    let tb = tempfile::tempdir().unwrap();
+    let sa = crate::pairing_pending::PendingStore::open(ta.path()).unwrap();
+    let sb = crate::pairing_pending::PendingStore::open(tb.path()).unwrap();
+    let (a, b) = tokio::join!(
+        a.handshake(
+            handshake_config(1, 2),
+            &sa,
+            |p| async move { p.decision(true) }
+        ),
+        b.handshake(
+            handshake_config(2, 1),
+            &sb,
+            |p| async move { p.decision(true) }
+        )
+    );
+    let a = a.unwrap();
+    let _b = b.unwrap();
+    let sealed = a.seal_for_promotion().await.unwrap();
+    let frozen = sealed.freeze(&sa).await.unwrap();
+    let (fields, handoff) = frozen.into_store_handoff();
+    let record = fields.record.clone();
+    let expected = sa.version().unwrap();
+    let staged_revision = expected.revision.checked_add(1).unwrap();
+    let receipt = crate::pairing_pending::AdmissionReceiptRecord {
+        attempt: record.attempt_id,
+        peer: record.peer_fingerprint,
+        peer_pin: fields.certificate_fingerprints[1 - fields.role.index()],
+        durable_fc_hash: fields.durable_fc_hash,
+        role: fields.role.index() as u8,
+        suite: SUITE.to_owned(),
+        protocol_version: 2,
+        transcript: fields.transcript,
+        binding: fields.local_binding,
+        revision: staged_revision,
+        identity_generation: expected.identity_generation,
+        revocation_generation: record.revocation_generation,
+        policy_revision: 0,
+        ownership: handoff.awaiting_handoff_ownership(staged_revision),
+    };
+    sa.stage_sealed_admission(expected, &record, &receipt)
+        .unwrap();
+    let (pending, staged, active) = sa.admission_state(record.attempt_id).unwrap();
+    assert!(!pending);
+    assert!(matches!(
+        staged.map(|receipt| receipt.ownership),
+        Some(crate::pairing_pending::AdmissionOwnership::AwaitingHandoff { .. })
+    ));
+    assert!(!active);
+
+    sa.rotate_identity(sa.version().unwrap()).unwrap();
+    drop(handoff);
+    drop(ea);
+
+    let reopened =
+        crate::pairing_v2::admission_authority::AdmissionAuthorityStore::open(ta.path()).unwrap();
+    assert_eq!(
+        reopened.reconcile(record.attempt_id).unwrap(),
+        crate::pairing_v2::admission_authority::ReconcileAdmission::Revoked
+    );
+    // A fresh attempt proves rotation cleared the staged reservation rather
+    // than leaving the old peer blocked after restart/recovery.
+    reopened
+        .prepare(
+            reopened.version().unwrap(),
+            [99; 32],
+            record.peer_fingerprint,
+        )
+        .unwrap();
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn freeze_before_endpoint_drop_is_durably_revoked_before_future_authority() {
@@ -639,7 +967,7 @@ async fn freeze_before_endpoint_drop_is_durably_revoked_before_future_authority(
     );
     drop_pause.release();
     drop_thread.join().unwrap();
-    assert!(result.is_ok());
+    assert_eq!(result, Err(crate::pairing_pending::StoreError::Invalid));
     let reopened =
         crate::pairing_v2::admission_authority::AdmissionAuthorityStore::open(ta.path()).unwrap();
     assert_eq!(
@@ -649,29 +977,8 @@ async fn freeze_before_endpoint_drop_is_durably_revoked_before_future_authority(
 }
 
 #[tokio::test]
-async fn endpoint_drop_revocation_faults_remain_observable_and_retryable() {
-    for (setting, first_reconcile) in [
-        (
-            "ledger:before_revoke_lock:error",
-            Err(crate::pairing_pending::StoreError::Unavailable),
-        ),
-        (
-            "ledger:before_revoke_load:error",
-            Err(crate::pairing_pending::StoreError::Unavailable),
-        ),
-        (
-            "ledger:before_write:error",
-            Err(crate::pairing_pending::StoreError::Unavailable),
-        ),
-        (
-            "pending:before_remove:error",
-            Err(crate::pairing_pending::StoreError::Unavailable),
-        ),
-        (
-            "pending:after_remove:error",
-            Ok(crate::pairing_v2::admission_authority::ReconcileAdmission::Revoked),
-        ),
-    ] {
+async fn endpoint_drop_after_store_handoff_does_not_run_revocation_cleanup() {
+    for _ in 0..5 {
         let (ea, _eb, a, b, _) = pair().await;
         let ta = tempfile::tempdir().unwrap();
         let tb = tempfile::tempdir().unwrap();
@@ -700,22 +1007,344 @@ async fn endpoint_drop_revocation_faults_remain_observable_and_retryable() {
             .await
             .unwrap();
 
-        unsafe { std::env::set_var("PAIRING_TEST_FS_FAULT", setting) };
-        crate::private_fs::faults::arm();
         drop(ea);
-        assert_eq!(store.reconcile(attempt), first_reconcile, "{setting}");
-        unsafe { std::env::remove_var("PAIRING_TEST_FS_FAULT") };
         assert_eq!(
             store.reconcile(attempt).unwrap(),
+            crate::pairing_v2::admission_authority::ReconcileAdmission::Promoted
+        );
+    }
+}
+
+/// Once the handoff has been claimed, an error before the final manifest
+/// rename is uncertain rather than successful. Recovery must revoke the
+/// ineligible staged receipt and leave no operational snapshot.
+#[tokio::test]
+async fn final_manifest_error_after_claim_is_not_operationally_active() {
+    let (ea, _eb, a, b, _) = pair().await;
+    let ta = tempfile::tempdir().unwrap();
+    let tb = tempfile::tempdir().unwrap();
+    let sa = crate::pairing_pending::PendingStore::open(ta.path()).unwrap();
+    let sb = crate::pairing_pending::PendingStore::open(tb.path()).unwrap();
+    let (a, b) = tokio::join!(
+        a.handshake(
+            handshake_config(1, 2),
+            &sa,
+            |p| async move { p.decision(true) }
+        ),
+        b.handshake(
+            handshake_config(2, 1),
+            &sb,
+            |p| async move { p.decision(true) }
+        )
+    );
+    let sealed = a.unwrap().seal_for_promotion().await.unwrap();
+    let frozen = sealed.freeze(&sa).await.unwrap();
+    let (fields, handoff) = frozen.into_store_handoff();
+    let record = fields.record.clone();
+    let expected = sa.version().unwrap();
+    let staged_revision = expected.revision.checked_add(1).unwrap();
+    let receipt = crate::pairing_pending::AdmissionReceiptRecord {
+        attempt: record.attempt_id,
+        peer: record.peer_fingerprint,
+        peer_pin: fields.certificate_fingerprints[1 - fields.role.index()],
+        durable_fc_hash: fields.durable_fc_hash,
+        role: fields.role.index() as u8,
+        suite: SUITE.to_owned(),
+        protocol_version: 2,
+        transcript: fields.transcript,
+        binding: fields.local_binding,
+        revision: staged_revision,
+        identity_generation: expected.identity_generation,
+        revocation_generation: record.revocation_generation,
+        policy_revision: 0,
+        ownership: handoff.awaiting_handoff_ownership(staged_revision),
+    };
+    sa.stage_sealed_admission(expected, &record, &receipt)
+        .unwrap();
+
+    unsafe { std::env::set_var("PAIRING_TEST_FS_FAULT", "ledger:before_rename:error") };
+    crate::private_fs::faults::arm();
+    assert!(matches!(
+        sa.finalize_staged_admission(sa.version().unwrap(), record.attempt_id, handoff,),
+        Err(crate::pairing_pending::StoreError::Unavailable)
+    ));
+    unsafe { std::env::remove_var("PAIRING_TEST_FS_FAULT") };
+
+    let store =
+        crate::pairing_v2::admission_authority::AdmissionAuthorityStore::open(ta.path()).unwrap();
+    assert_eq!(
+        store.reconcile(record.attempt_id).unwrap(),
+        crate::pairing_v2::admission_authority::ReconcileAdmission::Revoked
+    );
+    assert!(
+        store
+            .operational_admission_snapshot(record.attempt_id)
+            .is_err()
+    );
+    drop(ea);
+    drop(b.unwrap());
+}
+
+/// Exercise the production wrapper rather than a direct store call. A
+/// before-rename error may not be reported as success, and a fresh open must
+/// not manufacture an operational admission from the unfinished publication.
+#[tokio::test]
+async fn commit_wrapper_before_rename_error_reopens_without_operational_snapshot() {
+    let (_ea, _eb, a, b, _) = pair().await;
+    let ta = tempfile::tempdir().unwrap();
+    let tb = tempfile::tempdir().unwrap();
+    let sa = crate::pairing_pending::PendingStore::open(ta.path()).unwrap();
+    let sb = crate::pairing_pending::PendingStore::open(tb.path()).unwrap();
+    let (a, b) = tokio::join!(
+        a.handshake(
+            handshake_config(1, 2),
+            &sa,
+            |p| async move { p.decision(true) }
+        ),
+        b.handshake(
+            handshake_config(2, 1),
+            &sb,
+            |p| async move { p.decision(true) }
+        )
+    );
+    let a = a.unwrap();
+    let _b = b.unwrap();
+    let attempt = a.test_attempt();
+    let store =
+        crate::pairing_v2::admission_authority::AdmissionAuthorityStore::open(ta.path()).unwrap();
+
+    unsafe { std::env::set_var("PAIRING_TEST_FS_FAULT", "ledger:before_rename:error") };
+    crate::private_fs::faults::arm();
+    assert_eq!(
+        store
+            .commit_sealed_foundation(store.version().unwrap(), a)
+            .await,
+        Err(crate::pairing_pending::StoreError::Unavailable)
+    );
+    unsafe { std::env::remove_var("PAIRING_TEST_FS_FAULT") };
+
+    let reopened =
+        crate::pairing_v2::admission_authority::AdmissionAuthorityStore::open(ta.path()).unwrap();
+    assert_ne!(
+        reopened.reconcile(attempt).unwrap(),
+        crate::pairing_v2::admission_authority::ReconcileAdmission::Promoted
+    );
+    assert!(reopened.operational_admission_snapshot(attempt).is_err());
+}
+
+#[test]
+fn final_manifest_crash_after_claim_reconciles_durable_boundary() {
+    use std::process::Command;
+
+    for (stage, expected, operational) in [
+        (
+            "before_rename",
             crate::pairing_v2::admission_authority::ReconcileAdmission::Revoked,
-            "retry after {setting}"
+            false,
+        ),
+        (
+            "after_rename",
+            crate::pairing_v2::admission_authority::ReconcileAdmission::Promoted,
+            true,
+        ),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "pairing_v2::provisional_tls::tests::final_manifest_fault_worker",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("CSF12_FINALIZATION_FAULT_ROOT", root.path())
+            .env("PAIRING_TEST_FS_FAULT", format!("ledger:{stage}:crash"))
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(91), "{stage}");
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        let attempt_hex = stdout
+            .lines()
+            .find_map(|line| line.strip_prefix("FINALIZATION_ATTEMPT:"))
+            .unwrap_or_else(|| panic!("missing attempt for {stage}: {stdout}"));
+        assert_eq!(attempt_hex.len(), 64);
+        let mut attempt = [0u8; 32];
+        for (index, byte) in attempt.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(&attempt_hex[index * 2..index * 2 + 2], 16).unwrap();
+        }
+        let reopened =
+            crate::pairing_v2::admission_authority::AdmissionAuthorityStore::open(root.path())
+                .unwrap();
+        assert_eq!(reopened.reconcile(attempt).unwrap(), expected, "{stage}");
+        assert_eq!(
+            reopened.operational_admission_snapshot(attempt).is_ok(),
+            operational,
+            "{stage}"
         );
     }
 }
 
 #[cfg(unix)]
+#[test]
+#[ignore = "subprocess helper"]
+fn final_manifest_fault_worker() {
+    use std::io::Write;
+
+    let root = std::env::var_os("CSF12_FINALIZATION_FAULT_ROOT").unwrap();
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async move {
+            let (ea, _eb, a, b, _) = pair().await;
+            let other = tempfile::tempdir().unwrap();
+            let sa = crate::pairing_pending::PendingStore::open(root).unwrap();
+            let sb = crate::pairing_pending::PendingStore::open(other.path()).unwrap();
+            let (a, b) = tokio::join!(
+                a.handshake(
+                    handshake_config(1, 2),
+                    &sa,
+                    |p| async move { p.decision(true) }
+                ),
+                b.handshake(
+                    handshake_config(2, 1),
+                    &sb,
+                    |p| async move { p.decision(true) }
+                )
+            );
+            let sealed = a.unwrap().seal_for_promotion().await.unwrap();
+            let frozen = sealed.freeze(&sa).await.unwrap();
+            let (fields, handoff) = frozen.into_store_handoff();
+            let record = fields.record.clone();
+            let expected = sa.version().unwrap();
+            let staged_revision = expected.revision.checked_add(1).unwrap();
+            let receipt = crate::pairing_pending::AdmissionReceiptRecord {
+                attempt: record.attempt_id,
+                peer: record.peer_fingerprint,
+                peer_pin: fields.certificate_fingerprints[1 - fields.role.index()],
+                durable_fc_hash: fields.durable_fc_hash,
+                role: fields.role.index() as u8,
+                suite: SUITE.to_owned(),
+                protocol_version: 2,
+                transcript: fields.transcript,
+                binding: fields.local_binding,
+                revision: staged_revision,
+                identity_generation: expected.identity_generation,
+                revocation_generation: record.revocation_generation,
+                policy_revision: 0,
+                ownership: handoff.awaiting_handoff_ownership(staged_revision),
+            };
+            sa.stage_sealed_admission(expected, &record, &receipt)
+                .unwrap();
+            writeln!(
+                std::io::stdout(),
+                "FINALIZATION_ATTEMPT:{}",
+                record
+                    .attempt_id
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>()
+            )
+            .unwrap();
+            std::io::stdout().flush().unwrap();
+            crate::private_fs::faults::arm();
+            let result =
+                sa.finalize_staged_admission(sa.version().unwrap(), record.attempt_id, handoff);
+            assert!(result.is_err(), "fault worker unexpectedly finalized");
+            drop(ea);
+            drop(b.unwrap());
+        });
+}
+
 #[tokio::test]
-async fn durable_guard_fails_closed_in_a_fresh_process() {
+async fn guard_cleanup_failure_returns_no_success_and_reconciles_store_owned_metadata() {
+    use std::process::Command;
+
+    let (_ea, _eb, a, b, _) = pair().await;
+    let ta = tempfile::tempdir().unwrap();
+    let tb = tempfile::tempdir().unwrap();
+    let sa = crate::pairing_pending::PendingStore::open(ta.path()).unwrap();
+    let sb = crate::pairing_pending::PendingStore::open(tb.path()).unwrap();
+    let (a, b) = tokio::join!(
+        a.handshake(
+            handshake_config(1, 2),
+            &sa,
+            |p| async move { p.decision(true) }
+        ),
+        b.handshake(
+            handshake_config(2, 1),
+            &sb,
+            |p| async move { p.decision(true) }
+        )
+    );
+    let a = a.unwrap();
+    let _b = b.unwrap();
+    let attempt = a.test_attempt();
+    let store =
+        crate::pairing_v2::admission_authority::AdmissionAuthorityStore::open(ta.path()).unwrap();
+
+    unsafe { std::env::set_var("PAIRING_TEST_FS_FAULT", "guard:before_remove:error") };
+    crate::private_fs::faults::arm();
+    assert_eq!(
+        store
+            .commit_sealed_foundation(store.version().unwrap(), a)
+            .await,
+        Err(crate::pairing_pending::StoreError::Unavailable)
+    );
+    unsafe { std::env::remove_var("PAIRING_TEST_FS_FAULT") };
+    // A process that did not witness the failed unlink must still recognize
+    // StoreOwned and perform cleanup only, never re-run revocation.
+    let status = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "pairing_v2::provisional_tls::tests::admission_guard_restart_worker",
+            "--ignored",
+        ])
+        .env("CSF12_ADMISSION_GUARD_ROOT", ta.path())
+        .env(
+            "CSF12_ADMISSION_GUARD_ATTEMPT",
+            attempt
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>(),
+        )
+        .status()
+        .unwrap();
+    assert!(status.success());
+    assert_eq!(
+        store.reconcile(attempt).unwrap(),
+        crate::pairing_v2::admission_authority::ReconcileAdmission::Promoted
+    );
+}
+
+#[test]
+fn mismatched_guard_sidecar_is_never_removed_by_store_cleanup() {
+    let ta = tempfile::tempdir().unwrap();
+    let store = crate::pairing_pending::PendingStore::open(ta.path()).unwrap();
+    let attempt = [90; 32];
+    let mut revoker = store.admission_revoker([89; 32], attempt).unwrap();
+    revoker.arm();
+    let filename = format!(
+        "admission-revocation-{}.json",
+        attempt
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    );
+    let guard_path = ta.path().join("pairing-tombstones").join(filename);
+    let mut guard: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&guard_path).unwrap()).unwrap();
+    guard["token"] = serde_json::to_value([91u8; 32]).unwrap();
+    std::fs::write(&guard_path, serde_json::to_vec(&guard).unwrap()).unwrap();
+
+    assert_eq!(
+        revoker.release_to_store(),
+        Err(crate::pairing_pending::StoreError::Invalid)
+    );
+    assert!(guard_path.exists(), "mismatched guard must not be removed");
+}
+
+#[tokio::test]
+async fn store_owned_guard_reconciles_as_cleanup_in_a_fresh_process() {
     use std::process::Command;
 
     let (ea, _eb, a, b, _) = pair().await;
@@ -764,12 +1393,11 @@ async fn durable_guard_fails_closed_in_a_fresh_process() {
     assert!(status.success());
     assert_eq!(
         store.reconcile(attempt).unwrap(),
-        crate::pairing_v2::admission_authority::ReconcileAdmission::Revoked
+        crate::pairing_v2::admission_authority::ReconcileAdmission::Promoted
     );
     drop(ea);
 }
 
-#[cfg(unix)]
 #[test]
 #[ignore]
 fn admission_guard_restart_worker() {
@@ -784,7 +1412,7 @@ fn admission_guard_restart_worker() {
         crate::pairing_v2::admission_authority::AdmissionAuthorityStore::open(root).unwrap();
     assert_eq!(
         store.reconcile(attempt).unwrap(),
-        crate::pairing_v2::admission_authority::ReconcileAdmission::Revoked
+        crate::pairing_v2::admission_authority::ReconcileAdmission::Promoted
     );
 }
 #[tokio::test]

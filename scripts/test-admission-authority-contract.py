@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Static boundary and mutation checks for the default-off admission foundation."""
+"""Static/mutation checks for the staged durable admission boundary."""
 
 from pathlib import Path
 import re
@@ -12,7 +12,13 @@ AUTHORITY = ROOT / "crates/transport/src/pairing_v2/admission_authority.rs"
 PENDING = ROOT / "crates/transport/src/pairing_pending.rs"
 
 
+def section(source: str, start: str, end: str) -> str:
+    return source.split(start, 1)[1].split(end, 1)[0]
+
+
 def validate(handshake: str, provisional: str, authority: str, pending: str) -> None:
+    # The sealed witness remains private and non-cloneable; no product authority
+    # leaks while the durable handoff is being staged.
     assert "pub fn local_binding" not in handshake
     assert "pub(super) fn local_binding" not in handshake
     assert "pub(crate) fn local_binding" not in handshake
@@ -23,93 +29,107 @@ def validate(handshake: str, provisional: str, authority: str, pending: str) -> 
         r"#\[derive\([^]]*(?:Clone|Serialize)[^]]*\)\]\s*pub\(crate\) struct SealedPromotionEvidence",
         handshake,
     )
-    assert authority.count("evidence.revalidate()") >= 2
-    assert re.search(r"let frozen = evidence\s*\.freeze\(store\)\s*\.await", authority)
-    assert "CommitWitness::Live(Box::new(frozen))" in authority
-    frozen_body = handshake.split("pub(crate) struct FrozenPromotionEvidence", 1)[1].split("}", 1)[0]
+    frozen_body = section(
+        handshake,
+        "pub(crate) struct FrozenPromotionEvidence",
+        "}",
+    )
     assert "ProvisionalChannel" not in frozen_body
     assert "Stream" not in frozen_body
-    watcher = handshake.split("let disposition = tokio::select!", 1)[1].split("if disposition", 1)[0]
-    freeze_arm = "request=&mut freeze_request"
-    assert watcher.find("watch_request") < watcher.find(freeze_arm)
-    assert watcher.find("accept_bi") < watcher.find(freeze_arm)
-    assert watcher.find("accept_uni") < watcher.find(freeze_arm)
-    assert "connection.close(APPLICATION_ERROR.into(), b\"pairing ingress frozen\")" in watcher
-    assert watcher.find("scope.freeze(revoker)") < watcher.find("connection.close")
     assert "if state.phase != ConsentPhase::Active" in provisional
-    freeze_scope = provisional.split("fn freeze(&self", 1)[1].split("fn revoke(&self)", 1)[0]
-    assert freeze_scope.find("revoker.arm()") < freeze_scope.find("ConsentPhase::Frozen")
-    revoke_scope = provisional.split("fn revoke(&self)", 1)[1].split("}\n}", 1)[0]
-    mark_revoking_at = revoke_scope.find("revoker.mark_revoking()")
-    revoked_at = revoke_scope.find("ConsentPhase::Revoked")
-    assert 0 <= mark_revoking_at < revoked_at
-    drop_body = provisional.split("impl Drop for ProvisionalEndpoint", 1)[1].split("impl Drop for ProvisionalChannel", 1)[0]
-    revoke_scope_at = drop_body.find("let revoker = self.scope.revoke()")
-    revoke_store_at = drop_body.find("revoker.revoke()")
-    close_at = drop_body.find("self.endpoint.close")
-    assert 0 <= revoke_scope_at < close_at
-    assert 0 <= revoke_store_at < close_at
-    assert "self.store.resolve_admission_guard(attempt)?" in authority
-    assert re.search(
-        r"self\.ledger_dir\s*\.replace\(&admission_guard_filename\(attempt\), &bytes\)\?",
-        pending,
-    )
-    resolver = pending.split("fn resolve_admission_guard", 1)[1].split("fn revoke_current", 1)[0]
-    assert "Some(AdmissionGuardPhase::Active)" in resolver
-    assert "Some(AdmissionGuardPhase::RevokingOwned)" in resolver
-    assert "return Err(StoreError::Unavailable)" in resolver
-    assert "Some(AdmissionGuardPhase::RevokingRetryable)" in resolver
-    assert "armed: true" in resolver
-    assert "owns_revocation: false" in resolver
-    assert "revoker.revoke()" in resolver
-    transition = pending.split("pub(crate) fn mark_revoking", 1)[1].split("pub(crate) fn revoke", 1)[0]
-    assert "revocation_guard_phases()" in transition
-    assert "AdmissionGuardPhase::RevokingOwned" in transition
-    assert "self.store" not in transition
-    retry = pending.split("fn release_for_retry", 1)[1].split("impl Drop", 1)[0]
-    assert "AdmissionGuardPhase::RevokingRetryable" in retry
-    reconciliation = authority.split("pub fn reconcile(&self", 1)[1].split("/// Test-only", 1)[0]
-    recheck_at = reconciliation.find("admission_guard_still_active")
-    interpret_at = reconciliation.find("match (pending, receipt, active)")
-    assert 0 <= recheck_at < interpret_at
-    revocation = pending.split("fn revoke_current", 1)[1].split("fn reconcile_pairing", 1)[0]
-    revocation_before_save = revocation.split("self.save(&ledger)?", 1)[0]
-    assert "ledger.active_pins.retain(|pin| pin.peer != peer)" in revocation_before_save
-    assert re.search(
-        r"ledger\s*\.pending\s*\.retain\(\|entry\| entry\.record\.peer_fingerprint != peer\)",
-        revocation_before_save,
-    )
-    assert "ledger.tombstones.extend(&removed)" in revocation_before_save
+
+    # The authority performs an explicit two-stage publication: the first
+    # receipt is ineligible, then the frozen endpoint is claimed while the
+    # store lock is held before StoreOwned metadata and the pin are published.
+    assert "pub(crate) async fn commit_sealed_foundation" in authority
+    assert ".stage_sealed_admission(expected, commit.record(), commit.receipt())?" in authority
+    assert ".finalize_staged_admission(staged_version, attempt, handoff)" in authority
+    assert "revoker.release_to_store()?" in authority
+    assert "self.store.resolve_admission_guard(attempt)" in authority
     assert "use crate::identity_store::IdentityStore" not in authority
     assert ": IdentityStore" not in authority
-    assert "pub(crate) async fn commit_sealed_foundation" in authority
-    assert "commit_admission_foundation<F>" not in pending
-    assert "FnMut() -> Result<(), StoreError>" not in pending
-    metadata_at = authority.find("fn commit_metadata(")
-    assert metadata_at < 0 or "#[cfg(test)]" in authority[max(0, metadata_at - 200) : metadata_at]
-    assert "pub(crate) struct SealedAdmissionCommit" in authority
-    assert "commit: crate::pairing_v2::admission_authority::SealedAdmissionCommit" in pending
-    assert "active_pins: Vec<ActivePin>" in pending
-    assert "consumed_attempts: Vec<[u8; 32]>" in pending
-    assert "admission_receipts: Vec<AdmissionReceiptRecord>" in pending
-    commit = pending.split("fn commit_sealed_admission", 1)[1]
-    before_save = commit.split("self.save(&ledger)?", 1)[0]
-    assert "ledger.active_pins.push" in before_save
-    assert "ledger.consumed_attempts.push" in before_save
-    assert "ledger.admission_receipts.push" in before_save
-    assert commit.find("self.save(&ledger)?") < commit.find("Ok(receipt.clone())")
-    assert "return Ok(receipt.clone());\n            self.save(&ledger)?;" not in commit
-    assert "ledger.version != expected" in commit
-    assert "record.version.identity_generation != expected.identity_generation" in commit
-    assert "ledger.revocation(record.peer_fingerprint) != expected_revocation_generation" in commit
-    assert "ledger.policy_revision != expected_policy_revision" in commit
-    assert "receipt.suite != crate::pairing_v2::SUITE" in pending
-    assert re.search(
-        r"receipt\.protocol_version\s*!=\s*crate::pairing_v2::admission_authority::PROTOCOL_VERSION",
-        pending,
+
+    stage = section(pending, "pub(crate) fn stage_sealed_admission", "pub(crate) fn finalize_staged_admission")
+    assert "AdmissionOwnership::AwaitingHandoff" in stage
+    assert "ledger.admission_receipts.push(receipt.clone())" in stage
+    assert "ledger.active_pins.push" not in stage
+    assert stage.find("self.save(&ledger)?") < stage.find("Ok(receipt.clone())")
+
+    finalizer = section(pending, "pub(crate) fn finalize_staged_admission", "pub(crate) fn admission_state")
+    assert "AdmissionOwnership::StoreOwned" in finalizer
+    assert "handoff.store_owned_ownership(expected.revision, final_revision)" in finalizer
+    assert "let _lock = self.ledger_dir.lock()?;" in finalizer
+    assert "let revoker = handoff.claim().map_err(|_| StoreError::Invalid)?;" in finalizer
+    assert finalizer.find("let _lock = self.ledger_dir.lock()?;") < finalizer.find("handoff.claim()")
+    assert "ledger.active_pins.push(ActivePin" in finalizer
+    assert finalizer.find("ledger.active_pins.push(ActivePin") < finalizer.find("self.save(&ledger)?")
+    assert finalizer.find("self.save(&ledger)?") < finalizer.find("Ok((finalized, revoker))")
+
+    # A pin belongs to one durable admission receipt. A later attempt for the
+    # same peer must fail closed even if it presents the same pin value.
+    pin_for_peer = re.compile(
+        r"ledger\s*\.active_pins\s*\.iter\(\)\s*\.any\(\|pin\| pin\.peer == receipt\.peer\)"
     )
-    assert "receipt.revision > self.version.revision" in pending
-    assert "StoreError::ConsumedAttempt" in pending
+    # One fail-closed check occurs before the legacy synthetic publication,
+    # one guards its subsequent pin insertion, and one guards finalization.
+    assert len(pin_for_peer.findall(pending)) >= 3
+
+    # Admission is one durable relationship per peer. Rejecting a retry in
+    # prepare is earlier than sidecar creation, so a later endpoint drop cannot
+    # run peer-scoped revocation against an existing StoreOwned record.
+    assert "admission_reservations: Vec<AdmissionReservation>" in pending
+    prepare = section(pending, "pub fn prepare", "pub fn pending")
+    assert "ledger.active_pins.iter().any(|pin| pin.peer == peer)" in prepare
+    assert "reservation.peer == peer" in prepare
+    assert "admission_reservations" in prepare
+    assert "push(AdmissionReservation { peer, attempt })" in prepare
+    assert "ledger.pending.push" in prepare
+    assert prepare.find("push(AdmissionReservation { peer, attempt })") < prepare.find("ledger.pending.push")
+    assert "admission_reservations" in stage
+    assert "reservation.attempt == receipt.attempt && reservation.peer == receipt.peer" in stage
+    assert "admission_reservations" in finalizer
+    assert "retain(|reservation| reservation.attempt != attempt)" in finalizer
+    cancel = section(pending, "pub fn cancel", "pub fn revoke_candidate")
+    assert "retain(|reservation| reservation.attempt != attempt)" in cancel
+
+    # Every post-store sidecar removal reads and compares both attempt and
+    # token under the ledger lock. An attempt-only cleanup could erase a newer
+    # guard created for the same attempt.
+    assert "fn clear_admission_guard(" not in pending
+    exact_cleanup = section(pending, "fn clear_admission_guard_exact", "fn resolve_admission_guard")
+    assert "let _lock = self.ledger_dir.lock()?;" in exact_cleanup
+    assert "self.ledger_dir.read(&file, RECORD_LIMIT)?" in exact_cleanup
+    assert "guard.attempt != attempt || guard.token != token" in exact_cleanup
+    assert "self.ledger_dir.remove(&file)?" in exact_cleanup
+    assert pending.count("clear_admission_guard_exact(") >= 4
+    release = section(pending, "pub(crate) fn release_to_store", "pub(crate) fn arm")
+    assert "clear_admission_guard_exact(self.attempt, self.token)" in release
+    resolver = section(pending, "fn resolve_admission_guard", "fn admission_guard_still_active")
+    assert "self.clear_admission_guard_exact(attempt, guard.token)?" in resolver
+    assert "AdmissionOwnership::StoreOwned" in resolver
+
+    # Pre-claim endpoint drop remains conservative: it owns revocation and
+    # removes active pins/pending records, never turns a staged receipt into a
+    # normal success.
+    drop_body = section(provisional, "impl Drop for ProvisionalEndpoint", "impl Drop for ProvisionalChannel")
+    assert drop_body.find("let revoker = self.scope.revoke()") < drop_body.find("self.endpoint.close")
+    assert drop_body.find("revoker.revoke()") < drop_body.find("self.endpoint.close")
+    revocation = section(pending, "fn revoke_current", "fn reconcile_pairing")
+    assert "peer: [u8; 32],\n            attempt: [u8; 32],\n            token: [u8; 32]" in revocation
+    assert "let owns_pending" in revocation
+    assert "let owns_staged" in revocation
+    assert "AdmissionOwnership::AwaitingHandoff { guard_token, .. }" in revocation
+    assert "if !owns_pending && !owns_staged" in revocation
+    assert revocation.find("if !owns_pending && !owns_staged") < revocation.find("ledger.advance(expected)?")
+    before_save = revocation.split("self.save(&ledger)?", 1)[0]
+    assert "ledger.active_pins.retain(|pin| pin.peer != peer)" in before_save
+    assert re.search(
+        r"ledger\s*\.pending\s*\.retain\(\|entry\| entry\.record\.peer_fingerprint != peer\)",
+        before_save,
+    )
+    assert "ledger.tombstones.extend(&removed)" in before_save
+    rotation = section(pending, "pub fn rotate_identity", "impl OperationalPreflightLease")
+    assert "ledger.admission_reservations.clear();" in rotation
 
 
 def main() -> None:
@@ -121,37 +141,86 @@ def main() -> None:
     }
     validate(**sources)
     mutants = {
-        "public-binding-getter": ("handshake", "impl HandshakeCompletePendingAuthority {", "impl HandshakeCompletePendingAuthority {\n    pub fn local_binding(&self) {}"),
-        "borrowed-seal": ("handshake", "pub(crate) async fn seal_for_promotion(\n        self,", "pub(crate) async fn seal_for_promotion(\n        &self,"),
-        "clone-sealed": ("handshake", "pub(crate) struct SealedPromotionEvidence", "#[derive(Clone)]\npub(crate) struct SealedPromotionEvidence"),
-        "single-revalidation": ("authority", "evidence.revalidate()", "Ok(())"),
-        "drop-freeze": ("authority", ".freeze(store)\n            .await", ".freeze(store)"),
-        "unfrozen-live-witness": ("authority", "CommitWitness::Live(Box::new(frozen))", "CommitWitness::Live(Box::new(evidence))"),
-        "freeze-beats-queued-violation": ("handshake", "_=watch_request(&mut incoming.recv)=>true,", "request=&mut freeze_request=>{ let _ = request; false },\n                _=watch_request(&mut incoming.recv)=>true,"),
-        "freeze-without-closing-ingress": ("handshake", "connection.close(APPLICATION_ERROR.into(), b\"pairing ingress frozen\");", "let _ = &connection;"),
-        "drop-scope-check": ("provisional", "if state.phase != ConsentPhase::Active", "if false"),
-        "freeze-before-scope-cas": ("handshake", "if scope.freeze(revoker).is_err()", "connection.close(APPLICATION_ERROR.into(), b\"pairing ingress frozen\");\n                    if scope.freeze(revoker).is_err()"),
-        "omit-durable-drop-revocation": ("provisional", "let _revocation_result = revoker.revoke();", "let _revocation_result = Ok::<(), crate::pairing_pending::StoreError>(());"),
-        "omit-revocation-guard": ("pending", "self.ledger_dir\n                .replace(&admission_guard_filename(attempt), &bytes)?;", "let _ = bytes;"),
-        "consume-revocation-retry": ("pending", "armed: true", "armed: false"),
-        "drop-synchronous-revoking-transition": ("provisional", "revoker.mark_revoking();", "let _ = revoker;"),
-        "permit-concurrent-revocation-owner": ("pending", "Some(AdmissionGuardPhase::RevokingOwned) => {", "Some(AdmissionGuardPhase::Active) => {"),
-        "drop-retryable-revocation": ("pending", "revocation_guard_phases().insert(self.token, AdmissionGuardPhase::RevokingRetryable);", "revocation_guard_phases().insert(self.token, AdmissionGuardPhase::Active);"),
-        "drop-post-io-revocation-observation": ("authority", "!self.store.admission_guard_still_active(guard)", "false"),
-        "frozen-retains-runtime-channel": ("handshake", "pub(crate) struct FrozenPromotionEvidence {", "pub(crate) struct FrozenPromotionEvidence {\n    channel: ProvisionalChannel,"),
-        "return-before-durability": ("pending", "self.save(&ledger)?;\n            self.pending_dir.remove(&filename(receipt.attempt))?;", "return Ok(receipt.clone());\n            self.save(&ledger)?;\n            self.pending_dir.remove(&filename(receipt.attempt))?;"),
-        "legacy-identity-owner": ("authority", "use std::path::Path;", "use std::path::Path;\nuse crate::identity_store::IdentityStore;"),
-        "drop-active-pin": ("pending", "ledger.active_pins.push", "ledger.active_pins.extend"),
-        "drop-consumed": ("pending", "ledger.consumed_attempts.push", "ledger.consumed_attempts.extend"),
-        "drop-receipt": ("pending", "ledger.admission_receipts.push", "ledger.admission_receipts.extend"),
-        "drop-revision-cas": ("pending", "ledger.version != expected", "false"),
-        "drop-identity-cas": ("pending", "record.version.identity_generation != expected.identity_generation", "false"),
-        "drop-revocation-cas": ("pending", "ledger.revocation(record.peer_fingerprint) != expected_revocation_generation", "false"),
-        "drop-policy-cas": ("pending", "ledger.policy_revision != expected_policy_revision", "false"),
-        "unsealed-commit-input": ("pending", "commit: crate::pairing_v2::admission_authority::SealedAdmissionCommit", "commit: AdmissionReceiptRecord"),
-        "drop-exact-suite": ("pending", "receipt.suite != crate::pairing_v2::SUITE", "receipt.suite.is_empty()"),
-        "drop-protocol-bound": ("pending", "!= crate::pairing_v2::admission_authority::PROTOCOL_VERSION", "== 0"),
-        "drop-revision-bound": ("pending", "receipt.revision > self.version.revision", "false"),
+        "public-binding-getter": (
+            "handshake",
+            "impl HandshakeCompletePendingAuthority {",
+            "impl HandshakeCompletePendingAuthority {\n    pub fn local_binding(&self) {}",
+        ),
+        "borrowed-seal": (
+            "handshake",
+            "pub(crate) async fn seal_for_promotion(\n        self,",
+            "pub(crate) async fn seal_for_promotion(\n        &self,",
+        ),
+        "clone-sealed": (
+            "handshake",
+            "pub(crate) struct SealedPromotionEvidence",
+            "#[derive(Clone)]\npub(crate) struct SealedPromotionEvidence",
+        ),
+        "drop-staging": (
+            "authority",
+            ".stage_sealed_admission(expected, commit.record(), commit.receipt())?",
+            "/* no durable stage */",
+        ),
+        "drop-finalization": (
+            "authority",
+            ".finalize_staged_admission(staged_version, attempt, handoff)",
+            ".commit_sealed_admission(staged_version, commit)",
+        ),
+        "drop-handoff-claim": (
+            "pending",
+            "let revoker = handoff.claim().map_err(|_| StoreError::Invalid)?;",
+            "let revoker = handoff.release_for_test_only()?;",
+        ),
+        "permit-pin-inheritance": (
+            "pending",
+            "ledger\n                .active_pins\n                .iter()\n                .any(|pin| pin.peer == receipt.peer)",
+            "false",
+        ),
+        "permit-duplicate-live-prepare": (
+            "pending",
+            "ledger.active_pins.iter().any(|pin| pin.peer == peer)",
+            "false",
+        ),
+        "drop-peer-reservation": (
+            "pending",
+            "push(AdmissionReservation { peer, attempt });",
+            "let _ = (peer, attempt);",
+        ),
+        "permit-staged-retry": (
+            "pending",
+            ".any(|reservation| reservation.peer == peer)\n            {\n                return Err(StoreError::Conflict);\n            }",
+            ".any(|_| false)\n            {\n                return Err(StoreError::Conflict);\n            }",
+        ),
+        "attempt-only-cleanup": (
+            "pending",
+            "guard.attempt != attempt || guard.token != token",
+            "guard.attempt != attempt",
+        ),
+        "unlock-exact-cleanup": (
+            "pending",
+            "let _lock = self.ledger_dir.lock()?;\n            let file = admission_guard_filename(attempt);",
+            "let file = admission_guard_filename(attempt);",
+        ),
+        "cleanup-without-token": (
+            "pending",
+            "clear_admission_guard_exact(self.attempt, self.token)",
+            "clear_admission_guard_exact(self.attempt, [0; 32])",
+        ),
+        "drop-conservative-revocation": (
+            "pending",
+            "ledger.active_pins.retain(|pin| pin.peer != peer);",
+            "ledger.active_pins.retain(|_| true);",
+        ),
+        "stale-guard-revokes-newer-peer": (
+            "pending",
+            "if !owns_pending && !owns_staged {\n                return Ok(());\n            }",
+            "if false {\n                return Ok(());\n            }",
+        ),
+        "rotation-keeps-reservation": (
+            "pending",
+            "ledger.admission_reservations.clear();",
+            "let _ = &ledger.admission_reservations;",
+        ),
     }
     for name, (key, old, new) in mutants.items():
         assert old in sources[key], f"mutant {name} did not match source"
@@ -162,31 +231,7 @@ def main() -> None:
         except AssertionError:
             continue
         raise AssertionError(f"mutant {name} survived")
-    revocation_at = sources["pending"].find("fn revoke_current")
-    assert revocation_at >= 0
-    for name, old, new in [
-        (
-            "omit-revocation-active-pin-removal",
-            "ledger.active_pins.retain(|pin| pin.peer != peer);",
-            "ledger.active_pins.retain(|_| true);",
-        ),
-        (
-            "omit-revocation-tombstones",
-            "ledger.tombstones.extend(&removed);",
-            "let _ = &removed;",
-        ),
-    ]:
-        prefix = sources["pending"][:revocation_at]
-        suffix = sources["pending"][revocation_at:]
-        assert old in suffix, f"mutant {name} did not match revocation source"
-        candidate = dict(sources)
-        candidate["pending"] = prefix + suffix.replace(old, new, 1)
-        try:
-            validate(**candidate)
-        except AssertionError:
-            continue
-        raise AssertionError(f"mutant {name} survived")
-    print(f"PASS: base contract and {len(mutants) + 2} mutants rejected")
+    print(f"PASS: staged admission contract and {len(mutants)} mutants rejected")
 
 
 if __name__ == "__main__":
