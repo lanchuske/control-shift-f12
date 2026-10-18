@@ -107,3 +107,36 @@ fn ui_stdio_child_rejects_oversized_inherited_frames() {
     let status = child.wait().expect("wait for invalid-frame child");
     assert!(!status.success(), "oversized frames must be terminal");
 }
+
+#[test]
+fn ui_stdio_child_rejects_duplicate_arguments_without_projection_or_argument_echo() {
+    for body in [
+        r#"{"v":1,"id":"duplicate-handle","command":"ui.select_candidate","args":{"handle":{"address":"192.0.2.4"},"handle":"nearby-1"}}"#,
+        r#"{"v":1,"id":"duplicate-generation","command":"ui.approve_sas","args":{"generation":0,"generation":1,"matches":true}}"#,
+    ] {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_seamless-input"))
+            .args(["control", "--ui-stdio"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("ui stdio child should start");
+        let mut stdin = child.stdin.take().unwrap();
+        stdin.write_all(&(body.len() as u32).to_be_bytes()).unwrap();
+        stdin.write_all(body.as_bytes()).unwrap();
+        drop(stdin);
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            !output.status.success(),
+            "duplicate arguments must be terminal"
+        );
+        assert!(
+            output.stdout.is_empty(),
+            "ambiguous requests must not emit frames"
+        );
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(!stderr.contains("192.0.2.4"));
+        assert!(!stderr.contains("nearby-1"));
+        assert!(!stderr.contains("generation"));
+    }
+}

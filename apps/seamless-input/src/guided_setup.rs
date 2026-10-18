@@ -6,6 +6,105 @@ use seamless_discovery::guided::{
 use serde::{Deserialize, Serialize};
 use std::time::Instant;
 
+/// Local engine token, deliberately neither serializable nor an endpoint locator.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DiscoveryWindowGeneration {
+    scope: [u8; 16],
+    sequence: u64,
+}
+
+/// Consent owner for the separately gated product pairing lease. Opening this
+/// window creates only a catalogue; it does not browse, publish or bind a socket.
+/// This is not wired to SetupController or either desktop IPC adapter.
+pub struct PairingDiscoveryWindow {
+    catalog: ConsentCatalog,
+    scope: [u8; 16],
+    sequence: u64,
+    current: Option<DiscoveryWindowGeneration>,
+    deadline: u64,
+    leased: bool,
+    revocation: Option<crate::product_pairing_adapter::PairingLeaseRevocation>,
+}
+impl Default for PairingDiscoveryWindow {
+    fn default() -> Self {
+        use rand::RngCore;
+        let mut scope = [0; 16];
+        rand::rngs::OsRng.fill_bytes(&mut scope);
+        Self {
+            catalog: ConsentCatalog::default(),
+            scope,
+            sequence: 0,
+            current: None,
+            deadline: 0,
+            leased: false,
+            revocation: None,
+        }
+    }
+}
+impl PairingDiscoveryWindow {
+    pub fn open(&mut self, now_ms: u64) -> Result<DiscoveryWindowGeneration, SetupError> {
+        if self.current.is_some() {
+            return Err(SetupError::InvalidState);
+        }
+        let sequence = self.sequence.checked_add(1).ok_or(SetupError::Limit)?;
+        let deadline = now_ms.checked_add(300_000).ok_or(SetupError::Limit)?;
+        self.catalog.open(now_ms)?;
+        let generation = DiscoveryWindowGeneration {
+            scope: self.scope,
+            sequence,
+        };
+        self.sequence = sequence;
+        self.current = Some(generation);
+        self.deadline = deadline;
+        self.leased = false;
+        Ok(generation)
+    }
+
+    pub fn close(&mut self, now_ms: u64) -> Result<(), SetupError> {
+        // Revocation is synchronous and precedes clearing the consent catalogue,
+        // even if the supplied clock regresses.
+        let revoked = self
+            .revocation
+            .take()
+            .map(|lease| lease.revoke())
+            .transpose();
+        self.current = None;
+        let closed = self.catalog.close(now_ms).map_err(SetupError::from);
+        revoked.and(closed)
+    }
+
+    pub(crate) fn authorize_lease(
+        &mut self,
+        generation: DiscoveryWindowGeneration,
+        now_ms: u64,
+    ) -> Result<u64, SetupError> {
+        if self.current != Some(generation) || self.leased {
+            return Err(SetupError::InvalidState);
+        }
+        if let Err(error) = self.catalog.candidates(now_ms) {
+            let _ = self.close(now_ms);
+            return Err(error.into());
+        }
+        self.leased = true;
+        Ok(self.deadline)
+    }
+
+    pub(crate) fn attach_lease(
+        &mut self,
+        revocation: crate::product_pairing_adapter::PairingLeaseRevocation,
+    ) {
+        self.leased = true;
+        self.revocation = Some(revocation);
+    }
+}
+impl Drop for PairingDiscoveryWindow {
+    fn drop(&mut self) {
+        if let Some(lease) = self.revocation.take() {
+            let _ = lease.revoke();
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SetupError {

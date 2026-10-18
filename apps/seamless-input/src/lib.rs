@@ -9,6 +9,8 @@ pub mod display_inventory;
 #[cfg(feature = "pairing-v2-experimental")]
 pub mod guided_setup;
 pub mod peer;
+#[cfg(feature = "pairing-v2-experimental")]
+pub mod product_pairing_adapter;
 pub mod runtime;
 pub mod runtime_status;
 pub mod supervisor;

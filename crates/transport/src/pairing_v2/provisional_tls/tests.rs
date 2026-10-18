@@ -34,6 +34,105 @@ fn handshake_config(local: u8, remote: u8) -> super::HandshakeConfig {
         selected_rendezvous: [remote; 16],
     }
 }
+
+#[tokio::test]
+async fn one_local_sas_approval_never_commits_a_relationship() {
+    let (_ea, _eb, a, b, _) = pair().await;
+    let ta = tempfile::tempdir().unwrap();
+    let tb = tempfile::tempdir().unwrap();
+    let sa = crate::pairing_pending::PendingStore::open(ta.path()).unwrap();
+    let sb = crate::pairing_pending::PendingStore::open(tb.path()).unwrap();
+    let before_a = sa.version().unwrap();
+    let before_b = sb.version().unwrap();
+    let (prompt_a_tx, prompt_a_rx) = tokio::sync::oneshot::channel();
+    let (prompt_b_tx, prompt_b_rx) = tokio::sync::oneshot::channel();
+    let (approve_a_tx, approve_a_rx) = tokio::sync::oneshot::channel();
+    let (approve_b_tx, approve_b_rx) = tokio::sync::oneshot::channel();
+    let attempt_a = a.handshake(handshake_config(1, 2), &sa, |prompt| async move {
+        prompt_a_tx.send(prompt.clone()).unwrap();
+        prompt.decision(approve_a_rx.await.unwrap())
+    });
+    let attempt_b = b.handshake(handshake_config(2, 1), &sb, |prompt| async move {
+        prompt_b_tx.send(prompt.clone()).unwrap();
+        prompt.decision(approve_b_rx.await.unwrap())
+    });
+    tokio::pin!(attempt_a, attempt_b);
+    let decisions = async {
+        let (prompt_a, prompt_b) = tokio::join!(prompt_a_rx, prompt_b_rx);
+        let prompt_a = prompt_a.unwrap();
+        let prompt_b = prompt_b.unwrap();
+        assert_eq!(prompt_a.words, prompt_b.words);
+        assert_eq!(prompt_a.attempt, prompt_b.attempt);
+        assert_eq!(prompt_a.transcript, prompt_b.transcript);
+        approve_a_tx.send(true).unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        // The remote callback is deliberately still waiting on a separate
+        // local gesture. No protocol finalizer may prepare durable evidence.
+        assert_eq!(sa.version().unwrap(), before_a);
+        assert_eq!(sb.version().unwrap(), before_b);
+        assert!(sa.pending(prompt_a.attempt).unwrap().is_none());
+        assert!(sb.pending(prompt_b.attempt).unwrap().is_none());
+        let store =
+            crate::pairing_v2::admission_authority::AdmissionAuthorityStore::open(ta.path())
+                .unwrap();
+        assert_eq!(
+            store.reconcile(prompt_a.attempt).unwrap(),
+            crate::pairing_v2::admission_authority::ReconcileAdmission::Absent
+        );
+        // Keep the independent remote decision alive through every assertion.
+        drop(approve_b_tx);
+    };
+    tokio::time::timeout(Duration::from_secs(3), async {
+        tokio::select! {
+            biased;
+            _ = &mut attempt_a => panic!("one-sided approval completed local handshake"),
+            _ = &mut attempt_b => panic!("remote handshake completed without local gesture"),
+            _ = decisions => {}
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn current_foundation_revokes_committed_metadata_on_listener_shutdown() {
+    let (ea, _eb, a, b, _) = pair().await;
+    let ta = tempfile::tempdir().unwrap();
+    let tb = tempfile::tempdir().unwrap();
+    let sa = crate::pairing_pending::PendingStore::open(ta.path()).unwrap();
+    let sb = crate::pairing_pending::PendingStore::open(tb.path()).unwrap();
+    let (a, b) = tokio::join!(
+        a.handshake(
+            handshake_config(1, 2),
+            &sa,
+            |p| async move { p.decision(true) }
+        ),
+        b.handshake(
+            handshake_config(2, 1),
+            &sb,
+            |p| async move { p.decision(true) }
+        )
+    );
+    let _b = b.unwrap();
+    let store =
+        crate::pairing_v2::admission_authority::AdmissionAuthorityStore::open(ta.path()).unwrap();
+    let receipt = store
+        .commit_sealed_foundation(store.version().unwrap(), a.unwrap())
+        .await
+        .unwrap();
+    assert_eq!(
+        store.reconcile(receipt.attempt()).unwrap(),
+        crate::pairing_v2::admission_authority::ReconcileAdmission::Promoted
+    );
+    drop(ea);
+    // This is the current reviewed foundation boundary, not product success.
+    // Task 3 requires an independently reviewed, crash-safe handoff of durable
+    // ownership before normal listener cleanup can preserve a relationship.
+    assert_eq!(
+        store.reconcile(receipt.attempt()).unwrap(),
+        crate::pairing_v2::admission_authority::ReconcileAdmission::Revoked
+    );
+}
 #[tokio::test]
 async fn bilateral_rejects_substituted_tls_connection_before_candidate_io() {
     let (_ea, _eb, mut a, _b, _) = pair().await;
