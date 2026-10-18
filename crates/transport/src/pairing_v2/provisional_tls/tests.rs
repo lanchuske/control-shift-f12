@@ -3813,6 +3813,7 @@ async fn distributed_commit_accepts_independent_store_generations() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cancelling_coordinator_after_local_commit_preserves_quarantine() {
+    crate::pairing_v2::admission_authority::reset_after_local_commit_checkpoint();
     let (der, key) = identity(true);
     let endpoint = ProvisionalEndpoint::bind("127.0.0.1:0".parse().unwrap(), der, key).unwrap();
     let child_root = tempfile::tempdir().unwrap();
@@ -3863,12 +3864,7 @@ async fn cancelling_coordinator_after_local_commit_preserves_quarantine() {
     let commit_store = store.clone();
     let commit = tokio::spawn(async move { commit_store.commit_distributed(authority).await });
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    loop {
-        if store.reconcile_distributed(attempt).unwrap()
-            == crate::pairing_v2::admission_authority::ReconcileAdmission::RemoteOutcomeUnknown
-        {
-            break;
-        }
+    while !crate::pairing_v2::admission_authority::after_local_commit_checkpoint_reached() {
         assert!(
             std::time::Instant::now() < deadline,
             "local commit was not reached"

@@ -9,6 +9,8 @@ use crate::pairing_pending::{
 #[cfg(test)]
 use std::cell::Cell;
 use std::path::Path;
+#[cfg(test)]
+use std::sync::atomic::{AtomicBool, Ordering};
 
 #[allow(dead_code)]
 pub(crate) const PROTOCOL_VERSION: u16 = 2;
@@ -1361,7 +1363,23 @@ impl AdmissionAuthorityStore {
 }
 
 #[cfg(test)]
+static AFTER_LOCAL_COMMIT_REACHED: AtomicBool = AtomicBool::new(false);
+
+#[cfg(test)]
+pub(crate) fn reset_after_local_commit_checkpoint() {
+    AFTER_LOCAL_COMMIT_REACHED.store(false, Ordering::Release);
+}
+
+#[cfg(test)]
+pub(crate) fn after_local_commit_checkpoint_reached() -> bool {
+    AFTER_LOCAL_COMMIT_REACHED.load(Ordering::Acquire)
+}
+
+#[cfg(test)]
 fn distributed_process_checkpoint(name: &str) {
+    if name == "after_local_commit" {
+        AFTER_LOCAL_COMMIT_REACHED.store(true, Ordering::Release);
+    }
     if let Ok(mode) = std::env::var("CSF12_DISTRIBUTED_COMMIT_CRASH") {
         if mode == name {
             std::process::exit(92);
