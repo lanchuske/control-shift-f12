@@ -525,12 +525,9 @@ impl PrivateDir {
         } else {
             OPEN_EXISTING
         };
-        let Some(file) = open_path_with_flags(
-            &self.path.join(value),
-            false,
-            disposition,
-            additional_flags,
-        )? else {
+        let Some(file) =
+            open_path_with_flags(&self.path.join(value), false, disposition, additional_flags)?
+        else {
             return Ok(None);
         };
         let handle = file.as_raw_handle().cast();
@@ -754,7 +751,10 @@ mod tests {
     fn rename_info_rejects_embedded_nul() {
         use std::os::windows::ffi::OsStringExt;
         let path = std::ffi::OsString::from_wide(&[b'C' as u16, b':' as u16, 0, b'x' as u16]);
-        assert_eq!(rename_info(Path::new(&path), true), Err(StoreError::Invalid));
+        assert_eq!(
+            rename_info(Path::new(&path), true),
+            Err(StoreError::Invalid)
+        );
     }
 
     #[test]
