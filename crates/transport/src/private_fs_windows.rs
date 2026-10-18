@@ -40,6 +40,8 @@ use windows_sys::Win32::{
         Threading::{GetCurrentProcess, OpenProcessToken},
     },
 };
+#[cfg(test)]
+use windows_sys::Win32::Foundation::GetLastError;
 
 const ERROR_SUCCESS: u32 = 0;
 
@@ -90,6 +92,8 @@ fn rename_open_file(source: &File, destination: &Path, replace: bool) -> Result<
         )
     } == 0
     {
+        #[cfg(test)]
+        faults::record_failure("rename", Some(unsafe { GetLastError() } as i32));
         Err(StoreError::Unavailable)
     } else {
         Ok(())
@@ -103,6 +107,7 @@ pub(crate) mod faults {
     use std::cell::RefCell;
     std::thread_local! {static ARMED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };}
     std::thread_local! {static OPERATIONS: RefCell<Vec<&'static str>> = const { RefCell::new(Vec::new()) };}
+    std::thread_local! {static FAILURE: RefCell<Option<(&'static str, Option<i32>)>> = const { RefCell::new(None) };}
     #[cfg(feature = "pairing-v2-experimental")]
     pub fn arm() {
         ARMED.set(true);
@@ -137,9 +142,16 @@ pub(crate) mod faults {
     }
     pub fn reset_operations() {
         OPERATIONS.with(|operations| operations.borrow_mut().clear());
+        FAILURE.with(|failure| *failure.borrow_mut() = None);
     }
     pub fn take_operations() -> Vec<&'static str> {
         OPERATIONS.with(|operations| std::mem::take(&mut *operations.borrow_mut()))
+    }
+    pub fn record_failure(operation: &'static str, code: Option<i32>) {
+        FAILURE.with(|failure| *failure.borrow_mut() = Some((operation, code)));
+    }
+    pub fn take_failure() -> Option<(&'static str, Option<i32>)> {
+        FAILURE.with(|failure| failure.borrow_mut().take())
     }
 }
 
@@ -152,7 +164,11 @@ macro_rules! fault_point {
 
 fn flush_before_rename(file: &File, _value: &str) -> Result<(), StoreError> {
     fault_point!(_value, "before_file_sync");
-    file.sync_all().map_err(|_| StoreError::Unavailable)?;
+    file.sync_all().map_err(|error| {
+        #[cfg(test)]
+        faults::record_failure("pre-file-flush", error.raw_os_error());
+        StoreError::Unavailable
+    })?;
     #[cfg(test)]
     faults::record("pre-file-flush");
     fault_point!(_value, "after_file_sync");
@@ -174,7 +190,11 @@ fn publish_renamed_file(
 }
 
 fn flush_after_rename(file: &File) -> Result<(), StoreError> {
-    file.sync_all().map_err(|_| StoreError::Unavailable)?;
+    file.sync_all().map_err(|error| {
+        #[cfg(test)]
+        faults::record_failure("post-file-flush", error.raw_os_error());
+        StoreError::Unavailable
+    })?;
     #[cfg(test)]
     faults::record("post-file-flush");
     Ok(())
@@ -496,7 +516,11 @@ impl PrivateDir {
             harden(handle, true, &self.sid)?;
         }
         validate(handle, true, &self.sid)?;
-        self.flush()?;
+        self.flush().map_err(|error| {
+            #[cfg(test)]
+            faults::record_failure("directory-flush", None);
+            error
+        })?;
         Ok(Self {
             path,
             file,
@@ -792,10 +816,18 @@ mod tests {
         drop(target);
         faults::reset_operations();
 
-        private.replace("target", b"new").unwrap();
+        let result = private.replace("target", b"new");
+        let operations = faults::take_operations();
+        let failure = faults::take_failure();
 
         assert_eq!(
-            faults::take_operations(),
+            result,
+            Ok(()),
+            "replacement failed after {operations:?}; failure={failure:?}"
+        );
+
+        assert_eq!(
+            operations,
             [
                 "pre-file-flush",
                 "rename",
