@@ -12,6 +12,8 @@ use std::{
     path::{Path, PathBuf},
     ptr,
 };
+#[cfg(test)]
+use windows_sys::Win32::Foundation::GetLastError;
 use windows_sys::Win32::{
     Foundation::{
         CloseHandle, ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, GENERIC_READ, GENERIC_WRITE,
@@ -40,8 +42,6 @@ use windows_sys::Win32::{
         Threading::{GetCurrentProcess, OpenProcessToken},
     },
 };
-#[cfg(test)]
-use windows_sys::Win32::Foundation::GetLastError;
 
 const ERROR_SUCCESS: u32 = 0;
 
