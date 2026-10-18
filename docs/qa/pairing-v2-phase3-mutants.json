@@ -1,0 +1,96 @@
+{
+  "base": "945047a0ac1824ac990c29c4259efa97f2d2131c",
+  "scope": "offline phase-3; each mutant restored; assertion RED, no release claim",
+  "results": [
+    {
+      "id": "candidate-singleton",
+      "exit": 101,
+      "output": "    Finished `test` profile [unoptimized + debuginfo] target(s) in 3.37s\n     Running tests/pairing_v2_session.rs (target/debug/deps/pairing_v2_session-9315ee0ea1bf01b0)\n\nrunning 1 test\ntest coordinator_never_negotiates_multisuite_or_legacy_even_with_rebound_candidate_hash ... FAILED\n\nfailures:\n\n---- coordinator_never_negotiates_multisuite_or_legacy_even_with_rebound_candidate_hash stdout ----\n\nthread 'coordinator_never_negotiates_multisuite_or_legacy_even_with_rebound_candidate_hash' (8376961) panicked at crates/transport/tests/pairing_v2_session.rs:665:9:\nassertion failed: BoundHello::validate(&candidate, &binding, &encode(\"hello\", &hello).unwrap(),\n        fp, \"selected-connection\", 5, fp[..16].try_into().unwrap(),\n        1_893_456_000).is_err()\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n\n\nfailures:\n    coordinator_never_negotiates_multisuite_or_legacy_even_with_rebound_candidate_hash\n\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 15 filtered out; finished in 0.01s\n\nerror: test failed, to rerun pass `-p seamless-transport --test pairing_v2_session`\n"
+    },
+    {
+      "id": "hello-candidate-digest",
+      "exit": 101,
+      "output": "\nrunning 1 test\ntest reviewed_e2e_candidates_bind_exact_hello_fields_and_reject_v01_placeholders ... FAILED\n\nfailures:\n\n---- reviewed_e2e_candidates_bind_exact_hello_fields_and_reject_v01_placeholders stdout ----\n\nthread 'reviewed_e2e_candidates_bind_exact_hello_fields_and_reject_v01_placeholders' (8378281) panicked at crates/transport/tests/pairing_v2_session.rs:259:13:\nbinding/a/4\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n\n\nfailures:\n    reviewed_e2e_candidates_bind_exact_hello_fields_and_reject_v01_placeholders\n\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 15 filtered out; finished in 0.01s\n\nerror: test failed, to rerun pass `-p seamless-transport --test pairing_v2_session`\n"
+    },
+    {
+      "id": "both-commits",
+      "exit": 101,
+      "output": "    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.14s\n     Running tests/pairing_v2_session.rs (target/debug/deps/pairing_v2_session-9315ee0ea1bf01b0)\n\nrunning 1 test\ntest reveal_before_both_commitments_and_stale_ui_abort_without_resumption ... FAILED\n\nfailures:\n\n---- reveal_before_both_commitments_and_stale_ui_abort_without_resumption stdout ----\n\nthread 'reveal_before_both_commitments_and_stale_ui_abort_without_resumption' (8380578) panicked at crates/transport/tests/pairing_v2_session.rs:43:5:\nassertion failed: s.receive(SessionMessage::Reveal(Role::A, bytes(&v, \"reveal_a_hex\")),\n        2).is_err()\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n\n\nfailures:\n    reveal_before_both_commitments_and_stale_ui_abort_without_resumption\n\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 15 filtered out; finished in 0.01s\n\nerror: test failed, to rerun pass `-p seamless-transport --test pairing_v2_session`\n"
+    },
+    {
+      "id": "commitment-match",
+      "exit": 101,
+      "output": "\nrunning 1 test\ntest changed_commit_reveal_proof_or_approval_aborts_permanently ... FAILED\n\nfailures:\n\n---- changed_commit_reveal_proof_or_approval_aborts_permanently stdout ----\n\nthread 'changed_commit_reveal_proof_or_approval_aborts_permanently' (8382381) panicked at crates/transport/tests/pairing_v2_session.rs:500:9:\nfailure/1\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n\n\nfailures:\n    changed_commit_reveal_proof_or_approval_aborts_permanently\n\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 15 filtered out; finished in 0.01s\n\nerror: test failed, to rerun pass `-p seamless-transport --test pairing_v2_session`\n"
+    },
+    {
+      "id": "local-ui",
+      "exit": 101,
+      "output": "\nrunning 1 test\ntest one_sided_local_signed_record_is_not_a_local_ui_gesture ... FAILED\n\nfailures:\n\n---- one_sided_local_signed_record_is_not_a_local_ui_gesture stdout ----\n\nthread 'one_sided_local_signed_record_is_not_a_local_ui_gesture' (8384491) panicked at crates/transport/tests/pairing_v2_session.rs:88:5:\nassertion failed: s.receive(approval(&v, Role::A), 4).is_err()\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n\n\nfailures:\n    one_sided_local_signed_record_is_not_a_local_ui_gesture\n\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 15 filtered out; finished in 0.01s\n\nerror: test failed, to rerun pass `-p seamless-transport --test pairing_v2_session`\n"
+    },
+    {
+      "id": "ui-generation",
+      "exit": 101,
+      "output": "\nrunning 1 test\ntest reveal_before_both_commitments_and_stale_ui_abort_without_resumption ... FAILED\n\nfailures:\n\n---- reveal_before_both_commitments_and_stale_ui_abort_without_resumption stdout ----\n\nthread 'reveal_before_both_commitments_and_stale_ui_abort_without_resumption' (8385908) panicked at crates/transport/tests/pairing_v2_session.rs:68:9:\nassertion failed: s.confirm(attempt, transcript, if invalid == 2 { 8 } else { 7 }, invalid != 3,\n        4).is_err()\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n\n\nfailures:\n    reveal_before_both_commitments_and_stale_ui_abort_without_resumption\n\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 15 filtered out; finished in 0.03s\n\nerror: test failed, to rerun pass `-p seamless-transport --test pairing_v2_session`\n"
+    },
+    {
+      "id": "attempt-expiry",
+      "exit": 101,
+      "output": "    Finished `test` profile [unoptimized + debuginfo] target(s) in 2.22s\n     Running tests/pairing_v2_session.rs (target/debug/deps/pairing_v2_session-9315ee0ea1bf01b0)\n\nrunning 1 test\ntest cancellation_is_terminal_and_duplicates_cannot_extend_network_or_human_deadlines ... FAILED\n\nfailures:\n\n---- cancellation_is_terminal_and_duplicates_cannot_extend_network_or_human_deadlines stdout ----\n\nthread 'cancellation_is_terminal_and_duplicates_cannot_extend_network_or_human_deadlines' (8403608) panicked at crates/transport/tests/pairing_v2_session.rs:435:5:\nassertion failed: s.verification_words(300_000).is_none()\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n\n\nfailures:\n    cancellation_is_terminal_and_duplicates_cannot_extend_network_or_human_deadlines\n\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 15 filtered out; finished in 0.02s\n\nerror: test failed, to rerun pass `-p seamless-transport --test pairing_v2_session`\n"
+    },
+    {
+      "id": "a-durable-role",
+      "exit": 101,
+      "output": "\nrunning 1 test\ntest each_role_requires_own_durable_boundary_before_complete_and_remains_quarantined ... FAILED\n\nfailures:\n\n---- each_role_requires_own_durable_boundary_before_complete_and_remains_quarantined stdout ----\n\nthread 'each_role_requires_own_durable_boundary_before_complete_and_remains_quarantined' (8404493) panicked at crates/transport/tests/pairing_v2_session.rs:158:13:\nassertion `left == right` failed\n  left: false\n right: true\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n\n\nfailures:\n    each_role_requires_own_durable_boundary_before_complete_and_remains_quarantined\n\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 15 filtered out; finished in 0.07s\n\nerror: test failed, to rerun pass `-p seamless-transport --test pairing_v2_session`\n"
+    },
+    {
+      "id": "b-durable-role",
+      "exit": 101,
+      "output": "\nrunning 1 test\ntest each_role_requires_own_durable_boundary_before_complete_and_remains_quarantined ... FAILED\n\nfailures:\n\n---- each_role_requires_own_durable_boundary_before_complete_and_remains_quarantined stdout ----\n\nthread 'each_role_requires_own_durable_boundary_before_complete_and_remains_quarantined' (8405768) panicked at crates/transport/tests/pairing_v2_session.rs:158:13:\nassertion `left == right` failed\n  left: false\n right: true\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n\n\nfailures:\n    each_role_requires_own_durable_boundary_before_complete_and_remains_quarantined\n\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 15 filtered out; finished in 0.28s\n\nerror: test failed, to rerun pass `-p seamless-transport --test pairing_v2_session`\n"
+    },
+    {
+      "id": "candidate-2sec",
+      "exit": 101,
+      "output": "\nrunning 1 test\ntest exact_candidate_deadlines_and_monotonic_rollback_fail_closed ... FAILED\n\nfailures:\n\n---- exact_candidate_deadlines_and_monotonic_rollback_fail_closed stdout ----\n\nthread 'exact_candidate_deadlines_and_monotonic_rollback_fail_closed' (8406834) panicked at crates/transport/tests/pairing_v2_coordinator_limits.rs:64:5:\nassertion failed: gate.candidate(1, 30_000, 2000).is_err()\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n\n\nfailures:\n    exact_candidate_deadlines_and_monotonic_rollback_fail_closed\n\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.00s\n\nerror: test failed, to rerun pass `-p seamless-transport --test pairing_v2_coordinator_limits`\n"
+    },
+    {
+      "id": "global-sockets",
+      "exit": 101,
+      "output": "\nrunning 1 test\ntest sockets_are_bounded_per_source_and_globally_before_crypto_allocation ... FAILED\n\nfailures:\n\n---- sockets_are_bounded_per_source_and_globally_before_crypto_allocation stdout ----\n\nthread 'sockets_are_bounded_per_source_and_globally_before_crypto_allocation' (8408184) panicked at crates/transport/tests/pairing_v2_coordinator_limits.rs:56:5:\nassertion failed: gate.connect(source(9), 9, 120_000).is_err()\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n\n\nfailures:\n    sockets_are_bounded_per_source_and_globally_before_crypto_allocation\n\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.00s\n\nerror: test failed, to rerun pass `-p seamless-transport --test pairing_v2_coordinator_limits`\n"
+    },
+    {
+      "id": "source-burst",
+      "exit": 101,
+      "output": "\nrunning 1 test\ntest source_and_global_buckets_do_not_reset_when_consent_window_reopens ... FAILED\n\nfailures:\n\n---- source_and_global_buckets_do_not_reset_when_consent_window_reopens stdout ----\n\nthread 'source_and_global_buckets_do_not_reset_when_consent_window_reopens' (8409123) panicked at crates/transport/tests/pairing_v2_coordinator_limits.rs:33:5:\nassertion failed: gate.connect(source(1), 3, 0).is_err()\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n\n\nfailures:\n    source_and_global_buckets_do_not_reset_when_consent_window_reopens\n\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.00s\n\nerror: test failed, to rerun pass `-p seamless-transport --test pairing_v2_coordinator_limits`\n"
+    },
+    {
+      "id": "persist-expiry",
+      "exit": 101,
+      "output": "    Finished `test` profile [unoptimized + debuginfo] target(s) in 3.18s\n     Running tests/pairing_v2_session.rs (target/debug/deps/pairing_v2_session-9315ee0ea1bf01b0)\n\nrunning 1 test\ntest expiry_between_commit_verification_and_write_never_creates_durable_commit ... FAILED\n\nfailures:\n\n---- expiry_between_commit_verification_and_write_never_creates_durable_commit stdout ----\n\nthread 'expiry_between_commit_verification_and_write_never_creates_durable_commit' (8447702) panicked at crates/transport/tests/pairing_v2_session.rs:370:5:\nassertion failed: f.persist(&store, before,\n        JournalClock {\n            monotonic_ms: 300_000,\n            utc_seconds: 1_893_456_300,\n            ..clock\n        }).is_err()\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n\n\nfailures:\n    expiry_between_commit_verification_and_write_never_creates_durable_commit\n\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 15 filtered out; finished in 0.14s\n\nerror: test failed, to rerun pass `-p seamless-transport --test pairing_v2_session`\n"
+    },
+    {
+      "id": "all-journals",
+      "exit": 101,
+      "output": "    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.74s\n     Running tests/pairing_v2_session.rs (target/debug/deps/pairing_v2_session-9315ee0ea1bf01b0)\n\nrunning 1 test\ntest corrupt_journal_a_blocks_every_operation_on_unrelated_b_without_advancement_or_cleanup ... FAILED\n\nfailures:\n\n---- corrupt_journal_a_blocks_every_operation_on_unrelated_b_without_advancement_or_cleanup stdout ----\n\nthread 'corrupt_journal_a_blocks_every_operation_on_unrelated_b_without_advancement_or_cleanup' (8448790) panicked at crates/transport/tests/pairing_v2_session.rs:581:9:\noperation/0\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n\n\nfailures:\n    corrupt_journal_a_blocks_every_operation_on_unrelated_b_without_advancement_or_cleanup\n\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 15 filtered out; finished in 0.23s\n\nerror: test failed, to rerun pass `-p seamless-transport --test pairing_v2_session`\n"
+    },
+    {
+      "id": "durable-local-fc",
+      "exit": 101,
+      "output": "    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.47s\n     Running tests/pairing_v2_durable_recovery.rs (target/debug/deps/pairing_v2_durable_recovery-f9aadde089de8add)\n\nrunning 1 test\ntest authoritative_claim_cannot_replace_missing_local_durable_fc ... FAILED\n\nfailures:\n\n---- authoritative_claim_cannot_replace_missing_local_durable_fc stdout ----\n\nthread 'authoritative_claim_cannot_replace_missing_local_durable_fc' (8449886) panicked at crates/transport/tests/pairing_v2_durable_recovery.rs:284:5:\nassertion failed: verify_authoritative_recovery(&authority, [1; 32], &body, &sig, 1,\n        1_893_456_000).is_err()\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n\n\nfailures:\n    authoritative_claim_cannot_replace_missing_local_durable_fc\n\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 6 filtered out; finished in 0.28s\n\nerror: test failed, to rerun pass `-p seamless-transport --test pairing_v2_durable_recovery`\n"
+    },
+    {
+      "id": "durable-consume",
+      "exit": 101,
+      "output": "    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.15s\n     Running tests/pairing_v2_durable_recovery.rs (target/debug/deps/pairing_v2_durable_recovery-f9aadde089de8add)\n\nrunning 1 test\ntest accepted_remote_generations_are_not_local_generations_and_replay_survives_reopen ... FAILED\n\nfailures:\n\n---- accepted_remote_generations_are_not_local_generations_and_replay_survives_reopen stdout ----\n\nthread 'accepted_remote_generations_are_not_local_generations_and_replay_survives_reopen' (8450738) panicked at crates/transport/tests/pairing_v2_durable_recovery.rs:120:5:\nassertion failed: verify_authoritative_recovery(&reopened, [1; 32], &body, &sig, 2,\n        1_893_456_000).is_err()\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n\n\nfailures:\n    accepted_remote_generations_are_not_local_generations_and_replay_survives_reopen\n\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 6 filtered out; finished in 0.48s\n\nerror: test failed, to rerun pass `-p seamless-transport --test pairing_v2_durable_recovery`\n"
+    },
+    {
+      "id": "exact-authority",
+      "exit": 101,
+      "output": "\nrunning 1 test\ntest absent_or_changed_authority_and_local_revocation_fail_without_consumption ... FAILED\n\nfailures:\n\n---- absent_or_changed_authority_and_local_revocation_fail_without_consumption stdout ----\n\nthread 'absent_or_changed_authority_and_local_revocation_fail_without_consumption' (8451470) panicked at crates/transport/tests/pairing_v2_durable_recovery.rs:167:9:\nfailure/1\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n\n\nfailures:\n    absent_or_changed_authority_and_local_revocation_fail_without_consumption\n\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 6 filtered out; finished in 0.65s\n\nerror: test failed, to rerun pass `-p seamless-transport --test pairing_v2_durable_recovery`\n"
+    },
+    {
+      "id": "journal-prefix",
+      "exit": 101,
+      "output": "warning: method `follows` is never used\n   --> crates/transport/src/pairing_v2/journal.rs:149:19\n    |\n 77 | impl PublicJournal {\n    | ------------------ method in this implementation\n...\n149 |     pub(crate) fn follows(&self, old: &Self) -> bool {\n    |                   ^^^^^^^\n    |\n    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default\n\nwarning: `seamless-transport` (lib test) generated 1 warning\n    Finished `test` profile [unoptimized + debuginfo] target(s) in 2.45s\n     Running unittests src/lib.rs (target/debug/deps/seamless_transport-172a2000f0c721e0)\n\nrunning 1 test\ntest pairing_v2::journal::fault_tests::completed_journal_must_extend_exact_durable_prefix_including_original_clock ... FAILED\n\nfailures:\n\n---- pairing_v2::journal::fault_tests::completed_journal_must_extend_exact_durable_prefix_including_original_clock stdout ----\n\nthread 'pairing_v2::journal::fault_tests::completed_journal_must_extend_exact_durable_prefix_including_original_clock' (8457399) panicked at crates/transport/src/pairing_v2/journal_fault_tests.rs:154:9:\nassertion failed: store.persist_pairing_journal(version, &changed).is_err()\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n\n\nfailures:\n    pairing_v2::journal::fault_tests::completed_journal_must_extend_exact_durable_prefix_including_original_clock\n\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 5 filtered out; finished in 0.17s\n\nerror: test failed, to rerun pass `-p seamless-transport --lib`\n"
+    }
+  ]
+}

@@ -1,0 +1,189 @@
+{
+  "scope": "phase4-narrowed-browse-only-no-release",
+  "base": "e3576697b343544a8f1d587dc3fcd676d909cc80",
+  "date": "2026-10-16",
+  "verification": [
+    {
+      "name": "default",
+      "command": "/Users/lanchu/.cargo/bin/cargo test --workspace --offline",
+      "exit_code": 0,
+      "totals": [
+        220,
+        0,
+        2
+      ]
+    },
+    {
+      "name": "experimental",
+      "command": "/Users/lanchu/.cargo/bin/cargo test --workspace --features seamless-input/pairing-v2-experimental --offline",
+      "exit_code": 0,
+      "totals": [
+        292,
+        0,
+        2
+      ]
+    },
+    {
+      "name": "clippy-default",
+      "command": "/Users/lanchu/.cargo/bin/cargo clippy --workspace --all-targets --offline -- -D warnings",
+      "exit_code": 0,
+      "totals": [
+        0,
+        0,
+        0
+      ]
+    },
+    {
+      "name": "clippy-experimental",
+      "command": "/Users/lanchu/.cargo/bin/cargo clippy --workspace --all-targets --features seamless-input/pairing-v2-experimental --offline -- -D warnings",
+      "exit_code": 0,
+      "totals": [
+        0,
+        0,
+        0
+      ]
+    },
+    {
+      "name": "fmt",
+      "command": "/Users/lanchu/.cargo/bin/cargo fmt --all --check",
+      "exit_code": 0,
+      "totals": [
+        0,
+        0,
+        0
+      ]
+    },
+    {
+      "name": "diff",
+      "command": "git diff --check",
+      "exit_code": 0,
+      "totals": [
+        0,
+        0,
+        0
+      ]
+    }
+  ],
+  "mutants": [
+    {
+      "id": "consent",
+      "path": "crates/discovery/src/guided.rs",
+      "mutation": {
+        "from": "let end = self.deadline.ok_or(DiscoveryError::Closed)?;",
+        "to": "let end = self.deadline.unwrap_or(u64::MAX);"
+      },
+      "command": "/Users/lanchu/.cargo/bin/cargo test -p seamless-discovery --features pairing-v2-experimental --offline --test guided consent_window",
+      "exit_code": 101,
+      "expected_red": true,
+      "output": "   Compiling seamless-discovery v0.1.1 (/Users/lanchu/Documents/Codex/seamless-input/.worktrees/guided-setup-foundations/crates/discovery)\n    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.02s\n     Running tests/guided.rs (target/debug/deps/guided-9107b2f58febea91)\n\nrunning 1 test\ntest consent_window_and_current_handle_are_required_without_implicit_retry ... FAILED\n\nfailures:\n\n---- consent_window_and_current_handle_are_required_without_implicit_retry stdout ----\n\nthread 'consent_window_and_current_handle_are_required_without_implicit_retry' (8888382) panicked at crates/discovery/tests/guided.rs:21:5:\nassertion `left == right` failed\n  left: Ok(CandidateHandle { window: 0, sequence: 1 })\n right: Err(Closed)\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n\n\nfailures:\n    consent_window_and_current_handle_are_required_without_implicit_retry\n\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.00s\n\nerror: test failed, to rerun pass `-p seamless-discovery --test guided`\n"
+    },
+    {
+      "id": "capacity",
+      "path": "crates/discovery/src/guided.rs",
+      "mutation": {
+        "from": "self.entries.len() >= 20",
+        "to": "self.entries.len() >= 21"
+      },
+      "command": "/Users/lanchu/.cargo/bin/cargo test -p seamless-discovery --features pairing-v2-experimental --offline --test guided capacity_and",
+      "exit_code": 101,
+      "expected_red": true,
+      "output": "   Compiling seamless-discovery v0.1.1 (/Users/lanchu/Documents/Codex/seamless-input/.worktrees/guided-setup-foundations/crates/discovery)\n    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.56s\n     Running tests/guided.rs (target/debug/deps/guided-9107b2f58febea91)\n\nrunning 1 test\ntest capacity_and_address_bounds_precede_untrusted_catalogue_storage ... FAILED\n\nfailures:\n\n---- capacity_and_address_bounds_precede_untrusted_catalogue_storage stdout ----\n\nthread 'capacity_and_address_bounds_precede_untrusted_catalogue_storage' (8888677) panicked at crates/discovery/tests/guided.rs:44:5:\nassertion `left == right` failed\n  left: Ok(CandidateHandle { window: 1, sequence: 21 })\n right: Err(Limit)\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n\n\nfailures:\n    capacity_and_address_bounds_precede_untrusted_catalogue_storage\n\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.00s\n\nerror: test failed, to rerun pass `-p seamless-discovery --test guided`\n"
+    },
+    {
+      "id": "freshness",
+      "path": "crates/discovery/src/guided.rs",
+      "mutation": {
+        "from": "self.entries.retain(|_, e| now < e.expires);",
+        "to": "self.entries.retain(|_, e| now <= e.expires);"
+      },
+      "command": "/Users/lanchu/.cargo/bin/cargo test -p seamless-discovery --features pairing-v2-experimental --offline --test guided local_freshness",
+      "exit_code": 101,
+      "expected_red": true,
+      "output": "   Compiling seamless-discovery v0.1.1 (/Users/lanchu/Documents/Codex/seamless-input/.worktrees/guided-setup-foundations/crates/discovery)\n    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.52s\n     Running tests/guided.rs (target/debug/deps/guided-9107b2f58febea91)\n\nrunning 1 test\ntest local_freshness_window_deadline_and_clock_rollback_are_fail_closed ... FAILED\n\nfailures:\n\n---- local_freshness_window_deadline_and_clock_rollback_are_fail_closed stdout ----\n\nthread 'local_freshness_window_deadline_and_clock_rollback_are_fail_closed' (8888922) panicked at crates/discovery/tests/guided.rs:63:5:\nassertion `left == right` failed\n  left: Ok(SelectedLocator { handle: CandidateHandle { window: 1, sequence: 1 }, rendezvous: \"00000000000000000000000000000001\", addresses: [127.0.0.1:7777] })\n right: Err(Stale)\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n\n\nfailures:\n    local_freshness_window_deadline_and_clock_rollback_are_fail_closed\n\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.00s\n\nerror: test failed, to rerun pass `-p seamless-discovery --test guided`\n"
+    },
+    {
+      "id": "handle",
+      "path": "crates/discovery/src/guided.rs",
+      "mutation": {
+        "from": ".find(|entry| entry.handle == handle)",
+        "to": ".find(|_| true)"
+      },
+      "command": "/Users/lanchu/.cargo/bin/cargo test -p seamless-discovery --features pairing-v2-experimental --offline --test guided duplicate_refresh",
+      "exit_code": 101,
+      "expected_red": true,
+      "output": "   Compiling seamless-discovery v0.1.1 (/Users/lanchu/Documents/Codex/seamless-input/.worktrees/guided-setup-foundations/crates/discovery)\n    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.49s\n     Running tests/guided.rs (target/debug/deps/guided-9107b2f58febea91)\n\nrunning 1 test\ntest duplicate_refresh_is_stable_but_address_drift_removal_and_expiry_revoke_handles ... FAILED\n\nfailures:\n\n---- duplicate_refresh_is_stable_but_address_drift_removal_and_expiry_revoke_handles stdout ----\n\nthread 'duplicate_refresh_is_stable_but_address_drift_removal_and_expiry_revoke_handles' (8889197) panicked at crates/discovery/tests/guided.rs:91:5:\nassertion `left == right` failed\n  left: Ok(SelectedLocator { handle: CandidateHandle { window: 1, sequence: 1 }, rendezvous: \"00000000000000000000000000000001\", addresses: [127.0.0.2:7777] })\n right: Err(Stale)\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n\n\nfailures:\n    duplicate_refresh_is_stable_but_address_drift_removal_and_expiry_revoke_handles\n\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.00s\n\nerror: test failed, to rerun pass `-p seamless-discovery --test guided`\n"
+    },
+    {
+      "id": "metadata",
+      "path": "crates/discovery/src/guided.rs",
+      "mutation": {
+        "from": "|| info.get_properties().len() != 2",
+        "to": "|| info.get_properties().len() < 2"
+      },
+      "command": "/Users/lanchu/.cargo/bin/cargo test -p seamless-discovery --features pairing-v2-experimental --offline --lib parser_accepts",
+      "exit_code": 101,
+      "expected_red": true,
+      "output": "   Compiling seamless-discovery v0.1.1 (/Users/lanchu/Documents/Codex/seamless-input/.worktrees/guided-setup-foundations/crates/discovery)\n    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.40s\n     Running unittests src/lib.rs (target/debug/deps/seamless_discovery-8cc5352a687eaca2)\n\nrunning 1 test\ntest guided::tests::parser_accepts_only_minimal_metadata_and_opaque_hostname ... FAILED\n\nfailures:\n\n---- guided::tests::parser_accepts_only_minimal_metadata_and_opaque_hostname stdout ----\n\nthread 'guided::tests::parser_accepts_only_minimal_metadata_and_opaque_hostname' (8889414) panicked at crates/discovery/src/guided.rs:393:9:\nassertion failed: decode(&info(true)).is_none()\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n\n\nfailures:\n    guided::tests::parser_accepts_only_minimal_metadata_and_opaque_hostname\n\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s\n\nerror: test failed, to rerun pass `-p seamless-discovery --lib`\n"
+    },
+    {
+      "id": "controller_scope",
+      "path": "apps/seamless-input/src/guided_setup.rs",
+      "mutation": {
+        "from": "if handle.scope != self.scope {",
+        "to": "if false {"
+      },
+      "command": "/Users/lanchu/.cargo/bin/cargo test -p seamless-input --features pairing-v2-experimental --offline --test guided_setup restart_cannot",
+      "exit_code": 101,
+      "expected_red": true,
+      "output": "   Compiling seamless-discovery v0.1.1 (/Users/lanchu/Documents/Codex/seamless-input/.worktrees/guided-setup-foundations/crates/discovery)\n   Compiling seamless-input v0.1.1 (/Users/lanchu/Documents/Codex/seamless-input/.worktrees/guided-setup-foundations/apps/seamless-input)\n    Finished `test` profile [unoptimized + debuginfo] target(s) in 2.96s\n     Running tests/guided_setup.rs (target/debug/deps/guided_setup-525538aba5c2d6ec)\n\nrunning 1 test\ntest restart_cannot_reuse_a_handle_even_when_counters_repeat ... FAILED\n\nfailures:\n\n---- restart_cannot_reuse_a_handle_even_when_counters_repeat stdout ----\n\nthread 'restart_cannot_reuse_a_handle_even_when_counters_repeat' (8890250) panicked at apps/seamless-input/tests/guided_setup.rs:182:5:\nassertion `left == right` failed\n  left: Err(OperationalContractPending)\n right: Err(StaleCandidate)\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n\n\nfailures:\n    restart_cannot_reuse_a_handle_even_when_counters_repeat\n\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 8 filtered out; finished in 0.00s\n\nerror: test failed, to rerun pass `-p seamless-input --test guided_setup`\n"
+    },
+    {
+      "id": "controller_clock",
+      "path": "apps/seamless-input/src/guided_setup.rs",
+      "mutation": {
+        "from": "if self.poisoned || now < self.last {",
+        "to": "if self.poisoned {"
+      },
+      "command": "/Users/lanchu/.cargo/bin/cargo test -p seamless-input --features pairing-v2-experimental --offline --test guided_setup closed_snapshot_clock",
+      "exit_code": 101,
+      "expected_red": true,
+      "output": "   Compiling seamless-input v0.1.1 (/Users/lanchu/Documents/Codex/seamless-input/.worktrees/guided-setup-foundations/apps/seamless-input)\n    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.35s\n     Running tests/guided_setup.rs (target/debug/deps/guided_setup-525538aba5c2d6ec)\n\nrunning 1 test\ntest closed_snapshot_clock_rollback_poison_is_independent_of_catalogue ... FAILED\n\nfailures:\n\n---- closed_snapshot_clock_rollback_poison_is_independent_of_catalogue stdout ----\n\nthread 'closed_snapshot_clock_rollback_poison_is_independent_of_catalogue' (8891015) panicked at apps/seamless-input/tests/guided_setup.rs:74:16:\nassertion `left == right` failed\n  left: Ok(SetupSnapshot { schema_version: 1, status: Closed, pairing_transport: ContractPending, candidates: [], authenticated_sessions: 0, promotion_enabled: false, input_enabled: false, clipboard_enabled: false })\n right: Err(ClockRollback)\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n\n\nfailures:\n    closed_snapshot_clock_rollback_poison_is_independent_of_catalogue\n\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 8 filtered out; finished in 0.00s\n\nerror: test failed, to rerun pass `-p seamless-input --test guided_setup`\n"
+    },
+    {
+      "id": "controller_drop",
+      "path": "apps/seamless-input/src/guided_setup.rs",
+      "mutation": {
+        "from": "self.backend = None;",
+        "to": "// mutant: keep backend"
+      },
+      "command": "/Users/lanchu/.cargo/bin/cargo test -p seamless-input --features pairing-v2-experimental --offline --test guided_setup explicit_open_refresh",
+      "exit_code": 101,
+      "expected_red": true,
+      "output": "   Compiling seamless-input v0.1.1 (/Users/lanchu/Documents/Codex/seamless-input/.worktrees/guided-setup-foundations/apps/seamless-input)\n    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.63s\n     Running tests/guided_setup.rs (target/debug/deps/guided_setup-525538aba5c2d6ec)\n\nrunning 1 test\ntest explicit_open_refresh_select_stops_at_closed_transport_and_retry_revokes_handle ... FAILED\n\nfailures:\n\n---- explicit_open_refresh_select_stops_at_closed_transport_and_retry_revokes_handle stdout ----\n\nthread 'explicit_open_refresh_select_stops_at_closed_transport_and_retry_revokes_handle' (8891843) panicked at apps/seamless-input/tests/guided_setup.rs:93:5:\nassertion `left == right` failed\n  left: 0\n right: 1\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n\n\nfailures:\n    explicit_open_refresh_select_stops_at_closed_transport_and_retry_revokes_handle\n\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 8 filtered out; finished in 0.00s\n\nerror: test failed, to rerun pass `-p seamless-input --test guided_setup`\n"
+    },
+    {
+      "id": "controller_batch",
+      "path": "apps/seamless-input/src/guided_setup.rs",
+      "mutation": {
+        "from": "if events.len() > 32 {",
+        "to": "if events.len() > 33 {"
+      },
+      "command": "/Users/lanchu/.cargo/bin/cargo test -p seamless-input --features pairing-v2-experimental --offline --test guided_setup oversized_backend",
+      "exit_code": 101,
+      "expected_red": true,
+      "output": "   Compiling seamless-input v0.1.1 (/Users/lanchu/Documents/Codex/seamless-input/.worktrees/guided-setup-foundations/apps/seamless-input)\n    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.56s\n     Running tests/guided_setup.rs (target/debug/deps/guided_setup-525538aba5c2d6ec)\n\nrunning 1 test\ntest oversized_backend_batch_fails_closed_before_processing_any_event ... FAILED\n\nfailures:\n\n---- oversized_backend_batch_fails_closed_before_processing_any_event stdout ----\n\nthread 'oversized_backend_batch_fails_closed_before_processing_any_event' (8892469) panicked at apps/seamless-input/tests/guided_setup.rs:232:5:\nassertion `left == right` failed\n  left: Ok(SetupSnapshot { schema_version: 1, status: Browsing, pairing_transport: ContractPending, candidates: [], authenticated_sessions: 0, promotion_enabled: false, input_enabled: false, clipboard_enabled: false })\n right: Err(Limit)\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n\n\nfailures:\n    oversized_backend_batch_fails_closed_before_processing_any_event\n\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 8 filtered out; finished in 0.00s\n\nerror: test failed, to rerun pass `-p seamless-input --test guided_setup`\n"
+    },
+    {
+      "id": "transport_closed",
+      "path": "apps/seamless-input/src/guided_setup.rs",
+      "mutation": {
+        "from": "Err(SetupError::OperationalContractPending)",
+        "to": "Ok(SetupSnapshot {schema_version:1,status:SetupStatus::Closed,pairing_transport:TransportStatus::ContractPending,candidates:vec![],authenticated_sessions:0,promotion_enabled:false,input_enabled:false,clipboard_enabled:false})"
+      },
+      "command": "/Users/lanchu/.cargo/bin/cargo test -p seamless-input --features pairing-v2-experimental --offline --test guided_setup explicit_open_refresh",
+      "exit_code": 101,
+      "expected_red": true,
+      "output": "   Compiling seamless-input v0.1.1 (/Users/lanchu/Documents/Codex/seamless-input/.worktrees/guided-setup-foundations/apps/seamless-input)\n    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.33s\n     Running tests/guided_setup.rs (target/debug/deps/guided_setup-525538aba5c2d6ec)\n\nrunning 1 test\ntest explicit_open_refresh_select_stops_at_closed_transport_and_retry_revokes_handle ... FAILED\n\nfailures:\n\n---- explicit_open_refresh_select_stops_at_closed_transport_and_retry_revokes_handle stdout ----\n\nthread 'explicit_open_refresh_select_stops_at_closed_transport_and_retry_revokes_handle' (8893092) panicked at apps/seamless-input/tests/guided_setup.rs:89:5:\nassertion `left == right` failed\n  left: Ok(SetupSnapshot { schema_version: 1, status: Closed, pairing_transport: ContractPending, candidates: [], authenticated_sessions: 0, promotion_enabled: false, input_enabled: false, clipboard_enabled: false })\n right: Err(OperationalContractPending)\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n\n\nfailures:\n    explicit_open_refresh_select_stops_at_closed_transport_and_retry_revokes_handle\n\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 8 filtered out; finished in 0.00s\n\nerror: test failed, to rerun pass `-p seamless-input --test guided_setup`\n"
+    }
+  ]
+}

@@ -1,0 +1,70 @@
+{
+  "schema": "csf12-public-handshake-composition-evidence/1",
+  "base": "e01bde9a0c4a42b3be098e8d4c16fcf9427bf670",
+  "handshake_source": "18b3e0fe0e511f649ce7e2ac9eff2f50adabfd7f",
+  "composed_code_head": "26c653dfcddae9b87a7cffa5a344674e2e487212",
+  "reference_fixture_source": "49e7137d4448f3bfef30b5f1de08dc0e7fdc1365",
+  "verdict": "PASS as a local unsigned pending-authority candidate; no release, authority, admission, or native Windows claim",
+  "composition": {
+    "handshake_patch_equivalence": "PASS: git range-diff reports 18b3e0f^! = e01bde9..26c653d",
+    "windows_pending_store": "PASS: rebased base commit 6e5d1c6 is patch-equivalent to approved 7526cf0",
+    "phase5_owner": "PASS: e01bde9 is the exact sealed phase5 base",
+    "reference_commit_applied": false,
+    "reference_use": "The 49e reference is represented only by the approved fixture and documentation carried by the handshake patch."
+  },
+  "constraints": [
+    "pairing-v2-experimental remains default-off",
+    "final public type remains HandshakeCompletePendingAuthority",
+    "local_binding remains transport-local context and is not consumed as authority",
+    "no RecoveryAuthority provider added",
+    "no active trust, promotion, admission, input, clipboard, or downgrade path added",
+    "no push, pull request, CI, signing, or publication"
+  ],
+  "verification": {
+    "cargo_metadata_locked": "PASS",
+    "cargo_fmt_check": "PASS",
+    "workspace_default": {
+      "result": "PASS",
+      "local_passed": 253,
+      "local_filtered_environment_probes": 2,
+      "active_m2_exact_probes_passed": 2
+    },
+    "workspace_experimental": {
+      "result": "PASS",
+      "passed": 382,
+      "failed": 0,
+      "ignored_helpers": 4,
+      "active_m2_exact_probes_passed": 2
+    },
+    "clippy_default_all_targets_deny_warnings": "PASS",
+    "clippy_experimental_all_targets_deny_warnings": "PASS",
+    "transport_library": {
+      "passed": 51,
+      "failed": 0,
+      "ignored_subprocess_helpers": 2
+    },
+    "real_filesystem_fault_schedules": 96,
+    "process_death_before_and_after_quic_write": "PASS",
+    "two_process_handshake": "PASS",
+    "compile_fail_doctests": {
+      "passed": 5,
+      "failed": 0
+    },
+    "control_and_negative_matrix": "PASS",
+    "mutants": {
+      "source": "docs/qa/bilateral-handshake-evidence.json",
+      "validated_records": 11,
+      "all_functionally_red": true,
+      "all_restored": true,
+      "freshly_rerun_after_composition": false,
+      "transfer_basis": "The composed handshake patch is range-diff equivalent to the approved source patch."
+    },
+    "fixture_sha256": "4402bf351399c094e68ee3f6fbe747c54c47da43c254e233048e9ee753ad1438"
+  },
+  "limits": [
+    "The Windows personal host has no cargo toolchain; exact MSVC and Windows persistence tests were not measured and no toolchain was installed.",
+    "Native macOS/Windows interoperability and real LAN behavior were not measured.",
+    "External cryptographic review remains pending.",
+    "Authority, admission, promotion, UI, input, and clipboard activation are intentionally outside this candidate."
+  ]
+}

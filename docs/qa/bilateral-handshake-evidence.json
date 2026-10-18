@@ -1,0 +1,168 @@
+{
+  "schema": "csf12-bilateral-handshake-evidence/1",
+  "base": "75b2ebc49b27595f828eb7a8e94ee60fce414c1a",
+  "reference": "49e7137d4448f3bfef30b5f1de08dc0e7fdc1365",
+  "fixture_sha256": "4402bf351399c094e68ee3f6fbe747c54c47da43c254e233048e9ee753ad1438",
+  "verdict": "Internal implementation candidate awaiting independent review; not release GO. Full workspace suites fail only the unchanged native display probe on this host.",
+  "constraints": [
+    "default feature off",
+    "no RecoveryAuthority provider",
+    "no active trust/promotion/admission/input/clipboard",
+    "no native UI",
+    "no push/merge/CI/sign/publication"
+  ],
+  "environment": {
+    "cargo": "/Users/lanchu/.cargo/bin/cargo",
+    "offline": true,
+    "target": "/Volumes/LMCP/.codex-cache/cargo-target-bilateral.V7stBn/target",
+    "incremental": false
+  },
+  "suites": [
+    {
+      "command": "cargo test --workspace --offline --no-fail-fast --quiet",
+      "exit_code": 101,
+      "passed": 219,
+      "failed": 1,
+      "ignored": 2,
+      "output": "\nrunning 1 test\n.\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n\nrunning 9 tests\n.........\ntest result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.99s\n\n\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n\nrunning 8 tests\n........\ntest result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.05s\n\n\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n\nrunning 15 tests\n...............\ntest result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 6.80s\n\n\nrunning 10 tests\n..........\ntest result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s\n\n\nrunning 10 tests\n..........\ntest result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.10s\n\n\nrunning 8 tests\n........\ntest result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n\nrunning 2 tests\n..\ntest result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.16s\n\n\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n\nrunning 19 tests\n...................\ntest result: ok. 19 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s\n\n\nrunning 5 tests\n.....\ntest result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.13s\n\n\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n\nrunning 6 tests\n......\ntest result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n\nrunning 16 tests\n................\ntest result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n\nrunning 5 tests\n.....\ntest result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n\nrunning 12 tests\n............\ntest result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.39s\n\n\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n\nrunning 9 tests\n........ 8/9\nnative_non_admin_permission_and_display_probe_is_safe --- FAILED\n\nfailures:\n\n---- native_non_admin_permission_and_display_probe_is_safe stdout ----\n\nthread 'native_non_admin_permission_and_display_probe_is_safe' (9566931) panicked at crates/platform-macos/tests/permissions.rs:310:5:\nassertion failed: !displays.is_empty()\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n\n\nfailures:\n    native_non_admin_permission_and_display_probe_is_safe\n\ntest result: FAILED. 8 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s\n\nerror: test failed, to rerun pass `-p seamless-input-platform-macos --test permissions`\n\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n\nrunning 23 tests\n.......................\ntest result: ok. 23 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n\nrunning 13 tests\n.............\ntest result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s\n\n\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n\nrunning 20 tests\n....................\ntest result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.32s\n\n\nrunning 13 tests\n.............\ntest result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.73s\n\n\nrunning 3 tests\ni..\ntest result: ok. 2 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.06s\n\n\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n\nrunning 11 tests\n...........\ntest result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.47s\n\n\nrunning 4 tests\ni...\ntest result: ok. 3 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.99s\n\n\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\nerror: 1 target failed:\n    `-p seamless-input-platform-macos --test permissions`\n"
+    },
+    {
+      "command": "cargo test --workspace --features seamless-input/pairing-v2-experimental --offline --no-fail-fast --quiet",
+      "exit_code": 101,
+      "passed": 348,
+      "failed": 1,
+      "ignored": 4,
+      "output": "\nrunning 4 tests\n....\ntest result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.07s\n\n\nrunning 9 tests\n.........\ntest result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.18s\n\n\nrunning 5 tests\n.....\ntest result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n\nrunning 8 tests\n........\ntest result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.13s\n\n\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n\nrunning 15 tests\n...............\ntest result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 6.86s\n\n\nrunning 10 tests\n..........\ntest result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s\n\n\nrunning 9 tests\n.........\ntest result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s\n\n\nrunning 8 tests\n........\ntest result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n\nrunning 2 tests\n..\ntest result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.15s\n\n\nrunning 3 tests\n...\ntest result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s\n\n\nrunning 9 tests\n.........\ntest result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n\nrunning 19 tests\n...................\ntest result: ok. 19 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n\nrunning 5 tests\n.....\ntest result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s\n\n\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n\nrunning 6 tests\n......\ntest result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n\nrunning 16 tests\n................\ntest result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n\nrunning 5 tests\n.....\ntest result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n\nrunning 12 tests\n............\ntest result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.17s\n\n\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n\nrunning 9 tests\n........ 8/9\nnative_non_admin_permission_and_display_probe_is_safe --- FAILED\n\nfailures:\n\n---- native_non_admin_permission_and_display_probe_is_safe stdout ----\n\nthread 'native_non_admin_permission_and_display_probe_is_safe' (9568002) panicked at crates/platform-macos/tests/permissions.rs:310:5:\nassertion failed: !displays.is_empty()\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n\n\nfailures:\n    native_non_admin_permission_and_display_probe_is_safe\n\ntest result: FAILED. 8 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s\n\nerror: test failed, to rerun pass `-p seamless-input-platform-macos --test permissions`\n\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n\nrunning 23 tests\n.......................\ntest result: ok. 23 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n\nrunning 13 tests\n.............\ntest result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s\n\n\nrunning 53 tests\n...........................i...........i............test pairing_v2::provisional_tls::tests::bilateral_process_death_before_and_after_real_finalization_emit_keeps_quarantine has been running for over 60 seconds\n.\ntest result: ok. 51 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 61.67s\n\n\nrunning 20 tests\n....................\ntest result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.32s\n\n\nrunning 13 tests\n.............\ntest result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.61s\n\n\nrunning 3 tests\ni..\ntest result: ok. 2 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.06s\n\n\nrunning 5 tests\n.....\ntest result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n\nrunning 10 tests\n..........\ntest result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.96s\n\n\nrunning 3 tests\n...\ntest result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n\nrunning 4 tests\n....\ntest result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s\n\n\nrunning 16 tests\n................\ntest result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.38s\n\n\nrunning 16 tests\n................\ntest result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s\n\n\nrunning 11 tests\n...........\ntest result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.47s\n\n\nrunning 4 tests\ni...\ntest result: ok. 3 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 1.10s\n\n\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n\nrunning 5 tests\n.....\ntest result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.23s\n\nerror: 1 target failed:\n    `-p seamless-input-platform-macos --test permissions`\n"
+    }
+  ],
+  "clippy": {
+    "default": {
+      "exit_code": 0,
+      "command": "cargo clippy --workspace --all-targets --offline -- -D warnings"
+    },
+    "experimental": {
+      "exit_code": 0,
+      "command": "cargo clippy --workspace --all-targets --features seamless-input/pairing-v2-experimental --offline -- -D warnings"
+    }
+  },
+  "format_and_diff": {
+    "cargo_fmt_check": 0,
+    "git_diff_check": 0
+  },
+  "native_display": {
+    "local": "FAIL: crates/platform-macos/tests/permissions.rs:310 !displays.is_empty()",
+    "baseline_parent_evidence": "Exact 75b2ebc binary PASS on m2-24gb with active graphical display. Sleeping display on M4/M1 diagnosed by parent; no test changed.",
+    "fresh_native_interop": false
+  },
+  "tdd": [
+    "Raw parser/guards RED then GREEN",
+    "Candidate/Hello bindings RED then GREEN",
+    "Live evidence encoding RED then GREEN",
+    "Bilateral machine RED then GREEN",
+    "Real QUIC driver stub RED then GREEN",
+    "Precommit cleanup RED then GREEN",
+    "Late candidate/extra stream invalidation RED then GREEN",
+    "Actual emission process-death hook test RED then GREEN",
+    "Second TLS connection substitution test RED by timeout then GREEN immediate rejection, no SAS/store change"
+  ],
+  "measured": {
+    "transport_lib": {
+      "passed": 51,
+      "ignored": 2,
+      "seconds": 61.67
+    },
+    "oracle_records": 17,
+    "real_filesystem_fault_schedules": 96,
+    "filesystem_faults": "A Commit/B CommitAck/A Complete x journal/manifest x before/after write/fsync/rename/dirsync x I/O error/process exit; no returned emission bytes",
+    "real_emit_process_deaths": 2,
+    "emit_limit": "before/after write_all means local QUIC queue, not proven delivery",
+    "control_matrix": {
+      "cases": 70,
+      "fragmentation_cases": 10,
+      "negative_cases": 60
+    },
+    "candidate_negatives": 6,
+    "ui_negatives": 4,
+    "two_process": "PASS real separate OS processes with fresh identities, matching SAS/transcript/FC and pending-only evidence; out-of-band test lifetime acknowledgement, not protocol wire",
+    "second_tls": "PASS test-only private substitution rejected before I/O; independent connections yield different exporters for same label/context"
+  },
+  "mutants": [
+    {
+      "name": "sequence",
+      "exit_code": 101,
+      "functional_failure": "test pairing_v2::handshake_wire::tests::sequence_is_independently_checked_even_when_type_direction_and_payload_match ... FAILED",
+      "restored": true
+    },
+    {
+      "name": "candidate_leaf",
+      "exit_code": 101,
+      "functional_failure": "test pairing_v2::handshake_binding::tests::observed_leaf_swap_nonce_rendezvous_and_singleton_suite_are_not_claim_comparisons ... FAILED",
+      "restored": true
+    },
+    {
+      "name": "candidate_nonce",
+      "exit_code": 101,
+      "functional_failure": "test pairing_v2::handshake_binding::tests::observed_leaf_swap_nonce_rendezvous_and_singleton_suite_are_not_claim_comparisons ... FAILED",
+      "restored": true
+    },
+    {
+      "name": "hello_candidate",
+      "exit_code": 101,
+      "functional_failure": "test pairing_v2::handshake_binding::tests::hello_keeps_exact_candidate_hash_and_observed_identity ... FAILED",
+      "restored": true
+    },
+    {
+      "name": "cancel_mac",
+      "exit_code": 101,
+      "functional_failure": "test pairing_v2::handshake_evidence::tests::cancel_matches_oracle_and_rejects_each_bound_field_and_tag ... FAILED",
+      "restored": true
+    },
+    {
+      "name": "signer_identity",
+      "exit_code": 101,
+      "functional_failure": "test pairing_v2::handshake_evidence::tests::wrong_identity_signer_never_emits_a_record ... FAILED",
+      "restored": true
+    },
+    {
+      "name": "durable_before_emit",
+      "exit_code": 101,
+      "functional_failure": "test pairing_v2::handshake_machine::tests::durability_cas_failure_cannot_return_commit_or_fc_for_emission ... FAILED",
+      "restored": true
+    },
+    {
+      "name": "reset_action",
+      "exit_code": 101,
+      "functional_failure": "test pairing_v2::provisional_tls::tests::bilateral_rejection_issues_real_reset_and_stop_independently_of_connection_close ... FAILED",
+      "restored": true
+    },
+    {
+      "name": "stop_action",
+      "exit_code": 101,
+      "functional_failure": "test pairing_v2::provisional_tls::tests::bilateral_rejection_issues_real_reset_and_stop_independently_of_connection_close ... FAILED",
+      "restored": true
+    },
+    {
+      "name": "postcomplete_candidate",
+      "exit_code": 101,
+      "functional_failure": "test pairing_v2::provisional_tls::tests::bilateral_completed_capability_rejects_late_candidate_data ... FAILED",
+      "restored": true
+    },
+    {
+      "name": "postcomplete_stream",
+      "exit_code": 101,
+      "functional_failure": "test pairing_v2::provisional_tls::tests::bilateral_completed_capability_is_invalidated_by_late_extra_stream ... FAILED",
+      "restored": true
+    }
+  ],
+  "gaps": [
+    "Independent review of this exact delta pending",
+    "External crypto audit pending",
+    "Native macOS/Windows interoperability and real LAN not measured",
+    "Windows secure persistence unavailable here; operational handshake fails closed",
+    "Controller/native UI not connected",
+    "No packet-loss/network-policy/power-loss durability claims",
+    "Candidate completion rejects >=30 seconds but individual 30-second I/O waits can retain incomplete candidates longer; overall attempt 300 seconds",
+    "Outer-future cancellation/process death may leave inert quarantined pending evidence; no recovery shortcut",
+    "No authority or admission capability; completed live result invalidates on late protocol violations/closure"
+  ]
+}

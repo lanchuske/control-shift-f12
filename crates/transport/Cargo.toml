@@ -4,6 +4,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+# Verification-only internal slice; never enabled by the application by default.
+pairing-v2-experimental = ["dep:ring", "dep:x509-parser", "dep:der-parser", "dep:asn1-rs", "dep:curve25519-dalek", "dep:unicode-normalization", "dep:regex-syntax"]
+
 [dependencies]
 seamless-input-protocol = { path = "../protocol" }
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
@@ -20,9 +24,19 @@ serde_json = "1"
 sha2 = "0.10"
 spake2 = "0.4"
 zeroize = "1"
+ring = { version = "0.17", optional = true }
+x509-parser = { version = "0.18", optional = true }
+der-parser = { version = "10", optional = true }
+asn1-rs = { version = "0.7", optional = true }
+curve25519-dalek = { version = "4", optional = true }
+unicode-normalization = { version = "0.1", optional = true }
+regex-syntax = { version = "0.8", optional = true }
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security_Cryptography", "Win32_Storage_FileSystem"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Security_Cryptography", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Threading"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 seamless-discovery = { path = "../discovery" }

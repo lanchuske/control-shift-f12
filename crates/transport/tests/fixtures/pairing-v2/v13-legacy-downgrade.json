@@ -1,0 +1,7 @@
+{
+  "id": "V13",
+  "old_advanced": "legacy-advanced-quarantine",
+  "old_default": "update-required",
+  "v2": "compare-v2",
+  "v2_negotiation_failure": "reject-no-fallback"
+}

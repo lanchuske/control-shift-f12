@@ -1,0 +1,24 @@
+{
+  "base": "39bf6130744d1ddec566c2c60f1883e944112b96",
+  "scope": "Coverage-only round 2; production guard restored unchanged; each independent removal admits a length-1 signed proof",
+  "results": [
+    {
+      "field": "challenger_nonce",
+      "mutation": "for index in [1, 2, 5, 6] {",
+      "exit": 101,
+      "output": "   Compiling seamless-transport v0.1.1 (/Users/lanchu/Documents/Codex/seamless-input/.worktrees/guided-setup-foundations/crates/transport)\n    Finished `test` profile [unoptimized + debuginfo] target(s) in 5.57s\n     Running tests/pairing_v2_durable_recovery.rs (target/debug/deps/pairing_v2_durable_recovery-f9aadde089de8add)\n\nrunning 1 test\ntest operational_challenger_nonce_length_matrix_rejects_without_durable_mutation ... FAILED\n\nfailures:\n\n---- operational_challenger_nonce_length_matrix_rejects_without_durable_mutation stdout ----\n\nthread 'operational_challenger_nonce_length_matrix_rejects_without_durable_mutation' (8606973) panicked at crates/transport/tests/pairing_v2_durable_recovery.rs:348:9:\nassertion `left == right` failed: operational challenger_nonce length 1 must reject\n  left: Ok(())\n right: Err(Invalid)\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n\n\nfailures:\n    operational_challenger_nonce_length_matrix_rejects_without_durable_mutation\n\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 9 filtered out; finished in 0.85s\n\nerror: test failed, to rerun pass `-p seamless-transport --test pairing_v2_durable_recovery`\n"
+    },
+    {
+      "field": "responder_nonce",
+      "mutation": "for index in [1, 2, 4, 6] {",
+      "exit": 101,
+      "output": "   Compiling seamless-transport v0.1.1 (/Users/lanchu/Documents/Codex/seamless-input/.worktrees/guided-setup-foundations/crates/transport)\n    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.26s\n     Running tests/pairing_v2_durable_recovery.rs (target/debug/deps/pairing_v2_durable_recovery-f9aadde089de8add)\n\nrunning 1 test\ntest operational_responder_nonce_length_matrix_rejects_without_durable_mutation ... FAILED\n\nfailures:\n\n---- operational_responder_nonce_length_matrix_rejects_without_durable_mutation stdout ----\n\nthread 'operational_responder_nonce_length_matrix_rejects_without_durable_mutation' (8607592) panicked at crates/transport/tests/pairing_v2_durable_recovery.rs:348:9:\nassertion `left == right` failed: operational responder_nonce length 1 must reject\n  left: Ok(())\n right: Err(Invalid)\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n\n\nfailures:\n    operational_responder_nonce_length_matrix_rejects_without_durable_mutation\n\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 9 filtered out; finished in 0.82s\n\nerror: test failed, to rerun pass `-p seamless-transport --test pairing_v2_durable_recovery`\n"
+    },
+    {
+      "field": "tls_exporter",
+      "mutation": "for index in [1, 2, 4, 5] {",
+      "exit": 101,
+      "output": "   Compiling seamless-transport v0.1.1 (/Users/lanchu/Documents/Codex/seamless-input/.worktrees/guided-setup-foundations/crates/transport)\n    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.22s\n     Running tests/pairing_v2_durable_recovery.rs (target/debug/deps/pairing_v2_durable_recovery-f9aadde089de8add)\n\nrunning 1 test\ntest operational_tls_exporter_length_matrix_rejects_without_durable_mutation ... FAILED\n\nfailures:\n\n---- operational_tls_exporter_length_matrix_rejects_without_durable_mutation stdout ----\n\nthread 'operational_tls_exporter_length_matrix_rejects_without_durable_mutation' (8608131) panicked at crates/transport/tests/pairing_v2_durable_recovery.rs:348:9:\nassertion `left == right` failed: operational tls_exporter length 1 must reject\n  left: Ok(())\n right: Err(Invalid)\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n\n\nfailures:\n    operational_tls_exporter_length_matrix_rejects_without_durable_mutation\n\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 9 filtered out; finished in 0.87s\n\nerror: test failed, to rerun pass `-p seamless-transport --test pairing_v2_durable_recovery`\n"
+    }
+  ]
+}

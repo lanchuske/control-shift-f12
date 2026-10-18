@@ -1,0 +1,16 @@
+{
+  "algorithm": "Ed25519",
+  "attempt_id_hex": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "challenger_nonce_hex": "6e6f6e63652d31",
+  "exporter_hex": "6578706f72746572",
+  "fc_hash_hex": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "id": "V11",
+  "identity_generation": 3,
+  "migration": "interop-addendum-v1: attempt_id/fc_hash are raw 32-byte canonical fields; JSON uses lowercase hex",
+  "one_use": true,
+  "replay_result": false,
+  "responder_nonce_hex": "6e6f6e63652d32",
+  "revocation_generation": 4,
+  "role": "A",
+  "signature_hex": "3bfc637ede7661db728516898d2cc3522adebb97e79432be0e18b842eeb140a1c64dcebed6357b4ff65b9cc495137494b76278fdae56aaebd757e3a7e9205e06"
+}
