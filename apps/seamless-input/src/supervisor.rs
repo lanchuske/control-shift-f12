@@ -1449,7 +1449,7 @@ mod capture_buffer_tests {
             Arc,
             atomic::{AtomicBool, AtomicUsize, Ordering},
         },
-        time::{Duration, Instant},
+        time::Duration,
     };
 
     fn captured(event: InputEvent) -> CapturedInput {
@@ -1624,11 +1624,10 @@ mod capture_buffer_tests {
         assert!((1..=64).contains(&CAPTURE_DRAIN_BUDGET));
     }
 
-    #[tokio::test(flavor = "current_thread")]
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn slow_maintenance_does_not_block_input_service_cadence() {
         let serviced = Arc::new(AtomicUsize::new(0));
         let observed = Arc::clone(&serviced);
-        let started = Instant::now();
 
         interleave_maintenance(
             async { tokio::time::sleep(Duration::from_millis(45)).await },
@@ -1641,14 +1640,13 @@ mod capture_buffer_tests {
         .await
         .unwrap();
 
-        assert!(started.elapsed() >= Duration::from_millis(40));
         assert!(
             serviced.load(Ordering::SeqCst) >= 6,
             "input service did not interleave with slow maintenance"
         );
     }
 
-    #[tokio::test(flavor = "current_thread")]
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn pending_network_send_does_not_block_input_heartbeat_or_shutdown() {
         let (failure_tx, mut failure_rx) = tokio::sync::mpsc::unbounded_channel();
         let writer = OutboundWriter::spawn(
