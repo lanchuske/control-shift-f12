@@ -65,6 +65,8 @@ pub struct PeerCache {
     version: u16,
     entries: BTreeMap<String, (Advertisement, Option<Instant>)>,
 }
+const PEER_CACHE_CAPACITY: usize = 256;
+
 impl PeerCache {
     pub fn new(version: u16) -> Self {
         Self {
@@ -76,6 +78,11 @@ impl PeerCache {
         peer.instance.make_ascii_lowercase();
         peer.addresses.sort();
         peer.addresses.dedup();
+        self.entries
+            .retain(|_, (_, expires)| expires.is_none_or(|expires| now < expires));
+        if !self.entries.contains_key(&peer.instance) && self.entries.len() >= PEER_CACHE_CAPACITY {
+            return;
+        }
         let expires = peer.ttl.map(|ttl| now.checked_add(ttl).unwrap_or(now));
         self.entries.insert(peer.instance.clone(), (peer, expires));
     }
@@ -339,6 +346,97 @@ impl Drop for Discovery {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn cache_advertisement(index: usize, ttl: Option<Duration>, port: u16) -> Advertisement {
+        Advertisement {
+            instance: format!("{index:032x}"),
+            version: 1,
+            pairable: true,
+            addresses: vec![SocketAddr::from(([127, 0, 0, 1], port))],
+            ttl,
+        }
+    }
+
+    #[test]
+    fn unique_instance_flood_is_bounded_and_frees_capacity_on_remove() {
+        let now = Instant::now();
+        let mut cache = PeerCache::new(1);
+        for index in 0..256 {
+            cache.observe(cache_advertisement(index, None, 5_000), now);
+        }
+        cache.observe(cache_advertisement(256, None, 5_000), now);
+
+        let peers = cache.peers(now);
+        assert_eq!(peers.len(), 256);
+        assert!(
+            peers
+                .iter()
+                .all(|peer| peer.advertisement.instance != format!("{:032x}", 256))
+        );
+
+        cache.remove(&format!("{:032x}", 0));
+        cache.observe(cache_advertisement(256, None, 5_000), now);
+        let peers = cache.peers(now);
+        assert_eq!(peers.len(), 256);
+        assert!(
+            peers
+                .iter()
+                .all(|peer| peer.advertisement.instance != format!("{:032x}", 0))
+        );
+        assert!(
+            peers
+                .iter()
+                .any(|peer| peer.advertisement.instance == format!("{:032x}", 256))
+        );
+    }
+
+    #[test]
+    fn capacity_refreshes_existing_normalized_key_without_replacement() {
+        let now = Instant::now();
+        let mut cache = PeerCache::new(1);
+        for index in 0..256 {
+            cache.observe(cache_advertisement(index, None, 5_000), now);
+        }
+        let mut refresh = cache_advertisement(10, Some(Duration::from_secs(5)), 6_000);
+        refresh.instance.make_ascii_uppercase();
+        cache.observe(refresh, now);
+        cache.observe(cache_advertisement(256, None, 7_000), now);
+
+        let peers = cache.peers(now);
+        assert_eq!(peers.len(), 256);
+        let refreshed = peers
+            .iter()
+            .find(|peer| peer.advertisement.instance == format!("{:032x}", 10))
+            .unwrap();
+        assert_eq!(
+            refreshed.advertisement.addresses,
+            vec![SocketAddr::from(([127, 0, 0, 1], 6_000))]
+        );
+        assert!(
+            peers
+                .iter()
+                .all(|peer| peer.advertisement.instance != format!("{:032x}", 256))
+        );
+    }
+
+    #[test]
+    fn expired_entries_are_reclaimed_before_observe_capacity_check() {
+        let now = Instant::now();
+        let mut cache = PeerCache::new(1);
+        for index in 0..256 {
+            cache.observe(
+                cache_advertisement(index, Some(Duration::from_secs(1)), 5_000),
+                now,
+            );
+        }
+
+        let later = now + Duration::from_secs(2);
+        cache.observe(cache_advertisement(256, None, 6_000), later);
+
+        let peers = cache.peers(later);
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].advertisement.instance, format!("{:032x}", 256));
+    }
 
     #[test]
     fn polling_allowance_stops_on_count_or_elapsed_budget() {
