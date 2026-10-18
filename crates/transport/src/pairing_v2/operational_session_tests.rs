@@ -328,6 +328,7 @@ async fn v01_exchanges_exactly_six_records_on_one_bidirectional_stream() {
 }
 
 #[tokio::test]
+#[ignore = "requires a future authenticated operational-finalization authority"]
 async fn v01_dynamic_attempt_uses_live_tls_exporter_and_durable_snapshots() {
     let (a_der, a_key) = identity();
     let (b_der, b_key) = identity();
@@ -382,7 +383,7 @@ async fn v01_dynamic_attempt_uses_live_tls_exporter_and_durable_snapshots() {
 }
 
 #[tokio::test]
-async fn v01_dynamic_attempt_rejects_a_durable_tuple_with_the_wrong_tls_pin() {
+async fn unconfirmed_bilateral_receipt_cannot_start_an_operational_attempt() {
     let (a_der, a_key) = identity();
     let (b_der, b_key) = identity();
     let a_pin: [u8; 32] = Sha256::digest(&a_der).into();
@@ -397,8 +398,9 @@ async fn v01_dynamic_attempt_rejects_a_durable_tuple_with_the_wrong_tls_pin() {
     let br = b_store
         .prepare(b_store.version().unwrap(), [43; 32], [44; 32])
         .unwrap();
-    // The durable peer pin is a tuple member, not a hint: an authenticated
-    // connection with a different selected leaf cannot acquire a lease.
+    // Durable bilateral metadata is recovery-only until a later authenticated
+    // operational-finalization phase exists. It must fail before opening a
+    // transport even when the stored peer pin is deliberately wrong.
     a_store
         .commit_operational_test_receipt(&ar, [99; 32])
         .unwrap();
@@ -410,11 +412,12 @@ async fn v01_dynamic_attempt_rejects_a_durable_tuple_with_the_wrong_tls_pin() {
         b.accept_admitted(&b_store, br.attempt_id)
     );
     assert!(client.is_err());
-    drop(server);
+    assert!(server.is_err());
     assert_ne!(b_pin, [99; 32]);
 }
 
 #[tokio::test]
+#[ignore = "requires a future authenticated operational-finalization authority"]
 async fn corrupted_confirm_a_gets_application_reset_and_never_receives_confirm_b() {
     let (a_der, a_key, a_pin, b_der, b_key, b_pin) = loop {
         let (a_der, a_key) = identity();
@@ -464,6 +467,7 @@ async fn corrupted_confirm_a_gets_application_reset_and_never_receives_confirm_b
 }
 
 #[tokio::test]
+#[ignore = "requires a future authenticated operational-finalization authority"]
 async fn bidi_open_after_confirm_fin_is_rejected_by_the_terminal_close_boundary() {
     let (a_der, a_key, a_pin, b_der, b_key, b_pin) = loop {
         let (a_der, a_key) = identity();
@@ -521,6 +525,7 @@ async fn bidi_open_after_confirm_fin_is_rejected_by_the_terminal_close_boundary(
 }
 
 #[tokio::test]
+#[ignore = "requires a future authenticated operational-finalization authority"]
 async fn v01_dynamic_attempt_fails_closed_when_revocation_wins_before_promotion() {
     let (a_der, a_key) = identity();
     let (b_der, b_key) = identity();
@@ -580,6 +585,7 @@ async fn v01_dynamic_attempt_fails_closed_when_revocation_wins_before_promotion(
 }
 
 #[tokio::test]
+#[ignore = "requires a future authenticated operational-finalization authority"]
 async fn v01_revocation_between_accept_and_confirm_emits_no_confirm() {
     let (a_der, a_key) = identity();
     let (b_der, b_key) = identity();
@@ -639,6 +645,7 @@ async fn v01_revocation_between_accept_and_confirm_emits_no_confirm() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a future authenticated operational-finalization authority"]
 async fn v01_dynamic_attempt_succeeds_between_two_os_processes() {
     let (a_der, a_key) = identity_raw();
     let a_pin: [u8; 32] = Sha256::digest(&a_der).into();

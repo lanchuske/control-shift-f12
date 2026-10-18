@@ -1,5 +1,7 @@
+#[cfg(unix)]
+use std::fs::File;
 use std::{
-    fs::{self, File, OpenOptions},
+    fs::{self, OpenOptions},
     io::{self, Write},
     path::{Path, PathBuf},
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -274,9 +276,9 @@ fn owner_pid_from_path(path: &Path) -> Option<u32> {
         .ok()
 }
 
-fn sync_parent(path: &Path) -> Result<(), RuntimeStatusError> {
+fn sync_parent(_path: &Path) -> Result<(), RuntimeStatusError> {
     #[cfg(unix)]
-    if let Some(parent) = path.parent() {
+    if let Some(parent) = _path.parent() {
         File::open(parent)?.sync_all()?;
     }
     Ok(())

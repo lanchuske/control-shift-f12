@@ -34,6 +34,7 @@ ADMITTED_MACOS_HOST_PATHS = frozenset(
     {
         "native/macos/ControlShiftF12App/Sources/ControlShiftF12App/main.swift",
         "native/macos/ControlShiftF12App/Tests/ControlShiftF12AppTests/ControlShiftF12AppTests.swift",
+        "native/macos/ControlShiftF12App/Tests/ControlShiftF12AppTests/UiChildRequestTests.swift",
     }
 )
 ADMITTED_WINDOWS_CONTRACT_PATHS = frozenset(
@@ -457,7 +458,7 @@ class NativeHostBoundaryTests(unittest.TestCase):
             "RedirectStandardError = true",
             "start.Environment.Clear()",
             "start.ArgumentList.Add(argument)",
-            "UiChildSession.InitialRefreshFrame()",
+            "Session.InitialRefreshFrame()",
             "child.StandardInput.Close()",
             "child.Kill(entireProcessTree: false)",
         ):

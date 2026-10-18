@@ -36,15 +36,17 @@ fn recovery_tls_profile_requires_the_durable_peer_fingerprint() {
     let peer_fingerprint: [u8; 32] = Sha256::digest(&peer).into();
     assert!(super::profile_for_pinned_peer(&peer, peer_fingerprint, now).is_ok());
     assert!(super::profile_for_pinned_peer(&other, peer_fingerprint, now).is_err());
-    assert!(super::strict_pinned_configs(
-        peer,
-        identity(true).1,
-        [0; 32],
-        b"control-shift-f12-recovery/1",
-        1,
-        0,
-    )
-    .is_err());
+    assert!(
+        super::strict_pinned_configs(
+            peer,
+            identity(true).1,
+            [0; 32],
+            b"control-shift-f12-recovery/1",
+            1,
+            0,
+        )
+        .is_err()
+    );
 }
 
 #[tokio::test]
@@ -56,39 +58,23 @@ async fn recovery_tls_rejects_an_unpinned_peer_before_any_recovery_record() {
     let b_fingerprint: [u8; 32] = Sha256::digest(&b_certificate).into();
     let alpn = b"control-shift-f12-recovery/1";
 
-    let (server_config, _) = super::strict_pinned_configs(
-        b_certificate.clone(),
-        b_key,
-        a_fingerprint,
-        alpn,
-        1,
-        0,
-    )
-    .unwrap();
+    let (server_config, _) =
+        super::strict_pinned_configs(b_certificate.clone(), b_key, a_fingerprint, alpn, 1, 0)
+            .unwrap();
     let server = quinn::Endpoint::server(server_config, "127.0.0.1:0".parse().unwrap()).unwrap();
 
-    let (_, a_client) = super::strict_pinned_configs(
-        a_certificate,
-        a_key,
-        b_fingerprint,
-        alpn,
-        1,
-        0,
-    )
-    .unwrap();
+    let (_, a_client) =
+        super::strict_pinned_configs(a_certificate, a_key, b_fingerprint, alpn, 1, 0).unwrap();
     let mut client = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
     let (config, evidence) = a_client.fresh().unwrap();
     client.set_default_client_config(config);
     let connecting = client
         .connect(server.local_addr().unwrap(), "pairing.local")
         .unwrap();
-    let (connected, accepted) = tokio::join!(
-        connecting,
-        async {
-            let incoming = server.accept().await.unwrap();
-            incoming.await
-        }
-    );
+    let (connected, accepted) = tokio::join!(connecting, async {
+        let incoming = server.accept().await.unwrap();
+        incoming.await
+    });
     assert!(connected.is_ok());
     assert!(accepted.is_ok());
     assert!(evidence.was_requested());
@@ -132,39 +118,100 @@ async fn pinned_recovery_connection() -> (
 ) {
     let (a_certificate, a_key) = identity(true);
     let (b_certificate, b_key) = identity(true);
-    let a_fingerprint: [u8; 32] = Sha256::digest(&a_certificate).into();
-    let b_fingerprint: [u8; 32] = Sha256::digest(&b_certificate).into();
-    let alpn = b"control-shift-f12-recovery/1";
-    let (server_config, _) = super::strict_pinned_configs(
-        b_certificate,
-        b_key,
-        a_fingerprint,
-        alpn,
-        1,
-        0,
-    )
-    .unwrap();
-    let server = quinn::Endpoint::server(server_config, "127.0.0.1:0".parse().unwrap()).unwrap();
-    let (_, a_client) = super::strict_pinned_configs(
+    pinned_recovery_connection_for_identities(a_certificate, a_key, b_certificate, b_key).await
+}
+
+async fn pinned_recovery_connection_for_identities(
+    a_certificate: Vec<u8>,
+    a_key: rustls::pki_types::PrivateKeyDer<'static>,
+    b_certificate: Vec<u8>,
+    b_key: rustls::pki_types::PrivateKeyDer<'static>,
+) -> (
+    quinn::Endpoint,
+    quinn::Endpoint,
+    quinn::Connection,
+    quinn::Connection,
+) {
+    pinned_recovery_connection_with_alpn(
         a_certificate,
         a_key,
-        b_fingerprint,
-        alpn,
-        1,
-        0,
+        b_certificate,
+        b_key,
+        b"control-shift-f12-recovery/1",
     )
-    .unwrap();
+    .await
+}
+
+async fn pinned_recovery_connection_with_alpn(
+    a_certificate: Vec<u8>,
+    a_key: rustls::pki_types::PrivateKeyDer<'static>,
+    b_certificate: Vec<u8>,
+    b_key: rustls::pki_types::PrivateKeyDer<'static>,
+    alpn: &[u8],
+) -> (
+    quinn::Endpoint,
+    quinn::Endpoint,
+    quinn::Connection,
+    quinn::Connection,
+) {
+    let a_fingerprint: [u8; 32] = Sha256::digest(&a_certificate).into();
+    let b_fingerprint: [u8; 32] = Sha256::digest(&b_certificate).into();
+    let (server_config, _) =
+        super::strict_pinned_configs(b_certificate, b_key, a_fingerprint, alpn, 1, 0).unwrap();
+    let server = quinn::Endpoint::server(server_config, "127.0.0.1:0".parse().unwrap()).unwrap();
+    let (_, a_client) =
+        super::strict_pinned_configs(a_certificate, a_key, b_fingerprint, alpn, 1, 0).unwrap();
     let mut client = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
     let (config, _) = a_client.fresh().unwrap();
     client.set_default_client_config(config);
     let connecting = client
         .connect(server.local_addr().unwrap(), "pairing.local")
         .unwrap();
-    let (left_connection, right_connection) = tokio::join!(
-        connecting,
-        async { server.accept().await.unwrap().await.unwrap() }
-    );
+    let (left_connection, right_connection) = tokio::join!(connecting, async {
+        server.accept().await.unwrap().await.unwrap()
+    });
     (server, client, left_connection.unwrap(), right_connection)
+}
+
+fn observed_recovery_peer_pin(connection: &quinn::Connection) -> [u8; 32] {
+    let certs = connection
+        .peer_identity()
+        .unwrap()
+        .downcast::<Vec<rustls::pki_types::CertificateDer<'static>>>()
+        .unwrap();
+    Sha256::digest(certs[0].as_ref()).into()
+}
+
+#[tokio::test]
+async fn exact_peer_recovery_mint_rejects_wrong_alpn_or_expected_durable_pin() {
+    use crate::pairing_v2::recovery::{ExactPeerRecovery, exchange_exact_pair};
+    for wrong_alpn in [true, false] {
+        let (a, ak) = identity(true);
+        let (b, bk) = identity(true);
+        let a_pin = Sha256::digest(&a).into();
+        let b_pin = Sha256::digest(&b).into();
+        let alpn: &[u8] = if wrong_alpn {
+            b"different-control-channel/1"
+        } else {
+            b"control-shift-f12-recovery/1"
+        };
+        let (_server, _client, left, right) =
+            pinned_recovery_connection_with_alpn(a, ak, b, bk, alpn).await;
+        let left_evidence =
+            ExactPeerRecovery::new([1; 32], [2; 32], Some([3; 32]), 7, 11, 0).unwrap();
+        let right_evidence =
+            ExactPeerRecovery::new([1; 32], [3; 32], Some([2; 32]), 7, 11, 0).unwrap();
+        let expected = if wrong_alpn { b_pin } else { [9; 32] };
+        let (left_result, right_result) = tokio::join!(
+            exchange_exact_pair(&left, true, left_evidence, expected),
+            exchange_exact_pair(&right, false, right_evidence, a_pin),
+        );
+        assert!(
+            left_result.is_err(),
+            "the wrapper factory must reject wrong channel authentication"
+        );
+        assert!(right_result.is_err());
+    }
 }
 
 #[tokio::test]
@@ -193,11 +240,17 @@ async fn exact_peer_recovery_exchanges_one_complementary_record_over_pinned_tls(
             &left_connection,
             true,
             left.clone(),
+            observed_recovery_peer_pin(&left_connection)
         ),
-        crate::pairing_v2::recovery::exchange_exact_pair(&right_connection, false, right.clone()),
+        crate::pairing_v2::recovery::exchange_exact_pair(
+            &right_connection,
+            false,
+            right.clone(),
+            observed_recovery_peer_pin(&right_connection)
+        ),
     );
-    assert_eq!(left_peer.unwrap(), right);
-    assert_eq!(right_peer.unwrap(), left);
+    assert_eq!(left_peer.unwrap().evidence(), &right);
+    assert_eq!(right_peer.unwrap().evidence(), &left);
 }
 
 #[tokio::test]
@@ -222,11 +275,170 @@ async fn exact_peer_recovery_rejects_a_changed_binding_over_pinned_tls() {
     )
     .unwrap();
     let (left_result, right_result) = tokio::join!(
-        crate::pairing_v2::recovery::exchange_exact_pair(&left_connection, true, left),
-        crate::pairing_v2::recovery::exchange_exact_pair(&right_connection, false, changed),
+        crate::pairing_v2::recovery::exchange_exact_pair(
+            &left_connection,
+            true,
+            left,
+            observed_recovery_peer_pin(&left_connection)
+        ),
+        crate::pairing_v2::recovery::exchange_exact_pair(
+            &right_connection,
+            false,
+            changed,
+            observed_recovery_peer_pin(&right_connection)
+        ),
     );
     assert!(left_result.is_err());
     assert!(right_result.is_err());
+}
+
+fn seed_recovery_receipt(
+    root: &std::path::Path,
+    local: [u8; 32],
+    peer: [u8; 32],
+    attempt: [u8; 32],
+    peer_attempt: [u8; 32],
+) -> crate::pairing_pending::AdmissionReceiptRecord {
+    use crate::pairing_pending::{
+        AdmissionOwnership, AdmissionReceiptRecord, BilateralAdmissionRecord, PendingStore,
+        bind_prepared_bilateral_receipt_hash,
+    };
+    let store = PendingStore::open(root).unwrap();
+    let record = store
+        .prepare(store.version().unwrap(), attempt, peer)
+        .unwrap();
+    let version = store.version().unwrap();
+    let fields = BilateralTransactionFields {
+        local_identity: local,
+        peer_identity: peer,
+        local_attempt: attempt,
+        peer_attempt,
+        peer_pin: peer,
+        transcript: [175; 32],
+        suite: SUITE.to_owned(),
+        policy_revision: 0,
+    };
+    let mut receipt = AdmissionReceiptRecord {
+        attempt,
+        peer,
+        peer_pin: peer,
+        durable_fc_hash: [176; 32],
+        role: 0,
+        suite: SUITE.to_owned(),
+        protocol_version: 2,
+        transcript: fields.transcript,
+        binding: [177; 32],
+        revision: version.revision + 1,
+        identity_generation: version.identity_generation,
+        revocation_generation: record.revocation_generation,
+        policy_revision: 0,
+        ownership: AdmissionOwnership::StoreOwned {
+            guard_token: attempt,
+            staged_revision: version.revision,
+            handoff_revision: version.revision + 1,
+        },
+        bilateral: BilateralAdmissionRecord::prepared(
+            &fields,
+            attempt,
+            version.identity_generation,
+            record.revocation_generation,
+            0,
+        ),
+    };
+    bind_prepared_bilateral_receipt_hash(&mut receipt);
+    store
+        .publish_local_bilateral_receipt(version, &record, receipt)
+        .unwrap()
+}
+
+#[tokio::test]
+async fn exact_peer_recovery_coordinator_confirms_both_durable_receipts_without_authority() {
+    use crate::pairing_pending::{BilateralAdmissionState, PendingStore};
+    use crate::pairing_v2::admission_authority::{
+        AdmissionAuthorityStore, recover_bilateral_foundation,
+    };
+    // Cover reciprocal unconfirmed records and the one-sided confirmed crash.
+    for left_was_confirmed in [false, true] {
+        let (a, ak) = identity(true);
+        let (b, bk) = identity(true);
+        let a_hash = Sha256::digest(&a).into();
+        let b_hash = Sha256::digest(&b).into();
+        let left_root = tempfile::tempdir().unwrap();
+        let right_root = tempfile::tempdir().unwrap();
+        let left_receipt =
+            seed_recovery_receipt(left_root.path(), a_hash, b_hash, [171; 32], [172; 32]);
+        let right_receipt =
+            seed_recovery_receipt(right_root.path(), b_hash, a_hash, [172; 32], [171; 32]);
+        if left_was_confirmed {
+            let store = PendingStore::open(left_root.path()).unwrap();
+            store
+                .confirm_bilateral_receipt(
+                    store.version().unwrap(),
+                    [171; 32],
+                    left_receipt.bilateral.transaction_id,
+                    left_receipt.bilateral.local_receipt_hash,
+                    right_receipt.bilateral.local_receipt_hash,
+                )
+                .unwrap();
+        }
+        let left = AdmissionAuthorityStore::open(left_root.path()).unwrap();
+        let right = AdmissionAuthorityStore::open(right_root.path()).unwrap();
+        let (_server, _client, lc, rc) =
+            pinned_recovery_connection_for_identities(a, ak, b, bk).await;
+        recover_bilateral_foundation(&left, [171; 32], &right, [172; 32], Some((&lc, &rc)))
+            .await
+            .unwrap();
+        for (store, attempt, peer_hash) in [
+            (&left, [171; 32], right_receipt.bilateral.local_receipt_hash),
+            (&right, [172; 32], left_receipt.bilateral.local_receipt_hash),
+        ] {
+            let receipt = store.test_bilateral_receipt(attempt).unwrap().unwrap();
+            assert_eq!(
+                receipt.bilateral.state,
+                BilateralAdmissionState::BilateralConfirmed
+            );
+            assert_eq!(receipt.bilateral.peer_receipt_hash, Some(peer_hash));
+            assert!(store.operational_admission_snapshot(attempt).is_err());
+        }
+    }
+}
+
+#[tokio::test]
+async fn exact_peer_recovery_coordinator_mismatch_aborts_both_before_same_peer_retry() {
+    use crate::pairing_v2::admission_authority::{
+        AdmissionAuthorityStore, ReconcileAdmission, recover_bilateral_foundation,
+    };
+    let (a, ak) = identity(true);
+    let (b, bk) = identity(true);
+    let a_hash = Sha256::digest(&a).into();
+    let b_hash = Sha256::digest(&b).into();
+    let left_root = tempfile::tempdir().unwrap();
+    let right_root = tempfile::tempdir().unwrap();
+    seed_recovery_receipt(left_root.path(), a_hash, b_hash, [181; 32], [182; 32]);
+    // The authenticated peer has a different transaction, not authority to
+    // complete the receiver's immutable receipt.
+    seed_recovery_receipt(right_root.path(), b_hash, a_hash, [182; 32], [183; 32]);
+    let left = AdmissionAuthorityStore::open(left_root.path()).unwrap();
+    let right = AdmissionAuthorityStore::open(right_root.path()).unwrap();
+    let (_server, _client, lc, rc) = pinned_recovery_connection_for_identities(a, ak, b, bk).await;
+    assert!(
+        recover_bilateral_foundation(&left, [181; 32], &right, [182; 32], Some((&lc, &rc)))
+            .await
+            .is_err()
+    );
+    for (store, attempt, peer, retry) in [
+        (&left, [181; 32], b_hash, [184; 32]),
+        (&right, [182; 32], a_hash, [185; 32]),
+    ] {
+        assert_eq!(
+            store.reconcile(attempt).unwrap(),
+            ReconcileAdmission::Absent
+        );
+        assert!(store.operational_admission_snapshot(attempt).is_err());
+        store
+            .prepare(store.version().unwrap(), retry, peer)
+            .unwrap();
+    }
 }
 
 fn handshake_config(local: u8, remote: u8) -> super::HandshakeConfig {
@@ -1036,10 +1248,12 @@ fn task4_prepared_subprocess_crash_reconciles_exactly_before_fresh_same_peer_ret
     let left_peer = parse_marker(&stdout, "TASK4_LEFT_PEER:");
     let right_peer = parse_marker(&stdout, "TASK4_RIGHT_PEER:");
 
-    let left = crate::pairing_v2::admission_authority::AdmissionAuthorityStore::open(left_root.path())
-        .unwrap();
-    let right = crate::pairing_v2::admission_authority::AdmissionAuthorityStore::open(right_root.path())
-        .unwrap();
+    let left =
+        crate::pairing_v2::admission_authority::AdmissionAuthorityStore::open(left_root.path())
+            .unwrap();
+    let right =
+        crate::pairing_v2::admission_authority::AdmissionAuthorityStore::open(right_root.path())
+            .unwrap();
     for (store, attempt, peer, retry) in [
         (&left, left_attempt, left_peer, [201; 32]),
         (&right, right_attempt, right_peer, [202; 32]),
@@ -1093,10 +1307,12 @@ fn task4_staged_subprocess_crash_reconciles_exactly_before_fresh_same_peer_retry
     let left_peer = parse_marker(&stdout, "TASK4_LEFT_PEER:");
     let right_peer = parse_marker(&stdout, "TASK4_RIGHT_PEER:");
 
-    let left = crate::pairing_v2::admission_authority::AdmissionAuthorityStore::open(left_root.path())
-        .unwrap();
-    let right = crate::pairing_v2::admission_authority::AdmissionAuthorityStore::open(right_root.path())
-        .unwrap();
+    let left =
+        crate::pairing_v2::admission_authority::AdmissionAuthorityStore::open(left_root.path())
+            .unwrap();
+    let right =
+        crate::pairing_v2::admission_authority::AdmissionAuthorityStore::open(right_root.path())
+            .unwrap();
     for (store, attempt, peer, retry) in [
         (&left, left_attempt, left_peer, [203; 32]),
         (&right, right_attempt, right_peer, [204; 32]),
@@ -1150,10 +1366,12 @@ fn task4_proof_verified_subprocess_crash_reconciles_exactly_before_fresh_same_pe
     let left_peer = parse_marker(&stdout, "TASK4_LEFT_PEER:");
     let right_peer = parse_marker(&stdout, "TASK4_RIGHT_PEER:");
 
-    let left = crate::pairing_v2::admission_authority::AdmissionAuthorityStore::open(left_root.path())
-        .unwrap();
-    let right = crate::pairing_v2::admission_authority::AdmissionAuthorityStore::open(right_root.path())
-        .unwrap();
+    let left =
+        crate::pairing_v2::admission_authority::AdmissionAuthorityStore::open(left_root.path())
+            .unwrap();
+    let right =
+        crate::pairing_v2::admission_authority::AdmissionAuthorityStore::open(right_root.path())
+            .unwrap();
     for (store, attempt, peer, retry) in [
         (&left, left_attempt, left_peer, [206; 32]),
         (&right, right_attempt, right_peer, [207; 32]),
@@ -1207,10 +1425,12 @@ fn task4_frozen_subprocess_crash_reconciles_exactly_before_fresh_same_peer_retry
     let left_peer = parse_marker(&stdout, "TASK4_LEFT_PEER:");
     let right_peer = parse_marker(&stdout, "TASK4_RIGHT_PEER:");
 
-    let left = crate::pairing_v2::admission_authority::AdmissionAuthorityStore::open(left_root.path())
-        .unwrap();
-    let right = crate::pairing_v2::admission_authority::AdmissionAuthorityStore::open(right_root.path())
-        .unwrap();
+    let left =
+        crate::pairing_v2::admission_authority::AdmissionAuthorityStore::open(left_root.path())
+            .unwrap();
+    let right =
+        crate::pairing_v2::admission_authority::AdmissionAuthorityStore::open(right_root.path())
+            .unwrap();
     for (store, attempt, peer, retry) in [
         (&left, left_attempt, left_peer, [208; 32]),
         (&right, right_attempt, right_peer, [209; 32]),
@@ -1275,12 +1495,14 @@ fn task4_ambiguous_staged_sidecar_uses_legacy_fail_closed_recovery() {
     // legacy resolver and leave the staged receipt ineligible rather than
     // deleting durable state based on an untrusted token.
     let path = guard_path(left_root.path(), attempt);
-    let mut guard: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let mut guard: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
     guard["token"] = serde_json::to_value([255u8; 32]).unwrap();
     std::fs::write(&path, serde_json::to_vec(&guard).unwrap()).unwrap();
 
-    let left = crate::pairing_v2::admission_authority::AdmissionAuthorityStore::open(left_root.path())
-        .unwrap();
+    let left =
+        crate::pairing_v2::admission_authority::AdmissionAuthorityStore::open(left_root.path())
+            .unwrap();
     assert_eq!(
         left.reconcile(attempt).unwrap(),
         crate::pairing_v2::admission_authority::ReconcileAdmission::Revoked,
@@ -1288,7 +1510,10 @@ fn task4_ambiguous_staged_sidecar_uses_legacy_fail_closed_recovery() {
     );
     assert!(!left.test_has_admission_guard(attempt).unwrap());
     assert!(left.test_bilateral_receipt(attempt).unwrap().is_some());
-    assert!(left.prepare(left.version().unwrap(), [205; 32], peer).is_err());
+    assert!(
+        left.prepare(left.version().unwrap(), [205; 32], peer)
+            .is_err()
+    );
 }
 
 #[test]
@@ -1330,6 +1555,9 @@ fn task4_crash_matrix_worker() {
                 "staged" => Checkpoint::RightStaged,
                 "proof_verified" => Checkpoint::Task3ProofsVerified,
                 "frozen" => Checkpoint::RightFrozen,
+                "store_owned_before_release" => Checkpoint::StoreOwnedBeforeRelease,
+                "left_finalized" => Checkpoint::LeftFinalized,
+                "left_confirmed" => Checkpoint::LeftConfirmed,
                 other => panic!("unsupported Task4 crash boundary: {other}"),
             };
             let (hook, pause) = Hook::recording().pause_after(checkpoint);
@@ -1352,6 +1580,98 @@ fn task4_crash_matrix_worker() {
             std::io::Write::flush(&mut std::io::stdout()).unwrap();
             std::process::exit(91);
         });
+}
+
+fn task4_interrupted_publication_exact_abort(boundary: &str) {
+    use crate::pairing_v2::admission_authority::{
+        AdmissionAuthorityStore, ReconcileAdmission, recover_bilateral_foundation,
+    };
+    let left_root = tempfile::tempdir().unwrap();
+    let right_root = tempfile::tempdir().unwrap();
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--ignored",
+            "--exact",
+            "pairing_v2::provisional_tls::tests::task4_crash_matrix_worker",
+            "--nocapture",
+        ])
+        .env("CSF12_TASK4_LEFT_ROOT", left_root.path())
+        .env("CSF12_TASK4_RIGHT_ROOT", right_root.path())
+        .env("CSF12_TASK4_BOUNDARY", boundary)
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(91),
+        "worker stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let marker = |prefix: &str| -> [u8; 32] {
+        let hex = stdout
+            .lines()
+            .find_map(|line| line.strip_prefix(prefix))
+            .unwrap();
+        assert_eq!(hex.len(), 64);
+        std::array::from_fn(|index| u8::from_str_radix(&hex[index * 2..index * 2 + 2], 16).unwrap())
+    };
+    let left = AdmissionAuthorityStore::open(left_root.path()).unwrap();
+    let right = AdmissionAuthorityStore::open(right_root.path()).unwrap();
+    let left_attempt = marker("TASK4_LEFT_ATTEMPT:");
+    let right_attempt = marker("TASK4_RIGHT_ATTEMPT:");
+    assert!(left.operational_admission_snapshot(left_attempt).is_err());
+    assert!(right.operational_admission_snapshot(right_attempt).is_err());
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    // The interrupted peer has no fresh authenticated recovery channel. Both
+    // immutable transactions must be aborted, including the store-owned pin.
+    assert!(
+        runtime
+            .block_on(recover_bilateral_foundation(
+                &left,
+                left_attempt,
+                &right,
+                right_attempt,
+                None,
+            ))
+            .is_err()
+    );
+    for (store, attempt, peer, retry) in [
+        (&left, left_attempt, marker("TASK4_LEFT_PEER:"), [211; 32]),
+        (
+            &right,
+            right_attempt,
+            marker("TASK4_RIGHT_PEER:"),
+            [212; 32],
+        ),
+    ] {
+        assert_eq!(
+            store.reconcile(attempt).unwrap(),
+            ReconcileAdmission::Absent
+        );
+        assert!(!store.test_has_admission_guard(attempt).unwrap());
+        assert!(store.operational_admission_snapshot(attempt).is_err());
+        store
+            .prepare(store.version().unwrap(), retry, peer)
+            .unwrap();
+    }
+}
+
+#[test]
+fn task4_store_owned_before_release_crash_exact_aborts_before_same_peer_retry() {
+    task4_interrupted_publication_exact_abort("store_owned_before_release");
+}
+
+#[test]
+fn task4_left_finalized_crash_exact_aborts_before_same_peer_retry() {
+    task4_interrupted_publication_exact_abort("left_finalized");
+}
+
+#[test]
+fn task4_left_confirmed_crash_exact_aborts_before_same_peer_retry() {
+    task4_interrupted_publication_exact_abort("left_confirmed");
 }
 
 #[tokio::test]
@@ -2638,7 +2958,7 @@ async fn freeze_before_endpoint_drop_is_durably_revoked_before_future_authority(
         crate::pairing_v2::admission_authority::AdmissionAuthorityStore::open(ta.path()).unwrap();
     assert_eq!(
         reopened.reconcile(attempt).unwrap(),
-        crate::pairing_v2::admission_authority::ReconcileAdmission::Revoked
+        crate::pairing_v2::admission_authority::ReconcileAdmission::Absent
     );
 }
 
@@ -2758,7 +3078,7 @@ async fn final_manifest_error_after_claim_is_not_operationally_active() {
         crate::pairing_v2::admission_authority::AdmissionAuthorityStore::open(ta.path()).unwrap();
     assert_eq!(
         store.reconcile(record.attempt_id).unwrap(),
-        crate::pairing_v2::admission_authority::ReconcileAdmission::Revoked
+        crate::pairing_v2::admission_authority::ReconcileAdmission::Absent
     );
     assert!(
         store
@@ -2817,13 +3137,36 @@ async fn commit_wrapper_before_rename_error_reopens_without_operational_snapshot
 }
 
 #[test]
+fn final_manifest_worker_uses_the_cross_platform_crash_hook() {
+    let worker: fn() = final_manifest_fault_worker;
+    let _ = worker;
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "pairing_v2::provisional_tls::tests::final_manifest_fault_worker",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env("CSF12_FINALIZATION_WORKER_PROBE", "1")
+        .env("PAIRING_TEST_FS_FAULT", "ledger:before_rename:crash")
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(91),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn final_manifest_crash_after_claim_reconciles_durable_boundary() {
     use std::process::Command;
 
     for (stage, expected) in [
         (
             "before_rename",
-            crate::pairing_v2::admission_authority::ReconcileAdmission::Revoked,
+            crate::pairing_v2::admission_authority::ReconcileAdmission::Absent,
         ),
         (
             "after_rename",
@@ -2864,12 +3207,16 @@ fn final_manifest_crash_after_claim_reconciles_durable_boundary() {
     }
 }
 
-#[cfg(unix)]
 #[test]
 #[ignore = "subprocess helper"]
 fn final_manifest_fault_worker() {
     use std::io::Write;
 
+    if std::env::var_os("CSF12_FINALIZATION_WORKER_PROBE").is_some() {
+        crate::private_fs::faults::arm();
+        crate::private_fs::faults::point("ledger.json", "before_rename").unwrap();
+        panic!("cross-platform fault probe did not exit");
+    }
     let root = std::env::var_os("CSF12_FINALIZATION_FAULT_ROOT").unwrap();
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -3140,6 +3487,10 @@ async fn bilateral_rejection_issues_real_reset_and_stop_independently_of_connect
 
 #[tokio::test]
 async fn bilateral_control_fragmentation_and_adversarial_phase_matrix() {
+    #[cfg(windows)]
+    let fault_deadline = Duration::from_secs(15);
+    #[cfg(not(windows))]
+    let fault_deadline = Duration::from_secs(5);
     for mutation in 0..7 {
         for sequence in [0, 2, 4, 6, 8, 10, 12, 14, 15, 16] {
             let (_ea, _eb, mut a, mut b, _) = pair().await;
@@ -3171,9 +3522,11 @@ async fn bilateral_control_fragmentation_and_adversarial_phase_matrix() {
                     )
                 )
             };
-            let (a, b) = tokio::time::timeout(Duration::from_secs(5), test)
+            let (a, b) = tokio::time::timeout(fault_deadline, test)
                 .await
-                .expect("fault must not stall");
+                .unwrap_or_else(|_| {
+                    panic!("fault must not stall: mutation {mutation} sequence {sequence}")
+                });
             if mutation == 0 {
                 assert!(a.is_ok() && b.is_ok(), "fragment seq {sequence}");
             } else {

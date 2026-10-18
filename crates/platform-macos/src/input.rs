@@ -3,11 +3,12 @@ use seamless_input_core::platform::{AccessState, CaptureMode, EventDisposition, 
 use seamless_input_protocol::Button;
 use seamless_input_protocol::{InputEvent, Modifier};
 use std::collections::BTreeSet;
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
-};
+#[cfg(target_os = "macos")]
+use std::sync::Arc;
+#[cfg(any(target_os = "macos", test))]
+use std::sync::atomic::{AtomicBool, Ordering};
 
+#[cfg(any(target_os = "macos", test))]
 fn service_event_tap_until_stopped(stop: &AtomicBool, mut service_once: impl FnMut()) {
     while !stop.load(Ordering::Acquire) {
         service_once();

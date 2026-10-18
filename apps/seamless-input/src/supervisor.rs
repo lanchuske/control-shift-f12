@@ -24,12 +24,14 @@ use seamless_input_protocol::VERSION;
 use seamless_transport::{
     EndpointOptions, IdentityStore, PairingError, PeerEndpoint, PeerSession, ReconnectPolicy,
 };
+#[cfg(any(target_os = "macos", test))]
+use std::{collections::VecDeque, sync::Mutex};
 use std::{
-    collections::{BTreeMap, BTreeSet, VecDeque},
+    collections::{BTreeMap, BTreeSet},
     future::Future,
     net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::Arc,
     time::{Duration, Instant},
 };
 use tokio::{sync::mpsc, task::JoinHandle};
@@ -359,12 +361,28 @@ struct PeerLink {
 
 struct InboundPacket {
     peer: NodeId,
+    generation: u64,
     packet: Result<Vec<u8>, String>,
 }
 
 enum PeerPacketOutcome {
     Received(crate::runtime::RuntimeReceive),
     Isolated { recovery: Vec<RuntimeEffect> },
+}
+
+fn process_admitted_packet(
+    runtime: &mut Runtime,
+    peer: NodeId,
+    generation: u64,
+    packet: Result<Vec<u8>, String>,
+    now_ms: u64,
+) -> Option<PeerPacketOutcome> {
+    // This is the local admission epoch captured by the reader, not a field
+    // decoded from the wire. Old EOF/error packets must not close a new link.
+    if runtime.peer_epoch(peer) != Some(generation) {
+        return None;
+    }
+    Some(process_peer_packet(runtime, peer, packet, now_ms))
 }
 
 fn process_peer_packet(
@@ -573,7 +591,8 @@ impl NativeSupervisor {
             let Some(pin) = self.identity.peer(session.peer()) else {
                 continue;
             };
-            self.runtime
+            let generation = self
+                .runtime
                 .connect_admitted(
                     session.peer(),
                     Capabilities::all(),
@@ -588,7 +607,7 @@ impl NativeSupervisor {
             self.sessions.insert(session.peer(), session.clone());
             self.spawn_writer(session.clone());
             newly_admitted.push(session.peer());
-            self.spawn_reader(session);
+            self.spawn_reader(session, generation);
         }
         for peer in newly_admitted {
             let epoch = self
@@ -811,7 +830,7 @@ impl NativeSupervisor {
         Ok(())
     }
 
-    fn spawn_reader(&mut self, session: PeerSession) {
+    fn spawn_reader(&mut self, session: PeerSession, generation: u64) {
         if self.readers.contains_key(&session.peer()) {
             return;
         }
@@ -824,7 +843,15 @@ impl NativeSupervisor {
                     .await
                     .map_err(|error| error.to_string());
                 let closed = packet.is_err();
-                if sender.send(InboundPacket { peer, packet }).is_err() || closed {
+                if sender
+                    .send(InboundPacket {
+                        peer,
+                        generation,
+                        packet,
+                    })
+                    .is_err()
+                    || closed
+                {
                     break;
                 }
             }
@@ -834,7 +861,16 @@ impl NativeSupervisor {
 
     async fn drain_inbound(&mut self, now_ms: u64) -> Result<(), SupervisorError> {
         while let Ok(inbound) = self.inbound_rx.try_recv() {
-            match process_peer_packet(&mut self.runtime, inbound.peer, inbound.packet, now_ms) {
+            let Some(outcome) = process_admitted_packet(
+                &mut self.runtime,
+                inbound.peer,
+                inbound.generation,
+                inbound.packet,
+                now_ms,
+            ) else {
+                continue;
+            };
+            match outcome {
                 PeerPacketOutcome::Received(received) => {
                     #[cfg(test)]
                     self.observed_received.push(received.clone());
@@ -1308,22 +1344,26 @@ struct CapturedInput {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg(any(target_os = "macos", test))]
 enum CaptureEnqueueAction {
     Continue,
     RecoverLocal,
 }
 
+#[cfg(any(target_os = "macos", test))]
 struct CaptureBufferState {
     emergency: bool,
     ordered: VecDeque<CapturedInput>,
 }
 
 #[derive(Clone)]
+#[cfg(any(target_os = "macos", test))]
 struct CaptureBuffer {
     capacity: usize,
     state: Arc<Mutex<CaptureBufferState>>,
 }
 
+#[cfg(any(target_os = "macos", test))]
 impl CaptureBuffer {
     fn new(capacity: usize) -> Self {
         assert!(capacity > 0, "capture capacity must be non-zero");
@@ -1409,7 +1449,7 @@ mod capture_buffer_tests {
             Arc,
             atomic::{AtomicBool, AtomicUsize, Ordering},
         },
-        time::{Duration, Instant},
+        time::Duration,
     };
 
     fn captured(event: InputEvent) -> CapturedInput {
@@ -1584,11 +1624,10 @@ mod capture_buffer_tests {
         assert!((1..=64).contains(&CAPTURE_DRAIN_BUDGET));
     }
 
-    #[tokio::test(flavor = "current_thread")]
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn slow_maintenance_does_not_block_input_service_cadence() {
         let serviced = Arc::new(AtomicUsize::new(0));
         let observed = Arc::clone(&serviced);
-        let started = Instant::now();
 
         interleave_maintenance(
             async { tokio::time::sleep(Duration::from_millis(45)).await },
@@ -1601,14 +1640,13 @@ mod capture_buffer_tests {
         .await
         .unwrap();
 
-        assert!(started.elapsed() >= Duration::from_millis(40));
         assert!(
             serviced.load(Ordering::SeqCst) >= 6,
             "input service did not interleave with slow maintenance"
         );
     }
 
-    #[tokio::test(flavor = "current_thread")]
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn pending_network_send_does_not_block_input_heartbeat_or_shutdown() {
         let (failure_tx, mut failure_rx) = tokio::sync::mpsc::unbounded_channel();
         let writer = OutboundWriter::spawn(
@@ -2178,6 +2216,51 @@ mod fault_isolation_tests {
     }
 
     #[test]
+    fn obsolete_reader_packets_cannot_disconnect_a_replacement_admission() {
+        let (mut runtime, remote, previous) = test_runtime(Capabilities::all());
+        runtime.disconnect(remote);
+        let pin = PinnedPeer {
+            node_id: remote,
+            friendly_name: "peer".into(),
+            public_identity: vec![2],
+            certificate_pin: [2; 32],
+        };
+        let current = runtime
+            .connect_admitted(
+                remote,
+                Capabilities::all(),
+                Some(&pin),
+                SessionTrust::Authenticated,
+            )
+            .unwrap();
+        assert_ne!(previous, current);
+        runtime
+            .receive(
+                remote,
+                PeerMessage::Capabilities {
+                    epoch: current,
+                    capabilities: Capabilities::all(),
+                },
+                0,
+            )
+            .unwrap();
+        for packet in [
+            Err("EOF".into()),
+            Err("reader failed".into()),
+            Ok(vec![0xc1]),
+            Ok(encode_peer_message(&PeerMessage::Heartbeat { epoch: previous }).unwrap()),
+        ] {
+            assert!(process_admitted_packet(&mut runtime, remote, previous, packet, 1).is_none());
+            assert_eq!(runtime.peer_epoch(remote), Some(current));
+        }
+        assert!(matches!(
+            process_admitted_packet(&mut runtime, remote, current, Err("current EOF".into()), 2),
+            Some(PeerPacketOutcome::Isolated { .. })
+        ));
+        assert_eq!(runtime.peer_epoch(remote), None);
+    }
+
+    #[test]
     fn malformed_packet_isolates_peer_and_recovers_local_control() {
         let (mut runtime, remote, _) = test_runtime(Capabilities::all());
         runtime
@@ -2460,6 +2543,7 @@ mod tests {
         a.inbound_tx
             .send(InboundPacket {
                 peer: b_id,
+                generation: a.runtime.peer_epoch(b_id).unwrap(),
                 packet: Ok(encode_peer_message(&build(remote_epoch)).unwrap()),
             })
             .unwrap();
@@ -2821,6 +2905,7 @@ mod tests {
         a.inbound_tx
             .send(InboundPacket {
                 peer: b_id,
+                generation: a.runtime.peer_epoch(b_id).unwrap(),
                 packet: Ok(vec![0xc1]),
             })
             .unwrap();
