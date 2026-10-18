@@ -1125,7 +1125,6 @@ mod tests {
         assert!(buffer_size as usize >= size_of::<FILE_RENAME_INFO>());
     }
 
-
     #[test]
     fn replacement_operations_run_in_durable_order() {
         let root = tempfile::tempdir().unwrap();
