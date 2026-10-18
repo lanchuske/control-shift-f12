@@ -3520,7 +3520,9 @@ async fn bilateral_control_fragmentation_and_adversarial_phase_matrix() {
             };
             let (a, b) = tokio::time::timeout(Duration::from_secs(5), test)
                 .await
-                .expect("fault must not stall");
+                .unwrap_or_else(|_| {
+                    panic!("fault must not stall: mutation {mutation} sequence {sequence}")
+                });
             if mutation == 0 {
                 assert!(a.is_ok() && b.is_ok(), "fragment seq {sequence}");
             } else {
