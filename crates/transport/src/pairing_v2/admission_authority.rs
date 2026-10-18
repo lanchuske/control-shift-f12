@@ -102,8 +102,53 @@ impl AdmissionAuthorityStore {
         }
     }
 
+    /// Opens only a sealed, local operational preflight lease.  This is
+    /// intentionally crate-private: it exposes neither a general durable-pin
+    /// lookup nor a transport/input capability.
+    #[allow(dead_code)] // Wired by the sealed V01 operational session only.
+    pub(crate) fn acquire_operational_preflight_lease(
+        &self,
+        attempt: [u8; 32],
+        view_hash: [u8; 32],
+        connection_binding: [u8; 32],
+    ) -> Result<crate::pairing_pending::OperationalPreflightLease, StoreError> {
+        self.store
+            .acquire_operational_preflight_lease(attempt, view_hash, connection_binding)
+    }
+
+    #[allow(dead_code)] // Sealed default-off V01 boundary.
+    pub(crate) fn operational_admission_snapshot(
+        &self,
+        attempt: [u8; 32],
+    ) -> Result<crate::pairing_pending::OperationalAdmissionSnapshot, StoreError> {
+        self.store.operational_admission_snapshot(attempt)
+    }
+
     /// Test-only synthetic entry point. Production can commit only a live sealed
     /// handshake witness through `commit_sealed_foundation`.
+    #[cfg(test)]
+    pub(crate) fn commit_operational_test_receipt(
+        &self,
+        record: &PendingRecord,
+        peer_pin: [u8; 32],
+    ) -> Result<PromotionReceipt, StoreError> {
+        self.commit_metadata(
+            self.version()?,
+            record.revocation_generation,
+            record,
+            EvidenceFields {
+                attempt: record.attempt_id,
+                peer: record.peer_fingerprint,
+                peer_pin,
+                fc: [22; 32],
+                role: 0,
+                suite: super::SUITE,
+                transcript: [23; 32],
+                binding: [24; 32],
+            },
+        )
+    }
+
     #[cfg(test)]
     fn commit_metadata(
         &self,
@@ -470,6 +515,113 @@ mod tests {
             .unwrap();
         assert_eq!(
             store.reconcile(next.attempt_id).unwrap(),
+            ReconcileAdmission::Revoked
+        );
+    }
+
+    #[test]
+    fn operational_lease_abort_never_revokes_durable_admission() {
+        let root = tempfile::tempdir().unwrap();
+        let store = AdmissionAuthorityStore::open(root.path()).unwrap();
+        let record = store
+            .prepare(store.version().unwrap(), [81; 32], [82; 32])
+            .unwrap();
+        store
+            .commit_metadata(store.version().unwrap(), 0, &record, evidence(&record))
+            .unwrap();
+
+        let lease = store
+            .acquire_operational_preflight_lease(record.attempt_id, [83; 32], [84; 32])
+            .unwrap();
+        assert_eq!(lease.snapshot().receipt.attempt, record.attempt_id);
+        drop(lease);
+        assert_eq!(
+            store.reconcile(record.attempt_id).unwrap(),
+            ReconcileAdmission::Promoted
+        );
+    }
+
+    #[test]
+    fn operational_snapshot_copies_the_active_pairing_receipt_v2_exactly() {
+        let root = tempfile::tempdir().unwrap();
+        let store = AdmissionAuthorityStore::open(root.path()).unwrap();
+        let record = store
+            .prepare(store.version().unwrap(), [79; 32], [78; 32])
+            .unwrap();
+        store
+            .commit_metadata(store.version().unwrap(), 0, &record, evidence(&record))
+            .unwrap();
+        let snapshot = store
+            .operational_admission_snapshot(record.attempt_id)
+            .unwrap();
+        assert_eq!(snapshot.receipt.attempt, record.attempt_id);
+        assert_eq!(snapshot.receipt.protocol_version, PROTOCOL_VERSION);
+        assert_eq!(snapshot.receipt.protocol_version, 2);
+    }
+
+    #[test]
+    fn operational_final_lease_fails_closed_when_revoke_or_rotation_wins() {
+        for rotate in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let store = AdmissionAuthorityStore::open(root.path()).unwrap();
+            let record = store
+                .prepare(store.version().unwrap(), [85; 32], [86; 32])
+                .unwrap();
+            store
+                .commit_metadata(store.version().unwrap(), 0, &record, evidence(&record))
+                .unwrap();
+            let final_lease = store
+                .acquire_operational_preflight_lease(record.attempt_id, [87; 32], [88; 32])
+                .unwrap()
+                .promote([89; 32])
+                .unwrap();
+            final_lease.assert_current().unwrap();
+
+            if rotate {
+                store
+                    .store
+                    .rotate_identity(store.version().unwrap())
+                    .unwrap();
+            } else {
+                store
+                    .revoke_candidate(store.version().unwrap(), record.peer_fingerprint)
+                    .unwrap();
+            }
+            assert!(final_lease.assert_current().is_err());
+        }
+    }
+
+    #[test]
+    fn operational_revoke_vs_promote_race_never_leaves_a_usable_final_lease() {
+        let root = tempfile::tempdir().unwrap();
+        let store = AdmissionAuthorityStore::open(root.path()).unwrap();
+        let record = store
+            .prepare(store.version().unwrap(), [91; 32], [92; 32])
+            .unwrap();
+        store
+            .commit_metadata(store.version().unwrap(), 0, &record, evidence(&record))
+            .unwrap();
+        let preflight = store
+            .acquire_operational_preflight_lease(record.attempt_id, [93; 32], [94; 32])
+            .unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let path = root.path().to_path_buf();
+        let peer = record.peer_fingerprint;
+        let peer_barrier = barrier.clone();
+        let revoke = std::thread::spawn(move || {
+            peer_barrier.wait();
+            let peer_store = AdmissionAuthorityStore::open(path).unwrap();
+            let version = peer_store.version().unwrap();
+            peer_store.revoke_candidate(version, peer)
+        });
+        barrier.wait();
+        let final_lease = preflight.promote([95; 32]);
+        revoke.join().unwrap().unwrap();
+        if let Ok(final_lease) = final_lease {
+            assert!(final_lease.assert_current().is_err());
+        }
+        assert_eq!(
+            store.reconcile(record.attempt_id).unwrap(),
             ReconcileAdmission::Revoked
         );
     }

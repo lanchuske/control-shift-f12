@@ -12,6 +12,11 @@ mod handshake_evidence;
 mod handshake_machine;
 mod handshake_wire;
 pub mod operational_binding;
+#[cfg(feature = "pairing-v2-experimental")]
+#[allow(dead_code)] // Sealed default-off foundation; product has no caller in this phase.
+pub(crate) mod operational_session;
+#[cfg(test)]
+mod operational_session_tests;
 pub mod operational_wire;
 pub mod provisional_tls;
 pub use evidence::*;
