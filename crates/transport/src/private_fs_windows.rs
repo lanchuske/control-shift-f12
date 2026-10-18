@@ -921,8 +921,10 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let root_a = root.path().join("a");
         let root_b = root.path().join("b");
+        let root_c = root.path().join("c");
         std::fs::create_dir_all(&root_a).unwrap();
         std::fs::create_dir_all(&root_b).unwrap();
+        std::fs::create_dir_all(&root_c).unwrap();
         let private_a = PrivateDir::root(&root_a).unwrap();
         let private_b = PrivateDir::root(&root_b).unwrap();
         let mut target_a = private_a.open("x", true, true).unwrap().unwrap();
@@ -947,7 +949,7 @@ mod tests {
                 "private_fs::tests::root_relative_rename_binds_the_destination_to_the_retained_directory",
                 "--nocapture",
             ])
-            .current_dir(&root_b)
+            .current_dir(&root_c)
             .env(CHILD, "1")
             .env(ROOT_A, &root_a)
             .env(ROOT_B, &root_b)
