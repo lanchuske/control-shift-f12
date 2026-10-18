@@ -14,6 +14,7 @@ public sealed class UiChildSession
     private readonly FramedPayloadReader reader = new();
     private readonly HashSet<string> pendingRequestIds = new(StringComparer.Ordinal);
     private ulong nextRequestId;
+    private ulong highestProjectionGeneration;
 
     public ChildSessionState State { get; private set; } = ChildSessionState.Starting();
     public DesktopSnapshotProjection? Snapshot { get; private set; }
@@ -121,25 +122,29 @@ public sealed class UiChildSession
             switch (kind.GetString())
             {
                 case "ui_snapshot_v1" when DesktopSnapshotProjection.TryParse(json, out var snapshot):
+                    if (!AcceptProjectionGeneration(snapshot!.Generation))
+                    {
+                        return;
+                    }
                     Snapshot = snapshot;
-                    State = State.ReceiveCurrentProjection(snapshot!.Generation);
+                    State = State.ReceiveCurrentProjection(snapshot.Generation);
                     return;
                 case "ui_diagnostics_v1" when DiagnosticsProjection.TryParse(json, out var diagnostics):
-                    if (State.Phase != ChildSessionPhase.Running
-                        || Diagnostics is { Generation: var previous } && diagnostics!.Generation <= previous)
+                    if (State.Phase != ChildSessionPhase.Running)
                     {
                         Fault();
                         return;
                     }
+                    if (!AcceptProjectionGeneration(diagnostics!.Generation)) return;
                     Diagnostics = diagnostics;
                     return;
                 case "ui_pairing_v1" when PairingProjection.TryParse(json, out var pairing):
-                    if (State.Phase != ChildSessionPhase.Running
-                        || Pairing is { Generation: var previousPairing } && pairing!.Generation <= previousPairing)
+                    if (State.Phase != ChildSessionPhase.Running)
                     {
                         Fault();
                         return;
                     }
+                    if (!AcceptProjectionGeneration(pairing!.Generation)) return;
                     Pairing = pairing;
                     return;
                 case "ui_response_v1" when IsRecognizedResponse(document.RootElement):
@@ -153,6 +158,13 @@ public sealed class UiChildSession
         {
             Fault();
         }
+    }
+
+    private bool AcceptProjectionGeneration(ulong generation)
+    {
+        if (generation <= highestProjectionGeneration) return false;
+        highestProjectionGeneration = generation;
+        return true;
     }
 
     private bool IsRecognizedResponse(JsonElement root) =>

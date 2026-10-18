@@ -17,5 +17,6 @@
   <ItemGroup>
     <ProjectReference Include="..\ControlShiftF12App.Core\ControlShiftF12App.Core.csproj" />
     <ProjectReference Include="..\ControlShiftF12App\ControlShiftF12App.csproj" />
+    <ProjectReference Include="..\ControlShiftF12App.StderrProbe\ControlShiftF12App.StderrProbe.csproj" ReferenceOutputAssembly="false" />
   </ItemGroup>
 </Project>

@@ -338,7 +338,7 @@ final class DiagnosticsFrameController {
         ]
         guard Set(object.keys) == ["v", "kind", "snapshot"],
               let encoded = try? JSONSerialization.data(withJSONObject: object),
-              (try? JSONDecoder().decode(SnapshotGenerationEnvelope.self, from: encoded)) != nil,
+              let envelope = try? JSONDecoder().decode(SnapshotGenerationEnvelope.self, from: encoded),
               let version = object["v"] as? Int,
               version == 1,
               let snapshot = object["snapshot"] as? [String: Any],
@@ -360,6 +360,8 @@ final class DiagnosticsFrameController {
               capabilities["input_enabled"] as? Bool == false,
               capabilities["clipboard_enabled"] as? Bool == false
         else { throw HostError.invalidFrame }
+        guard envelope.snapshot.generation > highestGeneration else { return }
+        highestGeneration = envelope.snapshot.generation
         nearbyCandidates = candidates
         shell = state == "not_started" ? .readyToDiscover : .browsing
     }
