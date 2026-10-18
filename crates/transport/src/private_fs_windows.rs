@@ -786,7 +786,10 @@ mod tests {
     fn replacement_operations_run_in_durable_order() {
         let root = tempfile::tempdir().unwrap();
         let private = PrivateDir::root(root.path()).unwrap();
-        private.replace("target", b"old").unwrap();
+        let mut target = private.open("target", true, true).unwrap().unwrap();
+        target.write_all(b"old").unwrap();
+        target.sync_all().unwrap();
+        drop(target);
         faults::reset_operations();
 
         private.replace("target", b"new").unwrap();
