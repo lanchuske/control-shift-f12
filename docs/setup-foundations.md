@@ -97,10 +97,10 @@ rejected rather than silently repaired. Writers use a cross-process byte-range
 lock, bounded reads, temporary owner-only files opened write-through,
 pre-publication file flush, handle-based publication, post-publication file
 flush, and directory flush. Existing targets are replaced in one
-`FileRenameInfoEx` call whose destination is a validated leaf resolved relative
-to the retained directory handle, with replace-if-present and POSIX rename
-semantics. Already-open target handles continue to identify the old file while
-later opens identify the newly published file. This storage primitive requires
+`FileRenameInfoEx` call with an absolute destination, a null root handle,
+replace-if-present and POSIX rename semantics. Already-open target handles
+continue to identify the old file while later opens identify the newly
+published file. This storage primitive requires
 Windows 10 version 1607 or Windows Server 2016 and filesystem support; any
 unsupported or ambiguous durability result
 fails closed. Native durability evidence is scoped to the recorded Windows/NTFS
