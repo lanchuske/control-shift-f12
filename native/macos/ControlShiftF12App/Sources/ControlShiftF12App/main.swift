@@ -405,7 +405,7 @@ final class DiagnosticsFrameController {
         guard Set(object.keys) == ["v", "kind", "generation", "phase", "candidate_handle", "verification_words"],
               object["v"] as? Int == 1,
               object["kind"] as? String == "ui_pairing_v1",
-              let generation = object["generation"] as? UInt64, generation > highestGeneration,
+              let generation = object["generation"] as? UInt64,
               let candidate = object["candidate_handle"] as? String,
               let words = object["verification_words"] as? [String],
               let phase = object["phase"] as? String
@@ -421,6 +421,7 @@ final class DiagnosticsFrameController {
             state.acceptRemoteDisplay()
         default: throw HostError.invalidFrame
         }
+        guard generation > highestGeneration else { return }
         highestGeneration = generation
         pairing = state
     }
@@ -461,6 +462,7 @@ protocol ChildLifecycleChild: AnyObject {
     func terminate()
     func forceTerminate()
     func reap(timeout: TimeInterval) -> Bool
+    func clearTerminationHandler()
 }
 
 enum ChildOutputEvent {
@@ -475,6 +477,7 @@ enum ChildOutputEvent {
 final class ChildLifecycle {
     private let child: ChildLifecycleChild
     private let closeLock = NSLock()
+    private var closeFailure: ChildLifecycleError?
     private(set) var generation: UInt64 = 1
     private(set) var isClosed = false
 
@@ -497,24 +500,35 @@ final class ChildLifecycle {
         try? child.sendStopDiscovery()
     }
 
-    func close() {
+    func close() throws {
         closeLock.lock()
-        guard !isClosed else {
+        if isClosed {
+            let failure = closeFailure
             closeLock.unlock()
+            if let failure { throw failure }
             return
         }
         isClosed = true
         generation &+= 1
-        closeLock.unlock()
         child.closeInput()
         child.terminate()
-        if !child.reap(timeout: 0.25) {
+        var reaped = child.reap(timeout: 0.25)
+        if !reaped {
             child.forceTerminate()
-            _ = child.reap(timeout: 0.25)
+            reaped = child.reap(timeout: 0.25)
         }
+        child.clearTerminationHandler()
         child.closeOutput()
         child.closeError()
+        if !reaped { closeFailure = .unreaped }
+        let failure = closeFailure
+        closeLock.unlock()
+        if let failure { throw failure }
     }
+}
+
+enum ChildLifecycleError: Error {
+    case unreaped
 }
 
 /// The sole terminal transition for one child generation. It is main-thread
@@ -563,7 +577,7 @@ final class DiagnosticsSession {
         guard !isTerminal else { return }
         isTerminal = true
         controller.invalidate()
-        lifecycle.close()
+        try? lifecycle.close()
     }
 }
 
@@ -580,6 +594,7 @@ final class BundledChild: ChildLifecycleChild {
     private let requests: ChildRequestTracker
     private let outputDrainQueue = DispatchQueue(label: "control-shift-f12.stdout")
     private let errorDrainQueue = DispatchQueue(label: "control-shift-f12.stderr")
+    private let terminationQueue = DispatchQueue(label: "control-shift-f12.termination")
     private var discardedErrorBytes: UInt64 = 0
 
     init?(bundle: Bundle = .main, requests: ChildRequestTracker) {
@@ -677,7 +692,14 @@ final class BundledChild: ChildLifecycleChild {
     }
 
     func observeTermination(_ handler: @escaping () -> Void) {
-        process.terminationHandler = { _ in handler() }
+        process.terminationHandler = { [weak self] _ in
+            self?.terminationQueue.async { handler() }
+        }
+    }
+
+    func clearTerminationHandler() {
+        process.terminationHandler = nil
+        terminationQueue.sync {}
     }
 
     private func countDiscardedErrorBytes(_ count: Int) {
@@ -784,7 +806,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     func applicationWillTerminate(_ notification: Notification) {
         diagnostics.close()
         session = nil
-        lifecycle?.close()
+        try? lifecycle?.close()
     }
 
     @objc private func refreshDiagnostics() {

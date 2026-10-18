@@ -107,7 +107,7 @@ final class ControlShiftF12AppTests: XCTestCase {
         let lifecycle = ChildLifecycle(child: child)
 
         lifecycle.startDiscovery()
-        lifecycle.close()
+        try? lifecycle.close()
         lifecycle.startDiscovery()
 
         XCTAssertEqual(child.startDiscoveryCalls, 1)
@@ -118,7 +118,7 @@ final class ControlShiftF12AppTests: XCTestCase {
         let lifecycle = ChildLifecycle(child: child)
 
         lifecycle.stopDiscovery()
-        lifecycle.close()
+        try? lifecycle.close()
         lifecycle.stopDiscovery()
 
         XCTAssertEqual(child.stopDiscoveryCalls, 1)
@@ -285,6 +285,27 @@ final class ControlShiftF12AppTests: XCTestCase {
         XCTAssertTrue(controller.nearbyCandidates.isEmpty)
     }
 
+    func testPairingUsesTheSameGlobalGenerationAndIgnoresValidEqualOrOlderFrames() throws {
+        let controller = DiagnosticsFrameController()
+        try controller.consume(lengthPrefixed: frame(snapshotPayload(generation: 20, state: "not_started")))
+        try controller.consume(lengthPrefixed: frame(diagnosticsPayload(generation: 21)))
+        let equalPairing = """
+        {"v":1,"kind":"ui_pairing_v1","generation":21,"phase":"awaiting_local_confirmation","candidate_handle":"stale-peer","verification_words":["ember","ocean","violet","copper"]}
+        """.data(using: .utf8)!
+        let olderPairing = """
+        {"v":1,"kind":"ui_pairing_v1","generation":19,"phase":"awaiting_local_confirmation","candidate_handle":"older-peer","verification_words":["ember","ocean","violet","copper"]}
+        """.data(using: .utf8)!
+        let currentPairing = """
+        {"v":1,"kind":"ui_pairing_v1","generation":22,"phase":"awaiting_local_confirmation","candidate_handle":"current-peer","verification_words":["ember","ocean","violet","copper"]}
+        """.data(using: .utf8)!
+
+        XCTAssertNoThrow(try controller.consume(lengthPrefixed: frame(equalPairing)))
+        XCTAssertNoThrow(try controller.consume(lengthPrefixed: frame(olderPairing)))
+        XCTAssertNil(controller.pairing)
+        try controller.consume(lengthPrefixed: frame(currentPairing))
+        XCTAssertEqual(controller.pairing?.selectedCandidate, "current-peer")
+    }
+
     func testMalformedStaleSnapshotStillTerminatesInsteadOfHidingBehindGeneration() throws {
         let child = RecordingChild()
         let session = DiagnosticsSession(lifecycle: ChildLifecycle(child: child))
@@ -312,7 +333,7 @@ final class ControlShiftF12AppTests: XCTestCase {
         for _ in 0..<8 {
             group.enter()
             DispatchQueue.global().async {
-                lifecycle.close()
+                try? lifecycle.close()
                 group.leave()
             }
         }
@@ -325,7 +346,7 @@ final class ControlShiftF12AppTests: XCTestCase {
         let session = ChildLifecycle(child: child)
         let generation = session.generation
 
-        session.close()
+        try? session.close()
 
         XCTAssertTrue(child.inputClosed)
         XCTAssertTrue(child.outputClosed)
@@ -340,10 +361,47 @@ final class ControlShiftF12AppTests: XCTestCase {
         let child = SlowRecordingChild()
         let session = ChildLifecycle(child: child)
 
-        session.close()
+        try? session.close()
 
         XCTAssertEqual(child.reapAttempts, 2)
         XCTAssertTrue(child.forceTerminated)
+    }
+
+    func testCloseReportsSecondReapFailureAfterCleaningEveryPipe() {
+        let child = NeverReapedRecordingChild()
+        let lifecycle = ChildLifecycle(child: child)
+
+        XCTAssertThrowsError(try lifecycle.close())
+
+        XCTAssertTrue(child.inputClosed)
+        XCTAssertTrue(child.outputClosed)
+        XCTAssertTrue(child.errorClosed)
+        XCTAssertTrue(child.forceTerminated)
+        XCTAssertEqual(child.reapAttempts, 2)
+    }
+
+    func testCloseWaitsForInflightTerminationCallbackAndClearsIt() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let script = "cat >/dev/null"
+        let child = BundledChild(
+            executableURL: URL(fileURLWithPath: "/bin/sh"),
+            arguments: ["-c", script],
+            requests: ChildRequestTracker()
+        )
+        let callbackFinished = expectation(description: "termination callback drained")
+        child.observeTermination {
+            Thread.sleep(forTimeInterval: 0.1)
+            callbackFinished.fulfill()
+        }
+        try child.start()
+
+        let lifecycle = ChildLifecycle(child: child)
+        try lifecycle.close()
+
+        wait(for: [callbackFinished], timeout: 0)
     }
 
     func testBundledChildDrainsMoreThanTwoMebibytesOfStderrBeforeStdout() throws {
@@ -370,7 +428,7 @@ final class ControlShiftF12AppTests: XCTestCase {
         wait(for: [projection], timeout: 5)
 
         let lifecycle = ChildLifecycle(child: child)
-        lifecycle.close()
+        try lifecycle.close()
         XCTAssertTrue(lifecycle.isClosed)
     }
 
@@ -488,9 +546,10 @@ private class RecordingChild: ChildLifecycleChild {
         reapCalls += 1
         return true
     }
+    func clearTerminationHandler() {}
 }
 
-private final class SlowRecordingChild: RecordingChild {
+private class SlowRecordingChild: RecordingChild {
     var forceTerminated = false
     var reapAttempts = 0
 
@@ -521,5 +580,13 @@ private final class LockedRecordingChild: ChildLifecycleChild {
     func reap(timeout: TimeInterval) -> Bool {
         lock.lock(); reapCount += 1; lock.unlock()
         return true
+    }
+    func clearTerminationHandler() {}
+}
+
+private final class NeverReapedRecordingChild: SlowRecordingChild {
+    override func reap(timeout: TimeInterval) -> Bool {
+        reapAttempts += 1
+        return false
     }
 }

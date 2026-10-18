@@ -49,6 +49,30 @@ public sealed class WindowsUiChildOwnerTests
     }
 
     [Fact]
+    public async Task Close_coordinates_an_active_stdout_read_and_observes_its_completion()
+    {
+        var executable = FindProbeExecutable();
+        var environment = Environment.GetEnvironmentVariables()
+            .Keys.Cast<object>()
+            .ToDictionary(
+                key => key.ToString()!,
+                key => Environment.GetEnvironmentVariable(key.ToString()!)
+            );
+        var spec = new ChildLaunchSpec(executable, [], environment!);
+        await using var owner = await WindowsUiChildOwner.StartAsync(spec);
+        await owner.ReadInitialProjectionAsync(TimeSpan.FromSeconds(5));
+        var blockedRead = owner.RefreshAsync(TimeSpan.FromSeconds(30));
+        await Task.Delay(50);
+
+        var close = owner.CloseAsync();
+        await close.WaitAsync(TimeSpan.FromSeconds(5));
+        var terminal = await blockedRead.WaitAsync(TimeSpan.FromSeconds(1));
+
+        Assert.Equal(ChildSessionPhase.Terminal, terminal.State.Phase);
+        Assert.True(owner.HasExited);
+    }
+
+    [Fact]
     public async Task Owned_child_returns_a_valid_initial_projection_and_is_reaped_on_close()
     {
         var executable = FindEngineExecutable();

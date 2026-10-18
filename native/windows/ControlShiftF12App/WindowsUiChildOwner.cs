@@ -158,31 +158,46 @@ public sealed class WindowsUiChildOwner : IAsyncDisposable
     private async Task CloseCoreAsync()
     {
         closed = true;
-        child.StandardInput.Close();
-
-        using var cancellation = new CancellationTokenSource(TimeSpan.FromMilliseconds(250));
+        Exception failure = null!;
         try
         {
-            await child.WaitForExitAsync(cancellation.Token);
+            child.StandardInput.Close();
+            using var cancellation = new CancellationTokenSource(TimeSpan.FromMilliseconds(250));
+            try
+            {
+                await child.WaitForExitAsync(cancellation.Token);
+            }
+            catch (OperationCanceledException) when (!child.HasExited)
+            {
+                child.Kill(entireProcessTree: false);
+                await child.WaitForExitAsync();
+            }
         }
-        catch (OperationCanceledException) when (!child.HasExited)
+        catch (Exception error)
         {
-            child.Kill(entireProcessTree: false);
-            await child.WaitForExitAsync();
-        }
-
-        await stdoutGate.WaitAsync();
-        try
-        {
-            Session.CompleteOutput();
+            failure = error;
         }
         finally
         {
-            stdoutGate.Release();
+            if (!child.HasExited)
+            {
+                try { child.StandardOutput.Close(); } catch (Exception error) { failure ??= error; }
+                try { child.StandardError.Close(); } catch (Exception error) { failure ??= error; }
+            }
+            await stdoutGate.WaitAsync();
+            try
+            {
+                Session.CompleteOutput();
+            }
+            finally
+            {
+                stdoutGate.Release();
+            }
+            try { await stderrDrain; } catch (Exception error) { failure ??= error; }
+            try { child.StandardOutput.Close(); } catch (Exception error) { failure ??= error; }
+            try { child.StandardError.Close(); } catch (Exception error) { failure ??= error; }
         }
-        await stderrDrain;
-        child.StandardOutput.Close();
-        child.StandardError.Close();
+        if (failure is not null) throw failure;
     }
 
     private async Task DrainStderrAsync(Stream stream)
