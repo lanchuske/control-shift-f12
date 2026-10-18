@@ -886,7 +886,10 @@ mod tests {
         release_tx.send(()).unwrap();
         thread.join().unwrap();
         assert_eq!(result, Ok(()));
-        assert_eq!(private.read("target", 3).unwrap().as_deref(), Some(b"new"));
+        assert_eq!(
+            private.read("target", 3).unwrap().as_deref(),
+            Some(&b"new"[..])
+        );
     }
 
     #[test]
