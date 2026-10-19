@@ -31,8 +31,10 @@ fn refresh() -> Request {
 
 #[test]
 fn ui_stdio_child_exits_when_stdout_closes_while_stdin_is_held_open() {
+    let root = tempfile::tempdir().unwrap();
     let mut child = Command::new(env!("CARGO_BIN_EXE_seamless-input"))
         .args(["control", "--ui-stdio"])
+        .env("SEAMLESS_INPUT_HOME", root.path())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -69,8 +71,10 @@ fn ui_stdio_child_exits_when_stdout_closes_while_stdin_is_held_open() {
 
 #[test]
 fn ui_stdio_child_projects_refresh_without_changing_foundations_control() {
+    let root = tempfile::tempdir().unwrap();
     let mut child = Command::new(env!("CARGO_BIN_EXE_seamless-input"))
         .args(["control", "--ui-stdio"])
+        .env("SEAMLESS_INPUT_HOME", root.path())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -90,8 +94,10 @@ fn ui_stdio_child_projects_refresh_without_changing_foundations_control() {
 
 #[test]
 fn ui_stdio_child_rejects_oversized_inherited_frames() {
+    let root = tempfile::tempdir().unwrap();
     let mut child = Command::new(env!("CARGO_BIN_EXE_seamless-input"))
         .args(["control", "--ui-stdio"])
+        .env("SEAMLESS_INPUT_HOME", root.path())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -114,8 +120,10 @@ fn ui_stdio_child_rejects_duplicate_arguments_without_projection_or_argument_ech
         r#"{"v":1,"id":"duplicate-handle","command":"ui.select_candidate","args":{"handle":{"address":"192.0.2.4"},"handle":"nearby-1"}}"#,
         r#"{"v":1,"id":"duplicate-generation","command":"ui.approve_sas","args":{"generation":0,"generation":1,"matches":true}}"#,
     ] {
+        let root = tempfile::tempdir().unwrap();
         let mut child = Command::new(env!("CARGO_BIN_EXE_seamless-input"))
             .args(["control", "--ui-stdio"])
+            .env("SEAMLESS_INPUT_HOME", root.path())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())

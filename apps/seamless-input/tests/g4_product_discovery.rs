@@ -94,23 +94,66 @@ impl ProductChild {
         label: &str,
         predicate: impl Fn(&Value) -> bool,
     ) -> Value {
+        let mut timeline = Vec::new();
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
             assert!(
                 !remaining.is_zero(),
-                "timed out waiting for product child; stderr={}",
+                "timed out waiting for product child at {label}; timeline={timeline:?}; stderr={}",
                 self.stderr.lock().unwrap()
             );
             let frame = self.frames.recv_timeout(remaining).unwrap_or_else(|error| {
                 panic!(
-                    "product child frame before deadline at {label}: {error:?}; stderr={}",
+                    "product child frame before deadline at {label}: {error:?}; timeline={timeline:?}; stderr={}",
                     self.stderr.lock().unwrap()
                 )
             });
             if predicate(&frame) {
                 return frame;
             }
+            timeline.push((
+                frame["kind"].as_str().unwrap_or("unknown").to_owned(),
+                frame["snapshot"]["state"]
+                    .as_str()
+                    .or_else(|| frame["error"].as_str())
+                    .unwrap_or("-")
+                    .to_owned(),
+                frame["ok"].as_bool(),
+            ));
+            assert!(
+                !matches!(
+                    frame["snapshot"]["state"].as_str(),
+                    Some("rejected" | "cancelled" | "expired" | "remote_outcome_unknown")
+                ) && frame["ok"].as_bool() != Some(false),
+                "terminal product frame at {label}; timeline={timeline:?}; stderr={}",
+                self.stderr.lock().unwrap()
+            );
         }
+    }
+
+    fn latest_until_quiet(&self, mut latest: Value, predicate: impl Fn(&Value) -> bool) -> Value {
+        let deadline = Instant::now() + Duration::from_millis(250);
+        while let Ok(frame) = self
+            .frames
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+        {
+            assert!(
+                frame["ok"].as_bool() != Some(false),
+                "rejected product frame while selecting latest candidate; error={}",
+                frame["error"].as_str().unwrap_or("unknown")
+            );
+            if frame["kind"] == "ui_snapshot_v1" {
+                latest = frame;
+            }
+            if Instant::now() >= deadline {
+                break;
+            }
+        }
+        assert!(
+            predicate(&latest),
+            "latest product snapshot is no longer selectable"
+        );
+        latest
     }
 }
 
@@ -157,6 +200,14 @@ fn product_two_processes_discover_by_mdns_match_and_persist_non_operationally() 
                     .is_some_and(|v| v.len() == 1)
         },
     );
+    let candidate_snapshot = |frame: &Value| {
+        frame["kind"] == "ui_snapshot_v1"
+            && frame["snapshot"]["candidates"]
+                .as_array()
+                .is_some_and(|v| v.len() == 1)
+    };
+    let a_snapshot = a.latest_until_quiet(a_snapshot, candidate_snapshot);
+    let b_snapshot = b.latest_until_quiet(b_snapshot, candidate_snapshot);
     a.send(
         "select-a",
         "ui.select_candidate",
