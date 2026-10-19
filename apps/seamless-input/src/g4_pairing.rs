@@ -3,7 +3,10 @@
 
 use crate::{
     guided_setup::SetupError,
-    ui_contract::{CandidateCompatibility, CandidateFreshness, CandidateHandle, CandidateView},
+    ui_contract::{
+        CandidateCompatibility, CandidateFreshness, CandidateHandle, CandidateView,
+        RelationshipHandle,
+    },
 };
 #[cfg(feature = "g4-test-helper")]
 use seamless_discovery::Advertisement;
@@ -12,7 +15,8 @@ use seamless_discovery::guided::{
     CandidateHandle as DiscoveryHandle, ConsentCatalog, LocatorEvent, SelectedLocator,
 };
 use seamless_transport::pairing_v2::{
-    AdmissionAuthorityStore, DurableAdmissionState, handshake_selected_and_commit_distributed,
+    AdmissionAuthorityStore, DurableAdmissionState, ProductIdentity,
+    handshake_selected_and_commit_distributed,
     provisional_tls::{
         HandshakeConfig, IncomingHandshakeConfig, PRE_ADMISSION_SELECTION_WINDOW,
         PreAdmissionCandidate, ProvisionalEndpoint,
@@ -31,6 +35,22 @@ use std::{
 };
 
 const QUEUE_CAPACITY: usize = 16;
+
+#[cfg(feature = "pairing-v2-operational-experimental")]
+fn decode_relationship(value: &str) -> Result<[u8; 32], SetupError> {
+    if value.len() != 64 {
+        return Err(SetupError::InvalidArguments);
+    }
+    let mut decoded = [0_u8; 32];
+    for (index, pair) in value.as_bytes().as_chunks::<2>().0.iter().enumerate() {
+        let text = std::str::from_utf8(pair).map_err(|_| SetupError::InvalidArguments)?;
+        decoded[index] = u8::from_str_radix(text, 16).map_err(|_| SetupError::InvalidArguments)?;
+    }
+    if decoded == [0; 32] || value.bytes().any(|byte| byte.is_ascii_uppercase()) {
+        return Err(SetupError::InvalidArguments);
+    }
+    Ok(decoded)
+}
 
 pub(crate) struct G4DiscoveryCatalog {
     catalog: ConsentCatalog,
@@ -241,6 +261,14 @@ pub enum G4Command {
     Cancel {
         generation: u64,
     },
+    BeginV01 {
+        generation: u64,
+        relationship: RelationshipHandle,
+    },
+    DecideV01 {
+        generation: u64,
+        matches: bool,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -274,6 +302,24 @@ pub enum G4Event {
     RemoteOutcomeUnknown {
         generation: u64,
     },
+    V01Ready {
+        generation: u64,
+        words: [String; 4],
+        remaining_ms: u32,
+    },
+    V01Finished {
+        generation: u64,
+        outcome: V01Outcome,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum V01Outcome {
+    Verified,
+    Rejected,
+    Expired,
+    Revoked,
+    RemoteOutcomeUnknown,
 }
 
 impl G4Event {
@@ -282,6 +328,8 @@ impl G4Event {
             Self::Browsing { generation }
             | Self::Candidates { generation, .. }
             | Self::SasReady { generation, .. }
+            | Self::V01Ready { generation, .. }
+            | Self::V01Finished { generation, .. }
             | Self::Rejected { generation }
             | Self::Cancelled { generation }
             | Self::Expired { generation }
@@ -311,13 +359,23 @@ struct LiveSession {
     browsing: bool,
 }
 
+#[cfg(feature = "pairing-v2-operational-experimental")]
+struct LiveOperationalSession {
+    generation: u64,
+    attempt: seamless_transport::pairing_v2::product_operational::ProductOperationalAttempt,
+    _discovery: crate::product_operational_discovery::ProductOperationalDiscovery,
+}
+
 pub struct RealG4Backend {
     runtime: tokio::runtime::Runtime,
     session: Option<LiveSession>,
+    #[cfg(feature = "pairing-v2-operational-experimental")]
+    operational: Option<LiveOperationalSession>,
     events: tokio::sync::mpsc::Receiver<G4Event>,
     event_tx: tokio::sync::mpsc::Sender<G4Event>,
     now_ms: u64,
     store: Arc<AdmissionAuthorityStore>,
+    identity: Arc<ProductIdentity>,
     origin: Instant,
 }
 
@@ -354,6 +412,10 @@ impl RealG4Backend {
             AdmissionAuthorityStore::open(root.join("g4-admission"))
                 .map_err(|_| SetupError::Unavailable)?,
         );
+        let identity = Arc::new(
+            ProductIdentity::open_or_create(&root.join("g4-identity"))
+                .map_err(|_| SetupError::Unavailable)?,
+        );
         let initial_snapshot = initial_snapshot(&store)?;
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -365,10 +427,13 @@ impl RealG4Backend {
         let backend = Self {
             runtime,
             session: None,
+            #[cfg(feature = "pairing-v2-operational-experimental")]
+            operational: None,
             events,
             event_tx,
             now_ms: 0,
             store,
+            identity,
             origin: Instant::now(),
         };
         let _ = backend.event_tx.try_send(initial_snapshot);
@@ -376,7 +441,7 @@ impl RealG4Backend {
     }
 
     fn start(&mut self, generation: u64) -> Result<Vec<G4Event>, SetupError> {
-        if generation == 0 || self.session.is_some() {
+        if generation == 0 || self.session.is_some() || self.operational_active() {
             return Err(SetupError::InvalidState);
         }
         let mut local = [0; 16];
@@ -398,7 +463,8 @@ impl RealG4Backend {
         let bind_address = "0.0.0.0:0".parse().unwrap();
         let runtime_guard = self.runtime.enter();
         let endpoint = Arc::new(
-            ProvisionalEndpoint::bind_ephemeral(bind_address)
+            self.identity
+                .bind_pairing(bind_address)
                 .map_err(|_| SetupError::Unavailable)?,
         );
         drop(runtime_guard);
@@ -466,6 +532,127 @@ impl RealG4Backend {
             browsing: true,
         });
         Ok(vec![G4Event::Browsing { generation }])
+    }
+
+    #[cfg(feature = "pairing-v2-operational-experimental")]
+    fn begin_v01(
+        &mut self,
+        generation: u64,
+        relationship: RelationshipHandle,
+    ) -> Result<Vec<G4Event>, SetupError> {
+        if generation == 0 || self.session.is_some() || self.operational.is_some() {
+            return Err(SetupError::InvalidState);
+        }
+        let opaque_id = decode_relationship(relationship.as_str())?;
+        let admission = self
+            .store
+            .select_operational(opaque_id)
+            .map_err(|_| SetupError::InvalidState)?;
+        let runtime_guard = self.runtime.enter();
+        let mut discovery =
+            crate::product_operational_discovery::ProductOperationalDiscovery::start(
+                &self.identity,
+                self.now_ms,
+            )?;
+        drop(runtime_guard);
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let peers = loop {
+            let now_ms = self.origin.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+            let mut addresses: Vec<_> = discovery
+                .take_current(now_ms)?
+                .into_iter()
+                .flat_map(|locator| {
+                    let operational_addresses = locator.operational_addresses;
+                    locator
+                        .recovery_addresses
+                        .into_iter()
+                        .filter_map(move |recovery| {
+                            operational_addresses
+                                .iter()
+                                .copied()
+                                .find(|operational| operational.ip() == recovery.ip())
+                                .map(|operational| (recovery, operational))
+                        })
+                })
+                .collect();
+            addresses.sort_unstable();
+            if let Some(peer) = addresses.into_iter().next() {
+                break Some(peer);
+            }
+            if Instant::now() >= deadline {
+                break None;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let (recovery_peer, operational_peer) = peers
+            .map(|(recovery, operational)| (Some(recovery), Some(operational)))
+            .unwrap_or((None, None));
+        let recovered = self
+            .runtime
+            .block_on(
+                discovery
+                    .recovery()
+                    .recover(recovery_peer, &self.store, admission),
+            )
+            .map_err(|_| SetupError::Unavailable)?;
+        let mut attempt = self
+            .runtime
+            .block_on(
+                discovery
+                    .endpoint()
+                    .begin(operational_peer, &self.store, recovered),
+            )
+            .map_err(|_| SetupError::Unavailable)?;
+        let prompt = self
+            .runtime
+            .block_on(attempt.prompt())
+            .map_err(|_| SetupError::Unavailable)?;
+        self.operational = Some(LiveOperationalSession {
+            generation,
+            attempt,
+            _discovery: discovery,
+        });
+        Ok(vec![G4Event::V01Ready {
+            generation,
+            words: prompt.words,
+            remaining_ms: prompt.remaining_ms,
+        }])
+    }
+
+    #[cfg(feature = "pairing-v2-operational-experimental")]
+    fn decide_v01(&mut self, generation: u64, matches: bool) -> Result<Vec<G4Event>, SetupError> {
+        let mut session = self.operational.take().ok_or(SetupError::InvalidState)?;
+        if session.generation != generation {
+            self.operational = Some(session);
+            return Err(SetupError::StaleCandidate);
+        }
+        session
+            .attempt
+            .decide(matches)
+            .map_err(|_| SetupError::InvalidState)?;
+        let outcome = match self.runtime.block_on(session.attempt.finish()) {
+            seamless_transport::pairing_v2::product_operational::OperationalOutcome::Verified => V01Outcome::Verified,
+            seamless_transport::pairing_v2::product_operational::OperationalOutcome::Rejected => V01Outcome::Rejected,
+            seamless_transport::pairing_v2::product_operational::OperationalOutcome::Expired => V01Outcome::Expired,
+            seamless_transport::pairing_v2::product_operational::OperationalOutcome::Revoked => V01Outcome::Revoked,
+            seamless_transport::pairing_v2::product_operational::OperationalOutcome::RemoteOutcomeUnknown => V01Outcome::RemoteOutcomeUnknown,
+        };
+        Ok(vec![G4Event::V01Finished {
+            generation,
+            outcome,
+        }])
+    }
+
+    fn operational_active(&self) -> bool {
+        #[cfg(feature = "pairing-v2-operational-experimental")]
+        {
+            self.operational.is_some()
+        }
+        #[cfg(not(feature = "pairing-v2-operational-experimental"))]
+        {
+            false
+        }
     }
 
     fn stop(&mut self, generation: u64, report_outcome: bool) -> Result<Vec<G4Event>, SetupError> {
@@ -878,7 +1065,9 @@ impl G4WorkerBackend for RealG4Backend {
             G4Command::Start { generation }
             | G4Command::Stop { generation }
             | G4Command::Select { generation, .. }
-            | G4Command::Cancel { generation } => *generation,
+            | G4Command::Cancel { generation }
+            | G4Command::BeginV01 { generation, .. }
+            | G4Command::DecideV01 { generation, .. } => *generation,
             G4Command::Decide { token, .. } => self
                 .session
                 .as_ref()
@@ -945,6 +1134,34 @@ impl G4WorkerBackend for RealG4Backend {
                 })
             }
             G4Command::Cancel { generation } => self.stop(generation, true),
+            G4Command::BeginV01 {
+                generation,
+                relationship,
+            } => {
+                #[cfg(feature = "pairing-v2-operational-experimental")]
+                {
+                    self.begin_v01(generation, relationship)
+                }
+                #[cfg(not(feature = "pairing-v2-operational-experimental"))]
+                {
+                    let _ = (generation, relationship);
+                    Err(SetupError::InvalidState)
+                }
+            }
+            G4Command::DecideV01 {
+                generation,
+                matches,
+            } => {
+                #[cfg(feature = "pairing-v2-operational-experimental")]
+                {
+                    self.decide_v01(generation, matches)
+                }
+                #[cfg(not(feature = "pairing-v2-operational-experimental"))]
+                {
+                    let _ = (generation, matches);
+                    Err(SetupError::InvalidState)
+                }
+            }
         };
         result.unwrap_or_else(|_error| {
             #[cfg(feature = "g4-test-helper")]
@@ -1136,6 +1353,16 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "pairing-v2-operational-experimental")]
+    #[test]
+    fn operational_relationship_decoder_accepts_only_canonical_nonzero_hex() {
+        assert_eq!(decode_relationship(&"01".repeat(32)).unwrap(), [1; 32]);
+        assert!(decode_relationship(&"00".repeat(32)).is_err());
+        assert!(decode_relationship(&"AA".repeat(32)).is_err());
+        assert!(decode_relationship(&"gg".repeat(32)).is_err());
+        assert!(decode_relationship("01").is_err());
+    }
+
     #[test]
     fn g4_sas_decision_binds_exact_attempt_transcript_generation_once() {
         let current = PairingToken::from_engine([1; 32], [2; 32], 3);
@@ -1217,6 +1444,22 @@ mod tests {
 
         assert!(snapshot_reached.load(Ordering::Acquire));
         assert!(matches!(result, Err(SetupError::Unavailable)));
+    }
+
+    #[test]
+    fn backend_reopens_the_same_product_identity_for_pairing_and_v01() {
+        let root = tempfile::tempdir().unwrap();
+        let first = RealG4Backend::open(root.path())
+            .unwrap()
+            .identity
+            .fingerprint();
+        let second = RealG4Backend::open(root.path())
+            .unwrap()
+            .identity
+            .fingerprint();
+
+        assert_ne!(first, [0; 32]);
+        assert_eq!(first, second);
     }
 
     struct NoopBackend;

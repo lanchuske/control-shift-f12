@@ -727,6 +727,13 @@ impl AttemptGuard {
             .map_err(|_| Invalid)?
     }
 
+    pub(crate) fn remaining_ms(&self) -> u32 {
+        self.deadline
+            .saturating_duration_since(Instant::now())
+            .as_millis()
+            .min(u128::from(u32::MAX)) as u32
+    }
+
     #[cfg(test)]
     pub(crate) fn test_only_expired() -> Self {
         Self {
@@ -791,6 +798,10 @@ pub(crate) struct OperationalEndpoint {
 }
 
 impl OperationalEndpoint {
+    pub(crate) fn local_fingerprint(&self) -> [u8; 32] {
+        self.local_leaf
+    }
+
     pub(crate) fn bind(
         address: SocketAddr,
         certificate: Vec<u8>,
@@ -908,6 +919,37 @@ impl OperationalEndpoint {
         guard.assert_lease(None)?;
         let channel = self.accept_until(view.peer_fingerprint, &guard).await?;
         OperationalAttempt::new(channel, Role::B, authority, durable_attempt, view, guard).await
+    }
+
+    pub(crate) async fn connect_recovered(
+        &self,
+        peer: SocketAddr,
+        authority: &super::admission_authority::AdmissionAuthorityStore,
+        snapshot: crate::pairing_pending::OperationalAdmissionSnapshot,
+    ) -> Result<OperationalAttempt, Invalid> {
+        let guard = AttemptGuard::new();
+        let view = AuthorityView::from_snapshot(self.local_leaf, &snapshot)?;
+        if view.self_fingerprint >= view.peer_fingerprint {
+            return Err(Invalid);
+        }
+        let channel = self
+            .connect_until(peer, view.peer_fingerprint, &guard)
+            .await?;
+        OperationalAttempt::new_recovered(channel, Role::A, authority, snapshot, view, guard).await
+    }
+
+    pub(crate) async fn accept_recovered(
+        &self,
+        authority: &super::admission_authority::AdmissionAuthorityStore,
+        snapshot: crate::pairing_pending::OperationalAdmissionSnapshot,
+    ) -> Result<OperationalAttempt, Invalid> {
+        let guard = AttemptGuard::new();
+        let view = AuthorityView::from_snapshot(self.local_leaf, &snapshot)?;
+        if view.self_fingerprint <= view.peer_fingerprint {
+            return Err(Invalid);
+        }
+        let channel = self.accept_until(view.peer_fingerprint, &guard).await?;
+        OperationalAttempt::new_recovered(channel, Role::B, authority, snapshot, view, guard).await
     }
 }
 
@@ -1370,12 +1412,16 @@ pub(crate) struct LocalOperationalConsent {
 }
 
 impl LocalOperationalConsent {
-    #[cfg(test)]
-    pub(crate) fn test_only_approved(preconfirm: [u8; 32], commitment: [u8; 32]) -> Self {
+    pub(super) fn approved(preconfirm: [u8; 32], commitment: [u8; 32]) -> Self {
         Self {
             preconfirm,
             commitment,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_only_approved(preconfirm: [u8; 32], commitment: [u8; 32]) -> Self {
+        Self::approved(preconfirm, commitment)
     }
 
     pub(crate) fn matches(&self, preconfirm: [u8; 32], commitment: [u8; 32]) -> bool {
@@ -1522,6 +1568,69 @@ impl Drop for AttemptStream {
 }
 
 impl OperationalAttempt {
+    async fn new_recovered(
+        channel: OperationalChannel,
+        role: Role,
+        authority: &super::admission_authority::AdmissionAuthorityStore,
+        snapshot: crate::pairing_pending::OperationalAdmissionSnapshot,
+        view: AuthorityView,
+        mut guard: AttemptGuard,
+    ) -> Result<Self, Invalid> {
+        guard.attach(channel.connection.clone());
+        guard.assert_lease(None)?;
+        let encoded_view = view.encode()?;
+        let view_hash = hash(&encoded_view);
+        let (a, b) = match role {
+            Role::A => (view.self_fingerprint, view.peer_fingerprint),
+            Role::B => (view.peer_fingerprint, view.self_fingerprint),
+        };
+        let context = encode(
+            "operational-session-preflight-lease-context-v1",
+            &[
+                Value::Text("csf12-operational/1".to_owned()),
+                Value::Text(
+                    match role {
+                        Role::A => "A",
+                        Role::B => "B",
+                    }
+                    .to_owned(),
+                ),
+                Value::Bytes(a.to_vec()),
+                Value::Bytes(b.to_vec()),
+                Value::Bytes(view_hash.to_vec()),
+            ],
+        )?;
+        let exporter = channel.exporter(
+            b"EXPORTER-ControlShiftF12-OperationalPreflightLease-v1",
+            &context,
+        )?;
+        let binding = hash(&encode(
+            "operational-session-preflight-lease-binding-v1",
+            &[
+                Value::Text(
+                    match role {
+                        Role::A => "A",
+                        Role::B => "B",
+                    }
+                    .to_owned(),
+                ),
+                Value::Bytes(view_hash.to_vec()),
+                Value::Bytes(hash(&context).to_vec()),
+                Value::Bytes(hash(&exporter).to_vec()),
+            ],
+        )?);
+        let preflight = authority
+            .acquire_recovered_operational_preflight_lease(snapshot, view_hash, binding)
+            .map_err(|_| Invalid)?;
+        preflight.assert_current().map_err(|_| Invalid)?;
+        Ok(Self {
+            channel,
+            role,
+            view,
+            preflight: Some(preflight),
+            guard,
+        })
+    }
     fn assert_preflight_current(&self) -> Result<(), Invalid> {
         self.guard.assert_lease(None)?;
         self.preflight
@@ -1607,7 +1716,7 @@ impl OperationalAttempt {
         confirm: F,
     ) -> Result<(), Invalid>
     where
-        F: FnOnce([u8; 32], [u8; 32]) -> Future,
+        F: FnOnce([u8; 32], [u8; 32], u32) -> Future,
         Future: std::future::Future<Output = Result<LocalOperationalConsent, Invalid>>,
     {
         let result = self.complete_inner(confirm).await;
@@ -1619,7 +1728,7 @@ impl OperationalAttempt {
 
     async fn complete_inner<F, Future>(&mut self, confirm: F) -> Result<(), Invalid>
     where
-        F: FnOnce([u8; 32], [u8; 32]) -> Future,
+        F: FnOnce([u8; 32], [u8; 32], u32) -> Future,
         Future: std::future::Future<Output = Result<LocalOperationalConsent, Invalid>>,
     {
         let mut attempt = [0; 32];
@@ -1826,7 +1935,14 @@ impl OperationalAttempt {
             return Err(Invalid);
         }
         let preconfirm = preconfirm_transcript(&commitment, &[&first, &second, &open, &accept])?;
-        let consent = self.guard.within(confirm(preconfirm, ch)).await?;
+        let remaining_ms = self.guard.remaining_ms();
+        if remaining_ms == 0 {
+            return Err(Invalid);
+        }
+        let consent = self
+            .guard
+            .within(confirm(preconfirm, ch, remaining_ms))
+            .await?;
         if !consent.matches(preconfirm, ch) {
             return Err(Invalid);
         }

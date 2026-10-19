@@ -23,8 +23,8 @@ pub(crate) mod admission_authority;
 /// ```
 pub use admission_authority::{
     AdmissionAuthorityStore, DistributedAdmissionSummary, DistributedPairingError,
-    DurableAdmission, DurableAdmissionState, ReconcileAdmission, handshake_and_commit_distributed,
-    handshake_selected_and_commit_distributed,
+    DurableAdmission, DurableAdmissionState, OperationalAdmission, ReconcileAdmission,
+    handshake_and_commit_distributed, handshake_selected_and_commit_distributed,
 };
 pub mod codec;
 mod evidence;
@@ -39,8 +39,16 @@ pub(crate) mod operational_session;
 #[cfg(all(test, feature = "pairing-v2-operational-experimental"))]
 mod operational_session_tests;
 pub mod operational_wire;
+mod product_identity;
+#[cfg(feature = "pairing-v2-operational-experimental")]
+pub mod product_operational;
 pub mod provisional_tls;
+#[cfg(feature = "pairing-v2-operational-experimental")]
+pub use admission_authority::RecoveredOperationalAdmission;
 pub use evidence::*;
+pub use product_identity::{ProductIdentity, ProductIdentityError};
+#[cfg(feature = "pairing-v2-operational-experimental")]
+pub use product_identity::{ProductOperationalEndpoint, ProductRecoveryEndpoint};
 mod primitives;
 pub use primitives::*;
 mod candidate;

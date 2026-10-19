@@ -172,8 +172,19 @@ impl Drop for ProductChild {
     }
 }
 
+#[cfg(not(feature = "pairing-v2-operational-experimental"))]
 #[test]
-fn product_two_processes_discover_by_mdns_match_and_persist_non_operationally() {
+fn product_two_processes_discover_match_and_persist_durably() {
+    run_product_two_processes(false);
+}
+
+#[cfg(feature = "pairing-v2-operational-experimental")]
+#[test]
+fn product_two_processes_recover_and_verify_v01_after_durable_pairing() {
+    run_product_two_processes(true);
+}
+
+fn run_product_two_processes(verify_v01: bool) {
     let a_root = tempfile::tempdir().unwrap();
     let b_root = tempfile::tempdir().unwrap();
     let mut a = ProductChild::start(a_root.path());
@@ -185,9 +196,12 @@ fn product_two_processes_discover_by_mdns_match_and_persist_non_operationally() 
         "a mdns discovery",
         |frame| {
             frame["kind"] == "ui_snapshot_v1"
-                && frame["snapshot"]["candidates"]
-                    .as_array()
-                    .is_some_and(|v| v.len() == 1)
+                && frame["snapshot"]["candidates"].as_array().is_some_and(|v| {
+                    v.iter().any(|candidate| {
+                        candidate["compatibility"] == "compatible"
+                            && candidate["freshness"] == "current"
+                    })
+                })
         },
     );
     let b_snapshot = b.wait_for(
@@ -195,28 +209,45 @@ fn product_two_processes_discover_by_mdns_match_and_persist_non_operationally() 
         "b mdns discovery",
         |frame| {
             frame["kind"] == "ui_snapshot_v1"
-                && frame["snapshot"]["candidates"]
-                    .as_array()
-                    .is_some_and(|v| v.len() == 1)
+                && frame["snapshot"]["candidates"].as_array().is_some_and(|v| {
+                    v.iter().any(|candidate| {
+                        candidate["compatibility"] == "compatible"
+                            && candidate["freshness"] == "current"
+                    })
+                })
         },
     );
     let candidate_snapshot = |frame: &Value| {
         frame["kind"] == "ui_snapshot_v1"
-            && frame["snapshot"]["candidates"]
-                .as_array()
-                .is_some_and(|v| v.len() == 1)
+            && frame["snapshot"]["candidates"].as_array().is_some_and(|v| {
+                v.iter().any(|candidate| {
+                    candidate["compatibility"] == "compatible"
+                        && candidate["freshness"] == "current"
+                })
+            })
     };
     let a_snapshot = a.latest_until_quiet(a_snapshot, candidate_snapshot);
     let b_snapshot = b.latest_until_quiet(b_snapshot, candidate_snapshot);
+    let compatible_handle = |frame: &Value| {
+        frame["snapshot"]["candidates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|candidate| {
+                candidate["compatibility"] == "compatible" && candidate["freshness"] == "current"
+            })
+            .unwrap()["handle"]
+            .clone()
+    };
     a.send(
         "select-a",
         "ui.select_candidate",
-        json!({"handle":a_snapshot["snapshot"]["candidates"][0]["handle"]}),
+        json!({"handle":compatible_handle(&a_snapshot)}),
     );
     b.send(
         "select-b",
         "ui.select_candidate",
-        json!({"handle":b_snapshot["snapshot"]["candidates"][0]["handle"]}),
+        json!({"handle":compatible_handle(&b_snapshot)}),
     );
     let a_pairing = a.wait_for(Instant::now() + Duration::from_secs(15), "a sas", |frame| {
         frame["kind"] == "ui_pairing_v1"
@@ -239,15 +270,19 @@ fn product_two_processes_discover_by_mdns_match_and_persist_non_operationally() 
         "ui.approve_sas",
         json!({"generation":b_pairing["generation"],"matches":true}),
     );
-    for child in [&a, &b] {
-        let terminal = child.wait_for(
+    let durable = |child: &ProductChild| {
+        child.wait_for(
             Instant::now() + Duration::from_secs(15),
             "durable commit",
             |frame| {
                 frame["kind"] == "ui_snapshot_v1"
                     && frame["snapshot"]["state"] == "confirmed_relationship"
             },
-        );
+        )
+    };
+    let a_terminal = durable(&a);
+    let b_terminal = durable(&b);
+    for terminal in [&a_terminal, &b_terminal] {
         assert_eq!(
             terminal["snapshot"]["confirmed"].as_array().unwrap().len(),
             1
@@ -259,5 +294,41 @@ fn product_two_processes_discover_by_mdns_match_and_persist_non_operationally() 
             false
         );
         assert_eq!(terminal["snapshot"]["layout"]["state"], "not_configured");
+    }
+
+    if !verify_v01 {
+        return;
+    }
+
+    a.send(
+        "v01-a",
+        "ui.v01.begin",
+        json!({"relationship":a_terminal["snapshot"]["confirmed"][0]["handle"]}),
+    );
+    b.send(
+        "v01-b",
+        "ui.v01.begin",
+        json!({"relationship":b_terminal["snapshot"]["confirmed"][0]["handle"]}),
+    );
+    let a_v01 = a.wait_for(Instant::now() + Duration::from_secs(20), "a v01", |frame| {
+        frame["kind"] == "sas_display_v1" && frame["current"] == true
+    });
+    let b_v01 = b.wait_for(Instant::now() + Duration::from_secs(20), "b v01", |frame| {
+        frame["kind"] == "sas_display_v1" && frame["current"] == true
+    });
+    assert_eq!(a_v01["code_groups"], b_v01["code_groups"]);
+    a.send("confirm-v01-a", "ui.confirm_v01", json!({"matches":true}));
+    b.send("confirm-v01-b", "ui.confirm_v01", json!({"matches":true}));
+    for child in [&a, &b] {
+        child.wait_for(
+            Instant::now() + Duration::from_secs(20),
+            "verified v01 returns to the durable relationship",
+            |frame| {
+                frame["kind"] == "ui_snapshot_v1"
+                    && frame["snapshot"]["state"] == "confirmed_relationship"
+                    && frame["snapshot"]["capabilities"]["input_enabled"] == false
+                    && frame["snapshot"]["capabilities"]["clipboard_enabled"] == false
+            },
+        );
     }
 }

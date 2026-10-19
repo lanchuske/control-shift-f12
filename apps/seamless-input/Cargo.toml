@@ -14,7 +14,7 @@ OriginalFilename = "seamless-input.exe"
 default = ["pairing-v2-g4"]
 pairing-v2-g4 = ["seamless-discovery/pairing-v2-g4", "seamless-transport/pairing-v2-g4", "dep:mdns-sd", "dep:rustls"]
 g4-test-helper = ["pairing-v2-g4"]
-pairing-v2-operational-experimental = ["pairing-v2-g4", "seamless-transport/pairing-v2-operational-experimental"]
+pairing-v2-operational-experimental = ["pairing-v2-g4", "seamless-discovery/pairing-v2-operational-experimental", "seamless-transport/pairing-v2-operational-experimental"]
 pairing-v2-experimental = ["pairing-v2-g4", "seamless-discovery/pairing-v2-experimental", "seamless-transport/pairing-v2-experimental"]
 
 [dependencies]

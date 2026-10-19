@@ -8,12 +8,87 @@ use super::{
     Invalid,
     codec::{Value, decode, encode},
 };
+use rustls::pki_types::PrivateKeyDer;
+use std::net::SocketAddr;
 
 const RECOVERY_DOMAIN: &str = "control-shift-f12/bilateral-recovery-v1";
 const RECOVERY_KIND: &str = "bilateral-recovery";
 const RECOVERY_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
 const RECOVERY_MAX_RECORD: usize = 2048;
 const RECOVERY_ACK: u8 = 0xA1;
+const RECOVERY_ALPN: &[u8] = b"control-shift-f12-recovery/1";
+
+/// A short-lived recovery-only QUIC endpoint. It negotiates a distinct ALPN
+/// and requires mutual TLS; exact durable pin validation remains coupled to
+/// `exchange_exact_pair`, which consumes the resulting connection.
+pub(crate) struct RecoveryEndpoint {
+    endpoint: quinn::Endpoint,
+    client: super::provisional_tls::StrictClient,
+    local_leaf: [u8; 32],
+}
+
+impl RecoveryEndpoint {
+    pub(crate) fn bind(
+        address: SocketAddr,
+        certificate: Vec<u8>,
+        key: PrivateKeyDer<'static>,
+    ) -> Result<Self, Invalid> {
+        let local_leaf = super::evidence::hash(&certificate);
+        let (server, client) =
+            super::provisional_tls::strict_configs(certificate, key, RECOVERY_ALPN, 1, 0)?;
+        let endpoint = quinn::Endpoint::server(server, address).map_err(|_| Invalid)?;
+        Ok(Self {
+            endpoint,
+            client,
+            local_leaf,
+        })
+    }
+
+    pub(crate) fn local_fingerprint(&self) -> [u8; 32] {
+        self.local_leaf
+    }
+
+    pub(crate) fn local_addr(&self) -> Result<SocketAddr, Invalid> {
+        self.endpoint.local_addr().map_err(|_| Invalid)
+    }
+
+    pub(crate) async fn connect(&self, peer: SocketAddr) -> Result<quinn::Connection, Invalid> {
+        let (client, auth) = self.client.fresh()?;
+        let connecting = self
+            .endpoint
+            .connect_with(client, peer, "recovery.local")
+            .map_err(|_| Invalid)?;
+        let connection = tokio::time::timeout(RECOVERY_DEADLINE, connecting)
+            .await
+            .map_err(|_| Invalid)?
+            .map_err(|_| Invalid)?;
+        if !auth.was_requested() {
+            connection.close(0u32.into(), b"mutual authentication required");
+            return Err(Invalid);
+        }
+        Ok(connection)
+    }
+
+    pub(crate) async fn accept(&self) -> Result<quinn::Connection, Invalid> {
+        tokio::time::timeout(RECOVERY_DEADLINE, async {
+            self.endpoint
+                .accept()
+                .await
+                .ok_or(Invalid)?
+                .await
+                .map_err(|_| Invalid)
+        })
+        .await
+        .map_err(|_| Invalid)?
+    }
+}
+
+impl Drop for RecoveryEndpoint {
+    fn drop(&mut self) {
+        self.endpoint
+            .close(0u32.into(), b"recovery endpoint closed");
+    }
+}
 
 /// The immutable proof shape one peer presents when recovering one durable
 /// bilateral transaction.  `sender_receipt_hash` names the sender's local
@@ -303,6 +378,48 @@ async fn recovery_eof(recv: &mut quinn::RecvStream) -> Result<(), Invalid> {
 #[cfg(test)]
 mod tests {
     use super::ExactPeerRecovery;
+
+    fn identity() -> (Vec<u8>, rustls::pki_types::PrivateKeyDer<'static>) {
+        let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap();
+        let mut params = rcgen::CertificateParams::default();
+        params.is_ca = rcgen::IsCa::ExplicitNoCa;
+        params.subject_alt_names = vec![rcgen::SanType::URI(
+            "urn:control-shift-f12:identity".try_into().unwrap(),
+        )];
+        params.key_usages = vec![rcgen::KeyUsagePurpose::DigitalSignature];
+        let cert = params.self_signed(&key).unwrap();
+        (
+            cert.der().to_vec(),
+            rustls::pki_types::PrivatePkcs8KeyDer::from(key.serialize_der()).into(),
+        )
+    }
+
+    #[tokio::test]
+    async fn recovery_endpoint_uses_fresh_mutual_tls_and_exact_recovery_alpn() {
+        let (left_cert, left_key) = identity();
+        let (right_cert, right_key) = identity();
+        let left_pin = super::super::evidence::hash(&left_cert);
+        let right_pin = super::super::evidence::hash(&right_cert);
+        let left_endpoint =
+            super::RecoveryEndpoint::bind("127.0.0.1:0".parse().unwrap(), left_cert, left_key)
+                .unwrap();
+        let right_endpoint =
+            super::RecoveryEndpoint::bind("127.0.0.1:0".parse().unwrap(), right_cert, right_key)
+                .unwrap();
+
+        let (left_connection, right_connection) = tokio::join!(
+            left_endpoint.connect(right_endpoint.local_addr().unwrap()),
+            right_endpoint.accept()
+        );
+        let left_connection = left_connection.unwrap();
+        let right_connection = right_connection.unwrap();
+        let (left_peer, right_peer) = tokio::join!(
+            super::exchange_exact_pair(&left_connection, true, left(), right_pin),
+            super::exchange_exact_pair(&right_connection, false, right(), left_pin),
+        );
+        assert_eq!(left_peer.unwrap().authenticated_peer_pin(), right_pin);
+        assert_eq!(right_peer.unwrap().authenticated_peer_pin(), left_pin);
+    }
 
     #[test]
     fn exact_peer_recovery_identity_gate_requires_recovery_alpn_and_durable_pin() {
