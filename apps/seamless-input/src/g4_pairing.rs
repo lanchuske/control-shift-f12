@@ -342,6 +342,19 @@ impl RealG4Backend {
     }
 
     pub fn open(root: impl AsRef<Path>) -> Result<Self, SetupError> {
+        Self::open_with_initial_snapshot(root, |store| durable_snapshot(store, None))
+    }
+
+    fn open_with_initial_snapshot(
+        root: impl AsRef<Path>,
+        initial_snapshot: impl FnOnce(&Arc<AdmissionAuthorityStore>) -> Result<G4Event, SetupError>,
+    ) -> Result<Self, SetupError> {
+        let root = root.as_ref().to_path_buf();
+        let store = Arc::new(
+            AdmissionAuthorityStore::open(root.join("g4-admission"))
+                .map_err(|_| SetupError::Unavailable)?,
+        );
+        let initial_snapshot = initial_snapshot(&store)?;
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .worker_threads(2)
@@ -349,11 +362,6 @@ impl RealG4Backend {
             .build()
             .map_err(|_| SetupError::Unavailable)?;
         let (event_tx, events) = tokio::sync::mpsc::channel(16);
-        let root = root.as_ref().to_path_buf();
-        let store = Arc::new(
-            AdmissionAuthorityStore::open(root.join("g4-admission"))
-                .map_err(|_| SetupError::Unavailable)?,
-        );
         let backend = Self {
             runtime,
             session: None,
@@ -363,9 +371,7 @@ impl RealG4Backend {
             store,
             origin: Instant::now(),
         };
-        let _ = backend
-            .event_tx
-            .try_send(durable_snapshot(&backend.store, None)?);
+        let _ = backend.event_tx.try_send(initial_snapshot);
         Ok(backend)
     }
 
@@ -984,39 +990,81 @@ pub struct G4PairingWorker {
 }
 
 impl G4PairingWorker {
-    pub fn spawn(mut backend: impl G4WorkerBackend) -> Result<Self, WorkerError> {
+    pub fn spawn(backend: impl G4WorkerBackend) -> Result<Self, WorkerError> {
+        Self::spawn_factory(move || Ok(backend))
+    }
+
+    pub(crate) fn spawn_factory<B, F>(factory: F) -> Result<Self, WorkerError>
+    where
+        B: G4WorkerBackend,
+        F: FnOnce() -> Result<B, WorkerError> + Send + 'static,
+    {
+        Self::spawn_factory_with(factory, |worker| {
+            std::thread::Builder::new()
+                .name("g4-pairing-worker".into())
+                .spawn(worker)
+        })
+    }
+
+    fn spawn_factory_with<B, F, S>(factory: F, spawn_thread: S) -> Result<Self, WorkerError>
+    where
+        B: G4WorkerBackend,
+        F: FnOnce() -> Result<B, WorkerError> + Send + 'static,
+        S: FnOnce(Box<dyn FnOnce() + Send>) -> std::io::Result<JoinHandle<()>>,
+    {
         let (commands, command_rx) = mpsc::sync_channel(QUEUE_CAPACITY);
         let (events, event_rx) = mpsc::sync_channel(QUEUE_CAPACITY);
         let (stopped_tx, stopped) = mpsc::sync_channel(1);
+        let (started_tx, started_rx) = mpsc::sync_channel(1);
         let stopping = Arc::new(AtomicBool::new(false));
         let worker_stopping = stopping.clone();
-        let thread = std::thread::Builder::new()
-            .name("g4-pairing-worker".into())
-            .spawn(move || {
-                'worker: while !worker_stopping.load(Ordering::Acquire) {
-                    match command_rx.recv_timeout(Duration::from_millis(10)) {
-                        Ok(command) => {
-                            for event in backend.command(command) {
-                                if events.send(event).is_err() {
-                                    break 'worker;
-                                }
-                            }
-                        }
-                        Err(mpsc::RecvTimeoutError::Timeout) => {
-                            for event in backend.poll() {
-                                if events.send(event).is_err() {
-                                    break 'worker;
-                                }
-                            }
-                        }
-                        Err(mpsc::RecvTimeoutError::Disconnected) => break,
-                    }
+        let worker = Box::new(move || {
+            let mut backend = match factory() {
+                Ok(backend) => backend,
+                Err(error) => {
+                    let _ = started_tx.send(Err(error));
+                    return;
                 }
+            };
+            if started_tx.send(Ok(())).is_err() {
                 backend.shutdown();
-                drop(backend);
-                let _ = stopped_tx.send(());
-            })
-            .map_err(|_| WorkerError::Closed)?;
+                return;
+            }
+            'worker: while !worker_stopping.load(Ordering::Acquire) {
+                match command_rx.recv_timeout(Duration::from_millis(10)) {
+                    Ok(command) => {
+                        for event in backend.command(command) {
+                            if events.send(event).is_err() {
+                                break 'worker;
+                            }
+                        }
+                    }
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        for event in backend.poll() {
+                            if events.send(event).is_err() {
+                                break 'worker;
+                            }
+                        }
+                    }
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                }
+            }
+            backend.shutdown();
+            drop(backend);
+            let _ = stopped_tx.send(());
+        });
+        let thread = spawn_thread(worker).map_err(|_| WorkerError::Closed)?;
+        match started_rx.recv() {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                let _ = thread.join();
+                return Err(error);
+            }
+            Err(_) => {
+                let _ = thread.join();
+                return Err(WorkerError::Closed);
+            }
+        }
         Ok(Self {
             commands: Some(commands),
             events: Some(event_rx),
@@ -1147,6 +1195,70 @@ mod tests {
 
         assert_eq!(catalog.views(12).unwrap()[0].handle, original);
         assert!(catalog.select_once(&original, 13).is_ok());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn backend_store_error_does_not_drop_runtime_in_async_context() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("g4-admission"), b"not a directory").unwrap();
+
+        assert!(RealG4Backend::open(root.path()).is_err());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn backend_snapshot_error_does_not_drop_runtime_in_async_context() {
+        let root = tempfile::tempdir().unwrap();
+        let snapshot_reached = AtomicBool::new(false);
+
+        let result = RealG4Backend::open_with_initial_snapshot(root.path(), |_| {
+            snapshot_reached.store(true, Ordering::Release);
+            Err(SetupError::Unavailable)
+        });
+
+        assert!(snapshot_reached.load(Ordering::Acquire));
+        assert!(matches!(result, Err(SetupError::Unavailable)));
+    }
+
+    struct NoopBackend;
+
+    impl G4WorkerBackend for NoopBackend {
+        fn command(&mut self, _command: G4Command) -> Vec<G4Event> {
+            Vec::new()
+        }
+
+        fn poll(&mut self) -> Vec<G4Event> {
+            Vec::new()
+        }
+
+        fn shutdown(&mut self) {}
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn worker_factory_initializes_backend_off_the_async_caller() {
+        let mut worker = G4PairingWorker::spawn_factory(|| {
+            assert!(tokio::runtime::Handle::try_current().is_err());
+            Ok(NoopBackend)
+        })
+        .unwrap();
+
+        worker.shutdown(Duration::from_secs(1)).unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn worker_spawn_failure_does_not_invoke_the_backend_factory() {
+        let invoked = Arc::new(AtomicBool::new(false));
+        let invoked_by_factory = invoked.clone();
+
+        let result = G4PairingWorker::spawn_factory_with(
+            move || {
+                invoked_by_factory.store(true, Ordering::Release);
+                Ok(NoopBackend)
+            },
+            |_| Err(std::io::Error::other("injected thread creation failure")),
+        );
+
+        assert!(matches!(result, Err(WorkerError::Closed)));
+        assert!(!invoked.load(Ordering::Acquire));
     }
 
     struct SlowDropBackend {

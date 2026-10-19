@@ -299,8 +299,10 @@ impl UiStdioAdapter {
     #[cfg(feature = "pairing-v2-g4")]
     pub fn with_g4(now_ms: u64, root: impl AsRef<std::path::Path>) -> Result<Self, WorkerError> {
         let mut adapter = Self::new(now_ms);
-        let backend = RealG4Backend::open(root).map_err(|_| WorkerError::Closed)?;
-        adapter.g4 = Some(G4PairingWorker::spawn(backend)?);
+        let root = root.as_ref().to_path_buf();
+        adapter.g4 = Some(G4PairingWorker::spawn_factory(move || {
+            RealG4Backend::open(root).map_err(|_| WorkerError::Closed)
+        })?);
         Ok(adapter)
     }
 
