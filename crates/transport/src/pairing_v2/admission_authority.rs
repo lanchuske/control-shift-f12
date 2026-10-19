@@ -58,6 +58,18 @@ pub struct DurableAdmission {
     state: DurableAdmissionState,
 }
 
+/// Move-only selection of one current confirmed durable relationship. It is
+/// never serializable and does not expose the underlying attempt identifier.
+pub struct OperationalAdmission {
+    attempt: [u8; 32],
+}
+
+impl OperationalAdmission {
+    pub(crate) fn attempt(&self) -> [u8; 32] {
+        self.attempt
+    }
+}
+
 impl DurableAdmission {
     pub fn opaque_id(&self) -> [u8; 32] {
         self.opaque_id
@@ -66,6 +78,17 @@ impl DurableAdmission {
     pub fn state(&self) -> DurableAdmissionState {
         self.state
     }
+}
+
+fn durable_opaque_id(tuple: &crate::pairing_pending::DurableAdmissionTuple) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut digest = Sha256::new();
+    digest.update(b"control-shift-f12/g4-durable-admission-opaque-v1\0");
+    digest.update(tuple.attempt);
+    digest.update(tuple.peer);
+    digest.update(tuple.peer_pin);
+    digest.update(tuple.transaction);
+    digest.finalize().into()
 }
 
 /// Opaque metadata result for G4. It is deliberately not a transport, input,
@@ -1136,19 +1159,12 @@ impl AdmissionAuthorityStore {
     /// operational lease and never reconstructs authority outside PendingStore.
     pub fn durable_admissions(&self) -> Result<Vec<DurableAdmission>, StoreError> {
         use crate::pairing_pending::DurableAdmissionClass;
-        use sha2::{Digest, Sha256};
         use std::collections::BTreeSet;
 
         let mut opaque_ids = BTreeSet::new();
         let mut entries = Vec::new();
         for tuple in self.store.durable_admissions()? {
-            let mut digest = Sha256::new();
-            digest.update(b"control-shift-f12/g4-durable-admission-opaque-v1\0");
-            digest.update(tuple.attempt);
-            digest.update(tuple.peer);
-            digest.update(tuple.peer_pin);
-            digest.update(tuple.transaction);
-            let opaque_id: [u8; 32] = digest.finalize().into();
+            let opaque_id = durable_opaque_id(&tuple);
             if opaque_id == [0; 32] || !opaque_ids.insert(opaque_id) {
                 return Err(StoreError::Invalid);
             }
@@ -1162,6 +1178,30 @@ impl AdmissionAuthorityStore {
         }
         entries.sort_unstable_by_key(DurableAdmission::opaque_id);
         Ok(entries)
+    }
+
+    pub fn select_operational(
+        &self,
+        opaque_id: [u8; 32],
+    ) -> Result<OperationalAdmission, StoreError> {
+        if opaque_id == [0; 32] {
+            return Err(StoreError::Invalid);
+        }
+        let mut selected = None;
+        for tuple in self.store.durable_admissions()? {
+            if durable_opaque_id(&tuple) != opaque_id {
+                continue;
+            }
+            if tuple.class != crate::pairing_pending::DurableAdmissionClass::Confirmed
+                || selected.is_some()
+            {
+                return Err(StoreError::Invalid);
+            }
+            selected = Some(OperationalAdmission {
+                attempt: tuple.attempt,
+            });
+        }
+        selected.ok_or(StoreError::Invalid)
     }
 
     pub(crate) fn revoke_candidate(
@@ -2325,6 +2365,18 @@ mod tests {
         );
         assert!(catalog.iter().all(|entry| entry.opaque_id() != [0; 32]));
         assert_ne!(catalog[0].opaque_id(), catalog[1].opaque_id());
+
+        let confirmed = catalog
+            .iter()
+            .find(|entry| entry.state() == DurableAdmissionState::Confirmed)
+            .unwrap();
+        assert!(store.select_operational(confirmed.opaque_id()).is_ok());
+        let quarantined = catalog
+            .iter()
+            .find(|entry| entry.state() == DurableAdmissionState::Quarantined)
+            .unwrap();
+        assert!(store.select_operational(quarantined.opaque_id()).is_err());
+        assert!(store.select_operational([255; 32]).is_err());
 
         let reopened = AdmissionAuthorityStore::open(root.path()).unwrap();
         assert_eq!(reopened.durable_admissions().unwrap(), catalog);

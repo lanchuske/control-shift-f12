@@ -152,11 +152,11 @@ impl ProductOperationalEndpoint {
         &self,
         peer: SocketAddr,
         authority: &super::AdmissionAuthorityStore,
-        durable_attempt: [u8; 32],
+        admission: super::OperationalAdmission,
     ) -> Result<super::product_operational::ProductOperationalAttempt, super::Invalid> {
         let attempt = self
             .inner
-            .connect_admitted(peer, authority, durable_attempt)
+            .connect_admitted(peer, authority, admission.attempt())
             .await?;
         super::product_operational::ProductOperationalAttempt::start(attempt)
     }
@@ -164,11 +164,11 @@ impl ProductOperationalEndpoint {
     pub async fn accept(
         &self,
         authority: &super::AdmissionAuthorityStore,
-        durable_attempt: [u8; 32],
+        admission: super::OperationalAdmission,
     ) -> Result<super::product_operational::ProductOperationalAttempt, super::Invalid> {
         let attempt = self
             .inner
-            .accept_admitted(authority, durable_attempt)
+            .accept_admitted(authority, admission.attempt())
             .await?;
         super::product_operational::ProductOperationalAttempt::start(attempt)
     }
