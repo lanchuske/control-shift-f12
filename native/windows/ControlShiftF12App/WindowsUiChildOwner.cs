@@ -1,3 +1,5 @@
+#nullable enable
+
 using System;
 using System.Diagnostics;
 using System.IO;
@@ -19,6 +21,8 @@ internal sealed class UiGestureRejectedException(string message) : InvalidOperat
 public sealed class WindowsUiChildOwner : IAsyncDisposable
 {
     private readonly Process child;
+    private readonly IChildDiagnosticSink diagnostics;
+    private readonly ChildStderrClassifier stderrClassifier = new();
     private readonly Task stderrDrain;
     private readonly SemaphoreSlim stdoutGate = new(1, 1);
     private readonly object closeSync = new();
@@ -26,20 +30,35 @@ public sealed class WindowsUiChildOwner : IAsyncDisposable
     private long stderrBytesDiscarded;
     private bool closed;
 
-    private WindowsUiChildOwner(Process child)
+    private WindowsUiChildOwner(Process child, IChildDiagnosticSink diagnostics)
     {
         this.child = child;
+        this.diagnostics = diagnostics;
         stderrDrain = DrainStderrAsync(child.StandardError.BaseStream);
+        WriteDiagnostic(ChildDiagnosticKind.EngineStarted, ChildDiagnosticOperation.Lifecycle);
     }
 
     public UiChildSession Session { get; } = new();
     public bool HasExited => child.HasExited;
     public long StderrBytesDiscarded => Interlocked.Read(ref stderrBytesDiscarded);
 
-    public static Task<WindowsUiChildOwner> StartAsync(ChildLaunchSpec spec)
+    public static Task<WindowsUiChildOwner> StartAsync(
+        ChildLaunchSpec spec,
+        IChildDiagnosticSink? diagnostics = null
+    )
     {
+        diagnostics ??= NullChildDiagnosticSink.Instance;
+        TryWrite(diagnostics, ChildDiagnosticEvent.Create(
+            ChildDiagnosticKind.EngineStartRequested,
+            ChildDiagnosticOperation.Lifecycle
+        ));
         if (!File.Exists(spec.ExecutablePath))
         {
+            TryWrite(diagnostics, ChildDiagnosticEvent.Create(
+                ChildDiagnosticKind.EngineStartFailed,
+                ChildDiagnosticOperation.Lifecycle,
+                exceptionClass: ChildDiagnosticExceptionClass.Io
+            ));
             throw new FileNotFoundException("The reviewed local engine is unavailable.", spec.ExecutablePath);
         }
 
@@ -61,9 +80,21 @@ public sealed class WindowsUiChildOwner : IAsyncDisposable
             start.ArgumentList.Add(argument);
         }
 
-        var child = Process.Start(start)
-            ?? throw new InvalidOperationException("The reviewed local engine did not start.");
-        return Task.FromResult(new WindowsUiChildOwner(child));
+        try
+        {
+            var child = Process.Start(start)
+                ?? throw new InvalidOperationException("The reviewed local engine did not start.");
+            return Task.FromResult(new WindowsUiChildOwner(child, diagnostics));
+        }
+        catch (Exception error)
+        {
+            TryWrite(diagnostics, ChildDiagnosticEvent.Create(
+                ChildDiagnosticKind.EngineStartFailed,
+                ChildDiagnosticOperation.Lifecycle,
+                exceptionClass: ChildDiagnosticException.Classify(error)
+            ));
+            throw;
+        }
     }
 
     public async Task<UiChildSession> ReadInitialProjectionAsync(TimeSpan timeout)
@@ -74,8 +105,8 @@ public sealed class WindowsUiChildOwner : IAsyncDisposable
             throw new InvalidOperationException("The initial projection has already been requested.");
         }
 
-        await WriteFixedRequestAsync(Session.InitialRefreshFrame(), timeout);
-        return await ReadUntilProjectionAsync(previousGeneration: null, timeout);
+        await WriteFixedRequestAsync(Session.InitialRefreshFrame(), timeout, ChildDiagnosticOperation.InitialRefresh);
+        return await ReadUntilProjectionAsync(previousGeneration: null, timeout, ChildDiagnosticOperation.InitialRefresh);
     }
 
     public async Task<UiChildSession> StartDiscoveryAsync(TimeSpan timeout)
@@ -87,7 +118,7 @@ public sealed class WindowsUiChildOwner : IAsyncDisposable
             throw new UiGestureRejectedException("Discovery is unavailable outside the reviewed local starting state.");
         }
 
-        return await SendAndReadResponseAsync(Session.StartDiscoveryFrame(), timeout);
+        return await SendAndReadResponseAsync(Session.StartDiscoveryFrame(), timeout, ChildDiagnosticOperation.StartDiscovery);
     }
 
     public async Task<UiChildSession> StopDiscoveryAsync(TimeSpan timeout)
@@ -99,7 +130,7 @@ public sealed class WindowsUiChildOwner : IAsyncDisposable
             throw new UiGestureRejectedException("Discovery is not active.");
         }
 
-        return await SendAndReadResponseAsync(Session.StopDiscoveryFrame(), timeout);
+        return await SendAndReadResponseAsync(Session.StopDiscoveryFrame(), timeout, ChildDiagnosticOperation.StopDiscovery);
     }
 
     public async Task<UiChildSession> SelectCandidateAsync(string handle, TimeSpan timeout)
@@ -111,7 +142,7 @@ public sealed class WindowsUiChildOwner : IAsyncDisposable
         {
             throw new UiGestureRejectedException("Candidate selection requires current discovery.");
         }
-        return await SendAndReadResponseAsync(Session.SelectCandidateFrame(handle), timeout);
+        return await SendAndReadResponseAsync(Session.SelectCandidateFrame(handle), timeout, ChildDiagnosticOperation.SelectCandidate);
     }
 
     public async Task<UiChildSession> ApproveSasAsync(ulong generation, bool matches, TimeSpan timeout)
@@ -123,7 +154,7 @@ public sealed class WindowsUiChildOwner : IAsyncDisposable
         {
             throw new UiGestureRejectedException("No current pairing comparison is visible.");
         }
-        return await SendAndReadResponseAsync(Session.ApproveSasFrame(generation, matches), timeout);
+        return await SendAndReadResponseAsync(Session.ApproveSasFrame(generation, matches), timeout, ChildDiagnosticOperation.ApproveComparison);
     }
 
     public async Task<UiChildSession> CancelPairingAsync(ulong generation, TimeSpan timeout)
@@ -131,7 +162,7 @@ public sealed class WindowsUiChildOwner : IAsyncDisposable
         ThrowIfClosed();
         if (Session.State.Phase != ChildSessionPhase.Running || Session.Pairing?.Generation != generation)
             throw new UiGestureRejectedException("No current pairing comparison is visible.");
-        return await SendAndReadResponseAsync(Session.CancelPairingFrame(generation), timeout);
+        return await SendAndReadResponseAsync(Session.CancelPairingFrame(generation), timeout, ChildDiagnosticOperation.CancelPairing);
     }
 
     public async Task<UiChildSession> RefreshAsync(TimeSpan timeout)
@@ -141,7 +172,7 @@ public sealed class WindowsUiChildOwner : IAsyncDisposable
         {
             throw new InvalidOperationException("The local child has no current projection.");
         }
-        return await SendAndReadResponseAsync(Session.InitialRefreshFrame(), timeout);
+        return await SendAndReadResponseAsync(Session.InitialRefreshFrame(), timeout, ChildDiagnosticOperation.Refresh);
     }
 
     public async Task<UiChildSession> ObserveAsync(TimeSpan timeout)
@@ -152,7 +183,7 @@ public sealed class WindowsUiChildOwner : IAsyncDisposable
         var previousGeneration = Session.Snapshot.Generation;
         try
         {
-            return await ReadUntilProjectionAsync(previousGeneration, timeout);
+            return await ReadUntilProjectionAsync(previousGeneration, timeout, ChildDiagnosticOperation.Observe);
         }
         catch (OperationCanceledException)
         {
@@ -162,26 +193,54 @@ public sealed class WindowsUiChildOwner : IAsyncDisposable
         }
     }
 
-    private async Task<UiChildSession> SendAndReadResponseAsync(byte[] request, TimeSpan timeout)
+    private async Task<UiChildSession> SendAndReadResponseAsync(
+        byte[] request,
+        TimeSpan timeout,
+        ChildDiagnosticOperation operation
+    )
     {
         using var document = JsonDocument.Parse(request.AsMemory(4));
         var requestId = document.RootElement.GetProperty("id").GetString()!;
-        await WriteFixedRequestAsync(request, timeout);
-        return await ReadUntilProjectionAsync(previousGeneration: null, timeout, requestId);
+        await WriteFixedRequestAsync(request, timeout, operation);
+        return await ReadUntilProjectionAsync(previousGeneration: null, timeout, operation, requestId);
     }
 
-    private async Task WriteFixedRequestAsync(byte[] request, TimeSpan timeout)
+    private async Task WriteFixedRequestAsync(
+        byte[] request,
+        TimeSpan timeout,
+        ChildDiagnosticOperation operation
+    )
     {
-        using var cancellation = new CancellationTokenSource(timeout);
-        await child.StandardInput.BaseStream.WriteAsync(request, cancellation.Token);
-        await child.StandardInput.BaseStream.FlushAsync(cancellation.Token);
+        WriteDiagnostic(ChildDiagnosticKind.RequestWriteStarted, operation, byteCount: request.Length);
+        try
+        {
+            using var cancellation = new CancellationTokenSource(timeout);
+            await child.StandardInput.BaseStream.WriteAsync(request, cancellation.Token);
+            await child.StandardInput.BaseStream.FlushAsync(cancellation.Token);
+            WriteDiagnostic(ChildDiagnosticKind.RequestWriteCompleted, operation, byteCount: request.Length);
+        }
+        catch (Exception error)
+        {
+            WriteDiagnostic(
+                ChildDiagnosticKind.RequestWriteFailed,
+                operation,
+                exceptionClass: ChildDiagnosticException.Classify(error)
+            );
+            throw;
+        }
     }
 
-    private async Task<UiChildSession> ReadUntilProjectionAsync(ulong? previousGeneration, TimeSpan timeout, string requestId = null)
+    private async Task<UiChildSession> ReadUntilProjectionAsync(
+        ulong? previousGeneration,
+        TimeSpan timeout,
+        ChildDiagnosticOperation operation,
+        string? requestId = null
+    )
     {
         await stdoutGate.WaitAsync();
         try
         {
+            WriteDiagnostic(ChildDiagnosticKind.ReadStarted, operation);
             using var cancellation = new CancellationTokenSource(timeout);
             var buffer = new byte[8192];
             while (Session.State.Phase != ChildSessionPhase.Terminal)
@@ -190,17 +249,44 @@ public sealed class WindowsUiChildOwner : IAsyncDisposable
                 if (read == 0)
                 {
                     Session.CompleteOutput();
+                    WriteDiagnostic(ChildDiagnosticKind.ReadEndOfFile, operation);
+                    WriteDiagnostic(ChildDiagnosticKind.SessionTerminal, operation);
                     return Session;
                 }
+                WriteDiagnostic(ChildDiagnosticKind.ReadCompleted, operation, byteCount: read);
                 Session.ReceiveOutput(buffer.AsSpan(0, read).ToArray());
+                if (Session.State.Phase == ChildSessionPhase.Terminal)
+                {
+                    WriteDiagnostic(ChildDiagnosticKind.SessionTerminal, operation);
+                    return Session;
+                }
                 if (Session.Snapshot is not null
                     && (requestId is not null ? !Session.IsAwaitingResponse(requestId)
                         : previousGeneration is null || Session.Snapshot.Generation > previousGeneration))
                 {
+                    WriteDiagnostic(ChildDiagnosticKind.ProjectionAccepted, operation);
                     return Session;
                 }
             }
             return Session;
+        }
+        catch (OperationCanceledException)
+        {
+            WriteDiagnostic(
+                ChildDiagnosticKind.ReadTimedOut,
+                operation,
+                exceptionClass: ChildDiagnosticExceptionClass.Timeout
+            );
+            throw;
+        }
+        catch (Exception error)
+        {
+            WriteDiagnostic(
+                ChildDiagnosticKind.ReadFailed,
+                operation,
+                exceptionClass: ChildDiagnosticException.Classify(error)
+            );
+            throw;
         }
         finally
         {
@@ -219,6 +305,7 @@ public sealed class WindowsUiChildOwner : IAsyncDisposable
     private async Task CloseCoreAsync()
     {
         closed = true;
+        WriteDiagnostic(ChildDiagnosticKind.EngineCloseStarted, ChildDiagnosticOperation.Close);
         Exception failure = null!;
         try
         {
@@ -248,7 +335,8 @@ public sealed class WindowsUiChildOwner : IAsyncDisposable
             await stdoutGate.WaitAsync();
             try
             {
-                Session.CompleteOutput();
+                Session.CompleteLocalClose();
+                WriteDiagnostic(ChildDiagnosticKind.SessionTerminal, ChildDiagnosticOperation.Close);
             }
             finally
             {
@@ -258,6 +346,11 @@ public sealed class WindowsUiChildOwner : IAsyncDisposable
             try { child.StandardOutput.Close(); } catch (Exception error) { failure ??= error; }
             try { child.StandardError.Close(); } catch (Exception error) { failure ??= error; }
         }
+        WriteDiagnostic(
+            ChildDiagnosticKind.EngineClosed,
+            ChildDiagnosticOperation.Close,
+            exitCode: child.HasExited ? child.ExitCode : null
+        );
         if (failure is not null) throw failure;
     }
 
@@ -267,9 +360,48 @@ public sealed class WindowsUiChildOwner : IAsyncDisposable
         while (true)
         {
             var read = await stream.ReadAsync(buffer);
-            if (read == 0) return;
+            if (read == 0)
+            {
+                WriteDiagnostic(
+                    ChildDiagnosticKind.StderrCompleted,
+                    ChildDiagnosticOperation.Lifecycle,
+                    byteCount: stderrClassifier.ByteCount,
+                    stderrCategory: stderrClassifier.Category
+                );
+                return;
+            }
+            stderrClassifier.Observe(buffer.AsSpan(0, read));
             Interlocked.Add(ref stderrBytesDiscarded, read);
         }
+    }
+
+    private void WriteDiagnostic(
+        ChildDiagnosticKind kind,
+        ChildDiagnosticOperation operation,
+        long? byteCount = null,
+        int? exitCode = null,
+        ChildDiagnosticExceptionClass exceptionClass = ChildDiagnosticExceptionClass.None,
+        ChildStderrCategory stderrCategory = ChildStderrCategory.None
+    )
+    {
+        TryWrite(diagnostics, ChildDiagnosticEvent.Create(
+            kind,
+            operation,
+            processId: child.Id,
+            phase: Session.State.Phase,
+            generation: Session.State.CurrentProjectionGeneration,
+            byteCount: byteCount,
+            exitCode: exitCode,
+            exceptionClass: exceptionClass,
+            terminalReason: Session.TerminalReason,
+            stderrCategory: stderrCategory
+        ));
+    }
+
+    private static void TryWrite(IChildDiagnosticSink sink, ChildDiagnosticEvent item)
+    {
+        try { sink.Write(item); }
+        catch (Exception) { /* Diagnostics must never change fail-closed behavior. */ }
     }
 
     public async ValueTask DisposeAsync()
