@@ -39,8 +39,10 @@ pub(crate) mod operational_session;
 #[cfg(all(test, feature = "pairing-v2-operational-experimental"))]
 mod operational_session_tests;
 pub mod operational_wire;
+mod product_identity;
 pub mod provisional_tls;
 pub use evidence::*;
+pub use product_identity::{ProductIdentity, ProductIdentityError};
 mod primitives;
 pub use primitives::*;
 mod candidate;

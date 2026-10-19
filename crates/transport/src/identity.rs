@@ -470,32 +470,32 @@ fn atomic_replace(tmp: &Path, path: &Path) -> Result<(), std::io::Error> {
 }
 
 #[cfg(not(windows))]
-fn private_key_protection() -> &'static str {
+pub(crate) fn private_key_protection() -> &'static str {
     "plaintext-owner-only"
 }
 
 #[cfg(windows)]
-fn private_key_protection() -> &'static str {
+pub(crate) fn private_key_protection() -> &'static str {
     "dpapi-current-user"
 }
 
 #[cfg(not(windows))]
-fn protect_private_key(key: &[u8]) -> Result<Vec<u8>, PairingError> {
+pub(crate) fn protect_private_key(key: &[u8]) -> Result<Vec<u8>, PairingError> {
     Ok(key.to_vec())
 }
 
 #[cfg(not(windows))]
-fn unprotect_private_key(key: &[u8]) -> Result<Vec<u8>, PairingError> {
+pub(crate) fn unprotect_private_key(key: &[u8]) -> Result<Vec<u8>, PairingError> {
     Ok(key.to_vec())
 }
 
 #[cfg(windows)]
-fn protect_private_key(key: &[u8]) -> Result<Vec<u8>, PairingError> {
+pub(crate) fn protect_private_key(key: &[u8]) -> Result<Vec<u8>, PairingError> {
     dpapi_transform(key, true)
 }
 
 #[cfg(windows)]
-fn unprotect_private_key(key: &[u8]) -> Result<Vec<u8>, PairingError> {
+pub(crate) fn unprotect_private_key(key: &[u8]) -> Result<Vec<u8>, PairingError> {
     dpapi_transform(key, false)
 }
 
