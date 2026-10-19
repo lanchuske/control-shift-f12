@@ -1,6 +1,6 @@
 use std::net::{IpAddr, SocketAddr};
 
-pub const OPERATIONAL_SERVICE_TYPE: &str = "_csf12-operational._udp.local.";
+pub const OPERATIONAL_SERVICE_TYPE: &str = "_csf12-op._udp.local.";
 
 const MAX_ADDRESSES: usize = 8;
 const MAX_TTL_MS: u64 = 300_000;

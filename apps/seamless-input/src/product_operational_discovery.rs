@@ -280,4 +280,42 @@ mod tests {
         owner.poll(1).unwrap();
         assert!(owner.take_current(2).unwrap().is_empty());
     }
+
+    #[tokio::test]
+    async fn two_product_owners_discover_each_others_distinct_recovery_and_v01_ports() {
+        let left_root = tempfile::tempdir().unwrap();
+        let right_root = tempfile::tempdir().unwrap();
+        let left_identity =
+            ProductIdentity::open_or_create(&left_root.path().join("identity")).unwrap();
+        let right_identity =
+            ProductIdentity::open_or_create(&right_root.path().join("identity")).unwrap();
+        let mut left = ProductOperationalDiscovery::start(&left_identity, 0).unwrap();
+        let mut right = ProductOperationalDiscovery::start(&right_identity, 0).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut left_seen = Vec::new();
+        let mut right_seen = Vec::new();
+        while std::time::Instant::now() < deadline
+            && (left_seen.is_empty() || right_seen.is_empty())
+        {
+            let current = left.take_current(1).unwrap();
+            if !current.is_empty() {
+                left_seen = current;
+            }
+            let current = right.take_current(1).unwrap();
+            if !current.is_empty() {
+                right_seen = current;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert_eq!(left_seen.len(), 1);
+        assert_eq!(right_seen.len(), 1);
+        for seen in [&left_seen[0], &right_seen[0]] {
+            assert!(!seen.recovery_addresses.is_empty());
+            assert!(!seen.operational_addresses.is_empty());
+            assert_ne!(
+                seen.recovery_addresses[0].port(),
+                seen.operational_addresses[0].port()
+            );
+        }
+    }
 }
