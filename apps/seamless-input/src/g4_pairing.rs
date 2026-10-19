@@ -12,7 +12,8 @@ use seamless_discovery::guided::{
     CandidateHandle as DiscoveryHandle, ConsentCatalog, LocatorEvent, SelectedLocator,
 };
 use seamless_transport::pairing_v2::{
-    AdmissionAuthorityStore, DurableAdmissionState, handshake_selected_and_commit_distributed,
+    AdmissionAuthorityStore, DurableAdmissionState, ProductIdentity,
+    handshake_selected_and_commit_distributed,
     provisional_tls::{
         HandshakeConfig, IncomingHandshakeConfig, PRE_ADMISSION_SELECTION_WINDOW,
         PreAdmissionCandidate, ProvisionalEndpoint,
@@ -318,6 +319,7 @@ pub struct RealG4Backend {
     event_tx: tokio::sync::mpsc::Sender<G4Event>,
     now_ms: u64,
     store: Arc<AdmissionAuthorityStore>,
+    identity: Arc<ProductIdentity>,
     origin: Instant,
 }
 
@@ -354,6 +356,10 @@ impl RealG4Backend {
             AdmissionAuthorityStore::open(root.join("g4-admission"))
                 .map_err(|_| SetupError::Unavailable)?,
         );
+        let identity = Arc::new(
+            ProductIdentity::open_or_create(&root.join("g4-identity"))
+                .map_err(|_| SetupError::Unavailable)?,
+        );
         let initial_snapshot = initial_snapshot(&store)?;
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -369,6 +375,7 @@ impl RealG4Backend {
             event_tx,
             now_ms: 0,
             store,
+            identity,
             origin: Instant::now(),
         };
         let _ = backend.event_tx.try_send(initial_snapshot);
@@ -398,7 +405,8 @@ impl RealG4Backend {
         let bind_address = "0.0.0.0:0".parse().unwrap();
         let runtime_guard = self.runtime.enter();
         let endpoint = Arc::new(
-            ProvisionalEndpoint::bind_ephemeral(bind_address)
+            self.identity
+                .bind_pairing(bind_address)
                 .map_err(|_| SetupError::Unavailable)?,
         );
         drop(runtime_guard);
@@ -1217,6 +1225,22 @@ mod tests {
 
         assert!(snapshot_reached.load(Ordering::Acquire));
         assert!(matches!(result, Err(SetupError::Unavailable)));
+    }
+
+    #[test]
+    fn backend_reopens_the_same_product_identity_for_pairing_and_v01() {
+        let root = tempfile::tempdir().unwrap();
+        let first = RealG4Backend::open(root.path())
+            .unwrap()
+            .identity
+            .fingerprint();
+        let second = RealG4Backend::open(root.path())
+            .unwrap()
+            .identity
+            .fingerprint();
+
+        assert_ne!(first, [0; 32]);
+        assert_eq!(first, second);
     }
 
     struct NoopBackend;
