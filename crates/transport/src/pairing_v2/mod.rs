@@ -44,6 +44,8 @@ mod product_identity;
 pub mod product_operational;
 pub mod provisional_tls;
 pub use evidence::*;
+#[cfg(feature = "pairing-v2-operational-experimental")]
+pub use product_identity::ProductOperationalEndpoint;
 pub use product_identity::{ProductIdentity, ProductIdentityError};
 mod primitives;
 pub use primitives::*;

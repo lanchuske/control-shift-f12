@@ -148,6 +148,10 @@ pub struct ProductOperationalEndpoint {
 
 #[cfg(feature = "pairing-v2-operational-experimental")]
 impl ProductOperationalEndpoint {
+    pub fn publication_port(&self) -> Result<u16, super::Invalid> {
+        self.inner.local_addr().map(|address| address.port())
+    }
+
     pub async fn connect(
         &self,
         peer: SocketAddr,

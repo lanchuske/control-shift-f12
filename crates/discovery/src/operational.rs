@@ -80,8 +80,8 @@ impl OperationalMdns {
         })
     }
 
-    pub fn publish(&mut self, locator: [u8; 16], address: SocketAddr) -> Result<(), String> {
-        if self.published.is_some() || locator == [0; 16] || !unicast_endpoint(address) {
+    pub fn publish(&mut self, locator: [u8; 16], port: u16) -> Result<(), String> {
+        if self.published.is_some() || locator == [0; 16] || port == 0 {
             return Err("invalid operational mDNS publication".into());
         }
         let instance = encode_locator(locator);
@@ -91,11 +91,12 @@ impl OperationalMdns {
             OPERATIONAL_SERVICE_TYPE,
             &instance,
             &hostname,
-            address.ip(),
-            address.port(),
+            "",
+            port,
             properties,
         )
-        .map_err(|_| "invalid operational mDNS advertisement")?;
+        .map_err(|_| "invalid operational mDNS advertisement")?
+        .enable_addr_auto();
         let fullname = info.get_fullname().to_owned();
         self.daemon
             .register(info)
@@ -201,10 +202,6 @@ fn unicast_ip(address: IpAddr) -> bool {
     !address.is_unspecified()
         && !address.is_multicast()
         && !matches!(address, IpAddr::V4(ip) if ip.is_broadcast())
-}
-
-fn unicast_endpoint(address: SocketAddr) -> bool {
-    address.port() != 0 && unicast_ip(address.ip())
 }
 
 #[cfg(test)]

@@ -1,4 +1,6 @@
 use crate::guided_setup::SetupError;
+use seamless_discovery::operational::{OperationalEvent, OperationalMdns};
+use seamless_transport::pairing_v2::{ProductIdentity, ProductOperationalEndpoint};
 use std::{collections::BTreeMap, net::SocketAddr};
 
 const MAX_LOCATORS: usize = 16;
@@ -99,9 +101,69 @@ fn unicast(address: SocketAddr) -> bool {
         && !matches!(address.ip(), std::net::IpAddr::V4(ip) if ip.is_broadcast())
 }
 
+pub(crate) struct ProductOperationalDiscovery {
+    endpoint: ProductOperationalEndpoint,
+    mdns: OperationalMdns,
+    catalogue: OperationalCatalogue,
+}
+
+impl ProductOperationalDiscovery {
+    pub(crate) fn start(identity: &ProductIdentity, now_ms: u64) -> Result<Self, SetupError> {
+        let mut locator = [0; 16];
+        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut locator);
+        if locator == [0; 16] {
+            locator[0] = 1;
+        }
+        let endpoint = identity
+            .bind_operational("0.0.0.0:0".parse().unwrap())
+            .map_err(|_| SetupError::Unavailable)?;
+        let port = endpoint
+            .publication_port()
+            .map_err(|_| SetupError::Unavailable)?;
+        let mut mdns = OperationalMdns::start().map_err(|_| SetupError::Unavailable)?;
+        mdns.publish(locator, port)
+            .map_err(|_| SetupError::Unavailable)?;
+        Ok(Self {
+            endpoint,
+            mdns,
+            catalogue: OperationalCatalogue::open(locator, now_ms)?,
+        })
+    }
+
+    pub(crate) fn poll(&mut self, now_ms: u64) -> Result<(), SetupError> {
+        for event in self.mdns.poll().map_err(|_| SetupError::Unavailable)? {
+            match event {
+                OperationalEvent::Observed(observation) => self.catalogue.apply(
+                    OperationalObservation {
+                        locator: observation.locator,
+                        addresses: observation.addresses,
+                        ttl_ms: observation.ttl_ms,
+                    },
+                    now_ms,
+                )?,
+                OperationalEvent::Removed(locator) => self.catalogue.remove(locator, now_ms)?,
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn take_current(
+        &mut self,
+        now_ms: u64,
+    ) -> Result<Vec<SelectedOperationalLocator>, SetupError> {
+        self.poll(now_ms)?;
+        self.catalogue.take_current(now_ms)
+    }
+
+    pub(crate) fn endpoint(&self) -> &ProductOperationalEndpoint {
+        &self.endpoint
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{OperationalCatalogue, OperationalObservation};
+    use super::{OperationalCatalogue, OperationalObservation, ProductOperationalDiscovery};
+    use seamless_transport::pairing_v2::ProductIdentity;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
     fn observation(locator: u8, port: u16, ttl_ms: u64) -> OperationalObservation {
@@ -164,5 +226,16 @@ mod tests {
         }
         assert!(catalogue.apply(observation(17, 4017, 500), 1).is_err());
         assert_eq!(catalogue.take_current(2).unwrap().len(), 16);
+    }
+
+    #[tokio::test]
+    async fn product_owner_binds_publishes_and_owns_one_operational_endpoint() {
+        let root = tempfile::tempdir().unwrap();
+        let identity = ProductIdentity::open_or_create(&root.path().join("identity")).unwrap();
+        let mut owner = ProductOperationalDiscovery::start(&identity, 0).unwrap();
+
+        assert!(owner.endpoint().publication_port().unwrap() > 0);
+        owner.poll(1).unwrap();
+        assert!(owner.take_current(2).unwrap().is_empty());
     }
 }
