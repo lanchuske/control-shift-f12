@@ -21,6 +21,7 @@ pub enum UiRuntimeEvent {
     BootstrapSasReady,
     BootstrapReceiptVerified,
     V01SasReady(V01View),
+    V01Verified,
     V01Expired,
     PeerConfirmed,
     Diagnostics(Vec<DiagnosticRow>),
@@ -239,6 +240,14 @@ impl UiController {
                 self.snapshot.v01 = None;
                 self.v01_started_ms = None;
                 self.snapshot.state = UiState::InventoryCurrent;
+            }
+            UiRuntimeEvent::V01Verified
+                if self.snapshot.state == UiState::V01Pending && self.local_v01_confirmed =>
+            {
+                self.clear_v01_to_confirmed();
+                self.snapshot.inventory = None;
+                self.snapshot.layout.state = LayoutState::NotConfigured;
+                self.snapshot.capabilities = CapabilityView::all_disabled();
             }
             UiRuntimeEvent::V01Expired if self.snapshot.state == UiState::V01Pending => {
                 self.clear_v01_to_confirmed();

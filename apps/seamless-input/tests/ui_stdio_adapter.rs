@@ -1,6 +1,9 @@
 use seamless_input::{
     control_api::{self, Request},
-    ui_contract::{RemainingDuration, SasCode, UiError, UiState, V01View},
+    ui_contract::{
+        RelationshipHandle, RelationshipState, RelationshipView, RemainingDuration, SasCode,
+        UiError, UiState, V01View,
+    },
     ui_stdio_adapter::{
         AuthoritativeUiEvent, ChildFrame, MonotonicClock, PairingFrame, StdioReadEvent,
         TimedRequestReader, UiStdioAdapter, run_stdio_with_adapter,
@@ -61,6 +64,47 @@ fn adapter_in_v01() -> (UiStdioAdapter, Vec<ChildFrame>) {
         },
     );
     (adapter, frames)
+}
+
+#[test]
+fn product_v01_begin_accepts_only_one_current_relationship_handle() {
+    let relationship = RelationshipHandle::try_from("relationship-1".to_owned()).unwrap();
+    let mut adapter = UiStdioAdapter::new(0);
+    adapter.on_authoritative_at(
+        0,
+        AuthoritativeUiEvent::DurableRelationships(vec![RelationshipView {
+            handle: relationship.clone(),
+            state: RelationshipState::Unavailable,
+        }]),
+    );
+
+    let accepted = adapter.handle_host_request_at(
+        1,
+        &request(
+            "begin-v01",
+            "ui.v01.begin",
+            json!({"relationship": relationship}),
+        ),
+    );
+    assert!(
+        accepted
+            .iter()
+            .any(|frame| matches!(frame, ChildFrame::Response(response) if response.ok))
+    );
+
+    for (id, args) in [
+        ("missing", json!({})),
+        (
+            "extra",
+            json!({"relationship":"relationship-1","address":"192.0.2.1:9"}),
+        ),
+        ("unknown", json!({"relationship":"relationship-2"})),
+    ] {
+        let frames = adapter.handle_host_request_at(2, &request(id, "ui.v01.begin", args));
+        assert!(frames.iter().any(|frame| matches!(frame,
+            ChildFrame::Response(response) if !response.ok
+        )));
+    }
 }
 
 #[test]

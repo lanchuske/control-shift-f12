@@ -179,6 +179,24 @@ fn v01_deadline_and_cancel_clear_volatile_state_without_extending_it() {
 }
 
 #[test]
+fn product_v01_verification_returns_to_confirmed_without_runtime_capabilities() {
+    let mut controller = confirmed_controller();
+    enter_v01(&mut controller);
+    controller
+        .apply_local_at(1, UiCommand::ConfirmV01 { matches: true })
+        .unwrap();
+    controller.on_runtime_at(2, UiRuntimeEvent::V01Verified);
+
+    assert_eq!(controller.snapshot().state, UiState::ConfirmedRelationship);
+    assert!(controller.snapshot().v01.is_none());
+    assert!(controller.snapshot().inventory.is_none());
+    assert_eq!(
+        controller.snapshot().capabilities,
+        seamless_input::ui_contract::CapabilityView::all_disabled()
+    );
+}
+
+#[test]
 fn decisive_commands_and_runtime_events_expire_v01_at_exact_deadline_without_a_tick() {
     let mut confirm_controller = confirmed_controller();
     enter_v01(&mut confirm_controller);

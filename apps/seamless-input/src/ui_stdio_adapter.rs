@@ -34,7 +34,9 @@ const SAS_MAX_MS: u32 = 30_000;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AuthoritativeUiEvent {
     RelationshipVerified,
+    DurableRelationships(Vec<RelationshipView>),
     V01SasReady { view: V01View, remaining_ms: u32 },
+    V01Verified,
     PeerConfirmed,
     Diagnostics(Vec<DiagnosticRow>),
     PermissionRevoked,
@@ -229,6 +231,7 @@ enum HostCommand {
     SelectCandidate { handle: CandidateHandle },
     ApproveSas { generation: u64, matches: bool },
     CancelPairing { generation: u64 },
+    BeginV01 { relationship: RelationshipHandle },
     ConfirmV01 { matches: bool },
 }
 
@@ -261,6 +264,12 @@ struct ConfirmV01Args {
     matches: bool,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BeginV01Args {
+    relationship: RelationshipHandle,
+}
+
 pub struct UiStdioAdapter {
     controller: UiController,
     outgoing: Vec<ChildFrame>,
@@ -268,6 +277,7 @@ pub struct UiStdioAdapter {
     active_sas: Option<ActiveSas>,
     next_attempt_binding: u64,
     next_generation: u64,
+    pending_v01_relationship: Option<RelationshipHandle>,
     now_ms: u64,
     #[cfg(feature = "pairing-v2-g4")]
     g4: Option<G4PairingWorker>,
@@ -286,6 +296,7 @@ impl UiStdioAdapter {
             active_sas: None,
             next_attempt_binding: 1,
             next_generation: 1,
+            pending_v01_relationship: None,
             now_ms,
             #[cfg(feature = "pairing-v2-g4")]
             g4: None,
@@ -325,6 +336,12 @@ impl UiStdioAdapter {
                 self.controller
                     .on_runtime_at(now_ms, UiRuntimeEvent::RelationshipVerified);
             }
+            AuthoritativeUiEvent::DurableRelationships(relationships) => {
+                self.controller.on_runtime_at(
+                    now_ms,
+                    UiRuntimeEvent::G4DurableRelationships(relationships),
+                )
+            }
             AuthoritativeUiEvent::V01SasReady { view, remaining_ms }
                 if (1..=SAS_MAX_MS).contains(&remaining_ms) =>
             {
@@ -354,6 +371,11 @@ impl UiStdioAdapter {
                 }
             }
             AuthoritativeUiEvent::V01SasReady { .. } => self.clear_sas(),
+            AuthoritativeUiEvent::V01Verified => {
+                self.controller
+                    .on_runtime_at(now_ms, UiRuntimeEvent::V01Verified);
+                self.pending_v01_relationship = None;
+            }
             AuthoritativeUiEvent::PeerConfirmed => self
                 .controller
                 .on_runtime_at(now_ms, UiRuntimeEvent::PeerConfirmed),
@@ -372,6 +394,12 @@ impl UiStdioAdapter {
         }
         if self.controller.snapshot().v01.is_none() {
             self.clear_sas();
+        }
+        if !matches!(
+            self.controller.snapshot().state,
+            UiState::ConfirmedRelationship | UiState::V01Pending
+        ) {
+            self.pending_v01_relationship = None;
         }
         self.publish_snapshot_and_diagnostics();
         self.drain_child_frames()
@@ -455,7 +483,28 @@ impl UiStdioAdapter {
                     .apply_local_at(now_ms, UiCommand::ConfirmV01 { matches });
                 if self.controller.snapshot().v01.is_none() {
                     self.clear_sas();
+                    self.pending_v01_relationship = None;
                 }
+                self.publish_snapshot_and_diagnostics();
+                match result {
+                    Ok(()) => self.accepted(&request.id),
+                    Err(error) => self.rejected(&request.id, error),
+                }
+            }
+            Ok(HostCommand::BeginV01 { relationship }) => {
+                let current = self
+                    .controller
+                    .snapshot()
+                    .confirmed
+                    .iter()
+                    .any(|entry| entry.handle == relationship);
+                let result = if !current || self.pending_v01_relationship.is_some() {
+                    Err(UiError::InvalidState)
+                } else {
+                    self.controller
+                        .apply_local_at(now_ms, UiCommand::BeginV01)
+                        .inspect(|_| self.pending_v01_relationship = Some(relationship))
+                };
                 self.publish_snapshot_and_diagnostics();
                 match result {
                     Ok(()) => self.accepted(&request.id),
@@ -733,6 +782,7 @@ impl UiStdioAdapter {
             self.controller
                 .on_runtime_at(now_ms, UiRuntimeEvent::V01Expired);
             self.clear_sas();
+            self.pending_v01_relationship = None;
         }
     }
 
@@ -833,6 +883,9 @@ fn parse_host_command(request: &Request) -> Result<HostCommand, UiError> {
         }
         "ui.confirm_v01" => args::<ConfirmV01Args>(request).map(|args| HostCommand::ConfirmV01 {
             matches: args.matches,
+        }),
+        "ui.v01.begin" => args::<BeginV01Args>(request).map(|args| HostCommand::BeginV01 {
+            relationship: args.relationship,
         }),
         _ => Err(UiError::InvalidCommand),
     }
