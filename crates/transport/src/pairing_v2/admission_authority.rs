@@ -62,11 +62,24 @@ pub struct DurableAdmission {
 /// never serializable and does not expose the underlying attempt identifier.
 pub struct OperationalAdmission {
     attempt: [u8; 32],
+    peer_fingerprint: [u8; 32],
 }
 
 impl OperationalAdmission {
+    #[cfg(test)]
+    pub(crate) fn test_only(attempt: [u8; 32], peer_fingerprint: [u8; 32]) -> Self {
+        Self {
+            attempt,
+            peer_fingerprint,
+        }
+    }
+
     pub(crate) fn attempt(&self) -> [u8; 32] {
         self.attempt
+    }
+
+    pub(crate) fn peer_fingerprint(&self) -> [u8; 32] {
+        self.peer_fingerprint
     }
 }
 
@@ -1199,6 +1212,7 @@ impl AdmissionAuthorityStore {
             }
             selected = Some(OperationalAdmission {
                 attempt: tuple.attempt,
+                peer_fingerprint: tuple.peer_pin,
             });
         }
         selected.ok_or(StoreError::Invalid)

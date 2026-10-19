@@ -148,11 +148,25 @@ pub struct ProductOperationalEndpoint {
 
 #[cfg(feature = "pairing-v2-operational-experimental")]
 impl ProductOperationalEndpoint {
+    pub async fn begin(
+        &self,
+        peer: Option<SocketAddr>,
+        authority: &super::AdmissionAuthorityStore,
+        admission: super::OperationalAdmission,
+    ) -> Result<super::product_operational::ProductOperationalAttempt, super::Invalid> {
+        if self.inner.local_fingerprint() < admission.peer_fingerprint() {
+            self.connect(peer.ok_or(super::Invalid)?, authority, admission)
+                .await
+        } else {
+            self.accept(authority, admission).await
+        }
+    }
+
     pub fn publication_port(&self) -> Result<u16, super::Invalid> {
         self.inner.local_addr().map(|address| address.port())
     }
 
-    pub async fn connect(
+    async fn connect(
         &self,
         peer: SocketAddr,
         authority: &super::AdmissionAuthorityStore,
@@ -165,7 +179,7 @@ impl ProductOperationalEndpoint {
         super::product_operational::ProductOperationalAttempt::start(attempt)
     }
 
-    pub async fn accept(
+    async fn accept(
         &self,
         authority: &super::AdmissionAuthorityStore,
         admission: super::OperationalAdmission,
@@ -237,5 +251,18 @@ mod tests {
             serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["version"],
             1
         );
+    }
+
+    #[tokio::test]
+    async fn deterministic_operational_role_requires_a_locator_only_for_the_initiator() {
+        let root = tempfile::tempdir().unwrap();
+        let identity = ProductIdentity::open_or_create(&root.path().join("identity")).unwrap();
+        let endpoint = identity
+            .bind_operational("127.0.0.1:0".parse().unwrap())
+            .unwrap();
+        let store = super::super::AdmissionAuthorityStore::open(root.path().join("store")).unwrap();
+        let admission = super::super::OperationalAdmission::test_only([1; 32], [255; 32]);
+
+        assert!(endpoint.begin(None, &store, admission).await.is_err());
     }
 }

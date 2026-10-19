@@ -798,6 +798,10 @@ pub(crate) struct OperationalEndpoint {
 }
 
 impl OperationalEndpoint {
+    pub(crate) fn local_fingerprint(&self) -> [u8; 32] {
+        self.local_leaf
+    }
+
     pub(crate) fn bind(
         address: SocketAddr,
         certificate: Vec<u8>,
