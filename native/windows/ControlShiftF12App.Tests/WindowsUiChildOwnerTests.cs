@@ -81,7 +81,7 @@ public sealed class WindowsUiChildOwnerTests
         var spec = new ChildLaunchSpec(executable, [], environment!);
         await using var owner = await WindowsUiChildOwner.StartAsync(spec);
         await owner.ReadInitialProjectionAsync(TimeSpan.FromSeconds(5));
-        var blockedRead = owner.RefreshAsync(TimeSpan.FromSeconds(30));
+        var blockedRead = owner.ObserveAsync(TimeSpan.FromSeconds(30));
         await Task.Delay(50);
 
         var close = owner.CloseAsync();
@@ -103,7 +103,12 @@ public sealed class WindowsUiChildOwnerTests
                 key => key.ToString()!,
                 key => Environment.GetEnvironmentVariable(key.ToString()!)
             );
-        var spec = ChildLaunchSpec.Create(root, executable, environment);
+        var isolatedHome = Path.Combine(Path.GetTempPath(), "csf12-g4-owner-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(isolatedHome);
+        var productSpec = ChildLaunchSpec.Create(root, executable, environment);
+        var isolatedEnvironment = productSpec.Environment.ToDictionary(entry => entry.Key, entry => entry.Value);
+        isolatedEnvironment["SEAMLESS_INPUT_HOME"] = isolatedHome;
+        var spec = productSpec with { Environment = isolatedEnvironment };
         await using var owner = await WindowsUiChildOwner.StartAsync(spec);
 
         var session = await owner.ReadInitialProjectionAsync(TimeSpan.FromSeconds(5));
@@ -129,13 +134,14 @@ public sealed class WindowsUiChildOwnerTests
         for (var refresh = 0; refresh < 2; refresh++)
         {
             previousGeneration = owner.Session.Snapshot!.Generation;
-            var refreshed = await owner.RefreshAsync(TimeSpan.FromSeconds(5));
+            var refreshed = await owner.ObserveAsync(TimeSpan.FromSeconds(5));
             Assert.True(refreshed.Snapshot!.Generation > previousGeneration);
             Assert.Equal("browsing", refreshed.Snapshot.State);
         }
         await owner.CloseAsync();
         Assert.True(owner.HasExited);
         Assert.Equal(ChildSessionPhase.Terminal, owner.Session.State.Phase);
+        Directory.Delete(isolatedHome, recursive: true);
     }
 
     private static string FindEngineExecutable()

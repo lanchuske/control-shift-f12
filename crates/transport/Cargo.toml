@@ -5,8 +5,13 @@ edition.workspace = true
 license.workspace = true
 
 [features]
-# Verification-only internal slice; never enabled by the application by default.
-pairing-v2-experimental = ["dep:ring", "dep:x509-parser", "dep:der-parser", "dep:asn1-rs", "dep:curve25519-dalek", "dep:unicode-normalization", "dep:regex-syntax"]
+# G4 discovery/admission slice. It remains non-default until its product path
+# and full cross-platform gate are complete.
+pairing-v2-g4 = ["dep:ring", "dep:x509-parser", "dep:der-parser", "dep:asn1-rs", "dep:curve25519-dalek", "dep:unicode-normalization", "dep:regex-syntax"]
+# Later operational foundations remain separately default-off.
+pairing-v2-operational-experimental = ["pairing-v2-g4"]
+# Compatibility alias for existing verification commands while G4 is built.
+pairing-v2-experimental = ["pairing-v2-operational-experimental"]
 
 [dependencies]
 seamless-input-protocol = { path = "../protocol" }

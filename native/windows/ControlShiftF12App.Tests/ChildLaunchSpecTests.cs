@@ -15,8 +15,11 @@ public sealed class ChildLaunchSpecTests
             ["TEMP"] = @"C:\Users\Darío\AppData\Local\Temp",
             ["TMP"] = @"C:\Users\Darío\AppData\Local\Temp",
             ["LOCALAPPDATA"] = @"C:\Users\Darío\AppData\Local",
+            ["APPDATA"] = @"C:\Users\Darío\AppData\Roaming",
             ["USERPROFILE"] = @"C:\Users\Darío",
             ["PATH"] = @"C:\Windows\System32",
+            ["CSF12_G4_TEST_PEER_ADDRESS"] = "must-not-pass",
+            ["CSF12_G4_TEST_RENDEZVOUS"] = "must-not-pass",
             ["UNRELATED_SECRET"] = "must-not-pass",
         };
 
@@ -27,8 +30,11 @@ public sealed class ChildLaunchSpecTests
         );
 
         Assert.Equal(["control", "--ui-stdio"], spec.Arguments);
-        Assert.DoesNotContain("UNRELATED_SECRET", spec.Environment.Keys, StringComparer.OrdinalIgnoreCase);
+        Assert.True(new HashSet<string>(spec.Environment.Keys, StringComparer.OrdinalIgnoreCase).SetEquals([
+            "SystemRoot", "WINDIR", "TEMP", "TMP", "LOCALAPPDATA", "APPDATA", "USERPROFILE", "PATH",
+        ]));
         Assert.Equal(@"C:\Windows", spec.Environment["SystemRoot"]);
+        Assert.Equal(@"C:\Users\Darío\AppData\Roaming", spec.Environment["APPDATA"]);
     }
 
     [Fact]

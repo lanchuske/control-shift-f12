@@ -1,12 +1,16 @@
 using System;
 using System.Diagnostics;
 using System.IO;
+using System.Linq;
 using System.Runtime.ExceptionServices;
+using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
 using ControlShiftF12App.Core;
 
 namespace ControlShiftF12App;
+
+internal sealed class UiGestureRejectedException(string message) : InvalidOperationException(message);
 
 /// <summary>
 /// The sole owner for one local engine child. It has no network, shell or
@@ -78,37 +82,92 @@ public sealed class WindowsUiChildOwner : IAsyncDisposable
     {
         ThrowIfClosed();
         if (Session.State.Phase != ChildSessionPhase.Running
-            || Session.Snapshot is not { State: "not_started" } previous)
+            || Session.Snapshot is not { State: "not_started" } || Session.Pairing is not null)
         {
-            throw new InvalidOperationException("Discovery is unavailable outside the reviewed local starting state.");
+            throw new UiGestureRejectedException("Discovery is unavailable outside the reviewed local starting state.");
         }
 
-        await WriteFixedRequestAsync(Session.StartDiscoveryFrame(), timeout);
-        return await ReadUntilProjectionAsync(previous.Generation, timeout);
+        return await SendAndReadResponseAsync(Session.StartDiscoveryFrame(), timeout);
     }
 
     public async Task<UiChildSession> StopDiscoveryAsync(TimeSpan timeout)
     {
         ThrowIfClosed();
         if (Session.State.Phase != ChildSessionPhase.Running
-            || Session.Snapshot is not { State: "browsing" } previous)
+            || Session.Snapshot is not { State: "browsing" } || Session.Pairing is not null)
         {
-            throw new InvalidOperationException("Discovery is not active.");
+            throw new UiGestureRejectedException("Discovery is not active.");
         }
 
-        await WriteFixedRequestAsync(Session.StopDiscoveryFrame(), timeout);
-        return await ReadUntilProjectionAsync(previous.Generation, timeout);
+        return await SendAndReadResponseAsync(Session.StopDiscoveryFrame(), timeout);
+    }
+
+    public async Task<UiChildSession> SelectCandidateAsync(string handle, TimeSpan timeout)
+    {
+        ThrowIfClosed();
+        if (Session.State.Phase != ChildSessionPhase.Running
+            || Session.Snapshot is not { State: "browsing" }
+            || Session.Pairing is not null || !Session.Snapshot.Nearby.Contains(handle))
+        {
+            throw new UiGestureRejectedException("Candidate selection requires current discovery.");
+        }
+        return await SendAndReadResponseAsync(Session.SelectCandidateFrame(handle), timeout);
+    }
+
+    public async Task<UiChildSession> ApproveSasAsync(ulong generation, bool matches, TimeSpan timeout)
+    {
+        ThrowIfClosed();
+        if (Session.State.Phase != ChildSessionPhase.Running
+            || Session.Pairing is not { Phase: PairingBridgePhase.AwaitingLocalConfirmation } pairing
+            || pairing.Generation != generation)
+        {
+            throw new UiGestureRejectedException("No current pairing comparison is visible.");
+        }
+        return await SendAndReadResponseAsync(Session.ApproveSasFrame(generation, matches), timeout);
+    }
+
+    public async Task<UiChildSession> CancelPairingAsync(ulong generation, TimeSpan timeout)
+    {
+        ThrowIfClosed();
+        if (Session.State.Phase != ChildSessionPhase.Running || Session.Pairing?.Generation != generation)
+            throw new UiGestureRejectedException("No current pairing comparison is visible.");
+        return await SendAndReadResponseAsync(Session.CancelPairingFrame(generation), timeout);
     }
 
     public async Task<UiChildSession> RefreshAsync(TimeSpan timeout)
     {
         ThrowIfClosed();
-        if (Session.State.Phase != ChildSessionPhase.Running || Session.Snapshot is not { } previous)
+        if (Session.State.Phase != ChildSessionPhase.Running || Session.Snapshot is null)
         {
             throw new InvalidOperationException("The local child has no current projection.");
         }
-        await WriteFixedRequestAsync(Session.InitialRefreshFrame(), timeout);
-        return await ReadUntilProjectionAsync(previous.Generation, timeout);
+        return await SendAndReadResponseAsync(Session.InitialRefreshFrame(), timeout);
+    }
+
+    public async Task<UiChildSession> ObserveAsync(TimeSpan timeout)
+    {
+        ThrowIfClosed();
+        if (Session.State.Phase != ChildSessionPhase.Running || Session.Snapshot is null)
+            throw new InvalidOperationException("The local child has no current projection.");
+        var previousGeneration = Session.Snapshot.Generation;
+        try
+        {
+            return await ReadUntilProjectionAsync(previousGeneration, timeout);
+        }
+        catch (OperationCanceledException)
+        {
+            // Silence is a valid observation: no request or replay ID is
+            // consumed, and a later timer tick can continue reading.
+            return Session;
+        }
+    }
+
+    private async Task<UiChildSession> SendAndReadResponseAsync(byte[] request, TimeSpan timeout)
+    {
+        using var document = JsonDocument.Parse(request.AsMemory(4));
+        var requestId = document.RootElement.GetProperty("id").GetString()!;
+        await WriteFixedRequestAsync(request, timeout);
+        return await ReadUntilProjectionAsync(previousGeneration: null, timeout, requestId);
     }
 
     private async Task WriteFixedRequestAsync(byte[] request, TimeSpan timeout)
@@ -118,7 +177,7 @@ public sealed class WindowsUiChildOwner : IAsyncDisposable
         await child.StandardInput.BaseStream.FlushAsync(cancellation.Token);
     }
 
-    private async Task<UiChildSession> ReadUntilProjectionAsync(ulong? previousGeneration, TimeSpan timeout)
+    private async Task<UiChildSession> ReadUntilProjectionAsync(ulong? previousGeneration, TimeSpan timeout, string requestId = null)
     {
         await stdoutGate.WaitAsync();
         try
@@ -134,8 +193,9 @@ public sealed class WindowsUiChildOwner : IAsyncDisposable
                     return Session;
                 }
                 Session.ReceiveOutput(buffer.AsSpan(0, read).ToArray());
-                if (Session.Snapshot is { } snapshot
-                    && (previousGeneration is null || snapshot.Generation > previousGeneration))
+                if (Session.Snapshot is not null
+                    && (requestId is not null ? !Session.IsAwaitingResponse(requestId)
+                        : previousGeneration is null || Session.Snapshot.Generation > previousGeneration))
                 {
                     return Session;
                 }

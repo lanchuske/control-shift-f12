@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 import Darwin
 import XCTest
@@ -19,6 +20,162 @@ final class UiChildRequestTests: XCTestCase {
             XCTAssertNoThrow(try controller.consume(lengthPrefixed: response))
             XCTAssertThrowsError(try controller.consume(lengthPrefixed: response))
         }
+    }
+
+    func testPairingActionsContainOnlyOpaqueHandleAndBoundDecision() throws {
+        let requests = ChildRequestTracker()
+        let selected = try object(requests.frame(
+            command: "ui.select_candidate", args: ["handle": "nearby-7"]
+        ))
+        XCTAssertEqual(selected["command"] as? String, "ui.select_candidate")
+        XCTAssertEqual(selected["args"] as? [String: String], ["handle": "nearby-7"])
+
+        let approved = try object(requests.frame(
+            command: "ui.approve_sas", args: ["generation": UInt64(9), "matches": false]
+        ))
+        XCTAssertEqual(approved["command"] as? String, "ui.approve_sas")
+        let args = try XCTUnwrap(approved["args"] as? [String: Any])
+        XCTAssertEqual(args.count, 2)
+        XCTAssertEqual(args["generation"] as? UInt64, 9)
+        XCTAssertEqual(args["matches"] as? Bool, false)
+    }
+
+    func testCancelPairingCarriesOnlyTheCurrentNonzeroGeneration() throws {
+        let requests = ChildRequestTracker()
+        let cancelled = try object(requests.frame(
+            command: "ui.cancel_pairing", args: ["generation": UInt64(9)]
+        ))
+        XCTAssertEqual(cancelled["command"] as? String, "ui.cancel_pairing")
+        let args = try XCTUnwrap(cancelled["args"] as? [String: UInt64])
+        XCTAssertEqual(args, ["generation": 9])
+        XCTAssertThrowsError(try requests.frame(command: "ui.cancel_pairing", args: ["generation": UInt64(0)]))
+        XCTAssertThrowsError(try requests.frame(command: "ui.cancel_pairing", args: ["generation": UInt64(9), "matches": true]))
+    }
+
+    func testG4TerminalSnapshotsEraseSasAndNeverEnableSharing() throws {
+        for state in ["confirmed_relationship", "remote_outcome_unknown"] {
+            let controller = DiagnosticsFrameController()
+            try controller.consume(lengthPrefixed: framed([
+                "v": 1, "kind": "ui_pairing_v1", "generation": 7,
+                "phase": "awaiting_local_confirmation", "candidate_handle": "peer-1",
+                "verification_words": ["ember", "ocean", "violet", "copper"],
+            ]))
+            XCTAssertNotNil(controller.pairing)
+            try controller.consume(lengthPrefixed: snapshot(generation: 8, state: state))
+            XCTAssertNil(controller.pairing)
+            XCTAssertFalse(controller.shell.findNearbyEnabled)
+            XCTAssertFalse(controller.shell.inputSharingEnabled)
+            XCTAssertFalse(controller.shell.clipboardSharingEnabled)
+            XCTAssertFalse(controller.shell.saveLayoutEnabled)
+            XCTAssertEqual(controller.shell.connectionStatus, state == "confirmed_relationship"
+                ? "Confirmed — sharing unavailable" : "Outcome unknown — quarantined")
+        }
+    }
+
+    func testNonterminalRefreshPreservesOriginalSasUntilTerminalSnapshot() throws {
+        let controller = DiagnosticsFrameController()
+        try controller.consume(lengthPrefixed: framed([
+            "v": 1, "kind": "ui_pairing_v1", "generation": 7,
+            "phase": "awaiting_local_confirmation", "candidate_handle": "peer-1",
+            "verification_words": ["ember", "ocean", "violet", "copper"],
+        ]))
+        try controller.consume(lengthPrefixed: snapshot(generation: 6, state: "browsing"))
+        XCTAssertNotNil(controller.pairing)
+        for (offset, state) in ["bootstrap_connecting", "bootstrap_sas_pending", "bootstrap_receipt_prepared", "browsing"].enumerated() {
+            try controller.consume(lengthPrefixed: snapshot(generation: 8 + offset, state: state))
+            XCTAssertEqual(controller.pairingGeneration, 7)
+            XCTAssertEqual(controller.pairing?.verificationWords, ["ember", "ocean", "violet", "copper"])
+        }
+        try controller.consume(lengthPrefixed: snapshot(generation: 12, state: "not_started"))
+        XCTAssertNil(controller.pairing)
+        XCTAssertNil(controller.pairingGeneration)
+    }
+
+    func testG4RejectsOperationalRelationshipMetadata() throws {
+        let controller = DiagnosticsFrameController()
+        XCTAssertThrowsError(try controller.consume(lengthPrefixed: snapshot(
+            generation: 1, state: "confirmed_relationship", relationshipState: "active"
+        )))
+    }
+
+    func testNativePairingControlsSelectOnlyCurrentCandidatesAndBindDisplayedSas() throws {
+        _ = NSApplication.shared
+        let controller = DiagnosticsFrameController()
+        var selected: [String] = []
+        var decisions: [(UInt64, Bool)] = []
+        var cancellations: [UInt64] = []
+        let controls = MacPairingControls(controller: controller,
+            select: { selected.append($0) }, approve: { decisions.append(($0, $1)) },
+            cancel: { cancellations.append($0) })
+        let browsing = try framed(["v": 1, "kind": "ui_snapshot_v1", "snapshot": [
+            "schema_version": 1, "generation": 1, "state": "browsing", "diagnostics": [],
+            "candidates": [["handle": "peer-1", "compatibility": "compatible", "freshness": "current"],
+                           ["handle": "peer-stale", "compatibility": "compatible", "freshness": "stale"]],
+            "confirmed": [], "inventory": NSNull(), "layout": ["state": "not_configured"],
+            "capabilities": ["input_enabled": false, "clipboard_enabled": false],
+        ]])
+        try controller.consume(lengthPrefixed: browsing)
+        controls.render()
+        XCTAssertEqual(controls.candidates.itemTitles, ["peer-1"])
+        controls.selectButton.performClick(nil)
+        XCTAssertEqual(selected, ["peer-1"])
+
+        try controller.consume(lengthPrefixed: pairing(generation: 7))
+        controls.render()
+        XCTAssertEqual(controls.words.stringValue, "ember  ocean  violet  copper")
+        XCTAssertFalse(controls.selectButton.isEnabled)
+        try controller.consume(lengthPrefixed: pairing(generation: 8))
+        controls.matchButton.performClick(nil) // The displayed generation is now stale.
+        XCTAssertTrue(decisions.isEmpty)
+        controls.render()
+        controls.mismatchButton.performClick(nil)
+        XCTAssertEqual(decisions.count, 1)
+        XCTAssertEqual(decisions.first?.0, 8)
+        XCTAssertEqual(decisions.first?.1, false)
+
+        try controller.consume(lengthPrefixed: pairing(generation: 9))
+        controls.render()
+        controls.matchButton.performClick(nil)
+        controls.matchButton.performClick(nil)
+        XCTAssertEqual(decisions.count, 2)
+        XCTAssertEqual(decisions.last?.0, 9)
+        XCTAssertEqual(decisions.last?.1, true)
+        try controller.consume(lengthPrefixed: snapshot(generation: 10, state: "bootstrap_receipt_prepared"))
+        controls.render()
+        XCTAssertFalse(controls.matchButton.isEnabled)
+        XCTAssertTrue(controls.cancelButton.isEnabled)
+        controls.cancelButton.performClick(nil)
+        XCTAssertEqual(cancellations, [9])
+        controls.cancelButton.performClick(nil)
+        XCTAssertEqual(cancellations, [9])
+        try controller.consume(lengthPrefixed: pairing(generation: 11))
+        controls.render()
+        XCTAssertTrue(controls.matchButton.isEnabled)
+        controls.cancelButton.performClick(nil)
+        XCTAssertEqual(cancellations, [9, 11])
+        try controller.consume(lengthPrefixed: snapshot(generation: 12, state: "remote_outcome_unknown"))
+        controls.render()
+        XCTAssertEqual(controls.words.stringValue, "")
+        XCTAssertFalse(controls.cancelButton.isEnabled)
+        XCTAssertFalse(controls.matchButton.isEnabled)
+        XCTAssertFalse(controls.mismatchButton.isEnabled)
+        XCTAssertFalse(controls.selectButton.isEnabled)
+    }
+
+    private func pairing(generation: Int, phase: String = "awaiting_local_confirmation") throws -> Data {
+        try framed(["v": 1, "kind": "ui_pairing_v1", "generation": generation,
+                    "phase": phase, "candidate_handle": "peer-1",
+                    "verification_words": ["ember", "ocean", "violet", "copper"]])
+    }
+
+    private func snapshot(generation: Int, state: String, relationshipState: String = "unavailable") throws -> Data {
+        try framed(["v": 1, "kind": "ui_snapshot_v1", "snapshot": [
+            "schema_version": 1, "generation": generation, "state": state,
+            "diagnostics": [], "candidates": [],
+            "confirmed": state == "confirmed_relationship" ? [["handle": "peer-1", "state": relationshipState]] : [],
+            "inventory": NSNull(), "layout": ["state": "not_configured"],
+            "capabilities": ["input_enabled": false, "clipboard_enabled": false],
+        ]])
     }
 
     func testRepeatedRealChildGesturesAdvanceEverySnapshot() throws {

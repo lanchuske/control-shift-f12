@@ -38,20 +38,46 @@ fn consent_window_and_current_handle_are_required_without_implicit_retry() {
 fn capacity_and_address_bounds_precede_untrusted_catalogue_storage() {
     let mut catalog = ConsentCatalog::default();
     catalog.open(0).unwrap();
-    for n in 1..=20 {
+    for n in 1..=32 {
         catalog.observe(advertisement(n), 1).unwrap();
     }
     assert_eq!(
-        catalog.observe(advertisement(21), 1),
+        catalog.observe(advertisement(33), 1),
         Err(DiscoveryError::Limit)
     );
-    assert_eq!(catalog.candidates(1).unwrap().len(), 20);
+    assert_eq!(catalog.candidates(1).unwrap().len(), 32);
     let mut peer = advertisement(1);
     peer.addresses = (1..=9)
         .map(|n| format!("127.0.0.1:{}", 7000 + n).parse().unwrap())
         .collect();
     assert_eq!(catalog.observe(peer, 1), Err(DiscoveryError::Invalid));
-    assert_eq!(catalog.candidates(1).unwrap().len(), 20);
+    assert_eq!(catalog.candidates(1).unwrap().len(), 32);
+}
+
+#[test]
+fn g4_select_is_current_atomic_single_use_and_bounded() {
+    let mut catalog = ConsentCatalog::default();
+    catalog.open(0).unwrap();
+    let mut handles = Vec::new();
+    for n in 1..=32 {
+        handles.push(catalog.observe(advertisement(n), 1).unwrap());
+    }
+    assert_eq!(catalog.candidates(1).unwrap().len(), 32);
+    assert_eq!(
+        catalog.observe(advertisement(33), 1),
+        Err(DiscoveryError::Limit)
+    );
+
+    let selected = catalog.select_once(handles[0], 2).unwrap();
+    assert_eq!(selected.handle, handles[0]);
+    assert_eq!(
+        catalog.select_once(handles[0], 3),
+        Err(DiscoveryError::Closed)
+    );
+    assert_eq!(
+        catalog.select_once(handles[1], 3),
+        Err(DiscoveryError::Closed)
+    );
 }
 
 #[test]
@@ -60,12 +86,13 @@ fn local_freshness_window_deadline_and_clock_rollback_are_fail_closed() {
     catalog.open(0).unwrap();
     let handle = catalog.observe(advertisement(1), 0).unwrap();
     assert!(catalog.select(handle, 29_999).is_ok());
-    assert_eq!(catalog.select(handle, 30_000), Err(DiscoveryError::Stale));
-    assert!(catalog.candidates(30_000).unwrap().is_empty());
+    assert!(catalog.select(handle, 119_999).is_ok());
+    assert_eq!(catalog.select(handle, 120_000), Err(DiscoveryError::Stale));
+    assert!(catalog.candidates(120_000).unwrap().is_empty());
     let mut ttl = advertisement(2);
     ttl.ttl = Some(Duration::from_millis(5));
-    let short = catalog.observe(ttl, 30_001).unwrap();
-    assert_eq!(catalog.select(short, 30_006), Err(DiscoveryError::Stale));
+    let short = catalog.observe(ttl, 120_001).unwrap();
+    assert_eq!(catalog.select(short, 120_006), Err(DiscoveryError::Stale));
     assert_eq!(catalog.candidates(300_000), Err(DiscoveryError::Expired));
     catalog.open(300_001).unwrap();
     assert_eq!(
@@ -91,8 +118,10 @@ fn duplicate_refresh_is_stable_but_address_drift_removal_and_expiry_revoke_handl
     assert_eq!(catalog.select(first, 12), Err(DiscoveryError::Stale));
     catalog.remove(&advertisement(1).instance, 13).unwrap();
     assert_eq!(catalog.select(next, 14), Err(DiscoveryError::Stale));
-    let expired = catalog.observe(advertisement(1), 15).unwrap();
-    let fresh = catalog.observe(advertisement(1), 30_015).unwrap();
+    let mut bounded = advertisement(1);
+    bounded.ttl = Some(Duration::from_secs(30));
+    let expired = catalog.observe(bounded.clone(), 15).unwrap();
+    let fresh = catalog.observe(bounded, 30_015).unwrap();
     assert_ne!(expired, fresh);
 }
 

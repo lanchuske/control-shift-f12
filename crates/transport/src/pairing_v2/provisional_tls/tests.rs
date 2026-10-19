@@ -451,6 +451,285 @@ fn handshake_config(local: u8, remote: u8) -> super::HandshakeConfig {
 }
 
 #[tokio::test]
+async fn g4_pre_admission_ephemeral_endpoint_keeps_identity_private() {
+    let a = ProvisionalEndpoint::bind_ephemeral("127.0.0.1:0".parse().unwrap()).unwrap();
+    let b = ProvisionalEndpoint::bind_ephemeral("127.0.0.1:0".parse().unwrap()).unwrap();
+    let (outgoing, incoming) = tokio::join!(a.connect(b.local_addr().unwrap()), b.accept());
+    let (left, right) = tokio::join!(
+        outgoing
+            .unwrap()
+            .prepare_pre_admission(handshake_config(1, 2)),
+        incoming
+            .unwrap()
+            .prepare_pre_admission(handshake_config(2, 1)),
+    );
+    let (left, right) = tokio::join!(
+        left.unwrap().select_after_window(),
+        right.unwrap().select_after_window()
+    );
+    drop((left.unwrap(), right.unwrap()));
+}
+
+#[tokio::test]
+async fn g4_pre_admission_sole_candidate_can_select_after_bounded_wait() {
+    let (_ea, _eb, a, b, _) = pair().await;
+    let (a, b) = tokio::join!(
+        a.prepare_pre_admission(handshake_config(1, 2)),
+        b.prepare_incoming(
+            super::IncomingHandshakeConfig {
+                device_name: "Incoming peer".into(),
+                os: "macos".into(),
+                local_rendezvous: [2; 16],
+            },
+            |remote| remote == [1; 16]
+        ),
+    );
+    let (a, b) = (a.unwrap(), b.unwrap());
+    let deadline = a.selection_deadline().max(b.selection_deadline());
+    assert!(deadline <= tokio::time::Instant::now() + super::PRE_ADMISSION_SELECTION_WINDOW);
+    let (a, b) = tokio::join!(a.select_after_window(), b.select_after_window());
+    let (a, b) = (a.unwrap(), b.unwrap());
+    assert!(tokio::time::Instant::now() >= deadline);
+    let ta = tempfile::tempdir().unwrap();
+    let tb = tempfile::tempdir().unwrap();
+    let sa = crate::pairing_v2::AdmissionAuthorityStore::open(ta.path()).unwrap();
+    let sb = crate::pairing_v2::AdmissionAuthorityStore::open(tb.path()).unwrap();
+    let (left, right) = tokio::join!(
+        crate::pairing_v2::handshake_selected_and_commit_distributed(&sa, a, |p| async move {
+            p.decision(true)
+        }),
+        crate::pairing_v2::handshake_selected_and_commit_distributed(&sb, b, |p| async move {
+            p.decision(true)
+        }),
+    );
+    assert!(left.unwrap().is_confirmed());
+    assert!(right.unwrap().is_confirmed());
+}
+
+#[tokio::test]
+async fn g4_pre_admission_incoming_unknown_or_stale_catalog_rendezvous_fails_before_sas() {
+    for stale_local in [false, true] {
+        let (_ea, _eb, a, b, _) = pair().await;
+        let validated = std::sync::atomic::AtomicBool::new(false);
+        let (left, right) = tokio::join!(
+            a.prepare_pre_admission(handshake_config(1, 2)),
+            b.prepare_incoming(
+                super::IncomingHandshakeConfig {
+                    device_name: "Incoming peer".into(),
+                    os: "macos".into(),
+                    local_rendezvous: if stale_local { [3; 16] } else { [2; 16] },
+                },
+                |remote| {
+                    validated.store(true, std::sync::atomic::Ordering::SeqCst);
+                    assert_eq!(remote, [1; 16]);
+                    stale_local // unknown remote is not currently in the allowlist
+                }
+            ),
+        );
+        assert!(left.is_err());
+        assert!(right.is_err());
+        assert_eq!(
+            validated.load(std::sync::atomic::Ordering::SeqCst),
+            !stale_local
+        );
+    }
+}
+
+#[tokio::test]
+async fn g4_pre_admission_incoming_malformed_prelude_fails_before_catalog_or_sas() {
+    for mode in 0..5 {
+        let (_ea, _eb, attacker, incoming, _) = pair().await;
+        let exercise = async {
+            let (mut send, _recv) = attacker.connection.open_bi().await.unwrap();
+            let mut offer = b"CSF12-G4-SELECT\0".to_vec();
+            offer.extend_from_slice(&[1; 16]);
+            offer.extend_from_slice(&[2; 16]);
+            match mode {
+                0 => offer[0] ^= 1,
+                1 => offer.push(1),
+                2 => {
+                    offer.pop();
+                }
+                3 => offer[16..32].fill(0),
+                _ => offer[16..32].fill(2),
+            }
+            let _ = send.write_all(&offer).await;
+            let _ = send.finish();
+            tokio::time::timeout(Duration::from_secs(2), attacker.connection.closed())
+                .await
+                .unwrap();
+        };
+        let (result, ()) = tokio::join!(
+            incoming.prepare_incoming(
+                super::IncomingHandshakeConfig {
+                    device_name: "Incoming peer".into(),
+                    os: "macos".into(),
+                    local_rendezvous: [2; 16],
+                },
+                |_| panic!("malformed prelude reached catalog validation")
+            ),
+            exercise,
+        );
+        assert!(result.is_err(), "mode {mode}");
+    }
+}
+
+#[tokio::test]
+async fn g4_pre_admission_rejects_either_rendezvous_mismatch_before_store_or_sas() {
+    for mismatch_local in [false, true] {
+        let (_ea, _eb, a, b, _) = pair().await;
+        let config = if mismatch_local {
+            handshake_config(3, 2)
+        } else {
+            handshake_config(1, 3)
+        };
+        let (left, right) = tokio::join!(
+            a.prepare_pre_admission(config),
+            b.prepare_pre_admission(handshake_config(2, 1)),
+        );
+        assert!(left.is_err());
+        assert!(right.is_err());
+    }
+}
+
+#[tokio::test]
+async fn g4_pre_admission_simultaneous_election_both_orders_closes_loser_before_sas() {
+    for reverse_arrival in [false, true] {
+        // Make TLS-fingerprint A be the *larger* rendezvous, so a fingerprint
+        // election cannot accidentally satisfy this test.
+        let (mut ac, mut ak) = identity(true);
+        let (mut bc, mut bk) = identity(true);
+        if Sha256::digest(&ac).as_slice() < Sha256::digest(&bc).as_slice() {
+            std::mem::swap(&mut ac, &mut bc);
+            std::mem::swap(&mut ak, &mut bk);
+        }
+        let ea = ProvisionalEndpoint::bind("127.0.0.1:0".parse().unwrap(), ac, ak).unwrap();
+        let eb = ProvisionalEndpoint::bind("127.0.0.1:0".parse().unwrap(), bc, bk).unwrap();
+        let (a_out, b_in, b_out, a_in) = tokio::join!(
+            ea.connect(eb.local_addr().unwrap()),
+            eb.accept(),
+            eb.connect(ea.local_addr().unwrap()),
+            ea.accept(),
+        );
+        let (a_out, b_in, b_out, a_in) =
+            (a_out.unwrap(), b_in.unwrap(), b_out.unwrap(), a_in.unwrap());
+        let a_winner = a_out.connection.clone();
+        let b_winner = b_in.connection.clone();
+        let a_loser = a_in.connection.clone();
+        let b_loser = b_out.connection.clone();
+        let ta = tempfile::tempdir().unwrap();
+        let tb = tempfile::tempdir().unwrap();
+        let sa = crate::pairing_v2::AdmissionAuthorityStore::open(ta.path()).unwrap();
+        let sb = crate::pairing_v2::AdmissionAuthorityStore::open(tb.path()).unwrap();
+        let va = sa.version().unwrap();
+        let vb = sb.version().unwrap();
+        let (a_out, b_in, b_out, a_in) = tokio::join!(
+            a_out.prepare_pre_admission(handshake_config(1, 2)),
+            b_in.prepare_pre_admission(handshake_config(2, 1)),
+            b_out.prepare_pre_admission(handshake_config(2, 1)),
+            a_in.prepare_pre_admission(handshake_config(1, 2)),
+        );
+        let (a_out, b_in, b_out, a_in) =
+            (a_out.unwrap(), b_in.unwrap(), b_out.unwrap(), a_in.unwrap());
+        assert!(
+            a_out.selection_deadline()
+                <= tokio::time::Instant::now() + super::PRE_ADMISSION_SELECTION_WINDOW
+        );
+        assert_eq!(sa.version().unwrap(), va);
+        assert_eq!(sb.version().unwrap(), vb);
+        assert!(matches!(
+            ea.scope.0.lock().unwrap().phase,
+            super::ConsentPhase::Active
+        ));
+        assert!(matches!(
+            eb.scope.0.lock().unwrap().phase,
+            super::ConsentPhase::Active
+        ));
+        let (a, b) = if reverse_arrival {
+            (
+                a_in.select(Some(a_out)).unwrap(),
+                b_in.select(Some(b_out)).unwrap(),
+            )
+        } else {
+            (
+                a_out.select(Some(a_in)).unwrap(),
+                b_out.select(Some(b_in)).unwrap(),
+            )
+        };
+        tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::join!(a_loser.closed(), b_loser.closed());
+        })
+        .await
+        .unwrap();
+        assert!(a_winner.close_reason().is_none());
+        assert!(b_winner.close_reason().is_none());
+        assert_eq!(sa.version().unwrap(), va);
+        assert_eq!(sb.version().unwrap(), vb);
+        assert!(matches!(
+            ea.scope.0.lock().unwrap().phase,
+            super::ConsentPhase::Active
+        ));
+        assert!(matches!(
+            eb.scope.0.lock().unwrap().phase,
+            super::ConsentPhase::Active
+        ));
+        let prompts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let left_prompts = prompts.clone();
+        let right_prompts = prompts.clone();
+        assert_eq!(prompts.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let (left, right) = tokio::join!(
+            crate::pairing_v2::handshake_selected_and_commit_distributed(&sa, a, |p| async move {
+                left_prompts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                p.decision(false)
+            }),
+            crate::pairing_v2::handshake_selected_and_commit_distributed(&sb, b, |p| async move {
+                right_prompts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                p.decision(false)
+            }),
+        );
+        assert!(left.is_err());
+        assert!(right.is_err());
+        assert!(prompts.load(std::sync::atomic::Ordering::SeqCst) > 0);
+    }
+}
+
+#[tokio::test]
+async fn g4_pre_admission_peer_closed_loser_still_converges_on_shared_winner() {
+    let (ac, ak) = identity(true);
+    let (bc, bk) = identity(true);
+    let ea = ProvisionalEndpoint::bind("127.0.0.1:0".parse().unwrap(), ac, ak).unwrap();
+    let eb = ProvisionalEndpoint::bind("127.0.0.1:0".parse().unwrap(), bc, bk).unwrap();
+    let (a_out, b_in, b_out, a_in) = tokio::join!(
+        ea.connect(eb.local_addr().unwrap()),
+        eb.accept(),
+        eb.connect(ea.local_addr().unwrap()),
+        ea.accept(),
+    );
+    let (a_out, b_in, b_out, a_in) = (a_out.unwrap(), b_in.unwrap(), b_out.unwrap(), a_in.unwrap());
+    let a_winner = a_out.connection.clone();
+    let b_winner = b_in.connection.clone();
+    let b_loser = b_out.connection.clone();
+    let (a_out, b_in, b_out, a_in) = tokio::join!(
+        a_out.prepare_pre_admission(handshake_config(1, 2)),
+        b_in.prepare_pre_admission(handshake_config(2, 1)),
+        b_out.prepare_pre_admission(handshake_config(2, 1)),
+        a_in.prepare_pre_admission(handshake_config(1, 2)),
+    );
+    let (a_out, b_in, b_out, a_in) = (a_out.unwrap(), b_in.unwrap(), b_out.unwrap(), a_in.unwrap());
+
+    let _a = a_out.select(Some(a_in)).unwrap();
+    tokio::time::timeout(Duration::from_secs(2), b_loser.closed())
+        .await
+        .unwrap();
+
+    let _b = b_out
+        .select(Some(b_in))
+        .expect("an already-closed loser must not reject the shared live winner");
+    assert!(a_winner.close_reason().is_none());
+    assert!(b_winner.close_reason().is_none());
+}
+
+#[tokio::test]
 async fn one_local_sas_approval_never_commits_a_relationship() {
     let (_ea, _eb, a, b, _) = pair().await;
     let ta = tempfile::tempdir().unwrap();
@@ -832,16 +1111,14 @@ async fn every_durable_bilateral_commit_checkpoint_aborts_exactly() {
 
     macro_rules! assert_exact_abort {
         ($make_hook:expr, $expected:expr) => {
-            bilateral_commit_failure_aborts_exact_transactions_on_both_stores(
-                $make_hook, &$expected,
-            )
-            .await
+            bilateral_commit_failure_aborts_exact_transactions_on_both_stores($make_hook, $expected)
+                .await
         };
     }
 
     assert_exact_abort!(
         |endpoint| Hook::with_live_left_endpoint(endpoint).fail_after(Checkpoint::LeftStaged),
-        vec![
+        &[
             Checkpoint::PreflightComplete,
             Checkpoint::LeftStaged,
             Checkpoint::RightAborted,
@@ -850,7 +1127,7 @@ async fn every_durable_bilateral_commit_checkpoint_aborts_exactly() {
     );
     assert_exact_abort!(
         |endpoint| Hook::with_live_left_endpoint(endpoint).fail_after(Checkpoint::RightStaged),
-        vec![
+        &[
             Checkpoint::PreflightComplete,
             Checkpoint::LeftStaged,
             Checkpoint::RightStaged,
@@ -860,7 +1137,7 @@ async fn every_durable_bilateral_commit_checkpoint_aborts_exactly() {
     );
     assert_exact_abort!(
         |endpoint| Hook::with_live_left_endpoint(endpoint).fail_after(Checkpoint::LeftFinalized),
-        vec![
+        &[
             Checkpoint::PreflightComplete,
             Checkpoint::LeftStaged,
             Checkpoint::RightStaged,
@@ -875,7 +1152,7 @@ async fn every_durable_bilateral_commit_checkpoint_aborts_exactly() {
     );
     assert_exact_abort!(
         |endpoint| Hook::with_live_left_endpoint(endpoint).fail_after(Checkpoint::RightFinalized),
-        vec![
+        &[
             Checkpoint::PreflightComplete,
             Checkpoint::LeftStaged,
             Checkpoint::RightStaged,
@@ -891,7 +1168,7 @@ async fn every_durable_bilateral_commit_checkpoint_aborts_exactly() {
     );
     assert_exact_abort!(
         |endpoint| Hook::with_live_left_endpoint(endpoint).fail_after(Checkpoint::LeftConfirmed),
-        vec![
+        &[
             Checkpoint::PreflightComplete,
             Checkpoint::LeftStaged,
             Checkpoint::RightStaged,
@@ -908,7 +1185,7 @@ async fn every_durable_bilateral_commit_checkpoint_aborts_exactly() {
     );
     assert_exact_abort!(
         |endpoint| Hook::with_live_left_endpoint(endpoint).wrong_transaction_on_wire(),
-        vec![
+        &[
             Checkpoint::PreflightComplete,
             Checkpoint::LeftStaged,
             Checkpoint::RightStaged,
@@ -2040,11 +2317,90 @@ async fn bilateral_completed_capability_is_invalidated_by_late_extra_stream() {
     let b = b.unwrap();
     assert!(a.is_protocol_valid());
     b.test_late_extra().await;
-    let deadline = std::time::Instant::now() + Duration::from_secs(1);
+    // A syntactically plausible early finalization stream is retained only
+    // until the fixed finalization deadline so a legitimate cross-process
+    // handoff cannot race its local durable stage. It never gains authority.
+    let deadline = std::time::Instant::now() + Duration::from_secs(6);
     while a.is_protocol_valid() && std::time::Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
     assert!(!a.is_protocol_valid());
+}
+
+#[tokio::test]
+async fn silent_early_finalization_stream_is_bounded_and_invalidates() {
+    let (_ea, _eb, a, b, _) = pair().await;
+    let ta = tempfile::tempdir().unwrap();
+    let tb = tempfile::tempdir().unwrap();
+    let sa = crate::pairing_pending::PendingStore::open(ta.path()).unwrap();
+    let sb = crate::pairing_pending::PendingStore::open(tb.path()).unwrap();
+    let (a, b) = tokio::join!(
+        a.handshake(
+            handshake_config(1, 2),
+            &sa,
+            |p| async move { p.decision(true) }
+        ),
+        b.handshake(
+            handshake_config(2, 1),
+            &sb,
+            |p| async move { p.decision(true) }
+        )
+    );
+    let a = a.unwrap();
+    let b = b.unwrap();
+    if a.role() == crate::pairing_v2::Role::B {
+        b.test_silent_finalization_opener().await;
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while a.is_protocol_valid() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(!a.is_protocol_valid());
+    } else {
+        a.test_silent_finalization_opener().await;
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while b.is_protocol_valid() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(!b.is_protocol_valid());
+    }
+}
+
+#[tokio::test]
+async fn valid_open_without_local_handoff_expires_and_invalidates() {
+    let (_ea, _eb, a, b, _) = pair().await;
+    let ta = tempfile::tempdir().unwrap();
+    let tb = tempfile::tempdir().unwrap();
+    let sa = crate::pairing_pending::PendingStore::open(ta.path()).unwrap();
+    let sb = crate::pairing_pending::PendingStore::open(tb.path()).unwrap();
+    let (a, b) = tokio::join!(
+        a.handshake(
+            handshake_config(1, 2),
+            &sa,
+            |p| async move { p.decision(true) }
+        ),
+        b.handshake(
+            handshake_config(2, 1),
+            &sb,
+            |p| async move { p.decision(true) }
+        )
+    );
+    let a = a.unwrap();
+    let b = b.unwrap();
+    if a.role() == crate::pairing_v2::Role::B {
+        b.test_unowned_finalization_opener().await;
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while a.is_protocol_valid() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(!a.is_protocol_valid());
+    } else {
+        a.test_unowned_finalization_opener().await;
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while b.is_protocol_valid() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(!b.is_protocol_valid());
+    }
 }
 #[tokio::test]
 async fn bilateral_completed_capability_rejects_late_candidate_data() {
@@ -2615,7 +2971,7 @@ async fn concurrent_real_late_extra_and_freeze_has_one_safe_winner() {
                 .unwrap();
         match result {
             Err(crate::pairing_pending::StoreError::Invalid) => assert_ne!(
-                reopened.reconcile(attempt).unwrap(),
+                reopened.reconcile_distributed(attempt).unwrap(),
                 crate::pairing_v2::admission_authority::ReconcileAdmission::Promoted
             ),
             Ok(_) => assert_eq!(
@@ -3485,12 +3841,22 @@ async fn bilateral_rejection_issues_real_reset_and_stop_independently_of_connect
     assert!(b.connection.close_reason().is_none());
 }
 
+#[test]
+fn adversarial_matrix_deadline_keeps_fast_and_loaded_runners_bounded() {
+    assert_eq!(adversarial_matrix_deadline(false), Duration::from_secs(5));
+    assert_eq!(adversarial_matrix_deadline(true), Duration::from_secs(15));
+}
+
+fn adversarial_matrix_deadline(loaded_runner: bool) -> Duration {
+    Duration::from_secs(if loaded_runner { 15 } else { 5 })
+}
+
 #[tokio::test]
 async fn bilateral_control_fragmentation_and_adversarial_phase_matrix() {
-    #[cfg(windows)]
-    let fault_deadline = Duration::from_secs(15);
-    #[cfg(not(windows))]
-    let fault_deadline = Duration::from_secs(5);
+    let fault_deadline = adversarial_matrix_deadline(cfg!(any(
+        windows,
+        all(target_os = "macos", target_arch = "x86_64")
+    )));
     for mutation in 0..7 {
         for sequence in [0, 2, 4, 6, 8, 10, 12, 14, 15, 16] {
             let (_ea, _eb, mut a, mut b, _) = pair().await;
@@ -3681,6 +4047,432 @@ async fn bilateral_two_process_real_tls_sas_and_durable_fc_pending_only() {
         String::from_utf8_lossy(&output.stdout).contains(&format!("BILATERAL_PENDING:{expected}"))
     );
     assert_eq!(store.version().unwrap().revision, 3);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bilateral_two_process_distributed_commit_reopens_confirmed() {
+    let (der, key) = identity(true);
+    let endpoint = ProvisionalEndpoint::bind("127.0.0.1:0".parse().unwrap(), der, key).unwrap();
+    let child_root = tempfile::tempdir().unwrap();
+    let child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--ignored",
+            "--exact",
+            "pairing_v2::provisional_tls::tests::distributed_commit_process_worker",
+            "--nocapture",
+        ])
+        .env(
+            "CSF12_DISTRIBUTED_COMMIT_PEER",
+            endpoint.local_addr().unwrap().to_string(),
+        )
+        .env("CSF12_DISTRIBUTED_COMMIT_STORE", child_root.path())
+        .env("CSF12_DISTRIBUTED_COMMIT_HOLD_AFTER", "1")
+        .env("CSF12_DISTRIBUTED_LOCAL_RENDEZVOUS", "211")
+        .env("CSF12_DISTRIBUTED_PEER_RENDEZVOUS", "212")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut child = ProcessGuard(Some(child));
+    let parent_root = tempfile::tempdir().unwrap();
+    let store =
+        crate::pairing_v2::admission_authority::AdmissionAuthorityStore::open(parent_root.path())
+            .unwrap();
+    let channel = endpoint.accept().await.unwrap();
+    let retained_connection = channel.connection.clone();
+    let authority = channel
+        .handshake(
+            handshake_config(212, 211),
+            store.pending_store_for_handshake(),
+            |p| async move { p.decision(true) },
+        )
+        .await
+        .unwrap();
+    let summary = match store.commit_distributed(authority).await {
+        Ok(summary) => summary,
+        Err(error) => {
+            let output = child.0.take().unwrap().wait_with_output().unwrap();
+            panic!(
+                "parent error {error:?}; child status {:?}; child stderr {}",
+                output.status.code(),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    };
+    if !summary.is_confirmed() {
+        let output = child.0.take().unwrap().wait_with_output().unwrap();
+        panic!(
+            "parent state {:?}; child status {:?}; child stderr {}",
+            summary.state(),
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let attempt = summary.attempt();
+    drop(store);
+    let reopened =
+        crate::pairing_v2::admission_authority::AdmissionAuthorityStore::open(parent_root.path())
+            .unwrap();
+    assert_eq!(
+        reopened.reconcile(attempt).unwrap(),
+        crate::pairing_v2::admission_authority::ReconcileAdmission::Promoted
+    );
+
+    assert!(retained_connection.close_reason().is_none());
+    drop(summary);
+    tokio::time::timeout(Duration::from_secs(2), retained_connection.closed())
+        .await
+        .expect("dropping the opaque confirmed summary must close its retained connection");
+
+    if let Err(error) =
+        std::io::Write::write_all(child.0.as_mut().unwrap().stdin.as_mut().unwrap(), b"exit\n")
+    {
+        let output = child.0.take().unwrap().wait_with_output().unwrap();
+        panic!(
+            "child exited before release: {error}; status {:?}; stderr {}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while child.0.as_mut().unwrap().try_wait().unwrap().is_none() {
+        assert!(std::time::Instant::now() < deadline);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let output = child.0.take().unwrap().wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("DISTRIBUTED_CONFIRMED"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn distributed_commit_accepts_independent_store_generations() {
+    let (_ea, _eb, a, b, _) = pair().await;
+    let ta = tempfile::tempdir().unwrap();
+    let tb = tempfile::tempdir().unwrap();
+    let peer_a: [u8; 32] = Sha256::digest(&a.leaf).into();
+    let peer_b: [u8; 32] = Sha256::digest(&b.leaf).into();
+    let raw_a = crate::pairing_pending::PendingStore::open(ta.path()).unwrap();
+    let raw_b = crate::pairing_pending::PendingStore::open(tb.path()).unwrap();
+    raw_a.rotate_identity(raw_a.version().unwrap()).unwrap();
+    raw_b.rotate_identity(raw_b.version().unwrap()).unwrap();
+    raw_b.rotate_identity(raw_b.version().unwrap()).unwrap();
+    raw_a
+        .revoke_candidate(raw_a.version().unwrap(), peer_a)
+        .unwrap();
+    raw_b
+        .revoke_candidate(raw_b.version().unwrap(), peer_b)
+        .unwrap();
+    raw_b
+        .revoke_candidate(raw_b.version().unwrap(), peer_b)
+        .unwrap();
+    drop(raw_a);
+    drop(raw_b);
+    let store_a =
+        crate::pairing_v2::admission_authority::AdmissionAuthorityStore::open(ta.path()).unwrap();
+    let store_b =
+        crate::pairing_v2::admission_authority::AdmissionAuthorityStore::open(tb.path()).unwrap();
+    let (authority_a, authority_b) = tokio::join!(
+        a.handshake(
+            handshake_config(221, 222),
+            store_a.pending_store_for_handshake(),
+            |p| async move { p.decision(true) }
+        ),
+        b.handshake(
+            handshake_config(222, 221),
+            store_b.pending_store_for_handshake(),
+            |p| async move { p.decision(true) }
+        )
+    );
+    let (summary_a, summary_b) = tokio::join!(
+        store_a.commit_distributed(authority_a.unwrap()),
+        store_b.commit_distributed(authority_b.unwrap())
+    );
+    assert!(summary_a.unwrap().is_confirmed());
+    assert!(summary_b.unwrap().is_confirmed());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancelling_coordinator_after_local_commit_preserves_quarantine() {
+    crate::pairing_v2::admission_authority::reset_after_local_commit_checkpoint();
+    let (der, key) = identity(true);
+    let endpoint = ProvisionalEndpoint::bind("127.0.0.1:0".parse().unwrap(), der, key).unwrap();
+    let child_root = tempfile::tempdir().unwrap();
+    let child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--ignored",
+            "--exact",
+            "pairing_v2::provisional_tls::tests::distributed_commit_process_worker",
+            "--nocapture",
+        ])
+        .env(
+            "CSF12_DISTRIBUTED_COMMIT_PEER",
+            endpoint.local_addr().unwrap().to_string(),
+        )
+        .env("CSF12_DISTRIBUTED_COMMIT_STORE", child_root.path())
+        .env("CSF12_DISTRIBUTED_COMMIT_CRASH", "stall_after_local_commit")
+        .env("CSF12_DISTRIBUTED_COMMIT_BARRIER", "1")
+        .env("CSF12_DISTRIBUTED_LOCAL_RENDEZVOUS", "231")
+        .env("CSF12_DISTRIBUTED_PEER_RENDEZVOUS", "232")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut child = ProcessGuard(Some(child));
+    let parent_root = tempfile::tempdir().unwrap();
+    let store = Arc::new(
+        crate::pairing_v2::admission_authority::AdmissionAuthorityStore::open(parent_root.path())
+            .unwrap(),
+    );
+    let authority = endpoint
+        .accept()
+        .await
+        .unwrap()
+        .handshake(
+            handshake_config(232, 231),
+            store.pending_store_for_handshake(),
+            |p| async move { p.decision(true) },
+        )
+        .await
+        .unwrap();
+    let attempt = authority.test_attempt();
+    std::io::Write::write_all(
+        child.0.as_mut().unwrap().stdin.as_mut().unwrap(),
+        b"commit\n",
+    )
+    .unwrap();
+    let commit_store = store.clone();
+    let commit = tokio::spawn(async move { commit_store.commit_distributed(authority).await });
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !crate::pairing_v2::admission_authority::after_local_commit_checkpoint_reached() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "local commit was not reached"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    commit.abort();
+    assert!(commit.await.unwrap_err().is_cancelled());
+    child.0.as_mut().unwrap().kill().unwrap();
+    child.0.as_mut().unwrap().wait().unwrap();
+    child.0 = None;
+    drop(store);
+    let reopened =
+        crate::pairing_v2::admission_authority::AdmissionAuthorityStore::open(parent_root.path())
+            .unwrap();
+    assert_eq!(
+        reopened.reconcile_distributed(attempt).unwrap(),
+        crate::pairing_v2::admission_authority::ReconcileAdmission::RemoteOutcomeUnknown
+    );
+}
+
+#[test]
+#[ignore = "subprocess helper"]
+fn distributed_commit_process_worker() {
+    let peer = std::env::var("CSF12_DISTRIBUTED_COMMIT_PEER")
+        .unwrap()
+        .parse()
+        .unwrap();
+    let root =
+        std::path::PathBuf::from(std::env::var_os("CSF12_DISTRIBUTED_COMMIT_STORE").unwrap());
+    let local_rendezvous = std::env::var("CSF12_DISTRIBUTED_LOCAL_RENDEZVOUS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(1);
+    let peer_rendezvous = std::env::var("CSF12_DISTRIBUTED_PEER_RENDEZVOUS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(2);
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let (der, key) = identity(true);
+            let endpoint =
+                ProvisionalEndpoint::bind("127.0.0.1:0".parse().unwrap(), der, key).unwrap();
+            let store =
+                crate::pairing_v2::admission_authority::AdmissionAuthorityStore::open(&root)
+                    .unwrap();
+            let authority = endpoint
+                .connect(peer)
+                .await
+                .unwrap()
+                .handshake(
+                    handshake_config(local_rendezvous, peer_rendezvous),
+                    store.pending_store_for_handshake(),
+                    |p| async move { p.decision(true) },
+                )
+                .await
+                .unwrap();
+            if std::env::var_os("CSF12_DISTRIBUTED_COMMIT_BARRIER").is_some() {
+                tokio::task::spawn_blocking(|| {
+                    let mut line = String::new();
+                    std::io::stdin().read_line(&mut line).unwrap();
+                    assert_eq!(line, "commit\n");
+                })
+                .await
+                .unwrap();
+            }
+            let summary = store.commit_distributed(authority).await.unwrap();
+            assert!(summary.is_confirmed());
+            let attempt = summary.attempt();
+            drop(store);
+            let reopened =
+                crate::pairing_v2::admission_authority::AdmissionAuthorityStore::open(&root)
+                    .unwrap();
+            assert_eq!(
+                reopened.reconcile(attempt).unwrap(),
+                crate::pairing_v2::admission_authority::ReconcileAdmission::Promoted
+            );
+            println!("DISTRIBUTED_CONFIRMED");
+            if std::env::var_os("CSF12_DISTRIBUTED_COMMIT_HOLD_AFTER").is_some() {
+                tokio::task::spawn_blocking(|| {
+                    let mut line = String::new();
+                    std::io::stdin().read_line(&mut line).unwrap();
+                    assert_eq!(line, "exit\n");
+                })
+                .await
+                .unwrap();
+            }
+        });
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn distributed_process_crash_is_exact_abort_or_quarantine_by_commit_boundary() {
+    for (index, point) in [
+        "after_stage",
+        "after_local_commit",
+        "after_durable_exchange",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let child_rendezvous = 201 + (index as u8 * 2);
+        let parent_rendezvous = child_rendezvous + 1;
+        let (der, key) = identity(true);
+        let endpoint = ProvisionalEndpoint::bind("127.0.0.1:0".parse().unwrap(), der, key).unwrap();
+        let child_root = tempfile::tempdir().unwrap();
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "pairing_v2::provisional_tls::tests::distributed_commit_process_worker",
+                "--nocapture",
+            ])
+            .env(
+                "CSF12_DISTRIBUTED_COMMIT_PEER",
+                endpoint.local_addr().unwrap().to_string(),
+            )
+            .env("CSF12_DISTRIBUTED_COMMIT_STORE", child_root.path())
+            .env("CSF12_DISTRIBUTED_COMMIT_CRASH", point)
+            .env("CSF12_DISTRIBUTED_COMMIT_BARRIER", "1")
+            .env(
+                "CSF12_DISTRIBUTED_LOCAL_RENDEZVOUS",
+                child_rendezvous.to_string(),
+            )
+            .env(
+                "CSF12_DISTRIBUTED_PEER_RENDEZVOUS",
+                parent_rendezvous.to_string(),
+            )
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut child = ProcessGuard(Some(child));
+        let parent_root = tempfile::tempdir().unwrap();
+        let store = crate::pairing_v2::admission_authority::AdmissionAuthorityStore::open(
+            parent_root.path(),
+        )
+        .unwrap();
+        let authority = endpoint
+            .accept()
+            .await
+            .unwrap()
+            .handshake(
+                handshake_config(parent_rendezvous, child_rendezvous),
+                store.pending_store_for_handshake(),
+                |p| async move { p.decision(true) },
+            )
+            .await
+            .unwrap_or_else(|error| panic!("point {point}: handshake failed: {error:?}"));
+        let attempt = authority.test_attempt();
+        std::io::Write::write_all(
+            child.0.as_mut().unwrap().stdin.as_mut().unwrap(),
+            b"commit\n",
+        )
+        .unwrap();
+        let result = store.commit_distributed(authority).await;
+        if point == "after_stage" {
+            assert!(result.is_err(), "point {point}: {result:?}");
+        } else if point == "after_local_commit" {
+            assert_eq!(
+                result.unwrap().state(),
+                crate::pairing_v2::admission_authority::ReconcileAdmission::RemoteOutcomeUnknown
+            );
+        }
+        let output = child.0.take().unwrap().wait_with_output().unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(92),
+            "point {point}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        drop(store);
+        let reopened = crate::pairing_v2::admission_authority::AdmissionAuthorityStore::open(
+            parent_root.path(),
+        )
+        .unwrap();
+        let parent_state = reopened.reconcile_distributed(attempt).unwrap();
+        let child = crate::pairing_v2::admission_authority::AdmissionAuthorityStore::open(
+            child_root.path(),
+        )
+        .unwrap();
+        let child_state = child.reconcile_distributed(attempt).unwrap();
+        match point {
+            "after_stage" => {
+                assert!(matches!(
+                    parent_state,
+                    crate::pairing_v2::admission_authority::ReconcileAdmission::Revoked
+                        | crate::pairing_v2::admission_authority::ReconcileAdmission::Absent
+                ));
+                assert!(matches!(
+                    child_state,
+                    crate::pairing_v2::admission_authority::ReconcileAdmission::Revoked
+                        | crate::pairing_v2::admission_authority::ReconcileAdmission::Absent
+                ));
+            }
+            "after_local_commit" => {
+                assert_eq!(
+                    parent_state,
+                    crate::pairing_v2::admission_authority::ReconcileAdmission::RemoteOutcomeUnknown
+                );
+                assert_eq!(
+                    child_state,
+                    crate::pairing_v2::admission_authority::ReconcileAdmission::RemoteOutcomeUnknown
+                );
+            }
+            "after_durable_exchange" => {
+                assert!(matches!(
+                    parent_state,
+                    crate::pairing_v2::admission_authority::ReconcileAdmission::Promoted
+                        | crate::pairing_v2::admission_authority::ReconcileAdmission::RemoteOutcomeUnknown
+                ));
+                assert_eq!(
+                    child_state,
+                    crate::pairing_v2::admission_authority::ReconcileAdmission::RemoteOutcomeUnknown
+                );
+            }
+            _ => unreachable!(),
+        }
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

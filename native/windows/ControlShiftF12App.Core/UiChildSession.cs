@@ -20,6 +20,7 @@ public sealed class UiChildSession
     public DesktopSnapshotProjection? Snapshot { get; private set; }
     public DiagnosticsProjection? Diagnostics { get; private set; }
     public PairingProjection? Pairing { get; private set; }
+    public bool IsAwaitingResponse(string requestId) => pendingRequestIds.Contains(requestId);
 
     public byte[] InitialRefreshFrame()
         => CreateRequest("ui.refresh");
@@ -30,7 +31,25 @@ public sealed class UiChildSession
     public byte[] StopDiscoveryFrame()
         => CreateRequest("ui.stop_discovery");
 
-    private byte[] CreateRequest(string command)
+    public byte[] SelectCandidateFrame(string handle)
+    {
+        if (!IsHandle(handle)) throw new ArgumentException("Invalid opaque candidate handle.", nameof(handle));
+        return CreateRequest("ui.select_candidate", new { handle });
+    }
+
+    public byte[] ApproveSasFrame(ulong generation, bool matches)
+    {
+        if (generation == 0) throw new ArgumentOutOfRangeException(nameof(generation));
+        return CreateRequest("ui.approve_sas", new { generation, matches });
+    }
+
+    public byte[] CancelPairingFrame(ulong generation)
+    {
+        if (generation == 0) throw new ArgumentOutOfRangeException(nameof(generation));
+        return CreateRequest("ui.cancel_pairing", new { generation });
+    }
+
+    private byte[] CreateRequest(string command, object? args = null)
     {
         if (State.Phase == ChildSessionPhase.Terminal || pendingRequestIds.Count >= 256
             || nextRequestId == ulong.MaxValue)
@@ -38,7 +57,7 @@ public sealed class UiChildSession
             throw new InvalidOperationException("The local child request limit was reached.");
         }
         var id = $"windows-{++nextRequestId}";
-        var payload = Encoding.UTF8.GetBytes($"{{\"v\":1,\"id\":\"{id}\",\"command\":\"{command}\",\"args\":{{}}}}");
+        var payload = JsonSerializer.SerializeToUtf8Bytes(new { v = 1, id, command, args = args ?? new { } });
         var frame = new byte[sizeof(uint) + payload.Length];
         frame[0] = (byte)(payload.Length >> 24);
         frame[1] = (byte)(payload.Length >> 16);
@@ -48,6 +67,10 @@ public sealed class UiChildSession
         pendingRequestIds.Add(id);
         return frame;
     }
+
+    private static bool IsHandle(string value) =>
+        !string.IsNullOrEmpty(value) && value.Length <= 64
+        && value.All(character => char.IsAsciiLetterOrDigit(character) || character is '-' or '_');
 
     public void ReceiveOutput(IEnumerable<byte> bytes)
     {
@@ -127,6 +150,8 @@ public sealed class UiChildSession
                         return;
                     }
                     Snapshot = snapshot;
+                    if (snapshot.State is "not_started" or "confirmed_relationship" or "remote_outcome_unknown")
+                        Pairing = null;
                     State = State.ReceiveCurrentProjection(snapshot.Generation);
                     return;
                 case "ui_diagnostics_v1" when DiagnosticsProjection.TryParse(json, out var diagnostics):

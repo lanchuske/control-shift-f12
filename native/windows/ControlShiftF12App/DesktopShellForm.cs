@@ -11,8 +11,8 @@ using ControlShiftF12App.Core;
 namespace ControlShiftF12App;
 
 /// <summary>
-/// Presentation-only shell. It intentionally owns no engine, network, input,
-/// clipboard, or pairing capability until the reviewed local pipe owner exists.
+/// Presentation-only shell. Pairing gestures use only the reviewed local pipe;
+/// operational input, clipboard and layout controls have no action bindings.
 /// </summary>
 internal sealed class DesktopShellForm : Form
 {
@@ -20,6 +20,12 @@ internal sealed class DesktopShellForm : Form
     private WindowsUiChildOwner? childOwner;
     private Button? findNearbyButton;
     private Label? engineStatus;
+    private WindowsPairingControls? pairingControls;
+    private readonly UiCommandGate commandGate = new();
+    private readonly Timer refreshTimer = new() { Interval = 1000 };
+    private bool commandAffectsControls;
+    private bool closing;
+    private bool closeReady;
 
     public DesktopShellForm()
     {
@@ -52,6 +58,8 @@ internal sealed class DesktopShellForm : Form
         root.Controls.Add(BuildFooter(presentation), 0, 2);
         root.SetColumnSpan(root.GetControlFromPosition(0, 2)!, 2);
         Controls.Add(root);
+        refreshTimer.Tick += async (_, _) => await RunChildCommandAsync(
+            owner => owner.ObserveAsync(TimeSpan.FromMilliseconds(100)), affectsControls: false);
         Shown += async (_, _) => await ConnectLocalEngineAsync();
     }
 
@@ -92,6 +100,7 @@ internal sealed class DesktopShellForm : Form
             FlowDirection = FlowDirection.TopDown,
             WrapContents = false,
             Padding = new Padding(14),
+            AutoScroll = true,
         };
         content.Controls.Add(new Label
         {
@@ -111,7 +120,11 @@ internal sealed class DesktopShellForm : Form
         findNearbyButton = CreateDisabledButton("Find nearby computers");
         findNearbyButton.Click += async (_, _) => await StartLocalDiscoveryAsync();
         content.Controls.Add(findNearbyButton);
-        content.Controls.Add(CreateDisabledButton("Confirm code on both computers"));
+        pairingControls = new WindowsPairingControls(() => childOwner?.Session,
+            async handle => await RunChildCommandAsync(owner => owner.SelectCandidateAsync(handle, TimeSpan.FromSeconds(3))),
+            async (generation, matches) => await RunChildCommandAsync(owner => owner.ApproveSasAsync(generation, matches, TimeSpan.FromSeconds(3))),
+            async generation => await RunChildCommandAsync(owner => owner.CancelPairingAsync(generation, TimeSpan.FromSeconds(3))));
+        content.Controls.Add(pairingControls);
         content.Controls.Add(new Label
         {
             Text = "Discovery becomes available when the verified local engine session is connected.",
@@ -250,6 +263,7 @@ internal sealed class DesktopShellForm : Form
             var spec = ChildLaunchSpec.Create(packageRoot, enginePath, environment);
             childOwner = await WindowsUiChildOwner.StartAsync(spec);
             var session = await childOwner.ReadInitialProjectionAsync(TimeSpan.FromSeconds(3));
+            if (closing) return;
             if (session.State.Phase != ChildSessionPhase.Running || session.Snapshot is null)
             {
                 await childOwner.DisposeAsync();
@@ -258,11 +272,12 @@ internal sealed class DesktopShellForm : Form
                 return;
             }
 
-            findNearbyButton!.Enabled = session.Snapshot.State == "not_started";
-            SetEngineStatus("Local engine ready — no computers paired.", Color.FromArgb(0, 103, 80));
+            RenderCurrentState();
+            refreshTimer.Start();
         }
         catch (Exception)
         {
+            if (closing) return;
             if (childOwner is not null)
             {
                 await childOwner.DisposeAsync();
@@ -274,40 +289,75 @@ internal sealed class DesktopShellForm : Form
 
     private async Task StartLocalDiscoveryAsync()
     {
-        if (childOwner is null || findNearbyButton is null) return;
+        var currentOwner = childOwner;
+        if (currentOwner is null || currentOwner.Session.Pairing is not null) return;
+        var stopDiscovery = currentOwner.Session.Snapshot?.State == "browsing";
+        await RunChildCommandAsync(owner => stopDiscovery
+            ? owner.StopDiscoveryAsync(TimeSpan.FromSeconds(3))
+            : owner.StartDiscoveryAsync(TimeSpan.FromSeconds(3)));
+    }
 
-        findNearbyButton.Enabled = false;
+    private async Task RunChildCommandAsync(
+        Func<WindowsUiChildOwner, Task<UiChildSession>> command,
+        bool affectsControls = true)
+    {
+        if (closing || childOwner is null) return;
+        if (affectsControls)
+        {
+            if (commandAffectsControls) return;
+            commandAffectsControls = affectsControls;
+            RenderCurrentState();
+        }
         try
         {
-            if (childOwner.Session.Snapshot is { State: "browsing" })
+            await commandGate.RunAsync(waitForTurn: affectsControls, async () =>
             {
-                var stopped = await childOwner.StopDiscoveryAsync(TimeSpan.FromSeconds(3));
-                if (stopped.Snapshot is { State: "not_started" })
+                if (closing || childOwner is not { } owner) return;
+                try
                 {
-                    findNearbyButton.Text = "Find nearby computers";
-                    findNearbyButton.Enabled = true;
-                    SetEngineStatus("Local engine ready — no computers paired.", Color.FromArgb(0, 103, 80));
-                    return;
+                    await command(owner);
+                    if (owner.Session.State.Phase == ChildSessionPhase.Terminal) refreshTimer.Stop();
                 }
-            }
-
-            var session = await childOwner.StartDiscoveryAsync(TimeSpan.FromSeconds(3));
-            if (session.Snapshot is { State: "browsing" } snapshot)
-            {
-                findNearbyButton.Text = "Stop searching";
-                findNearbyButton.Enabled = true;
-                SetEngineStatus(snapshot.Nearby.Count == 0
-                    ? "Looking for nearby computers — none found yet."
-                    : "Nearby computers found — confirm the same code on both computers.", Color.FromArgb(0, 103, 80));
-                return;
-            }
+                catch (Exception error)
+                {
+                    // A stale queued gesture is rejected before it writes. Real transport failures
+                    // remain terminal and are never replayed automatically.
+                    if (ShouldTerminateCommand(error))
+                    {
+                        refreshTimer.Stop();
+                        owner.Session.CompleteOutput();
+                    }
+                }
+                if (!closing) RenderCurrentState();
+            });
         }
-        catch (Exception)
+        finally
         {
-            // The safe fallback below intentionally exposes no technical child detail.
+            if (affectsControls)
+            {
+                commandAffectsControls = false;
+                if (!closing) RenderCurrentState();
+            }
         }
+    }
 
-        SetEngineStatus("Discovery stopped safely — try again after the local engine is ready.", Color.Firebrick);
+    internal static bool ShouldDisableControls(bool gesturePending) => gesturePending;
+
+    internal static bool ShouldTerminateCommand(Exception error) =>
+        error is not UiGestureRejectedException;
+
+    private void RenderCurrentState()
+    {
+        var controlsBusy = ShouldDisableControls(commandAffectsControls);
+        pairingControls?.Render(controlsBusy);
+        if (childOwner is not { } owner || findNearbyButton is null) return;
+        var session = owner.Session;
+        var state = session.Snapshot?.State;
+        findNearbyButton.Text = state == "browsing" ? "Stop searching" : "Find nearby computers";
+        findNearbyButton.Enabled = !controlsBusy && session.State.Phase == ChildSessionPhase.Running
+            && session.Pairing is null && state is "not_started" or "browsing";
+        SetEngineStatus(G4PairingPresentation.From(session).Status,
+            session.State.Phase == ChildSessionPhase.Running ? Color.FromArgb(0, 103, 80) : Color.Firebrick);
     }
 
     private void SetEngineStatus(string text, Color color)
@@ -317,10 +367,231 @@ internal sealed class DesktopShellForm : Form
         engineStatus.ForeColor = color;
     }
 
+    protected override async void OnFormClosing(FormClosingEventArgs e)
+    {
+        if (closeReady || childOwner is null) { base.OnFormClosing(e); return; }
+        e.Cancel = true;
+        base.OnFormClosing(e);
+        if (closing) return;
+        closing = true;
+        refreshTimer.Stop();
+        try { await childOwner.DisposeAsync(); }
+        catch (Exception) { /* Closing never exposes raw child detail or replays a gesture. */ }
+        childOwner = null;
+        closeReady = true;
+        Close();
+    }
+
     protected override void OnFormClosed(FormClosedEventArgs e)
     {
-        childOwner?.DisposeAsync().AsTask().GetAwaiter().GetResult();
-        childOwner = null;
+        closing = true;
+        refreshTimer.Stop();
+        refreshTimer.Dispose();
         base.OnFormClosed(e);
     }
+}
+
+internal sealed class UiCommandGate
+{
+    private readonly System.Threading.SemaphoreSlim gate = new(1, 1);
+    private int foregroundQueued;
+
+    internal async Task<bool> RunAsync(bool waitForTurn, Func<Task> command)
+    {
+        var ownsForegroundSlot = waitForTurn
+            && System.Threading.Interlocked.CompareExchange(ref foregroundQueued, 1, 0) == 0;
+        if (waitForTurn && !ownsForegroundSlot) return false;
+        try
+        {
+            var entered = waitForTurn
+                ? await WaitForTurnAsync()
+                : await gate.WaitAsync(0);
+            if (!entered) return false;
+            try
+            {
+                await command();
+                return true;
+            }
+            finally
+            {
+                gate.Release();
+            }
+        }
+        finally
+        {
+            if (ownsForegroundSlot)
+                System.Threading.Volatile.Write(ref foregroundQueued, 0);
+        }
+    }
+
+    private async Task<bool> WaitForTurnAsync()
+    {
+        await gate.WaitAsync();
+        return true;
+    }
+}
+
+/// <summary>The real pairing surface, shared by the form and native-control tests.</summary>
+internal sealed class WindowsPairingControls : FlowLayoutPanel
+{
+    internal ComboBox Candidates { get; } = new() { DropDownStyle = ComboBoxStyle.DropDownList, Width = 244 };
+    internal Button SelectButton { get; } = Button("Compare selected computer");
+    internal Label Words { get; } = new() { AutoSize = false, Width = 244, Height = 56, AccessibleName = "Verification words" };
+    internal Button MatchButton { get; } = Button("Match");
+    internal Button MismatchButton { get; } = Button("Mismatch");
+    internal Button CancelButton { get; } = Button("Cancel");
+    private readonly Label status = new() { AutoSize = false, Width = 244, Height = 54 };
+    private readonly Func<UiChildSession?> session;
+    private readonly Action<string> select;
+    private readonly Action<ulong, bool> approve;
+    private readonly Action<ulong> cancel;
+    private ulong? displayedGeneration;
+    private ulong? displayedSnapshotGeneration;
+    private ulong? submittedGeneration;
+    private ulong? cancelledGeneration;
+    private ulong? submittedSnapshotGeneration;
+    private bool busy;
+    private Control? observedParent;
+
+    internal WindowsPairingControls(Func<UiChildSession?> session, Action<string> select,
+        Action<ulong, bool> approve, Action<ulong> cancel)
+    {
+        this.session = session;
+        this.select = select;
+        this.approve = approve;
+        this.cancel = cancel;
+        FlowDirection = FlowDirection.TopDown;
+        WrapContents = false;
+        AutoSize = true;
+        AutoSizeMode = AutoSizeMode.GrowAndShrink;
+        Candidates.AccessibleName = "Current nearby computer";
+        Words.Font = new Font("Segoe UI Semibold", 12F);
+        Controls.AddRange([Candidates, SelectButton, status, Words, MatchButton, MismatchButton, CancelButton]);
+        SelectButton.Click += (_, _) => SelectCurrentCandidate();
+        MatchButton.Click += (_, _) => Decide(true);
+        MismatchButton.Click += (_, _) => Decide(false);
+        CancelButton.Click += (_, _) => CancelCurrentPairing();
+        Render();
+    }
+
+    internal void Render(bool busy = false)
+    {
+        this.busy = busy;
+        var current = session();
+        var presentation = current is null ? null : G4PairingPresentation.From(current);
+        displayedGeneration = presentation?.Generation;
+        displayedSnapshotGeneration = current?.Snapshot?.Generation;
+        var selected = Candidates.SelectedItem as string;
+        Candidates.Items.Clear();
+        foreach (var handle in presentation?.Candidates ?? []) Candidates.Items.Add(handle);
+        if (selected is not null && Candidates.Items.Contains(selected)) Candidates.SelectedItem = selected;
+        else if (Candidates.Items.Count > 0) Candidates.SelectedIndex = 0;
+        SelectButton.Enabled = !busy && presentation?.CanSelect == true
+            && displayedSnapshotGeneration != submittedSnapshotGeneration;
+        Candidates.Enabled = SelectButton.Enabled;
+        Words.Text = current?.Pairing?.VerificationWords is { Count: 4 } words
+            ? string.Join(Environment.NewLine, words)
+            : "";
+        Words.Height = Words.GetPreferredSize(Size.Empty).Height;
+        UpdateDecisionAvailability(presentation);
+        CancelButton.Enabled = !busy && presentation?.CanCancel == true && displayedGeneration != cancelledGeneration;
+        status.Text = presentation?.Status ?? "Local engine unavailable — pairing disabled";
+        if (displayedGeneration is { } generation)
+        {
+            if (generation == cancelledGeneration) status.Text = "Waiting for cancellation — sharing remains off.";
+            else if (generation == submittedGeneration) status.Text = "Waiting for the other computer — sharing remains off.";
+        }
+    }
+
+    private void SelectCurrentCandidate()
+    {
+        var current = session();
+        if (!SelectButton.Enabled || current?.State.Phase != ChildSessionPhase.Running
+            || current.Snapshot is not { State: "browsing" } snapshot || current.Pairing is not null
+            || snapshot.Generation != displayedSnapshotGeneration
+            || Candidates.SelectedItem is not string handle || !snapshot.Nearby.Contains(handle)) return;
+        submittedSnapshotGeneration = displayedSnapshotGeneration;
+        Render(busy);
+        select(handle);
+    }
+
+    private void Decide(bool matches)
+    {
+        var current = session();
+        if (!MatchButton.Enabled || !VerificationWordsAreFullyVisible()
+            || current?.State.Phase != ChildSessionPhase.Running
+            || displayedGeneration is not { } generation
+            || current.Pairing is not { Phase: PairingBridgePhase.AwaitingLocalConfirmation } pairing
+            || pairing.Generation != generation) return;
+        submittedGeneration = generation;
+        if (!matches) cancelledGeneration = generation;
+        Render(busy);
+        approve(generation, matches);
+    }
+
+    internal bool VerificationWordsAreFullyVisible()
+    {
+        var lines = Words.Text.Split(Environment.NewLine);
+        if (lines.Length != 4 || lines.Any(string.IsNullOrWhiteSpace)
+            || !Words.Visible || !Words.IsHandleCreated) return false;
+        var required = Words.GetPreferredSize(Size.Empty);
+        var textBounds = new Rectangle(Words.PointToScreen(Point.Empty), required);
+        var visibleBounds = Words.RectangleToScreen(Words.ClientRectangle);
+        for (Control? ancestor = Words.Parent; ancestor is not null; ancestor = ancestor.Parent)
+        {
+            if (!ancestor.Visible || !ancestor.IsHandleCreated) return false;
+            visibleBounds.Intersect(ancestor.RectangleToScreen(ancestor.ClientRectangle));
+        }
+        return visibleBounds.Contains(textBounds);
+    }
+
+    protected override void OnParentChanged(EventArgs e)
+    {
+        if (observedParent is not null)
+        {
+            observedParent.Layout -= ParentGeometryChanged;
+            observedParent.SizeChanged -= ParentGeometryChanged;
+            if (observedParent is ScrollableControl scrollable) scrollable.Scroll -= ParentScrolled;
+        }
+        base.OnParentChanged(e);
+        observedParent = Parent;
+        if (observedParent is not null)
+        {
+            observedParent.Layout += ParentGeometryChanged;
+            observedParent.SizeChanged += ParentGeometryChanged;
+            if (observedParent is ScrollableControl scrollable) scrollable.Scroll += ParentScrolled;
+        }
+    }
+
+    protected override void OnLayout(LayoutEventArgs levent)
+    {
+        base.OnLayout(levent);
+        UpdateDecisionAvailability();
+    }
+
+    private void ParentGeometryChanged(object? sender, EventArgs e) => UpdateDecisionAvailability();
+
+    private void ParentScrolled(object? sender, ScrollEventArgs e) => UpdateDecisionAvailability();
+
+    private void UpdateDecisionAvailability(G4PairingPresentation? presentation = null)
+    {
+        var current = session();
+        presentation ??= current is null ? null : G4PairingPresentation.From(current);
+        MatchButton.Enabled = !busy && presentation?.CanMatch == true
+            && displayedGeneration != submittedGeneration && VerificationWordsAreFullyVisible();
+        MismatchButton.Enabled = MatchButton.Enabled;
+    }
+
+    private void CancelCurrentPairing()
+    {
+        var current = session();
+        if (!CancelButton.Enabled || current?.State.Phase != ChildSessionPhase.Running
+            || displayedGeneration is not { } generation || current.Pairing?.Generation != generation) return;
+        submittedGeneration = generation;
+        cancelledGeneration = generation;
+        Render(busy);
+        cancel(generation);
+    }
+
+    private static Button Button(string text) => new() { Text = text, Width = 244, Height = 34, Enabled = false };
 }

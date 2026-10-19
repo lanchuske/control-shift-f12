@@ -2,9 +2,30 @@
 //! injected-clock limits and quarantined durable evidence. The sealed bilateral
 //! handshake emits only the reviewed control wire. No application I/O,
 //! RecoveryAuthority provider, active trust, promotion or admission.
-#[cfg(feature = "pairing-v2-experimental")]
+#[cfg(feature = "pairing-v2-g4")]
 #[allow(dead_code)] // Internal foundation remains deliberately unwired and default-off.
 pub(crate) mod admission_authority;
+#[cfg(feature = "pairing-v2-g4")]
+/// Opaque G4 admission boundary. Legacy/local-only mutation and reconciliation
+/// methods are intentionally unavailable to external consumers.
+///
+/// ```compile_fail
+/// use seamless_transport::pairing_v2::AdmissionAuthorityStore;
+/// fn bypass(store: &AdmissionAuthorityStore) {
+///     let _ = store.reconcile([0; 32]);
+/// }
+/// ```
+/// ```compile_fail
+/// use seamless_transport::pairing_v2::AdmissionAuthorityStore;
+/// fn bypass(store: &AdmissionAuthorityStore) {
+///     let _ = store.prepare(store.version().unwrap(), [1; 32], [2; 32]);
+/// }
+/// ```
+pub use admission_authority::{
+    AdmissionAuthorityStore, DistributedAdmissionSummary, DistributedPairingError,
+    DurableAdmission, DurableAdmissionState, ReconcileAdmission, handshake_and_commit_distributed,
+    handshake_selected_and_commit_distributed,
+};
 pub mod codec;
 mod evidence;
 mod handshake_binding;
@@ -12,10 +33,10 @@ mod handshake_evidence;
 mod handshake_machine;
 mod handshake_wire;
 pub mod operational_binding;
-#[cfg(feature = "pairing-v2-experimental")]
+#[cfg(feature = "pairing-v2-operational-experimental")]
 #[allow(dead_code)] // Sealed default-off foundation; product has no caller in this phase.
 pub(crate) mod operational_session;
-#[cfg(test)]
+#[cfg(all(test, feature = "pairing-v2-operational-experimental"))]
 mod operational_session_tests;
 pub mod operational_wire;
 pub mod provisional_tls;
@@ -29,8 +50,8 @@ mod identity;
 pub use coordinator_limits::*;
 mod recovery_authority;
 pub use recovery_authority::*;
-#[cfg(feature = "pairing-v2-experimental")]
-#[allow(dead_code)] // The sealed grammar precedes the future authenticated transport.
+#[cfg(feature = "pairing-v2-g4")]
+#[allow(dead_code)] // Exact authenticated recovery is required by G4 admission.
 pub(crate) mod recovery;
 mod session;
 pub use identity::{Identity, validate_identity};

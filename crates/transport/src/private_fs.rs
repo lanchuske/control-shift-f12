@@ -14,7 +14,7 @@ use std::{
 pub(crate) struct PrivateDir(File);
 
 // Fault controls exist only in the unit-test executable, never in library builds.
-#[cfg(all(test, feature = "pairing-v2-experimental"))]
+#[cfg(all(test, feature = "pairing-v2-g4"))]
 pub(crate) mod faults {
     use super::StoreError;
     use std::sync::{Arc, Barrier};
@@ -93,7 +93,7 @@ pub(crate) mod faults {
 
 macro_rules! fault_point {
     ($file:expr, $stage:expr) => {
-        #[cfg(all(test, feature = "pairing-v2-experimental"))]
+        #[cfg(all(test, feature = "pairing-v2-g4"))]
         {
             faults::pause_point($file, $stage);
             faults::point($file, $stage)?;
@@ -125,7 +125,7 @@ fn validate(file: &File, directory: bool) -> Result<(), StoreError> {
 }
 
 impl PrivateDir {
-    #[cfg(feature = "pairing-v2-experimental")]
+    #[cfg(feature = "pairing-v2-g4")]
     pub(crate) fn try_clone(&self) -> Result<Self, StoreError> {
         self.0
             .try_clone()

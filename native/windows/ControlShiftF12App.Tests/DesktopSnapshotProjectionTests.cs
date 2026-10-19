@@ -1,4 +1,5 @@
 using ControlShiftF12App.Core;
+using System.Text.Json;
 using Xunit;
 
 namespace ControlShiftF12App.Tests;
@@ -64,5 +65,26 @@ public sealed class DesktopSnapshotProjectionTests
         """;
 
         Assert.False(DesktopSnapshotProjection.TryParse(snapshot, out _));
+    }
+
+    [Theory]
+    [InlineData("compatible", "stale")]
+    [InlineData("compatible", "gone")]
+    [InlineData("incompatible", "current")]
+    [InlineData("needs_update", "current")]
+    public void Noncurrent_or_incompatible_candidates_cannot_be_selected(string compatibility, string freshness)
+    {
+        var snapshot = JsonSerializer.Serialize(new {
+            v = 1, kind = "ui_snapshot_v1", snapshot = new {
+                schema_version = 1, generation = 2, state = "browsing",
+                diagnostics = Array.Empty<object>(),
+                candidates = new[] { new { handle = "peer-1", compatibility, freshness } },
+                confirmed = Array.Empty<object>(), inventory = (object?)null,
+                layout = new { state = "not_configured" },
+                capabilities = new { input_enabled = false, clipboard_enabled = false },
+            },
+        });
+        Assert.True(DesktopSnapshotProjection.TryParse(snapshot, out var projection));
+        Assert.Empty(projection!.Nearby);
     }
 }

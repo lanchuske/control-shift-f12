@@ -57,6 +57,6 @@ public sealed record PairingBridgeState(
 
     private static bool AreVerificationWords(IReadOnlyList<string> words) =>
         words.Count == 4
-        && words.All(word => word.Length is > 0 and <= 24
+        && words.All(word => word.Length is > 0 and <= 16
             && word.All(character => character is >= 'a' and <= 'z'));
 }

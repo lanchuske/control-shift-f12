@@ -37,7 +37,6 @@ public sealed record DesktopSnapshotProjection(
                 || !HasInteger(snapshot, "schema_version", 1)
                 || !HasNonzeroUInt64(snapshot, "generation")
                 || !EmptyArray(snapshot, "diagnostics")
-                || !EmptyArray(snapshot, "confirmed")
                 || !IsNull(snapshot, "inventory")
                 || !HasExactlyObject(snapshot, "layout", ["state"], "state", "not_configured")
                 || !HasCapabilitiesDisabled(snapshot))
@@ -47,7 +46,8 @@ public sealed record DesktopSnapshotProjection(
 
             if (!snapshot.TryGetProperty("state", out var stateValue)
                 || stateValue.ValueKind != JsonValueKind.String
-                || stateValue.GetString() is not { } state)
+                || stateValue.GetString() is not { } state
+                || !ValidRelationships(snapshot, state))
             {
                 return false;
             }
@@ -60,6 +60,11 @@ public sealed record DesktopSnapshotProjection(
                     break;
                 case "browsing" when TryParseCurrentCandidates(snapshot, out var currentCandidates):
                     nearby = currentCandidates;
+                    break;
+                case "confirmed_relationship" or "remote_outcome_unknown"
+                    or "bootstrap_connecting" or "bootstrap_sas_pending" or "bootstrap_receipt_prepared"
+                    when TryParseCurrentCandidates(snapshot, out _):
+                    nearby = [];
                     break;
                 default:
                     return false;
@@ -79,6 +84,26 @@ public sealed record DesktopSnapshotProjection(
         {
             return false;
         }
+    }
+
+    private static bool ValidRelationships(JsonElement snapshot, string state)
+    {
+        if (state != "confirmed_relationship") return EmptyArray(snapshot, "confirmed");
+        if (!snapshot.TryGetProperty("confirmed", out var relationships)
+            || relationships.ValueKind != JsonValueKind.Array
+            || relationships.GetArrayLength() is 0 or > 32) return false;
+        var handles = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var relationship in relationships.EnumerateArray())
+        {
+            if (!HasExactly(relationship, ["handle", "state"])
+                || !HasString(relationship, "state", "unavailable")
+                || !relationship.TryGetProperty("handle", out var handle)
+                || handle.ValueKind != JsonValueKind.String
+                || handle.GetString() is not { Length: > 0 and <= 64 } value
+                || !value.All(c => char.IsAsciiLetterOrDigit(c) || c is '-' or '_')
+                || !handles.Add(value)) return false;
+        }
+        return true;
     }
 
     private static bool HasCapabilitiesDisabled(JsonElement snapshot)
@@ -118,8 +143,12 @@ public sealed record DesktopSnapshotProjection(
                 || handle.GetString()!.Length > 64
                 || !handle.GetString()!.All(character =>
                     char.IsAsciiLetterOrDigit(character) || character is '-' or '_')
-                || !HasString(candidate, "compatibility", "compatible")
-                || !HasString(candidate, "freshness", "current"))
+                || !(HasString(candidate, "compatibility", "compatible")
+                    || HasString(candidate, "compatibility", "needs_update")
+                    || HasString(candidate, "compatibility", "incompatible"))
+                || !(HasString(candidate, "freshness", "current")
+                    || HasString(candidate, "freshness", "stale")
+                    || HasString(candidate, "freshness", "gone")))
             {
                 return false;
             }
@@ -127,7 +156,8 @@ public sealed record DesktopSnapshotProjection(
             {
                 return false;
             }
-            handles.Add(handle.GetString()!);
+            if (HasString(candidate, "compatibility", "compatible") && HasString(candidate, "freshness", "current"))
+                handles.Add(handle.GetString()!);
         }
 
         candidates = handles;

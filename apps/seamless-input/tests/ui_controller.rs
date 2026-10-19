@@ -290,6 +290,10 @@ fn fenced_remote_outcome_refuses_new_v01_or_layout_edits() {
 
     assert_eq!(controller.snapshot().state, UiState::RemoteOutcomeUnknown);
     assert_eq!(
+        controller.snapshot().layout.state,
+        LayoutState::NotConfigured
+    );
+    assert_eq!(
         controller.apply_local_at(0, UiCommand::BeginV01),
         Err(UiError::Blocked)
     );
