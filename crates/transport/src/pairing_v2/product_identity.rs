@@ -146,6 +146,34 @@ pub struct ProductOperationalEndpoint {
     pub(crate) inner: super::operational_session::OperationalEndpoint,
 }
 
+#[cfg(feature = "pairing-v2-operational-experimental")]
+impl ProductOperationalEndpoint {
+    pub async fn connect(
+        &self,
+        peer: SocketAddr,
+        authority: &super::AdmissionAuthorityStore,
+        durable_attempt: [u8; 32],
+    ) -> Result<super::product_operational::ProductOperationalAttempt, super::Invalid> {
+        let attempt = self
+            .inner
+            .connect_admitted(peer, authority, durable_attempt)
+            .await?;
+        super::product_operational::ProductOperationalAttempt::start(attempt)
+    }
+
+    pub async fn accept(
+        &self,
+        authority: &super::AdmissionAuthorityStore,
+        durable_attempt: [u8; 32],
+    ) -> Result<super::product_operational::ProductOperationalAttempt, super::Invalid> {
+        let attempt = self
+            .inner
+            .accept_admitted(authority, durable_attempt)
+            .await?;
+        super::product_operational::ProductOperationalAttempt::start(attempt)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::ProductIdentity;

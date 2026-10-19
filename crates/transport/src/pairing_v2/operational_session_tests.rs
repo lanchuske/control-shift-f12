@@ -31,7 +31,7 @@ fn frozen_v01_records_round_trip_exactly_and_enforce_the_six_record_schedule() {
     assert_eq!(records.len(), 6);
 
     for (sequence, value) in records.iter().enumerate() {
-        let raw = hex(&value.as_str().unwrap());
+        let raw = hex(value.as_str().unwrap());
         let record = OperationalRecord::decode(&raw).unwrap();
         assert_eq!(record.sequence(), sequence as u32);
         assert_eq!(record.encode().unwrap(), raw);
@@ -362,22 +362,24 @@ async fn v01_dynamic_attempt_uses_live_tls_exporter_and_durable_snapshots() {
     assert!(aa.is_ok(), "initiator admission failed");
     assert!(bb.is_ok(), "acceptor admission failed");
     let (ra, rb) = tokio::join!(
-        aa.unwrap()
-            .complete_with_local_consent(|preconfirm, commitment| async move {
+        aa.unwrap().complete_with_local_consent(
+            |preconfirm, commitment, _remaining_ms| async move {
                 Ok(
                     super::operational_session::LocalOperationalConsent::test_only_approved(
                         preconfirm, commitment,
                     ),
                 )
-            }),
-        bb.unwrap()
-            .complete_with_local_consent(|preconfirm, commitment| async move {
+            }
+        ),
+        bb.unwrap().complete_with_local_consent(
+            |preconfirm, commitment, _remaining_ms| async move {
                 Ok(
                     super::operational_session::LocalOperationalConsent::test_only_approved(
                         preconfirm, commitment,
                     ),
                 )
-            })
+            }
+        )
     );
     assert!(ra.is_ok() && rb.is_ok(), "a={ra:?}; b={rb:?}");
 }
@@ -449,15 +451,15 @@ async fn corrupted_confirm_a_gets_application_reset_and_never_receives_confirm_b
     let raw = super::operational_session::TestRawPeer::from_admitted_attempt(a_attempt.unwrap());
     let (raw_result, victim) = tokio::join!(
         raw.send_corrupt_confirm_a(),
-        b_attempt
-            .unwrap()
-            .complete_with_local_consent(|preconfirm, commitment| async move {
+        b_attempt.unwrap().complete_with_local_consent(
+            |preconfirm, commitment, _remaining_ms| async move {
                 Ok(
                     super::operational_session::LocalOperationalConsent::test_only_approved(
                         preconfirm, commitment,
                     ),
                 )
-            })
+            }
+        )
     );
     assert!(
         raw_result.is_ok(),
@@ -499,15 +501,15 @@ async fn bidi_open_after_confirm_fin_is_rejected_by_the_terminal_close_boundary(
     let raw = super::operational_session::TestRawPeer::from_admitted_attempt(a_attempt.unwrap());
     let (raw_result, victim) = tokio::join!(
         raw.send_valid_confirm_a_then_open_late_stream(),
-        b_attempt
-            .unwrap()
-            .complete_with_local_consent(|preconfirm, commitment| async move {
+        b_attempt.unwrap().complete_with_local_consent(
+            |preconfirm, commitment, _remaining_ms| async move {
                 Ok(
                     super::operational_session::LocalOperationalConsent::test_only_approved(
                         preconfirm, commitment,
                     ),
                 )
-            })
+            }
+        )
     );
     assert!(
         raw_result.is_ok(),
@@ -563,14 +565,14 @@ async fn v01_dynamic_attempt_fails_closed_when_revocation_wins_before_promotion(
         .unwrap();
     let (ra, rb) = tokio::time::timeout(std::time::Duration::from_secs(2), async {
         tokio::join!(
-            aa.complete_with_local_consent(|preconfirm, commitment| async move {
+            aa.complete_with_local_consent(|preconfirm, commitment, _remaining_ms| async move {
                 Ok(
                     super::operational_session::LocalOperationalConsent::test_only_approved(
                         preconfirm, commitment,
                     ),
                 )
             }),
-            bb.complete_with_local_consent(|preconfirm, commitment| async move {
+            bb.complete_with_local_consent(|preconfirm, commitment, _remaining_ms| async move {
                 Ok(
                     super::operational_session::LocalOperationalConsent::test_only_approved(
                         preconfirm, commitment,
@@ -620,7 +622,7 @@ async fn v01_revocation_between_accept_and_confirm_emits_no_confirm() {
     let bb = bb.unwrap();
     let (first, second) = tokio::time::timeout(Duration::from_secs(2), async {
         tokio::join!(
-            aa.complete_with_local_consent(|preconfirm, commitment| async move {
+            aa.complete_with_local_consent(|preconfirm, commitment, _remaining_ms| async move {
                 a_store
                     .revoke_candidate(a_store.version().unwrap(), ar.peer_fingerprint)
                     .unwrap();
@@ -630,7 +632,7 @@ async fn v01_revocation_between_accept_and_confirm_emits_no_confirm() {
                     ),
                 )
             }),
-            bb.complete_with_local_consent(|preconfirm, commitment| async move {
+            bb.complete_with_local_consent(|preconfirm, commitment, _remaining_ms| async move {
                 Ok(
                     super::operational_session::LocalOperationalConsent::test_only_approved(
                         preconfirm, commitment,
@@ -707,7 +709,7 @@ async fn v01_dynamic_attempt_succeeds_between_two_os_processes() {
         parent
             .connect_admitted(address, &store, record.attempt_id)
             .await?
-            .complete_with_local_consent(|preconfirm, commitment| async move {
+            .complete_with_local_consent(|preconfirm, commitment, _remaining_ms| async move {
                 Ok(
                     super::operational_session::LocalOperationalConsent::test_only_approved(
                         preconfirm, commitment,
@@ -771,7 +773,7 @@ fn operational_dynamic_process_worker() {
                 .accept_admitted(&store, record.attempt_id)
                 .await
                 .unwrap()
-                .complete_with_local_consent(|preconfirm, commitment| async move {
+                .complete_with_local_consent(|preconfirm, commitment, _remaining_ms| async move {
                     Ok(
                         super::operational_session::LocalOperationalConsent::test_only_approved(
                             preconfirm, commitment,

@@ -727,6 +727,13 @@ impl AttemptGuard {
             .map_err(|_| Invalid)?
     }
 
+    pub(crate) fn remaining_ms(&self) -> u32 {
+        self.deadline
+            .saturating_duration_since(Instant::now())
+            .as_millis()
+            .min(u128::from(u32::MAX)) as u32
+    }
+
     #[cfg(test)]
     pub(crate) fn test_only_expired() -> Self {
         Self {
@@ -1370,12 +1377,16 @@ pub(crate) struct LocalOperationalConsent {
 }
 
 impl LocalOperationalConsent {
-    #[cfg(test)]
-    pub(crate) fn test_only_approved(preconfirm: [u8; 32], commitment: [u8; 32]) -> Self {
+    pub(super) fn approved(preconfirm: [u8; 32], commitment: [u8; 32]) -> Self {
         Self {
             preconfirm,
             commitment,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_only_approved(preconfirm: [u8; 32], commitment: [u8; 32]) -> Self {
+        Self::approved(preconfirm, commitment)
     }
 
     pub(crate) fn matches(&self, preconfirm: [u8; 32], commitment: [u8; 32]) -> bool {
@@ -1607,7 +1618,7 @@ impl OperationalAttempt {
         confirm: F,
     ) -> Result<(), Invalid>
     where
-        F: FnOnce([u8; 32], [u8; 32]) -> Future,
+        F: FnOnce([u8; 32], [u8; 32], u32) -> Future,
         Future: std::future::Future<Output = Result<LocalOperationalConsent, Invalid>>,
     {
         let result = self.complete_inner(confirm).await;
@@ -1619,7 +1630,7 @@ impl OperationalAttempt {
 
     async fn complete_inner<F, Future>(&mut self, confirm: F) -> Result<(), Invalid>
     where
-        F: FnOnce([u8; 32], [u8; 32]) -> Future,
+        F: FnOnce([u8; 32], [u8; 32], u32) -> Future,
         Future: std::future::Future<Output = Result<LocalOperationalConsent, Invalid>>,
     {
         let mut attempt = [0; 32];
@@ -1826,7 +1837,14 @@ impl OperationalAttempt {
             return Err(Invalid);
         }
         let preconfirm = preconfirm_transcript(&commitment, &[&first, &second, &open, &accept])?;
-        let consent = self.guard.within(confirm(preconfirm, ch)).await?;
+        let remaining_ms = self.guard.remaining_ms();
+        if remaining_ms == 0 {
+            return Err(Invalid);
+        }
+        let consent = self
+            .guard
+            .within(confirm(preconfirm, ch, remaining_ms))
+            .await?;
         if !consent.matches(preconfirm, ch) {
             return Err(Invalid);
         }
