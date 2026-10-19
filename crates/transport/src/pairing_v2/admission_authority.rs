@@ -3,8 +3,9 @@
 #[cfg(test)]
 use crate::pairing_pending::AdmissionOwnership;
 use crate::pairing_pending::{
-    AdmissionReceiptRecord, BilateralAdmissionRecord, BilateralTransactionFields, PendingRecord,
-    PendingStore, StoreError, StoreVersion, bind_prepared_bilateral_receipt_hash,
+    AdmissionReceiptRecord, BilateralAdmissionRecord, BilateralTransactionFields,
+    OperationalAdmissionSnapshot, PendingRecord, PendingStore, StoreError, StoreVersion,
+    bind_prepared_bilateral_receipt_hash,
 };
 #[cfg(test)]
 use std::cell::Cell;
@@ -63,6 +64,12 @@ pub struct DurableAdmission {
 pub struct OperationalAdmission {
     attempt: [u8; 32],
     peer_fingerprint: [u8; 32],
+}
+
+/// Move-only, process-local authority minted by one fresh authenticated
+/// recovery exchange. Persisted admission metadata cannot construct it.
+pub(crate) struct RecoveredOperationalAdmission {
+    snapshot: OperationalAdmissionSnapshot,
 }
 
 impl OperationalAdmission {
@@ -1218,6 +1225,33 @@ impl AdmissionAuthorityStore {
         selected.ok_or(StoreError::Invalid)
     }
 
+    pub(crate) fn recover_operational(
+        &self,
+        admission: OperationalAdmission,
+        peer: super::recovery::AuthenticatedExactPeerRecovery,
+    ) -> Result<RecoveredOperationalAdmission, StoreError> {
+        if peer.authenticated_peer_pin() != admission.peer_fingerprint() {
+            return Err(StoreError::Invalid);
+        }
+        let receipt = self
+            .store
+            .confirm_authenticated_peer_recovery(admission.attempt(), peer)?;
+        let snapshot = self.store.authenticated_recovery_snapshot(&receipt)?;
+        Ok(RecoveredOperationalAdmission { snapshot })
+    }
+
+    pub(crate) fn consume_recovered_operational(
+        &self,
+        recovered: RecoveredOperationalAdmission,
+    ) -> Result<OperationalAdmissionSnapshot, StoreError> {
+        let current = self
+            .store
+            .authenticated_recovery_snapshot(&recovered.snapshot.receipt)?;
+        (current == recovered.snapshot)
+            .then_some(current)
+            .ok_or(StoreError::Invalid)
+    }
+
     pub(crate) fn revoke_candidate(
         &self,
         expected: StoreVersion,
@@ -1321,6 +1355,19 @@ impl AdmissionAuthorityStore {
     ) -> Result<crate::pairing_pending::OperationalPreflightLease, StoreError> {
         self.store
             .acquire_operational_preflight_lease(attempt, view_hash, connection_binding)
+    }
+
+    pub(crate) fn acquire_recovered_operational_preflight_lease(
+        &self,
+        snapshot: OperationalAdmissionSnapshot,
+        view_hash: [u8; 32],
+        connection_binding: [u8; 32],
+    ) -> Result<crate::pairing_pending::OperationalPreflightLease, StoreError> {
+        self.store.acquire_recovered_operational_preflight_lease(
+            snapshot,
+            view_hash,
+            connection_binding,
+        )
     }
 
     #[allow(dead_code)] // Sealed default-off V01 boundary.
@@ -2394,6 +2441,94 @@ mod tests {
 
         let reopened = AdmissionAuthorityStore::open(root.path()).unwrap();
         assert_eq!(reopened.durable_admissions().unwrap(), catalog);
+    }
+
+    #[test]
+    fn authenticated_recovery_mints_one_current_ephemeral_operational_admission() {
+        let root = tempfile::tempdir().unwrap();
+        let store = AdmissionAuthorityStore::open(root.path()).unwrap();
+        let record = store
+            .prepare(store.version().unwrap(), [231; 32], [232; 32])
+            .unwrap();
+        store
+            .commit_metadata(
+                store.version().unwrap(),
+                record.revocation_generation,
+                &record,
+                evidence(&record),
+            )
+            .unwrap();
+        let receipt = store
+            .test_bilateral_receipt(record.attempt_id)
+            .unwrap()
+            .unwrap();
+        store
+            .store
+            .confirm_bilateral_receipt(
+                store.version().unwrap(),
+                record.attempt_id,
+                receipt.bilateral.transaction_id,
+                receipt.bilateral.local_receipt_hash,
+                [233; 32],
+            )
+            .unwrap();
+        let current = store
+            .durable_admissions()
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.state() == DurableAdmissionState::Confirmed)
+            .unwrap();
+        let metadata_only = store.select_operational(current.opaque_id()).unwrap();
+        assert!(
+            store
+                .operational_admission_snapshot(metadata_only.attempt())
+                .is_err(),
+            "disk metadata alone must remain non-operational"
+        );
+        let peer = super::super::recovery::ExactPeerRecovery::new(
+            receipt.bilateral.transaction_id.as_bytes(),
+            [233; 32],
+            Some(receipt.bilateral.local_receipt_hash),
+            receipt.identity_generation,
+            receipt.revocation_generation,
+            receipt.policy_revision,
+        )
+        .unwrap();
+        let peer = super::super::recovery::AuthenticatedExactPeerRecovery::test_only(
+            peer,
+            receipt.peer_pin,
+        );
+
+        let recovered = store
+            .recover_operational(metadata_only, peer)
+            .expect("fresh authenticated recovery must mint an ephemeral admission");
+        let snapshot = store
+            .consume_recovered_operational(recovered)
+            .expect("unchanged durable state must consume once");
+        assert_eq!(snapshot.receipt.attempt, record.attempt_id);
+
+        let selected = store.select_operational(current.opaque_id()).unwrap();
+        let peer = super::super::recovery::ExactPeerRecovery::new(
+            receipt.bilateral.transaction_id.as_bytes(),
+            [233; 32],
+            Some(receipt.bilateral.local_receipt_hash),
+            receipt.identity_generation,
+            receipt.revocation_generation,
+            receipt.policy_revision,
+        )
+        .unwrap();
+        let peer = super::super::recovery::AuthenticatedExactPeerRecovery::test_only(
+            peer,
+            receipt.peer_pin,
+        );
+        let stale = store.recover_operational(selected, peer).unwrap();
+        store
+            .revoke_candidate(store.version().unwrap(), record.peer_fingerprint)
+            .unwrap();
+        assert!(
+            store.consume_recovered_operational(stale).is_err(),
+            "revocation between recovery and consumption must invalidate the token"
+        );
     }
 
     #[test]

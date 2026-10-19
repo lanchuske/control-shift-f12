@@ -920,6 +920,37 @@ impl OperationalEndpoint {
         let channel = self.accept_until(view.peer_fingerprint, &guard).await?;
         OperationalAttempt::new(channel, Role::B, authority, durable_attempt, view, guard).await
     }
+
+    pub(crate) async fn connect_recovered(
+        &self,
+        peer: SocketAddr,
+        authority: &super::admission_authority::AdmissionAuthorityStore,
+        snapshot: crate::pairing_pending::OperationalAdmissionSnapshot,
+    ) -> Result<OperationalAttempt, Invalid> {
+        let guard = AttemptGuard::new();
+        let view = AuthorityView::from_snapshot(self.local_leaf, &snapshot)?;
+        if view.self_fingerprint >= view.peer_fingerprint {
+            return Err(Invalid);
+        }
+        let channel = self
+            .connect_until(peer, view.peer_fingerprint, &guard)
+            .await?;
+        OperationalAttempt::new_recovered(channel, Role::A, authority, snapshot, view, guard).await
+    }
+
+    pub(crate) async fn accept_recovered(
+        &self,
+        authority: &super::admission_authority::AdmissionAuthorityStore,
+        snapshot: crate::pairing_pending::OperationalAdmissionSnapshot,
+    ) -> Result<OperationalAttempt, Invalid> {
+        let guard = AttemptGuard::new();
+        let view = AuthorityView::from_snapshot(self.local_leaf, &snapshot)?;
+        if view.self_fingerprint <= view.peer_fingerprint {
+            return Err(Invalid);
+        }
+        let channel = self.accept_until(view.peer_fingerprint, &guard).await?;
+        OperationalAttempt::new_recovered(channel, Role::B, authority, snapshot, view, guard).await
+    }
 }
 
 impl Drop for OperationalEndpoint {
@@ -1537,6 +1568,69 @@ impl Drop for AttemptStream {
 }
 
 impl OperationalAttempt {
+    async fn new_recovered(
+        channel: OperationalChannel,
+        role: Role,
+        authority: &super::admission_authority::AdmissionAuthorityStore,
+        snapshot: crate::pairing_pending::OperationalAdmissionSnapshot,
+        view: AuthorityView,
+        mut guard: AttemptGuard,
+    ) -> Result<Self, Invalid> {
+        guard.attach(channel.connection.clone());
+        guard.assert_lease(None)?;
+        let encoded_view = view.encode()?;
+        let view_hash = hash(&encoded_view);
+        let (a, b) = match role {
+            Role::A => (view.self_fingerprint, view.peer_fingerprint),
+            Role::B => (view.peer_fingerprint, view.self_fingerprint),
+        };
+        let context = encode(
+            "operational-session-preflight-lease-context-v1",
+            &[
+                Value::Text("csf12-operational/1".to_owned()),
+                Value::Text(
+                    match role {
+                        Role::A => "A",
+                        Role::B => "B",
+                    }
+                    .to_owned(),
+                ),
+                Value::Bytes(a.to_vec()),
+                Value::Bytes(b.to_vec()),
+                Value::Bytes(view_hash.to_vec()),
+            ],
+        )?;
+        let exporter = channel.exporter(
+            b"EXPORTER-ControlShiftF12-OperationalPreflightLease-v1",
+            &context,
+        )?;
+        let binding = hash(&encode(
+            "operational-session-preflight-lease-binding-v1",
+            &[
+                Value::Text(
+                    match role {
+                        Role::A => "A",
+                        Role::B => "B",
+                    }
+                    .to_owned(),
+                ),
+                Value::Bytes(view_hash.to_vec()),
+                Value::Bytes(hash(&context).to_vec()),
+                Value::Bytes(hash(&exporter).to_vec()),
+            ],
+        )?);
+        let preflight = authority
+            .acquire_recovered_operational_preflight_lease(snapshot, view_hash, binding)
+            .map_err(|_| Invalid)?;
+        preflight.assert_current().map_err(|_| Invalid)?;
+        Ok(Self {
+            channel,
+            role,
+            view,
+            preflight: Some(preflight),
+            guard,
+        })
+    }
     fn assert_preflight_current(&self) -> Result<(), Invalid> {
         self.guard.assert_lease(None)?;
         self.preflight

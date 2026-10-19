@@ -1665,6 +1665,55 @@ mod unix {
                 .ok_or(StoreError::Invalid)
         }
 
+        /// Captures or revalidates the exact durable tuple authorized by a
+        /// fresh authenticated recovery exchange. Unlike
+        /// `current_operational_snapshot`, this path never treats persisted
+        /// bilateral metadata as authority: the caller must already hold the
+        /// process-local recovery result and supply the exact receipt it
+        /// authenticated.
+        #[cfg(feature = "pairing-v2-g4")]
+        pub(crate) fn authenticated_recovery_snapshot(
+            &self,
+            authenticated: &AdmissionReceiptRecord,
+        ) -> Result<OperationalAdmissionSnapshot, StoreError> {
+            if authenticated.attempt == [0; 32] {
+                return Err(StoreError::Invalid);
+            }
+            let _lock = self.ledger_dir.lock()?;
+            let ledger = self.load_validated_manifest()?;
+            let receipt = ledger
+                .admission_receipts
+                .iter()
+                .find(|receipt| receipt.attempt == authenticated.attempt)
+                .cloned()
+                .ok_or(StoreError::Invalid)?;
+            let active = receipt == *authenticated
+                && receipt.identity_generation == ledger.version.identity_generation
+                && receipt.revocation_generation == ledger.revocation(receipt.peer)
+                && receipt.policy_revision == ledger.policy_revision
+                && receipt.ownership.is_store_owned()
+                && matches!(
+                    receipt.bilateral.state,
+                    BilateralAdmissionState::BilateralConfirmed
+                )
+                && receipt
+                    .bilateral
+                    .peer_receipt_hash
+                    .is_some_and(|hash| hash != [0; 32])
+                && ledger.active_pins.iter().any(|pin| {
+                    pin.peer == receipt.peer
+                        && pin.pin == receipt.peer_pin
+                        && pin.identity_generation == receipt.identity_generation
+                        && pin.revocation_generation == receipt.revocation_generation
+                });
+            active
+                .then_some(OperationalAdmissionSnapshot {
+                    receipt,
+                    store_revision: ledger.version.revision,
+                })
+                .ok_or(StoreError::Invalid)
+        }
+
         /// Acquires a process-local operational preflight lease only after one
         /// atomic durable snapshot read.  The lease is never serialized and an
         /// ordinary drop merely forgets the local token.
@@ -1710,6 +1759,49 @@ mod unix {
         }
 
         #[cfg(feature = "pairing-v2-g4")]
+        pub(crate) fn acquire_recovered_operational_preflight_lease(
+            &self,
+            snapshot: OperationalAdmissionSnapshot,
+            view_hash: [u8; 32],
+            connection_binding: [u8; 32],
+        ) -> Result<OperationalPreflightLease, StoreError> {
+            if view_hash == [0; 32] || connection_binding == [0; 32] {
+                return Err(StoreError::Invalid);
+            }
+            if self.authenticated_recovery_snapshot(&snapshot.receipt)? != snapshot {
+                return Err(StoreError::Conflict);
+            }
+            let store = self.clone_for_operational_lease()?;
+            let mut token = [0; 32];
+            rand::rngs::OsRng.fill_bytes(&mut token);
+            if token == [0; 32] {
+                return Err(StoreError::Unavailable);
+            }
+            let mut leases = operational_lease_states();
+            if leases.contains_key(&token) {
+                return Err(StoreError::Unavailable);
+            }
+            leases.insert(
+                token,
+                OperationalLeaseState {
+                    snapshot: snapshot.clone(),
+                    phase: OperationalLeasePhase::Preflight {
+                        view_hash,
+                        connection_binding,
+                    },
+                },
+            );
+            Ok(OperationalPreflightLease {
+                store,
+                token,
+                snapshot,
+                view_hash,
+                connection_binding,
+                live: true,
+            })
+        }
+
+        #[cfg(feature = "pairing-v2-g4")]
         pub(crate) fn operational_admission_snapshot(
             &self,
             attempt: [u8; 32],
@@ -1723,7 +1815,7 @@ mod unix {
             &self,
             snapshot: &OperationalAdmissionSnapshot,
         ) -> Result<bool, StoreError> {
-            Ok(self.current_operational_snapshot(snapshot.receipt.attempt)? == *snapshot)
+            Ok(self.authenticated_recovery_snapshot(&snapshot.receipt)? == *snapshot)
         }
 
         #[cfg(feature = "pairing-v2-g4")]
