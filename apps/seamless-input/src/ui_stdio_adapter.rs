@@ -22,8 +22,8 @@ use crate::{
     control_api::{self, Request},
     ui_contract::{
         CandidateHandle, CandidateView, CapabilityView, DiagnosticRow, InventoryView, LayoutView,
-        RelationshipHandle, RelationshipState, RelationshipView, UiCommand, UiError, UiSnapshot,
-        UiState, V01View,
+        RelationshipHandle, RelationshipState, RelationshipView, RemainingDuration, SasCode,
+        UiCommand, UiError, UiSnapshot, UiState, V01View,
     },
     ui_controller::{UiController, UiRuntimeEvent},
 };
@@ -478,6 +478,19 @@ impl UiStdioAdapter {
                 }
             }
             Ok(HostCommand::ConfirmV01 { matches }) => {
+                #[cfg(feature = "pairing-v2-g4")]
+                if self.pending_v01_relationship.is_some()
+                    && let Some(g4) = self.g4.as_ref()
+                    && g4
+                        .try_command(G4Command::DecideV01 {
+                            generation: self.g4_generation,
+                            matches,
+                        })
+                        .is_err()
+                {
+                    let rejected = self.rejected(&request.id, UiError::Blocked);
+                    return self.with_pending(pending, rejected);
+                }
                 let result = self
                     .controller
                     .apply_local_at(now_ms, UiCommand::ConfirmV01 { matches });
@@ -501,6 +514,18 @@ impl UiStdioAdapter {
                 let result = if !current || self.pending_v01_relationship.is_some() {
                     Err(UiError::InvalidState)
                 } else {
+                    #[cfg(feature = "pairing-v2-g4")]
+                    if let Some(g4) = self.g4.as_ref()
+                        && g4
+                            .try_command(G4Command::BeginV01 {
+                                generation: self.g4_generation,
+                                relationship: relationship.clone(),
+                            })
+                            .is_err()
+                    {
+                        let rejected = self.rejected(&request.id, UiError::Blocked);
+                        return self.with_pending(pending, rejected);
+                    }
                     self.controller
                         .apply_local_at(now_ms, UiCommand::BeginV01)
                         .inspect(|_| self.pending_v01_relationship = Some(relationship))
@@ -696,6 +721,56 @@ impl UiStdioAdapter {
                         });
                         self.outgoing.push(ChildFrame::Pairing(frame));
                     }
+                }
+                G4Event::V01Ready {
+                    words,
+                    remaining_ms,
+                    ..
+                } => {
+                    let remaining = if remaining_ms > 10_000 {
+                        RemainingDuration::MoreThanTenSeconds
+                    } else {
+                        RemainingDuration::Seconds(
+                            remaining_ms
+                                .saturating_add(999)
+                                .div_ceil(1_000)
+                                .clamp(1, 10) as u8,
+                        )
+                    };
+                    if let Ok(code) = SasCode::try_from(words.to_vec()) {
+                        let frames = self.on_authoritative_at(
+                            now_ms,
+                            AuthoritativeUiEvent::V01SasReady {
+                                view: V01View { code, remaining },
+                                remaining_ms,
+                            },
+                        );
+                        self.outgoing.extend(frames);
+                    }
+                }
+                G4Event::V01Finished { outcome, .. } => {
+                    use seamless_transport::pairing_v2::product_operational::OperationalOutcome;
+                    match outcome {
+                        OperationalOutcome::Verified => {
+                            let frames =
+                                self.on_authoritative_at(now_ms, AuthoritativeUiEvent::V01Verified);
+                            self.outgoing.extend(frames);
+                        }
+                        OperationalOutcome::RemoteOutcomeUnknown | OperationalOutcome::Revoked => {
+                            let frames = self.on_authoritative_at(
+                                now_ms,
+                                AuthoritativeUiEvent::RemoteOutcomeUnknown,
+                            );
+                            self.outgoing.extend(frames);
+                        }
+                        OperationalOutcome::Rejected | OperationalOutcome::Expired => {
+                            self.controller
+                                .on_runtime_at(now_ms, UiRuntimeEvent::PairingAborted);
+                            self.clear_sas();
+                            self.pending_v01_relationship = None;
+                        }
+                    }
+                    self.g4_generation = self.g4_generation.saturating_add(1);
                 }
                 G4Event::DurableSnapshot {
                     generation,
@@ -1060,6 +1135,15 @@ mod g4_tests {
                         }],
                     }]
                 }
+                G4Command::BeginV01 { generation, .. } => vec![G4Event::V01Ready {
+                    generation,
+                    words: ["able", "baker", "cable", "delta"].map(str::to_owned),
+                    remaining_ms: 9_000,
+                }],
+                G4Command::DecideV01 { generation, .. } => vec![G4Event::V01Finished {
+                    generation,
+                    outcome: seamless_transport::pairing_v2::product_operational::OperationalOutcome::Verified,
+                }],
                 _ => Vec::new(),
             }
         }
@@ -1103,6 +1187,72 @@ mod g4_tests {
             std::thread::sleep(Duration::from_millis(2));
         }
         panic!("expected G4 command was not recorded");
+    }
+
+    #[test]
+    fn product_v01_routes_only_redacted_prompt_and_single_decision_through_worker() {
+        let commands = Arc::new(Mutex::new(Vec::new()));
+        let mut adapter = UiStdioAdapter::new(0);
+        adapter.g4 = Some(
+            G4PairingWorker::spawn(Backend {
+                commands: commands.clone(),
+                commit_on_match: false,
+                quarantine_on_cancel: false,
+            })
+            .unwrap(),
+        );
+        let relationship: RelationshipHandle = "relationship-1".to_owned().try_into().unwrap();
+        adapter.on_authoritative_at(
+            0,
+            AuthoritativeUiEvent::DurableRelationships(vec![RelationshipView {
+                handle: relationship.clone(),
+                state: RelationshipState::Unavailable,
+            }]),
+        );
+
+        let response = adapter.handle_host_request_at(
+            1,
+            &request(
+                "begin-v01-worker",
+                "ui.v01.begin",
+                serde_json::json!({"relationship": relationship}),
+            ),
+        );
+        assert!(
+            response
+                .iter()
+                .any(|frame| matches!(frame, ChildFrame::Response(response) if response.ok))
+        );
+        wait_for_command(
+            &commands,
+            |command| matches!(command, G4Command::BeginV01 { relationship, .. } if relationship.as_str() == "relationship-1"),
+        );
+        let frames = poll_until(
+            &mut adapter,
+            |frame| matches!(frame, ChildFrame::SasDisplay(frame) if frame.code_groups.as_ref().is_some_and(|groups| groups == &["able", "baker", "cable", "delta"])),
+        );
+        let sas = frames
+            .iter()
+            .find(|frame| matches!(frame, ChildFrame::SasDisplay(_)))
+            .expect("redacted SAS frame");
+        assert!(serde_json::to_string(sas).is_ok_and(|json| !json.contains("relationship-1")));
+
+        let response = adapter.handle_host_request_at(
+            2,
+            &request(
+                "confirm-v01-worker",
+                "ui.confirm_v01",
+                serde_json::json!({"matches": true}),
+            ),
+        );
+        assert!(
+            response
+                .iter()
+                .any(|frame| matches!(frame, ChildFrame::Response(response) if response.ok))
+        );
+        wait_for_command(&commands, |command| {
+            matches!(command, G4Command::DecideV01 { matches: true, .. })
+        });
     }
 
     struct RestartBackend {

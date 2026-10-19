@@ -3,7 +3,10 @@
 
 use crate::{
     guided_setup::SetupError,
-    ui_contract::{CandidateCompatibility, CandidateFreshness, CandidateHandle, CandidateView},
+    ui_contract::{
+        CandidateCompatibility, CandidateFreshness, CandidateHandle, CandidateView,
+        RelationshipHandle,
+    },
 };
 #[cfg(feature = "g4-test-helper")]
 use seamless_discovery::Advertisement;
@@ -14,6 +17,7 @@ use seamless_discovery::guided::{
 use seamless_transport::pairing_v2::{
     AdmissionAuthorityStore, DurableAdmissionState, ProductIdentity,
     handshake_selected_and_commit_distributed,
+    product_operational::OperationalOutcome,
     provisional_tls::{
         HandshakeConfig, IncomingHandshakeConfig, PRE_ADMISSION_SELECTION_WINDOW,
         PreAdmissionCandidate, ProvisionalEndpoint,
@@ -242,6 +246,14 @@ pub enum G4Command {
     Cancel {
         generation: u64,
     },
+    BeginV01 {
+        generation: u64,
+        relationship: RelationshipHandle,
+    },
+    DecideV01 {
+        generation: u64,
+        matches: bool,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -275,6 +287,15 @@ pub enum G4Event {
     RemoteOutcomeUnknown {
         generation: u64,
     },
+    V01Ready {
+        generation: u64,
+        words: [String; 4],
+        remaining_ms: u32,
+    },
+    V01Finished {
+        generation: u64,
+        outcome: OperationalOutcome,
+    },
 }
 
 impl G4Event {
@@ -283,6 +304,8 @@ impl G4Event {
             Self::Browsing { generation }
             | Self::Candidates { generation, .. }
             | Self::SasReady { generation, .. }
+            | Self::V01Ready { generation, .. }
+            | Self::V01Finished { generation, .. }
             | Self::Rejected { generation }
             | Self::Cancelled { generation }
             | Self::Expired { generation }
@@ -886,7 +909,9 @@ impl G4WorkerBackend for RealG4Backend {
             G4Command::Start { generation }
             | G4Command::Stop { generation }
             | G4Command::Select { generation, .. }
-            | G4Command::Cancel { generation } => *generation,
+            | G4Command::Cancel { generation }
+            | G4Command::BeginV01 { generation, .. }
+            | G4Command::DecideV01 { generation, .. } => *generation,
             G4Command::Decide { token, .. } => self
                 .session
                 .as_ref()
@@ -953,6 +978,8 @@ impl G4WorkerBackend for RealG4Backend {
                 })
             }
             G4Command::Cancel { generation } => self.stop(generation, true),
+            G4Command::BeginV01 { .. } => Err(SetupError::InvalidState),
+            G4Command::DecideV01 { .. } => Err(SetupError::InvalidState),
         };
         result.unwrap_or_else(|_error| {
             #[cfg(feature = "g4-test-helper")]
