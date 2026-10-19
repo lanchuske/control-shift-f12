@@ -253,6 +253,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "pairing-v2-operational-experimental")]
     #[tokio::test]
     async fn deterministic_operational_role_requires_a_locator_only_for_the_initiator() {
         let root = tempfile::tempdir().unwrap();

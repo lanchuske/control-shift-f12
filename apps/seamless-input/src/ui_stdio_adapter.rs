@@ -515,6 +515,10 @@ impl UiStdioAdapter {
                     Err(UiError::InvalidState)
                 } else {
                     #[cfg(feature = "pairing-v2-g4")]
+                    if self.g4.is_some() {
+                        self.g4_generation = self.g4_generation.max(1);
+                    }
+                    #[cfg(feature = "pairing-v2-g4")]
                     if let Some(g4) = self.g4.as_ref()
                         && g4
                             .try_command(G4Command::BeginV01 {
@@ -749,21 +753,21 @@ impl UiStdioAdapter {
                     }
                 }
                 G4Event::V01Finished { outcome, .. } => {
-                    use seamless_transport::pairing_v2::product_operational::OperationalOutcome;
+                    use crate::g4_pairing::V01Outcome;
                     match outcome {
-                        OperationalOutcome::Verified => {
+                        V01Outcome::Verified => {
                             let frames =
                                 self.on_authoritative_at(now_ms, AuthoritativeUiEvent::V01Verified);
                             self.outgoing.extend(frames);
                         }
-                        OperationalOutcome::RemoteOutcomeUnknown | OperationalOutcome::Revoked => {
+                        V01Outcome::RemoteOutcomeUnknown | V01Outcome::Revoked => {
                             let frames = self.on_authoritative_at(
                                 now_ms,
                                 AuthoritativeUiEvent::RemoteOutcomeUnknown,
                             );
                             self.outgoing.extend(frames);
                         }
-                        OperationalOutcome::Rejected | OperationalOutcome::Expired => {
+                        V01Outcome::Rejected | V01Outcome::Expired => {
                             self.controller
                                 .on_runtime_at(now_ms, UiRuntimeEvent::PairingAborted);
                             self.clear_sas();
@@ -1142,7 +1146,7 @@ mod g4_tests {
                 }],
                 G4Command::DecideV01 { generation, .. } => vec![G4Event::V01Finished {
                     generation,
-                    outcome: seamless_transport::pairing_v2::product_operational::OperationalOutcome::Verified,
+                    outcome: crate::g4_pairing::V01Outcome::Verified,
                 }],
                 _ => Vec::new(),
             }
