@@ -1,6 +1,8 @@
 use crate::guided_setup::SetupError;
 use seamless_discovery::operational::{OperationalEvent, OperationalMdns};
-use seamless_transport::pairing_v2::{ProductIdentity, ProductOperationalEndpoint};
+use seamless_transport::pairing_v2::{
+    ProductIdentity, ProductOperationalEndpoint, ProductRecoveryEndpoint,
+};
 use std::{collections::BTreeMap, net::SocketAddr};
 
 const MAX_LOCATORS: usize = 16;
@@ -9,17 +11,19 @@ const MAX_TTL_MS: u64 = 300_000;
 
 pub(crate) struct OperationalObservation {
     pub(crate) locator: [u8; 16],
-    pub(crate) addresses: Vec<SocketAddr>,
+    pub(crate) recovery_addresses: Vec<SocketAddr>,
+    pub(crate) operational_addresses: Vec<SocketAddr>,
     pub(crate) ttl_ms: u64,
 }
 
 pub(crate) struct SelectedOperationalLocator {
-    pub(crate) addresses: Vec<SocketAddr>,
+    pub(crate) recovery_addresses: Vec<SocketAddr>,
+    pub(crate) operational_addresses: Vec<SocketAddr>,
 }
 
 pub(crate) struct OperationalCatalogue {
     local_locator: [u8; 16],
-    entries: BTreeMap<[u8; 16], (Vec<SocketAddr>, u64)>,
+    entries: BTreeMap<[u8; 16], (Vec<SocketAddr>, Vec<SocketAddr>, u64)>,
     last_ms: u64,
 }
 
@@ -42,11 +46,14 @@ impl OperationalCatalogue {
     ) -> Result<(), SetupError> {
         self.advance(now_ms)?;
         if observation.locator == [0; 16]
-            || observation.addresses.is_empty()
-            || observation.addresses.len() > MAX_ADDRESSES
+            || observation.recovery_addresses.is_empty()
+            || observation.operational_addresses.is_empty()
+            || observation.recovery_addresses.len() > MAX_ADDRESSES
+            || observation.operational_addresses.len() > MAX_ADDRESSES
             || observation
-                .addresses
+                .recovery_addresses
                 .iter()
+                .chain(observation.operational_addresses.iter())
                 .any(|address| !unicast(*address))
             || !(1..=MAX_TTL_MS).contains(&observation.ttl_ms)
         {
@@ -61,8 +68,14 @@ impl OperationalCatalogue {
         let expires_at = now_ms
             .checked_add(observation.ttl_ms)
             .ok_or(SetupError::Limit)?;
-        self.entries
-            .insert(observation.locator, (observation.addresses, expires_at));
+        self.entries.insert(
+            observation.locator,
+            (
+                observation.recovery_addresses,
+                observation.operational_addresses,
+                expires_at,
+            ),
+        );
         Ok(())
     }
 
@@ -73,7 +86,12 @@ impl OperationalCatalogue {
         self.advance(now_ms)?;
         Ok(std::mem::take(&mut self.entries)
             .into_values()
-            .map(|(addresses, _)| SelectedOperationalLocator { addresses })
+            .map(
+                |(recovery_addresses, operational_addresses, _)| SelectedOperationalLocator {
+                    recovery_addresses,
+                    operational_addresses,
+                },
+            )
             .collect())
     }
 
@@ -89,7 +107,7 @@ impl OperationalCatalogue {
         }
         self.last_ms = now_ms;
         self.entries
-            .retain(|_, (_, expires_at)| now_ms < *expires_at);
+            .retain(|_, (_, _, expires_at)| now_ms < *expires_at);
         Ok(())
     }
 }
@@ -102,6 +120,7 @@ fn unicast(address: SocketAddr) -> bool {
 }
 
 pub(crate) struct ProductOperationalDiscovery {
+    recovery: ProductRecoveryEndpoint,
     endpoint: ProductOperationalEndpoint,
     mdns: OperationalMdns,
     catalogue: OperationalCatalogue,
@@ -114,16 +133,23 @@ impl ProductOperationalDiscovery {
         if locator == [0; 16] {
             locator[0] = 1;
         }
+        let recovery = identity
+            .bind_recovery("0.0.0.0:0".parse().unwrap())
+            .map_err(|_| SetupError::Unavailable)?;
         let endpoint = identity
             .bind_operational("0.0.0.0:0".parse().unwrap())
             .map_err(|_| SetupError::Unavailable)?;
-        let port = endpoint
+        let recovery_port = recovery
+            .publication_port()
+            .map_err(|_| SetupError::Unavailable)?;
+        let operational_port = endpoint
             .publication_port()
             .map_err(|_| SetupError::Unavailable)?;
         let mut mdns = OperationalMdns::start().map_err(|_| SetupError::Unavailable)?;
-        mdns.publish(locator, port)
+        mdns.publish(locator, recovery_port, operational_port)
             .map_err(|_| SetupError::Unavailable)?;
         Ok(Self {
+            recovery,
             endpoint,
             mdns,
             catalogue: OperationalCatalogue::open(locator, now_ms)?,
@@ -136,7 +162,8 @@ impl ProductOperationalDiscovery {
                 OperationalEvent::Observed(observation) => self.catalogue.apply(
                     OperationalObservation {
                         locator: observation.locator,
-                        addresses: observation.addresses,
+                        recovery_addresses: observation.recovery_addresses,
+                        operational_addresses: observation.operational_addresses,
                         ttl_ms: observation.ttl_ms,
                     },
                     now_ms,
@@ -158,6 +185,10 @@ impl ProductOperationalDiscovery {
     pub(crate) fn endpoint(&self) -> &ProductOperationalEndpoint {
         &self.endpoint
     }
+
+    pub(crate) fn recovery(&self) -> &ProductRecoveryEndpoint {
+        &self.recovery
+    }
 }
 
 #[cfg(test)]
@@ -169,9 +200,13 @@ mod tests {
     fn observation(locator: u8, port: u16, ttl_ms: u64) -> OperationalObservation {
         OperationalObservation {
             locator: [locator; 16],
-            addresses: vec![SocketAddr::new(
+            recovery_addresses: vec![SocketAddr::new(
                 IpAddr::V4(Ipv4Addr::new(192, 0, 2, locator)),
                 port,
+            )],
+            operational_addresses: vec![SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::new(192, 0, 2, locator)),
+                port + 1,
             )],
             ttl_ms,
         }
@@ -186,7 +221,14 @@ mod tests {
 
         let selected = catalogue.take_current(131).unwrap();
         assert_eq!(selected.len(), 1);
-        assert_eq!(selected[0].addresses, observation(2, 4202, 500).addresses);
+        assert_eq!(
+            selected[0].recovery_addresses,
+            observation(2, 4202, 500).recovery_addresses
+        );
+        assert_eq!(
+            selected[0].operational_addresses,
+            observation(2, 4202, 500).operational_addresses
+        );
         assert!(catalogue.take_current(132).unwrap().is_empty());
     }
 
@@ -206,13 +248,13 @@ mod tests {
         assert!(catalogue.take_current(110).unwrap().is_empty());
 
         let mut too_many_addresses = observation(3, 4103, 500);
-        too_many_addresses.addresses = (1..=9)
+        too_many_addresses.recovery_addresses = (1..=9)
             .map(|last| SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, last)), 4103))
             .collect();
         assert!(catalogue.apply(too_many_addresses, 120).is_err());
 
         let mut unspecified = observation(4, 4104, 500);
-        unspecified.addresses = vec!["0.0.0.0:4104".parse().unwrap()];
+        unspecified.recovery_addresses = vec!["0.0.0.0:4104".parse().unwrap()];
         assert!(catalogue.apply(unspecified, 120).is_err());
     }
 

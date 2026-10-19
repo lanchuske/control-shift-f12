@@ -206,13 +206,16 @@ impl ProductOperationalEndpoint {
         &self,
         peer: Option<SocketAddr>,
         authority: &super::AdmissionAuthorityStore,
-        admission: super::OperationalAdmission,
+        admission: super::RecoveredOperationalAdmission,
     ) -> Result<super::product_operational::ProductOperationalAttempt, super::Invalid> {
-        if self.inner.local_fingerprint() < admission.peer_fingerprint() {
-            self.connect(peer.ok_or(super::Invalid)?, authority, admission)
+        let snapshot = authority
+            .consume_recovered_operational(admission)
+            .map_err(|_| super::Invalid)?;
+        if self.inner.local_fingerprint() < snapshot.receipt.peer_pin {
+            self.connect(peer.ok_or(super::Invalid)?, authority, snapshot)
                 .await
         } else {
-            self.accept(authority, admission).await
+            self.accept(authority, snapshot).await
         }
     }
 
@@ -224,11 +227,11 @@ impl ProductOperationalEndpoint {
         &self,
         peer: SocketAddr,
         authority: &super::AdmissionAuthorityStore,
-        admission: super::OperationalAdmission,
+        snapshot: crate::pairing_pending::OperationalAdmissionSnapshot,
     ) -> Result<super::product_operational::ProductOperationalAttempt, super::Invalid> {
         let attempt = self
             .inner
-            .connect_admitted(peer, authority, admission.attempt())
+            .connect_recovered(peer, authority, snapshot)
             .await?;
         super::product_operational::ProductOperationalAttempt::start(attempt)
     }
@@ -236,12 +239,9 @@ impl ProductOperationalEndpoint {
     async fn accept(
         &self,
         authority: &super::AdmissionAuthorityStore,
-        admission: super::OperationalAdmission,
+        snapshot: crate::pairing_pending::OperationalAdmissionSnapshot,
     ) -> Result<super::product_operational::ProductOperationalAttempt, super::Invalid> {
-        let attempt = self
-            .inner
-            .accept_admitted(authority, admission.attempt())
-            .await?;
+        let attempt = self.inner.accept_recovered(authority, snapshot).await?;
         super::product_operational::ProductOperationalAttempt::start(attempt)
     }
 }
@@ -330,19 +330,5 @@ mod tests {
         let admission = super::super::OperationalAdmission::test_only([1; 32], [255; 32]);
 
         assert!(endpoint.recover(None, &store, admission).await.is_err());
-    }
-
-    #[cfg(feature = "pairing-v2-operational-experimental")]
-    #[tokio::test]
-    async fn deterministic_operational_role_requires_a_locator_only_for_the_initiator() {
-        let root = tempfile::tempdir().unwrap();
-        let identity = ProductIdentity::open_or_create(&root.path().join("identity")).unwrap();
-        let endpoint = identity
-            .bind_operational("127.0.0.1:0".parse().unwrap())
-            .unwrap();
-        let store = super::super::AdmissionAuthorityStore::open(root.path().join("store")).unwrap();
-        let admission = super::super::OperationalAdmission::test_only([1; 32], [255; 32]);
-
-        assert!(endpoint.begin(None, &store, admission).await.is_err());
     }
 }

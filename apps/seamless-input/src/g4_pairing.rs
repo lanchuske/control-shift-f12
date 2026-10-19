@@ -557,12 +557,24 @@ impl RealG4Backend {
         drop(runtime_guard);
 
         let deadline = Instant::now() + Duration::from_secs(5);
-        let peer = loop {
+        let peers = loop {
             let now_ms = self.origin.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
             let mut addresses: Vec<_> = discovery
                 .take_current(now_ms)?
                 .into_iter()
-                .flat_map(|locator| locator.addresses)
+                .flat_map(|locator| {
+                    let operational_addresses = locator.operational_addresses;
+                    locator
+                        .recovery_addresses
+                        .into_iter()
+                        .filter_map(move |recovery| {
+                            operational_addresses
+                                .iter()
+                                .copied()
+                                .find(|operational| operational.ip() == recovery.ip())
+                                .map(|operational| (recovery, operational))
+                        })
+                })
                 .collect();
             addresses.sort_unstable();
             if let Some(peer) = addresses.into_iter().next() {
@@ -573,9 +585,24 @@ impl RealG4Backend {
             }
             std::thread::sleep(Duration::from_millis(20));
         };
+        let (recovery_peer, operational_peer) = peers
+            .map(|(recovery, operational)| (Some(recovery), Some(operational)))
+            .unwrap_or((None, None));
+        let recovered = self
+            .runtime
+            .block_on(
+                discovery
+                    .recovery()
+                    .recover(recovery_peer, &self.store, admission),
+            )
+            .map_err(|_| SetupError::Unavailable)?;
         let mut attempt = self
             .runtime
-            .block_on(discovery.endpoint().begin(peer, &self.store, admission))
+            .block_on(
+                discovery
+                    .endpoint()
+                    .begin(operational_peer, &self.store, recovered),
+            )
             .map_err(|_| SetupError::Unavailable)?;
         let prompt = self
             .runtime

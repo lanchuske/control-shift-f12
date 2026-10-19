@@ -9,7 +9,8 @@ const DAEMON_FRESHNESS_MS: u64 = 120_000;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OperationalAdvertisement {
     pub locator: [u8; 16],
-    pub addresses: Vec<SocketAddr>,
+    pub recovery_addresses: Vec<SocketAddr>,
+    pub operational_addresses: Vec<SocketAddr>,
     pub ttl_ms: u64,
 }
 
@@ -22,11 +23,19 @@ fn decode_wire(
     ttl_ms: u64,
 ) -> Option<OperationalAdvertisement> {
     let locator = decode_locator(instance)?;
+    let properties: std::collections::BTreeMap<_, _> = properties.iter().copied().collect();
+    let operational_port = properties
+        .get("op")
+        .and_then(|value| value.parse::<u16>().ok());
     if hostname != format!("{instance}.local.")
-        || properties != [("v", "1")]
+        || properties.len() != 2
+        || properties.get("v") != Some(&"2")
+        || operational_port.is_none()
         || addresses.is_empty()
         || addresses.len() > MAX_ADDRESSES
         || port == 0
+        || operational_port == Some(0)
+        || operational_port == Some(port)
         || !(1..=MAX_TTL_MS).contains(&ttl_ms)
     {
         return None;
@@ -42,9 +51,15 @@ fn decode_wire(
     if endpoints.len() != addresses.len() {
         return None;
     }
+    let operational_port = operational_port?;
+    let operational_addresses = endpoints
+        .iter()
+        .map(|address| SocketAddr::new(address.ip(), operational_port))
+        .collect();
     Some(OperationalAdvertisement {
         locator,
-        addresses: endpoints,
+        recovery_addresses: endpoints,
+        operational_addresses,
         ttl_ms,
     })
 }
@@ -80,19 +95,32 @@ impl OperationalMdns {
         })
     }
 
-    pub fn publish(&mut self, locator: [u8; 16], port: u16) -> Result<(), String> {
-        if self.published.is_some() || locator == [0; 16] || port == 0 {
+    pub fn publish(
+        &mut self,
+        locator: [u8; 16],
+        recovery_port: u16,
+        operational_port: u16,
+    ) -> Result<(), String> {
+        if self.published.is_some()
+            || locator == [0; 16]
+            || recovery_port == 0
+            || operational_port == 0
+            || recovery_port == operational_port
+        {
             return Err("invalid operational mDNS publication".into());
         }
         let instance = encode_locator(locator);
         let hostname = format!("{instance}.local.");
-        let properties = std::collections::HashMap::from([("v".to_owned(), "1".to_owned())]);
+        let properties = std::collections::HashMap::from([
+            ("v".to_owned(), "2".to_owned()),
+            ("op".to_owned(), operational_port.to_string()),
+        ]);
         let info = mdns_sd::ServiceInfo::new(
             OPERATIONAL_SERVICE_TYPE,
             &instance,
             &hostname,
             "",
-            port,
+            recovery_port,
             properties,
         )
         .map_err(|_| "invalid operational mDNS advertisement")?
@@ -210,13 +238,13 @@ mod tests {
     use std::net::IpAddr;
 
     #[test]
-    fn operational_wire_accepts_only_exact_v1_private_locator_metadata() {
+    fn operational_wire_v2_keeps_recovery_and_v01_on_distinct_ports() {
         assert_ne!(OPERATIONAL_SERVICE_TYPE, crate::mdns::SERVICE_TYPE);
         let locator = "11111111111111111111111111111111";
         let decoded = decode_wire(
             locator,
             "11111111111111111111111111111111.local.",
-            &[("v", "1")],
+            &[("op", "5312"), ("v", "2")],
             &["192.0.2.10".parse::<IpAddr>().unwrap()],
             4312,
             15_000,
@@ -224,7 +252,14 @@ mod tests {
         .unwrap();
 
         assert_eq!(decoded.locator, [0x11; 16]);
-        assert_eq!(decoded.addresses, vec!["192.0.2.10:4312".parse().unwrap()]);
+        assert_eq!(
+            decoded.recovery_addresses,
+            vec!["192.0.2.10:4312".parse().unwrap()]
+        );
+        assert_eq!(
+            decoded.operational_addresses,
+            vec!["192.0.2.10:5312".parse().unwrap()]
+        );
         assert_eq!(decoded.ttl_ms, 15_000);
     }
 
