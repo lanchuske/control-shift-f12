@@ -172,8 +172,19 @@ impl Drop for ProductChild {
     }
 }
 
+#[cfg(not(feature = "pairing-v2-operational-experimental"))]
+#[test]
+fn product_two_processes_discover_match_and_persist_durably() {
+    run_product_two_processes(false);
+}
+
+#[cfg(feature = "pairing-v2-operational-experimental")]
 #[test]
 fn product_two_processes_recover_and_verify_v01_after_durable_pairing() {
+    run_product_two_processes(true);
+}
+
+fn run_product_two_processes(verify_v01: bool) {
     let a_root = tempfile::tempdir().unwrap();
     let b_root = tempfile::tempdir().unwrap();
     let mut a = ProductChild::start(a_root.path());
@@ -283,6 +294,10 @@ fn product_two_processes_recover_and_verify_v01_after_durable_pairing() {
             false
         );
         assert_eq!(terminal["snapshot"]["layout"]["state"], "not_configured");
+    }
+
+    if !verify_v01 {
+        return;
     }
 
     a.send(
