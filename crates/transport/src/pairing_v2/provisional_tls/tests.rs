@@ -3841,12 +3841,22 @@ async fn bilateral_rejection_issues_real_reset_and_stop_independently_of_connect
     assert!(b.connection.close_reason().is_none());
 }
 
+#[test]
+fn adversarial_matrix_deadline_keeps_fast_and_loaded_runners_bounded() {
+    assert_eq!(adversarial_matrix_deadline(false), Duration::from_secs(5));
+    assert_eq!(adversarial_matrix_deadline(true), Duration::from_secs(15));
+}
+
+fn adversarial_matrix_deadline(loaded_runner: bool) -> Duration {
+    Duration::from_secs(if loaded_runner { 15 } else { 5 })
+}
+
 #[tokio::test]
 async fn bilateral_control_fragmentation_and_adversarial_phase_matrix() {
-    #[cfg(windows)]
-    let fault_deadline = Duration::from_secs(15);
-    #[cfg(not(windows))]
-    let fault_deadline = Duration::from_secs(5);
+    let fault_deadline = adversarial_matrix_deadline(cfg!(any(
+        windows,
+        all(target_os = "macos", target_arch = "x86_64")
+    )));
     for mutation in 0..7 {
         for sequence in [0, 2, 4, 6, 8, 10, 12, 14, 15, 16] {
             let (_ea, _eb, mut a, mut b, _) = pair().await;
