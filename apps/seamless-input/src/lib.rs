@@ -11,6 +11,11 @@ pub mod g4_pairing;
 #[cfg(feature = "pairing-v2-g4")]
 pub mod guided_setup;
 pub mod peer;
+#[cfg(feature = "pairing-v2-operational-experimental")]
+// Task 3 stages the bounded catalogue before Task 4's session owner consumes
+// it. Keeping it feature-gated prevents an unfinished path entering defaults.
+#[allow(dead_code)]
+pub(crate) mod product_operational_discovery;
 #[cfg(feature = "pairing-v2-g4")]
 pub mod product_pairing_adapter;
 pub mod runtime;
