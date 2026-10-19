@@ -23,12 +23,17 @@ internal sealed class DesktopShellForm : Form
     private WindowsPairingControls? pairingControls;
     private readonly UiCommandGate commandGate = new();
     private readonly Timer refreshTimer = new() { Interval = 1000 };
+    private readonly IChildDiagnosticSink diagnosticSink;
+    private readonly IDisposable? disposableDiagnosticSink;
     private bool commandAffectsControls;
     private bool closing;
     private bool closeReady;
 
     public DesktopShellForm()
     {
+        diagnosticSink = CreateDiagnosticSink();
+        disposableDiagnosticSink = diagnosticSink as IDisposable;
+        WriteDiagnostic(ChildDiagnosticKind.HostStarted, ChildDiagnosticOperation.Lifecycle);
         var presentation = DesktopShellPresentation.From(DesktopJourneyState.Initial());
 
         Text = "Control Shift F12";
@@ -261,7 +266,7 @@ internal sealed class DesktopShellForm : Form
                 .Keys.Cast<object>()
                 .ToDictionary(key => key.ToString()!, key => Environment.GetEnvironmentVariable(key.ToString()!));
             var spec = ChildLaunchSpec.Create(packageRoot, enginePath, environment);
-            childOwner = await WindowsUiChildOwner.StartAsync(spec);
+            childOwner = await WindowsUiChildOwner.StartAsync(spec, diagnosticSink);
             var session = await childOwner.ReadInitialProjectionAsync(TimeSpan.FromSeconds(3));
             if (closing) return;
             if (session.State.Phase != ChildSessionPhase.Running || session.Snapshot is null)
@@ -325,7 +330,13 @@ internal sealed class DesktopShellForm : Form
                     if (ShouldTerminateCommand(error))
                     {
                         refreshTimer.Stop();
-                        owner.Session.CompleteOutput();
+                        owner.Session.CompleteHostCommandFailure();
+                        WriteDiagnostic(
+                            ChildDiagnosticKind.SessionTerminal,
+                            ChildDiagnosticOperation.Lifecycle,
+                            ChildDiagnosticException.Classify(error),
+                            owner.Session
+                        );
                     }
                 }
                 if (!closing) RenderCurrentState();
@@ -387,7 +398,51 @@ internal sealed class DesktopShellForm : Form
         closing = true;
         refreshTimer.Stop();
         refreshTimer.Dispose();
+        try { disposableDiagnosticSink?.Dispose(); }
+        catch (Exception) { /* Diagnostics never interfere with shutdown. */ }
         base.OnFormClosed(e);
+    }
+
+    private static IChildDiagnosticSink CreateDiagnosticSink()
+    {
+        try
+        {
+            var configured = Environment.GetEnvironmentVariable("CSF12_DIAGNOSTIC_LOG_DIR");
+            var root = !string.IsNullOrWhiteSpace(configured)
+                ? configured
+                : Path.Combine(
+                    Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                    "ControlShiftF12",
+                    "Diagnostics"
+                );
+            return JsonLineChildDiagnosticSink.Create(root, Environment.ProcessId);
+        }
+        catch (Exception)
+        {
+            return NullChildDiagnosticSink.Instance;
+        }
+    }
+
+    private void WriteDiagnostic(
+        ChildDiagnosticKind kind,
+        ChildDiagnosticOperation operation,
+        ChildDiagnosticExceptionClass exceptionClass = ChildDiagnosticExceptionClass.None,
+        UiChildSession? session = null
+    )
+    {
+        try
+        {
+            diagnosticSink.Write(ChildDiagnosticEvent.Create(
+                kind,
+                operation,
+                processId: Environment.ProcessId,
+                phase: session?.State.Phase,
+                generation: session?.State.CurrentProjectionGeneration,
+                exceptionClass: exceptionClass,
+                terminalReason: session?.TerminalReason ?? ChildSessionTerminalReason.None
+            ));
+        }
+        catch (Exception) { /* Diagnostics never change fail-closed behavior. */ }
     }
 }
 

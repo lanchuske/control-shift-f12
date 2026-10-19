@@ -20,6 +20,7 @@ public sealed class UiChildSession
     public DesktopSnapshotProjection? Snapshot { get; private set; }
     public DiagnosticsProjection? Diagnostics { get; private set; }
     public PairingProjection? Pairing { get; private set; }
+    public ChildSessionTerminalReason TerminalReason { get; private set; }
     public bool IsAwaitingResponse(string requestId) => pendingRequestIds.Contains(requestId);
 
     public byte[] InitialRefreshFrame()
@@ -95,12 +96,14 @@ public sealed class UiChildSession
             Accept(payload);
             if (State.Phase != ChildSessionPhase.Terminal)
             {
+                TerminalReason = ChildSessionTerminalReason.EndOfFile;
                 State = State.EndOfFile();
                 ClearProjection();
             }
             return;
         }
 
+        TerminalReason = ChildSessionTerminalReason.EndOfFile;
         State = State.EndOfFile();
         ClearProjection();
     }
@@ -116,6 +119,7 @@ public sealed class UiChildSession
             }
             if (outcome == FrameReadOutcome.Invalid || payload is null)
             {
+                TerminalReason = ChildSessionTerminalReason.InvalidFrame;
                 State = State.ChannelFailure();
                 ClearProjection();
                 return;
@@ -205,7 +209,24 @@ public sealed class UiChildSession
 
     private void Fault()
     {
+        TerminalReason = ChildSessionTerminalReason.InvalidFrame;
         State = State.ChannelFailure();
+        ClearProjection();
+    }
+
+    public void CompleteHostCommandFailure()
+    {
+        if (State.Phase == ChildSessionPhase.Terminal) return;
+        TerminalReason = ChildSessionTerminalReason.HostCommandFailure;
+        State = State.ChannelFailure();
+        ClearProjection();
+    }
+
+    public void CompleteLocalClose()
+    {
+        if (State.Phase == ChildSessionPhase.Terminal) return;
+        TerminalReason = ChildSessionTerminalReason.LocalClose;
+        State = State.LocalClose();
         ClearProjection();
     }
 
