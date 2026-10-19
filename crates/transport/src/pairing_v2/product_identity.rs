@@ -133,8 +133,62 @@ impl ProductIdentity {
         .map(|inner| ProductOperationalEndpoint { inner })
     }
 
+    #[cfg(feature = "pairing-v2-operational-experimental")]
+    pub fn bind_recovery(
+        &self,
+        address: SocketAddr,
+    ) -> Result<ProductRecoveryEndpoint, super::Invalid> {
+        super::recovery::RecoveryEndpoint::bind(
+            address,
+            self.certificate.clone(),
+            self.private_key_der(),
+        )
+        .map(|inner| ProductRecoveryEndpoint { inner })
+    }
+
     fn private_key_der(&self) -> PrivateKeyDer<'static> {
         PrivatePkcs8KeyDer::from(self.private_key.to_vec()).into()
+    }
+}
+
+#[cfg(feature = "pairing-v2-operational-experimental")]
+pub struct ProductRecoveryEndpoint {
+    pub(crate) inner: super::recovery::RecoveryEndpoint,
+}
+
+#[cfg(feature = "pairing-v2-operational-experimental")]
+impl ProductRecoveryEndpoint {
+    pub fn publication_port(&self) -> Result<u16, super::Invalid> {
+        self.inner.local_addr().map(|address| address.port())
+    }
+
+    pub async fn recover(
+        &self,
+        peer: Option<SocketAddr>,
+        authority: &super::AdmissionAuthorityStore,
+        admission: super::OperationalAdmission,
+    ) -> Result<super::RecoveredOperationalAdmission, super::Invalid> {
+        let initiator = self.inner.local_fingerprint() < admission.peer_fingerprint();
+        let connection = if initiator {
+            self.inner.connect(peer.ok_or(super::Invalid)?).await?
+        } else {
+            self.inner.accept().await?
+        };
+        let evidence = authority
+            .operational_recovery_evidence(&admission)
+            .map_err(|_| super::Invalid)?;
+        let authenticated = super::recovery::exchange_exact_pair(
+            &connection,
+            initiator,
+            evidence,
+            admission.peer_fingerprint(),
+        )
+        .await?;
+        let recovered = authority
+            .recover_operational(admission, authenticated)
+            .map_err(|_| super::Invalid)?;
+        connection.close(0u32.into(), b"recovery complete");
+        Ok(recovered)
     }
 }
 
@@ -251,6 +305,31 @@ mod tests {
             serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["version"],
             1
         );
+    }
+
+    #[cfg(feature = "pairing-v2-operational-experimental")]
+    #[tokio::test]
+    async fn product_identity_binds_a_separate_recovery_only_endpoint() {
+        let root = tempfile::tempdir().unwrap();
+        let identity = ProductIdentity::open_or_create(&root.path().join("identity")).unwrap();
+        let endpoint = identity
+            .bind_recovery("127.0.0.1:0".parse().unwrap())
+            .unwrap();
+        assert_ne!(endpoint.publication_port().unwrap(), 0);
+    }
+
+    #[cfg(feature = "pairing-v2-operational-experimental")]
+    #[tokio::test]
+    async fn recovery_initiator_requires_a_peer_locator_before_touching_the_store() {
+        let root = tempfile::tempdir().unwrap();
+        let identity = ProductIdentity::open_or_create(&root.path().join("identity")).unwrap();
+        let endpoint = identity
+            .bind_recovery("127.0.0.1:0".parse().unwrap())
+            .unwrap();
+        let store = super::super::AdmissionAuthorityStore::open(root.path().join("store")).unwrap();
+        let admission = super::super::OperationalAdmission::test_only([1; 32], [255; 32]);
+
+        assert!(endpoint.recover(None, &store, admission).await.is_err());
     }
 
     #[cfg(feature = "pairing-v2-operational-experimental")]

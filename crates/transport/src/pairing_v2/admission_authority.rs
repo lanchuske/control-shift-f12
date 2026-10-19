@@ -68,7 +68,7 @@ pub struct OperationalAdmission {
 
 /// Move-only, process-local authority minted by one fresh authenticated
 /// recovery exchange. Persisted admission metadata cannot construct it.
-pub(crate) struct RecoveredOperationalAdmission {
+pub struct RecoveredOperationalAdmission {
     snapshot: OperationalAdmissionSnapshot,
 }
 
@@ -1238,6 +1238,13 @@ impl AdmissionAuthorityStore {
             .confirm_authenticated_peer_recovery(admission.attempt(), peer)?;
         let snapshot = self.store.authenticated_recovery_snapshot(&receipt)?;
         Ok(RecoveredOperationalAdmission { snapshot })
+    }
+
+    pub(crate) fn operational_recovery_evidence(
+        &self,
+        admission: &OperationalAdmission,
+    ) -> Result<super::recovery::ExactPeerRecovery, StoreError> {
+        self.store.recovery_evidence(admission.attempt())
     }
 
     pub(crate) fn consume_recovered_operational(

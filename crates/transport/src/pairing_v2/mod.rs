@@ -43,10 +43,12 @@ mod product_identity;
 #[cfg(feature = "pairing-v2-operational-experimental")]
 pub mod product_operational;
 pub mod provisional_tls;
-pub use evidence::*;
 #[cfg(feature = "pairing-v2-operational-experimental")]
-pub use product_identity::ProductOperationalEndpoint;
+pub use admission_authority::RecoveredOperationalAdmission;
+pub use evidence::*;
 pub use product_identity::{ProductIdentity, ProductIdentityError};
+#[cfg(feature = "pairing-v2-operational-experimental")]
+pub use product_identity::{ProductOperationalEndpoint, ProductRecoveryEndpoint};
 mod primitives;
 pub use primitives::*;
 mod candidate;
